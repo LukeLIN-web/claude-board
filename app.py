@@ -152,7 +152,9 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
         "skills_used": transcripts.extract_skills_used(tp) if tp else [],
         "memory_ops": transcripts.extract_memory_ops(tp) if tp else [],
         "plan_history": transcripts.extract_plan_history(tp) if tp else [],
-        "pending_question": transcripts.extract_pending_question(tp) if tp else None,
+        # Live interactive menu (AskUserQuestion / permission prompt) parsed from
+        # the tmux pane — the transcript doesn't record it until it's resolved.
+        "menu": actions.get_pane_menu(pid),
     }
 
 

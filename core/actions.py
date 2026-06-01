@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import shlex
 import shutil
@@ -454,6 +455,74 @@ def respond_permission(pid: int, choice: str) -> dict:
     r = tmux.send_keys(pane, *keys)
     r["choice"] = choice
     return r
+
+
+# A numbered menu option line, e.g. "❯ 1. Yes" or "  2. 绿色". The leading
+# cursor/whitespace (incl. nbsp) is stripped; group 1 = number, group 2 = label.
+_MENU_OPT_RE = re.compile(r"^[\s ❯>*]*(\d+)\.[\s ]+(.*\S)\s*$")
+
+
+def parse_pane_menu(text: str) -> Optional[dict]:
+    """Parse an interactive menu (AskUserQuestion picker / permission prompt)
+    out of a captured tmux pane, or None if no menu is currently on screen.
+
+    The pending question/permission is NOT written to the transcript until it's
+    resolved, so the live screen is the only place its options exist. Returns
+    {kind, prompt, options:[{num, label}]}.
+    """
+    if not text:
+        return None
+    lines = text.split("\n")
+    joined = "\n".join(lines)
+    is_question = ("to select" in joined and "navigate" in joined)
+    is_perm = "Do you want to proceed" in joined
+    if not (is_question or is_perm):
+        return None
+
+    opts: list[tuple[int, str]] = []
+    first_opt_line: Optional[int] = None
+    for i, ln in enumerate(lines):
+        m = _MENU_OPT_RE.match(ln)
+        if m:
+            opts.append((int(m.group(1)), m.group(2).strip()))
+            if first_opt_line is None:
+                first_opt_line = i
+    starts = [i for i, (n, _) in enumerate(opts) if n == 1]
+    if not starts or first_opt_line is None:
+        return None
+    s = starts[-1]
+    run = [opts[s]]
+    for n, l in opts[s + 1:]:
+        if n == run[-1][0] + 1:
+            run.append((n, l))
+        else:
+            break
+
+    prompt = ""
+    for ln in reversed(lines[:first_opt_line]):
+        t = ln.replace(" ", " ").strip().lstrip("☐").strip()
+        if t and not set(t) <= set("─-—=· "):
+            prompt = t
+            break
+    return {
+        "kind": "question" if is_question else "permission",
+        "prompt": prompt,
+        "options": [{"num": n, "label": l} for n, l in run],
+    }
+
+
+def get_pane_menu(pid: int) -> Optional[dict]:
+    """Capture `pid`'s tmux pane and return the live interactive menu, or None."""
+    w = find_window(pid)
+    if not w or not w.tty:
+        return None
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return None
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return None
+    return parse_pane_menu(cap["text"])
 
 
 # Keys the dashboard is allowed to send into an interactive menu (e.g. the

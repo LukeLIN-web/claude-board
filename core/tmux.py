@@ -135,6 +135,14 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     return {"ok": True, "pane_id": r["stdout"].strip()}
 
 
+def capture_pane(pane: str) -> dict:
+    """Return the visible text of `pane` as {ok, text} (never raises)."""
+    r = _run("capture-pane", "-p", "-t", pane)
+    if not r["ok"]:
+        return {"ok": False, "error": r["error"], "text": ""}
+    return {"ok": True, "text": r["stdout"]}
+
+
 def send_keys(pane: str, *keys: str) -> dict:
     """Send tmux key names (e.g. "1", "Enter", "Escape") into `pane`.
 
