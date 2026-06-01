@@ -89,16 +89,31 @@ end tell
 '''
 
 
-def fork_session(pid: int) -> dict:
-    """Open a new iTerm2 window and fork the session (new ID, inherits history)."""
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
+def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
+    """Open `claude <claude_args>` in a new window, cwd-anchored.
 
-    inner = f"cd {shlex.quote(w.cwd)} && claude --resume {shlex.quote(w.session_id)} --fork-session"
+    Prefers the tmux backend (Linux/headless); falls back to a new iTerm2 window
+    via AppleScript on macOS. Returns a structured dict and never raises. If
+    neither backend is available, returns a clear actionable error rather than
+    the opaque `[Errno 2] No such file or directory: 'osascript'`.
+    """
+    if tmux.available():
+        r = tmux.new_window(cwd, ["claude", *claude_args])
+        if r["ok"]:
+            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
+        return {"ok": False, "error": r["error"], "backend": "tmux"}
+
+    if not shutil.which("osascript"):
+        return {
+            "ok": False,
+            "error": "no terminal backend: start a tmux server (Linux) "
+                     "or run on macOS with iTerm2 (osascript not found)",
+        }
+
+    args_str = " ".join(shlex.quote(a) for a in claude_args)
+    inner = f"cd {shlex.quote(cwd)} && claude {args_str}"
     quoted_for_applescript = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
     script = _FORK_APPLESCRIPT_ITERM.format(cmd=quoted_for_applescript)
-
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
@@ -108,11 +123,22 @@ def fork_session(pid: int) -> dict:
         return {"ok": False, "error": str(e)}
     return {
         "ok": proc.returncode == 0,
-        "cwd": w.cwd,
-        "session_id": w.session_id,
+        "cwd": cwd,
+        "backend": "iterm",
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
+
+
+def fork_session(pid: int) -> dict:
+    """Open a new window and fork the session (new ID, inherits history)."""
+    w = find_window(pid)
+    if not w:
+        return {"ok": False, "error": f"no window pid={pid}"}
+
+    r = open_claude_window(w.cwd, ["--resume", w.session_id, "--fork-session"])
+    r.setdefault("session_id", w.session_id)
+    return r
 
 
 def _render_session_markdown(pid: int, limit: int = 80) -> Optional[tuple[str, str]]:

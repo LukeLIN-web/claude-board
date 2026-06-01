@@ -277,7 +277,6 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
 
 @app.post("/api/history/{session_id}/resume")
 def api_history_resume(session_id: str) -> dict:
-    import shlex, subprocess
     # If the session is alive, focus it instead of opening a new window.
     for w in sessions.list_windows():
         if w.session_id == session_id and w.alive and w.tty:
@@ -293,28 +292,13 @@ def api_history_resume(session_id: str) -> dict:
     if not sess:
         return {"ok": False, "error": "session not found in index"}
     cwd = sess.get("project") or str(Path.home())
-    inner = f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
-    quoted = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
-    script = f'''tell application "iTerm2"
-    activate
-    set newWin to (create window with default profile)
-    tell current session of newWin
-        write text {quoted}
-    end tell
-end tell'''
-    try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": proc.returncode == 0, "action": "resumed", "session_id": session_id, "cwd": cwd}
+    r = actions.open_claude_window(cwd, ["--resume", session_id])
+    r.update({"action": "resumed", "session_id": session_id, "cwd": cwd})
+    return r
 
 
 @app.post("/api/history/{session_id}/fork")
 def api_history_fork(session_id: str) -> dict:
-    import shlex, subprocess
     data = history.list_sessions(limit=9999)
     sess = None
     for s in data["sessions"]:
@@ -324,23 +308,9 @@ def api_history_fork(session_id: str) -> dict:
     if not sess:
         return {"ok": False, "error": "session not found in index"}
     cwd = sess.get("project") or str(Path.home())
-    inner = f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)} --fork-session"
-    quoted = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
-    script = f'''tell application "iTerm2"
-    activate
-    set newWin to (create window with default profile)
-    tell current session of newWin
-        write text {quoted}
-    end tell
-end tell'''
-    try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": proc.returncode == 0, "action": "forked", "session_id": session_id, "cwd": cwd}
+    r = actions.open_claude_window(cwd, ["--resume", session_id, "--fork-session"])
+    r.update({"action": "forked", "session_id": session_id, "cwd": cwd})
+    return r
 
 
 @app.get("/api/skills/{name}/sessions")

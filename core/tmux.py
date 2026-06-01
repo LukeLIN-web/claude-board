@@ -116,18 +116,20 @@ def _resolve_target() -> dict:
     return {"ok": False, "error": "no tmux session available to spawn into"}
 
 
-def new_window(cwd: str) -> dict:
-    """Open a new tmux window running `claude` in `cwd`; returns {ok, pane_id, error?}.
+def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
+    """Open a new tmux window in `cwd` running `cmd`; returns {ok, pane_id, error?}.
 
-    Spawned sessions launch with `--dangerously-skip-permissions` so the fleet can
-    drive them non-interactively (no per-action permission prompts blocking the pane).
+    Defaults to spawning `claude --dangerously-skip-permissions` so the fleet can
+    drive new sessions non-interactively (no per-action permission prompts blocking
+    the pane). Callers that need a different command — e.g. forking or resuming an
+    existing session — pass `cmd` explicitly.
     """
     target = _resolve_target()
     if not target["ok"]:
         return {"ok": False, "error": target["error"]}
+    cmd = cmd or ["claude", "--dangerously-skip-permissions"]
     r = _run("new-window", "-P", "-F", "#{pane_id}",
-             "-t", target["target"], "-c", cwd,
-             "claude", "--dangerously-skip-permissions")
+             "-t", target["target"], "-c", cwd, *cmd)
     if not r["ok"]:
         return {"ok": False, "error": r["error"]}
     return {"ok": True, "pane_id": r["stdout"].strip()}

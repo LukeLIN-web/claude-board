@@ -341,13 +341,14 @@
                   class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
             Export</button>
           <!-- Send a single prompt into this session's tmux pane (hidden when tmux unavailable) -->
-          <div class="flex items-center gap-1 ml-auto" x-show="tmuxAvailable">
-            <input type="text" x-model="promptDrafts[w.pid]" placeholder="Send a prompt…"
-                   @keydown.enter="sendPrompt(w.pid)"
+          <div class="flex items-end gap-2 w-full mt-1" x-show="tmuxAvailable">
+            <textarea x-model="promptDrafts[w.pid]" rows="3"
+                   placeholder="Send a prompt…  (Shift+Enter to send · Enter for newline)"
+                   @keydown.enter.shift.prevent="sendPrompt(w.pid)"
                    :disabled="!!promptSending[w.pid]"
-                   class="text-xs border border-gray-200 rounded px-2 py-1 w-44 focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50">
+                   class="text-sm leading-snug border border-gray-200 rounded px-3 py-2 flex-1 resize-y min-h-[4.5rem] focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50"></textarea>
             <button @click="sendPrompt(w.pid)" :disabled="!!promptSending[w.pid]"
-                    class="text-xs border border-emerald-200 text-emerald-600 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait">
+                    class="text-sm border border-emerald-200 text-emerald-600 px-4 py-2 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait self-stretch shrink-0">
               <span x-text="promptSending[w.pid] ? 'Sending…' : 'Send'"></span></button>
           </div>
         </div>
@@ -366,6 +367,14 @@
         <span x-show="timelineData?.platform === 'codex'" class="text-[10px] bg-green-500 text-white px-1.5 rounded">codex</span>
       </h2>
       <div class="flex items-center gap-2">
+        <!-- Assistant font-size adjuster -->
+        <div class="flex items-center border border-gray-200 rounded overflow-hidden" title="Assistant 字体大小">
+          <button @click="setAssistantFont(-1)"
+                  class="px-2 py-1 text-xs text-gray-600 hover:bg-gray-100 transition">A−</button>
+          <span class="px-1.5 text-[10px] text-gray-400 tabular-nums" x-text="assistantFontPx + 'px'"></span>
+          <button @click="setAssistantFont(1)"
+                  class="px-2 py-1 text-sm text-gray-600 hover:bg-gray-100 transition">A+</button>
+        </div>
         <button @click="showPlanHistory = !showPlanHistory"
                 x-show="timelineData?.plan_history?.length"
                 class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded hover:bg-purple-50 transition"
@@ -374,6 +383,17 @@
         <button @click="expandedPid = null; expandedHistoryId = null; timelineData = null; planData = null"
                 class="text-gray-400 hover:text-gray-700 text-lg">&times;</button>
       </div>
+    </div>
+    <!-- Send a single prompt into this live session's tmux pane (only for live sessions) -->
+    <div class="flex items-end gap-2 mb-4" x-show="expandedPid !== null && tmuxAvailable">
+      <textarea x-model="promptDrafts[expandedPid]" rows="3"
+                placeholder="Send a prompt to this session…  (Shift+Enter to send · Enter for newline)"
+                @keydown.enter.shift.prevent="sendPrompt(expandedPid)"
+                :disabled="!!promptSending[expandedPid]"
+                class="text-sm leading-snug border border-gray-200 rounded px-3 py-2 flex-1 resize-y min-h-[4.5rem] focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50"></textarea>
+      <button @click="sendPrompt(expandedPid)" :disabled="!!promptSending[expandedPid]"
+              class="text-sm border border-emerald-200 text-emerald-600 px-4 py-2 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait self-stretch shrink-0">
+        <span x-text="promptSending[expandedPid] ? 'Sending…' : 'Send'"></span></button>
     </div>
     <!-- Plan version history -->
     <div x-show="showPlanHistory && timelineData?.plan_history?.length" class="mb-4 bg-purple-50 rounded-lg p-4 border border-purple-200 text-sm" x-transition>
@@ -471,6 +491,7 @@
     <div class="space-y-2 max-h-[32rem] overflow-y-auto" x-ref="eventsList">
       <template x-for="(ev, idx) in (timelineData?.events || [])" :key="idx">
         <div :id="'tl-ev-'+idx" class="text-sm border-l-2 pl-3 py-1"
+             x-show="ev.kind !== 'system'"
              :class="{
                'border-blue-400': ev.kind==='user_text',
                'border-emerald-400': ev.kind==='assistant_text',
@@ -513,7 +534,12 @@
               </template>
             </div>
           </template>
-          <template x-if="ev.kind !== 'tool_use'">
+          <!-- Assistant output: show in full, no scroll, no truncation, adjustable font -->
+          <template x-if="ev.kind === 'assistant_text'">
+            <pre class="text-gray-700 whitespace-pre-wrap break-words"
+                 :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
+          </template>
+          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text'">
             <pre class="text-xs text-gray-700 max-h-32 overflow-y-auto" x-text="ev.text?.slice(0,2000) || ''"></pre>
           </template>
         </div>
@@ -622,6 +648,9 @@ function fleet() {
     searchResults: null,
     expandedPid: null,
     expandedHistoryId: null,
+    // Last-seen updated_at of the open live timeline; lets applySnapshot detect
+    // new activity (e.g. the assistant replied) and auto-refresh the timeline.
+    expandedUpdatedAt: null,
     timelineData: null,
     planData: null,
     toasts: [],
@@ -651,6 +680,12 @@ function fleet() {
     spawning: false,
     promptDrafts: {},
     promptSending: {},
+    assistantFontPx: Number(localStorage.getItem('assistantFontPx')) || 14,
+
+    setAssistantFont(delta) {
+      this.assistantFontPx = Math.min(28, Math.max(10, this.assistantFontPx + delta));
+      localStorage.setItem('assistantFontPx', this.assistantFontPx);
+    },
 
     get recentCwds() {
       const seen = [];
@@ -664,8 +699,17 @@ function fleet() {
       return this.windows.filter(w => w.triage === 'waiting_perm');
     },
     get filteredWindows() {
-      if (!this.statusFilter) return this.windows;
-      return this.windows.filter(w => w.triage === this.statusFilter);
+      const list = this.statusFilter
+        ? this.windows.filter(w => w.triage === this.statusFilter)
+        : this.windows;
+      // Pin each card to a fixed position by creation time so panels never
+      // jump when a session's status flips (working ↔ completed) — the server
+      // sorts by recent activity, which reshuffles cards and is easy to
+      // misclick. started_at is immutable per session; pid is the tiebreaker
+      // (and fallback for sessions with no recorded start time).
+      return list.slice().sort(
+        (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid
+      );
     },
 
     init() {
@@ -706,6 +750,38 @@ function fleet() {
       this.windows = snap.windows || [];
       this.counts = snap.counts || this.counts;
       if ('tmux_available' in snap) this.tmuxAvailable = !!snap.tmux_available;
+      // If a live session's timeline is open and its activity advanced (the
+      // assistant replied, a tool ran, etc.), re-fetch the timeline so the user
+      // sees the new events without reopening the panel.
+      if (this.expandedPid !== null) {
+        const w = this.windows.find((x) => x.pid === this.expandedPid);
+        if (w && w.updated_at !== this.expandedUpdatedAt) {
+          this.expandedUpdatedAt = w.updated_at;
+          this.refreshTimeline();
+        }
+      }
+    },
+
+    // Re-fetch the open live timeline in place, preserving the user's scroll:
+    // only snap to the bottom if they were already near it (so reading older
+    // events isn't interrupted, but new replies stay visible by default).
+    async refreshTimeline() {
+      const pid = this.expandedPid;
+      if (pid === null) return;
+      const el = this.$refs.eventsList;
+      const stick = !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 60;
+      try {
+        const r = await fetch(`/api/windows/${pid}/timeline`);
+        if (!r.ok) return;
+        const data = await r.json();
+        if (this.expandedPid !== pid) return; // user navigated away mid-fetch
+        this.timelineData = data;
+        if (stick) {
+          this.$nextTick(() => {
+            const e = this.$refs.eventsList; if (e) e.scrollTop = e.scrollHeight;
+          });
+        }
+      } catch (e) { /* transient fetch error; next snapshot retries */ }
     },
 
     formatIdle(seconds) {
@@ -849,13 +925,17 @@ function fleet() {
 
     async toggleExpand(pid) {
       if (this.expandedPid === pid) {
-        this.expandedPid = null; this.timelineData = null; this.planData = null;
+        this.expandedPid = null; this.expandedUpdatedAt = null;
+        this.timelineData = null; this.planData = null;
         return;
       }
       this.expandedPid = pid;
       this.expandedHistoryId = null;
       this.planData = null;
       this.showPlanHistory = false;
+      // Baseline the activity marker so the next bump (assistant reply, tool
+      // call) triggers an auto-refresh via applySnapshot.
+      this.expandedUpdatedAt = this.windows.find((w) => w.pid === pid)?.updated_at ?? null;
       const r = await fetch(`/api/windows/${pid}/timeline`);
       this.timelineData = await r.json();
       this.$nextTick(() => {
