@@ -10,9 +10,11 @@ cd claude-fleet
 bash run.sh          # creates a venv, installs deps, starts the dashboard
 ```
 
-The backend only **reads** `~/.claude/` and `~/.codex/` — it never mutates agent
-state. Keep it that way: read-only access to the user's harness data is a core
-invariant.
+The backend never writes to the user's stored harness data under `~/.claude/` and
+`~/.codex/` — that read-only access is a core invariant; keep it that way. Fleet is
+read-only **by default**: a few explicit, user-triggered actions (fork, close,
+review, and tmux-backed session spawn / single-prompt injection on Linux) act on
+live sessions, but they must never read-modify-write the stored harness data.
 
 ### Demo data
 

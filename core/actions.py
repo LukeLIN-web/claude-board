@@ -10,8 +10,12 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from . import tmux
 from .sessions import CLAUDE_HOME, find_window
 from .transcripts import timeline, extract_plan_history, extract_skills_used, extract_memory_ops
+
+# Upper bound on an injected single-line prompt (after newline collapse).
+_MAX_PROMPT_CHARS = 8000
 
 # Focus shim resolution: a user override at ~/.claude/focus-tty.sh wins; otherwise
 # the bundled cross-setup default (Terminal.app / iTerm2 / tmux) shipped with the repo.
@@ -382,3 +386,32 @@ end tell'''
         "pid": pid,
         "session_id": w.session_id,
     }
+
+
+def create_session(cwd: str) -> dict:
+    """Spawn a new tmux window running `claude` in `cwd` (validated server-side)."""
+    if not cwd or not cwd.strip():
+        return {"ok": False, "error": "cwd is required"}
+    resolved = os.path.expanduser(cwd.strip())
+    if not os.path.isdir(resolved):
+        return {"ok": False, "error": f"not a directory: {resolved}"}
+    return tmux.new_window(resolved)
+
+
+def send_prompt(pid: int, text: str) -> dict:
+    """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
+    w = find_window(pid)
+    if not w:
+        return {"ok": False, "error": f"no window pid={pid}"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+    # v1 is single-line: fold any internal newlines into spaces.
+    collapsed = " ".join((text or "").split("\n")).strip()
+    if not collapsed:
+        return {"ok": False, "error": "prompt is empty"}
+    if len(collapsed) > _MAX_PROMPT_CHARS:
+        return {"ok": False, "error": f"prompt too long (max {_MAX_PROMPT_CHARS} chars)"}
+    return tmux.send_text(pane, collapsed)

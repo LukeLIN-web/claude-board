@@ -94,7 +94,7 @@ Plan 版本历史：一个 session 通常迭代 5-14 次 plan，每次 Write 是
 
 ## 架构
 
-单文件前端（Alpine.js + Tailwind CDN，不需要 npm），Python 后端只读 `~/.claude/` 和 `~/.codex/`，不改任何 agent 状态。
+单文件前端（Alpine.js + Tailwind CDN，不需要 npm）。Python 后端从不写入 `~/.claude/` 和 `~/.codex/` 中存储的 harness 数据——这些数据保持只读。它**默认只读**：少数显式的、用户触发的操作（fork、close、review，以及 Linux 上基于 tmux 的新建会话 / 单条 prompt 注入）作用于运行中的会话，而非存储的数据。
 
 ```
 app.py                FastAPI + SSE (2s 轮询)

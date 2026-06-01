@@ -9,3 +9,6 @@ __pycache__/
 # generated demo data + public mirror clone
 fixtures/demo-home/
 .public-mirror/
+
+# humanize / codex skill cache
+.humanize/

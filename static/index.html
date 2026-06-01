@@ -66,6 +66,32 @@
             class="text-xs border px-2 py-1 rounded hover:bg-purple-50 transition"
             :class="showMemory ? 'border-purple-400 text-purple-600 bg-purple-50' : 'border-gray-200 text-gray-600'">
       Memory</button>
+    <!-- New session (tmux spawn) — hidden when tmux is unavailable -->
+    <div class="relative" x-show="tmuxAvailable" @click.outside="showSpawn = false">
+      <button @click="showSpawn = !showSpawn"
+              class="text-xs border px-2 py-1 rounded hover:bg-emerald-50 transition"
+              :class="showSpawn ? 'border-emerald-400 text-emerald-600 bg-emerald-50' : 'border-gray-200 text-gray-600'">
+        + New session</button>
+      <div x-show="showSpawn" x-cloak
+           class="absolute left-0 mt-1 w-80 bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-2">
+        <label class="text-xs text-gray-500">Spawn <code>claude</code> in a directory</label>
+        <select x-model="spawnCwdSelect" class="border rounded px-2 py-1 text-sm bg-white">
+          <option value="">— recent directory —</option>
+          <template x-for="d in recentCwds" :key="d">
+            <option :value="d" x-text="d"></option>
+          </template>
+        </select>
+        <input type="text" x-model="spawnCwd" placeholder="…or type a path"
+               @keydown.enter="spawnSession()"
+               class="border rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400">
+        <div class="flex justify-end gap-2">
+          <button @click="showSpawn = false" class="text-xs text-gray-400 hover:text-gray-700">Cancel</button>
+          <button @click="spawnSession()" :disabled="spawning"
+                  class="text-xs bg-emerald-600 text-white px-3 py-1 rounded hover:bg-emerald-700 transition disabled:opacity-50 disabled:cursor-wait">
+            <span x-text="spawning ? 'Spawning…' : 'Spawn'"></span></button>
+        </div>
+      </div>
+    </div>
   </div>
   <div class="flex items-center gap-2">
     <input type="text" placeholder="Search..." x-model="searchQuery"
@@ -315,6 +341,16 @@
           <button @click="exportWindow(w.pid)"
                   class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
             Export</button>
+          <!-- Send a single prompt into this session's tmux pane (hidden when tmux unavailable) -->
+          <div class="flex items-center gap-1 ml-auto" x-show="tmuxAvailable">
+            <input type="text" x-model="promptDrafts[w.pid]" placeholder="Send a prompt…"
+                   @keydown.enter="sendPrompt(w.pid)"
+                   :disabled="promptSending[w.pid]"
+                   class="text-xs border border-gray-200 rounded px-2 py-1 w-44 focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50">
+            <button @click="sendPrompt(w.pid)" :disabled="promptSending[w.pid]"
+                    class="text-xs border border-emerald-200 text-emerald-600 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait">
+              <span x-text="promptSending[w.pid] ? 'Sending…' : 'Send'"></span></button>
+          </div>
         </div>
       </div>
     </template>
@@ -609,6 +645,21 @@ function fleet() {
     skillSessions: {},
     expandedMemory: null,
     memorySessions: {},
+    tmuxAvailable: false,
+    showSpawn: false,
+    spawnCwd: '',
+    spawnCwdSelect: '',
+    spawning: false,
+    promptDrafts: {},
+    promptSending: {},
+
+    get recentCwds() {
+      const seen = [];
+      for (const w of this.windows) {
+        if (w.cwd && !seen.includes(w.cwd)) seen.push(w.cwd);
+      }
+      return seen;
+    },
 
     get waitingWindows() {
       return this.windows.filter(w => w.triage === 'waiting_perm');
@@ -655,6 +706,7 @@ function fleet() {
     applySnapshot(snap) {
       this.windows = snap.windows || [];
       this.counts = snap.counts || this.counts;
+      if ('tmux_available' in snap) this.tmuxAvailable = !!snap.tmux_available;
     },
 
     formatIdle(seconds) {
@@ -673,6 +725,56 @@ function fleet() {
       const r = await fetch(`/api/windows/${pid}/fork`, { method: 'POST' });
       const d = await r.json();
       this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
+    },
+
+    async spawnSession() {
+      if (this.spawning) return;
+      const cwd = (this.spawnCwd && this.spawnCwd.trim()) || this.spawnCwdSelect;
+      if (!cwd) { this.toast('Pick or type a directory'); return; }
+      this.spawning = true;
+      try {
+        const r = await fetch('/api/windows/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cwd }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          this.toast('Spawned claude in ' + cwd);
+          this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = '';
+        } else {
+          this.toast('Spawn failed: ' + (d.error || ''));
+        }
+      } catch (e) {
+        this.toast('Spawn failed: ' + e);
+      } finally {
+        this.spawning = false;
+      }
+    },
+
+    async sendPrompt(pid) {
+      if (this.promptSending[pid]) return;
+      const text = (this.promptDrafts[pid] || '').trim();
+      if (!text) { this.toast('Type a prompt first'); return; }
+      this.promptSending[pid] = true;
+      try {
+        const r = await fetch(`/api/windows/${pid}/prompt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          this.toast('Sent prompt');
+          this.promptDrafts[pid] = '';
+        } else {
+          this.toast('Send failed: ' + (d.error || ''));
+        }
+      } catch (e) {
+        this.toast('Send failed: ' + e);
+      } finally {
+        this.promptSending[pid] = false;
+      }
     },
 
     async reviewWindow(pid) {

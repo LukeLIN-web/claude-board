@@ -10,9 +10,10 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, codex, history, memory, patrol, perms, plans, search, sessions, skills, transcripts
+from core import actions, codex, history, memory, patrol, perms, plans, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -77,6 +78,9 @@ def _enriched_snapshot() -> dict:
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
         -w.get("updated_at", 0),
     ))
+    # Capability flag for the UI to gate the tmux-backed controls. `available()`
+    # is cached, so this does not spawn a tmux subprocess on every 2s poll.
+    snap["tmux_available"] = tmux.available()
     return snap
 
 
@@ -185,6 +189,24 @@ def api_focus(pid: int) -> dict:
     if not w.tty:
         return {"ok": False, "error": "no tty available for this pid"}
     return actions.focus_terminal(w.tty)
+
+
+class CreateBody(BaseModel):
+    cwd: str
+
+
+class PromptBody(BaseModel):
+    text: str
+
+
+@app.post("/api/windows/create")
+def api_window_create(body: CreateBody) -> dict:
+    return actions.create_session(body.cwd)
+
+
+@app.post("/api/windows/{pid}/prompt")
+def api_window_prompt(pid: int, body: PromptBody) -> dict:
+    return actions.send_prompt(pid, body.text)
 
 
 @app.post("/api/windows/{pid}/fork")

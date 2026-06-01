@@ -11,8 +11,7 @@ done.
 ## Run it in 30 seconds
 
 ```bash
-git clone https://github.com/tianyilt/claude-fleet
-cd claude-fleet && bash run.sh
+bash run.sh
 # open http://127.0.0.1:7878 in your browser
 ```
 
@@ -110,7 +109,10 @@ Write is a full snapshot, each Edit is a red/green diff.
 ## Architecture
 
 Single-file frontend (Alpine.js + Tailwind via CDN — no npm). The Python backend
-only **reads** `~/.claude/` and `~/.codex/`; it never mutates any agent state.
+never writes to the stored harness data under `~/.claude/` and `~/.codex/` — that
+data stays read-only. It is read-only **by default**: a few explicit,
+user-triggered actions (fork, close, review, and tmux-backed session spawn /
+single-prompt injection on Linux) act on live sessions, never on the stored data.
 
 ```
 app.py                FastAPI + SSE (2s polling)
