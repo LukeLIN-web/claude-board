@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Fleet</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<style>
+  [x-cloak] { display: none !important; }
+  @keyframes pulse-red { 0%,100%{opacity:1} 50%{opacity:.5} }
+  .pulse-red { animation: pulse-red 1.2s ease-in-out infinite; }
+  .status-busy, .triage-working { background-color: #10b981; }
+  .triage-waiting_perm { background-color: #ef4444; animation: pulse-red 1.2s ease-in-out infinite; }
+  .triage-stalled { background-color: #f59e0b; }
+  .triage-completed { background-color: #3b82f6; }
+  .triage-closeable { background-color: #9ca3af; }
+  pre { white-space: pre-wrap; word-break: break-all; }
+  .toast-enter { animation: slideIn .3s ease-out; }
+  @keyframes slideIn { from{transform:translateY(1rem);opacity:0} to{transform:translateY(0);opacity:1} }
+</style>
+</head>
+
+<body class="bg-gray-50 text-gray-900 min-h-screen" x-data="fleet()" x-init="init()" x-cloak>
+
+<!-- ===== Top bar: pending permissions ===== -->
+<div class="sticky top-0 z-50 bg-red-600 text-white px-4 py-2 shadow-lg flex items-center gap-3 text-sm"
+     x-show="waitingWindows.length > 0" x-transition>
+  <span class="font-bold shrink-0">PENDING (<span x-text="waitingWindows.length"></span>)</span>
+  <div class="flex gap-2 overflow-x-auto">
+    <template x-for="w in waitingWindows" :key="w.pid">
+      <button @click="focusWindow(w.pid)"
+              class="bg-red-700 hover:bg-red-800 rounded px-3 py-1 shrink-0 flex items-center gap-1 transition">
+        <span class="inline-block w-2 h-2 rounded-full bg-white pulse-red"></span>
+        <span x-text="w.name || w.project_name"></span>
+        <span class="opacity-70 text-xs" x-text="w.permission_msg || 'permission prompt'"></span>
+      </button>
+    </template>
+  </div>
+</div>
+
+<!-- ===== Header ===== -->
+<header class="px-6 py-3 border-b bg-white flex items-center justify-between">
+  <div class="flex items-center gap-3">
+    <h1 class="text-xl font-bold tracking-tight">Claude Fleet</h1>
+    <div class="flex gap-1 text-xs">
+      <span class="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full cursor-pointer hover:bg-emerald-200"
+            :class="statusFilter==='working' ? 'ring-2 ring-emerald-500' : ''"
+            @click="statusFilter = (statusFilter==='working' ? '' : 'working')"
+            x-text="counts.busy + ' busy'"></span>
+      <span class="bg-red-100 text-red-800 px-2 py-0.5 rounded-full cursor-pointer hover:bg-red-200"
+            :class="statusFilter==='waiting_perm' ? 'ring-2 ring-red-500' : ''"
+            @click="statusFilter = (statusFilter==='waiting_perm' ? '' : 'waiting_perm')"
+            x-show="counts.waiting > 0" x-text="counts.waiting + ' waiting'"></span>
+      <span class="bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full cursor-pointer hover:bg-gray-200"
+            :class="statusFilter==='completed' || statusFilter==='closeable' ? 'ring-2 ring-gray-400' : ''"
+            @click="statusFilter = (statusFilter==='completed' ? 'closeable' : statusFilter==='closeable' ? '' : 'completed')"
+            x-text="counts.idle + ' idle'"></span>
+    </div>
+    <!-- Skills / Memory buttons -->
+    <button @click="showSkills = !showSkills; if(showSkills) loadSkills()"
+            class="text-xs border px-2 py-1 rounded hover:bg-blue-50 transition"
+            :class="showSkills ? 'border-blue-400 text-blue-600 bg-blue-50' : 'border-gray-200 text-gray-600'">
+      Skills</button>
+    <button @click="showMemory = !showMemory; if(showMemory) loadMemory()"
+            class="text-xs border px-2 py-1 rounded hover:bg-purple-50 transition"
+            :class="showMemory ? 'border-purple-400 text-purple-600 bg-purple-50' : 'border-gray-200 text-gray-600'">
+      Memory</button>
+  </div>
+  <div class="flex items-center gap-2">
+    <input type="text" placeholder="Search..." x-model="searchQuery"
+           @keydown.enter="doSearch()"
+           class="border rounded-lg pl-3 pr-8 py-1.5 text-sm w-64 focus:outline-none focus:ring-2 focus:ring-blue-400">
+    <button @click="doSearch()" class="text-gray-400 hover:text-gray-700 text-sm">Search</button>
+    <select x-model="statusFilter" class="border rounded-lg px-2 py-1.5 text-sm bg-white">
+      <option value="">All</option>
+      <option value="working">working</option>
+      <option value="waiting_perm">waiting</option>
+      <option value="stalled">stalled</option>
+      <option value="completed">completed</option>
+      <option value="closeable">closeable</option>
+    </select>
+  </div>
+</header>
+
+<main class="px-6 py-4">
+
+  <!-- ===== Skills panel ===== -->
+  <div x-show="showSkills && skillsList" class="mb-4 bg-white rounded-xl shadow-sm border p-4" x-transition>
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold text-sm">Skills (<span x-text="(skillsList||[]).length"></span>)</h2>
+      <button @click="showSkills = false" class="text-gray-400 hover:text-gray-700">&times;</button>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-[70vh] overflow-y-auto">
+      <template x-for="sk in (skillsList||[])" :key="sk.name">
+        <div class="border rounded text-xs"
+             :class="sk.is_system ? 'border-purple-200 bg-purple-50/30' : ''">
+          <div class="px-3 py-2 cursor-pointer hover:bg-gray-50 transition"
+               @click="toggleSkillExpand(sk.name)">
+            <div class="flex items-center gap-2">
+              <span class="text-gray-400 text-[10px] shrink-0"
+                    x-text="expandedSkill === sk.name ? '▼' : '▶'"></span>
+              <span class="font-mono font-medium text-blue-700 shrink-0" x-text="sk.name"></span>
+              <span class="text-[9px] px-1 rounded shrink-0" x-show="sk.origin && sk.origin !== 'claude'"
+                    :class="sk.is_system ? 'bg-purple-200 text-purple-800' : 'bg-orange-200 text-orange-800'"
+                    x-text="sk.is_system ? 'system' : sk.origin"></span>
+              <span class="text-gray-500 truncate flex-1" x-text="sk.description"></span>
+              <span class="bg-blue-100 text-blue-700 rounded-full px-1.5 shrink-0 font-medium"
+                    x-show="sk.total_activity" x-text="sk.total_activity"></span>
+            </div>
+            <div class="flex gap-3 mt-1 text-[10px] text-gray-400" x-show="sk.total_activity">
+              <span x-show="sk.invoke_count" x-text="sk.invoke_count + ' invokes'"></span>
+              <span x-show="sk.reads" class="text-sky-500" x-text="'↓' + sk.reads + ' reads'"></span>
+              <span x-show="sk.writes" class="text-pink-500" x-text="'↑' + sk.writes + ' writes'"></span>
+              <span x-show="sk.bash_refs" x-text="sk.bash_refs + ' bash'"></span>
+              <span x-text="sk.session_count + ' sessions'"></span>
+            </div>
+          </div>
+          <!-- Expanded: per-session breakdown -->
+          <div x-show="expandedSkill === sk.name" class="border-t bg-white px-3 py-2 max-h-64 overflow-y-auto" x-transition>
+            <div x-show="!skillSessions[sk.name]" class="text-gray-400">Loading...</div>
+            <template x-for="row in (skillSessions[sk.name] || [])" :key="row.session_id">
+              <div class="py-1 border-b border-gray-100 last:border-0 cursor-pointer hover:bg-blue-50 px-1 rounded"
+                   @click="openHistoryTimeline(row.session_id); showSkills = false">
+                <div class="flex items-center gap-1">
+                  <span class="text-[9px] px-1 rounded text-white shrink-0"
+                        :class="row.platform==='codex' ? 'bg-green-500' : row.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                        x-text="row.platform"></span>
+                  <span class="text-gray-700 truncate flex-1" x-text="row.title"></span>
+                  <span class="text-[10px] text-gray-500 shrink-0 font-mono">
+                    <span x-show="row.invoke" class="text-amber-600" x-text="row.invoke+'i'"></span>
+                    <span x-show="row.reads" class="text-sky-600" x-text="'↓'+row.reads"></span>
+                    <span x-show="row.writes" class="text-pink-600" x-text="'↑'+row.writes"></span>
+                    <span x-show="row.bash_refs" class="text-gray-400" x-text="row.bash_refs+'b'"></span>
+                  </span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ===== Memory panel ===== -->
+  <div x-show="showMemory && memoryData" class="mb-4 bg-white rounded-xl shadow-sm border p-4" x-transition>
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold text-sm">Memory (<span x-text="memoryData?.total || 0"></span>)</h2>
+      <button @click="showMemory = false" class="text-gray-400 hover:text-gray-700">&times;</button>
+    </div>
+    <template x-for="(mems, type) in (memoryData?.groups || {})" :key="type">
+      <div class="mb-3">
+        <h3 class="text-xs font-semibold uppercase tracking-wide mb-1"
+            :class="{'text-blue-600': type==='user', 'text-amber-600': type==='feedback', 'text-emerald-600': type==='project', 'text-purple-600': type==='reference'}"
+            x-text="type"></h3>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+          <template x-for="m in mems" :key="m.name">
+            <div class="border rounded text-xs"
+                 :class="m.in_memory_index ? 'border-emerald-200 bg-emerald-50/30' : ''">
+              <div class="px-3 py-2 cursor-pointer hover:bg-gray-50"
+                   @click="toggleMemoryExpand(m.file_stem)">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center gap-1 min-w-0">
+                    <span class="text-gray-400 text-[10px] shrink-0"
+                          x-text="expandedMemory === m.file_stem ? '▼' : '▶'"></span>
+                    <span class="font-medium truncate" x-text="m.file_stem"></span>
+                    <span class="text-[9px] bg-emerald-100 text-emerald-700 px-1 rounded shrink-0"
+                          x-show="m.in_memory_index" title="In MEMORY.md (auto-loaded into system prompt)">idx</span>
+                  </div>
+                  <span class="text-[10px] text-gray-400 shrink-0"
+                        x-show="m.read_sessions || m.write_sessions"
+                        x-text="'↓' + (m.read_sessions||0) + ' ↑' + (m.write_sessions||0)"></span>
+                </div>
+                <div class="text-gray-500 truncate" x-text="m.description"></div>
+              </div>
+              <!-- Expanded: per-session breakdown + content -->
+              <div x-show="expandedMemory === m.file_stem" class="border-t bg-white px-3 py-2" x-transition>
+                <div class="space-y-1 max-h-40 overflow-y-auto mb-2">
+                  <div x-show="!memorySessions[m.file_stem]" class="text-gray-400">Loading...</div>
+                  <template x-for="row in (memorySessions[m.file_stem] || [])" :key="row.session_id">
+                    <div class="py-1 cursor-pointer hover:bg-blue-50 px-1 rounded text-[11px]"
+                         @click="openHistoryTimeline(row.session_id); showMemory = false">
+                      <div class="flex items-center gap-1">
+                        <span class="text-[9px] px-1 rounded text-white shrink-0"
+                              :class="row.platform==='codex' ? 'bg-green-500' : row.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                              x-text="row.platform"></span>
+                        <span class="text-gray-700 truncate flex-1" x-text="row.title"></span>
+                        <span class="font-mono text-[10px] shrink-0">
+                          <span x-show="row.reads" class="text-sky-600" x-text="'↓'+row.reads"></span>
+                          <span x-show="row.writes" class="text-pink-600" x-text="'↑W'+row.writes"></span>
+                          <span x-show="row.edits" class="text-amber-600" x-text="'↑E'+row.edits"></span>
+                        </span>
+                      </div>
+                    </div>
+                  </template>
+                  <div x-show="memorySessions[m.file_stem] && memorySessions[m.file_stem].length === 0" class="text-gray-400 italic">
+                    No explicit access (loaded via MEMORY.md index)
+                  </div>
+                </div>
+                <pre class="text-gray-600 max-h-32 overflow-y-auto whitespace-pre-wrap border-t pt-1 text-[10px]"
+                     x-text="m.content_preview"></pre>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- ===== Search results ===== -->
+  <div x-show="searchResults !== null" class="mb-4 bg-white rounded-xl shadow-sm border p-4" x-transition>
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold text-sm">
+        "<span x-text="searchQuery" class="text-blue-600"></span>"
+        — <span x-text="(searchResults||[]).length"></span> hits
+      </h2>
+      <button @click="searchResults = null" class="text-gray-400 hover:text-gray-700">&times;</button>
+    </div>
+    <div class="divide-y max-h-96 overflow-y-auto">
+      <template x-for="hit in (searchResults||[])" :key="hit.path + ':' + hit.line">
+        <div class="py-2 text-sm cursor-pointer hover:bg-gray-50"
+             @click="openTimelineForSession(hit.session_id)">
+          <div class="flex items-center gap-2 text-xs text-gray-500">
+            <span class="px-1 rounded text-white text-[10px]"
+                  :class="hit.platform==='codex' ? 'bg-green-500' : hit.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                  x-text="hit.platform"></span>
+            <span x-text="hit.ts?.slice(0,19) || ''"></span>
+            <span class="bg-gray-100 rounded px-1" x-text="hit.project_slug?.slice(0,30)"></span>
+          </div>
+          <p class="mt-0.5 text-gray-700" x-text="hit.excerpt"></p>
+          <!-- Context trace -->
+          <div x-show="hit.context?.length" class="mt-1 ml-2 border-l-2 border-gray-200 pl-2 space-y-0.5">
+            <template x-for="ctx in (hit.context||[])" :key="ctx.line">
+              <div class="text-xs" :class="ctx.is_match ? 'font-medium text-gray-900 bg-yellow-50 -ml-2 pl-2 border-l-2 border-yellow-400' : 'text-gray-400'">
+                <span class="text-[10px] font-mono mr-1"
+                      :class="{'text-blue-500': ctx.type==='user', 'text-emerald-500': ctx.type==='assistant', 'text-amber-500': ctx.type?.startsWith('codex')}"
+                      x-text="ctx.type"></span>
+                <span x-text="ctx.text?.slice(0,120)"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ===== Window cards grid ===== -->
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+    <template x-for="w in filteredWindows" :key="w.pid">
+      <div class="bg-white rounded-xl shadow-sm border hover:shadow-md transition cursor-pointer relative"
+           :class="{ 'ring-2 ring-red-400': w.triage === 'waiting_perm', 'ring-2 ring-blue-400': expandedPid === w.pid }"
+           @click="toggleExpand(w.pid)">
+        <div class="p-4 pb-2">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="inline-block w-3 h-3 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
+            <span class="font-semibold text-sm truncate" x-text="w.name || w.first_input || w.project_name"></span>
+            <span class="text-[10px] px-1.5 rounded-full text-white shrink-0" :class="'triage-' + w.triage"
+                  x-text="w.triage"></span>
+          </div>
+          <div class="text-xs text-gray-500 truncate" x-text="w.cwd"></div>
+        </div>
+        <div class="px-4 pb-2 text-xs space-y-1">
+          <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
+          <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
+          <!-- Review verdict -->
+          <div x-show="reviewVerdicts[w.pid]"
+               class="bg-blue-50 border border-blue-200 rounded p-2 text-xs text-blue-800 max-h-32 overflow-y-auto whitespace-pre-wrap"
+               x-text="reviewVerdicts[w.pid]"></div>
+          <!-- Background tasks -->
+          <div x-show="w.background_tasks?.length" class="space-y-0.5">
+            <template x-for="(bt, i) in (w.background_tasks||[])" :key="i">
+              <div class="text-[10px] text-amber-700 bg-amber-50 rounded px-1.5 py-0.5 truncate">
+                <span class="font-medium" x-text="bt.type === 'monitor' ? 'Monitor' : 'Bash bg'"></span>:
+                <span x-text="bt.description || bt.command"></span>
+              </div>
+            </template>
+          </div>
+          <!-- Skill tags -->
+          <div class="flex gap-1 flex-wrap" x-show="w.skills_used?.length || w.memory_ops?.length">
+            <template x-for="sk in (w.skills_used||[])" :key="sk">
+              <span class="bg-purple-50 text-purple-600 text-[10px] px-1.5 rounded" x-text="sk"></span>
+            </template>
+            <template x-for="m in (w.memory_ops||[])" :key="m.name+m.operation">
+              <span class="text-[10px] px-1.5 rounded"
+                    :class="m.operation === 'read' ? 'bg-sky-50 text-sky-600' : 'bg-pink-50 text-pink-600'"
+                    x-text="(m.operation === 'read' ? '↓' : '↑') + m.name"></span>
+            </template>
+          </div>
+          <div class="text-gray-400">
+            <span x-text="formatIdle(w.idle_seconds)"></span> ·
+            pid <span x-text="w.pid"></span>
+          </div>
+        </div>
+        <div class="px-4 pb-3 pt-1 flex gap-2 flex-wrap" @click.stop>
+          <button @click="focusWindow(w.pid)"
+                  class="text-xs px-2 py-1 rounded border transition"
+                  :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
+            Focus</button>
+          <button @click="toggleExpand(w.pid)"
+                  class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
+            Timeline</button>
+          <button x-show="w.triage === 'completed' || w.triage === 'stalled'"
+                  @click="reviewWindow(w.pid)"
+                  class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition"
+                  :class="reviewStatuses[w.pid]==='running' ? 'opacity-50 cursor-wait' : ''"
+                  :disabled="reviewStatuses[w.pid]==='running'">
+            <span x-text="reviewStatuses[w.pid]==='running' ? 'Reviewing...' : (reviewStatuses[w.pid]==='done' ? 'See Review' : 'Review')"></span></button>
+          <button x-show="w.triage === 'closeable'"
+                  @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.pid)"
+                  class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
+            Close</button>
+          <button @click="forkWindow(w.pid)"
+                  class="text-xs border border-green-200 text-green-600 px-2 py-1 rounded hover:bg-green-50 transition">
+            Fork</button>
+          <button @click="exportWindow(w.pid)"
+                  class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
+            Export</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- ===== Timeline panel ===== -->
+  <div x-ref="timelinePanel"
+       x-show="(expandedPid !== null && timelineData) || (expandedHistoryId && timelineData)"
+       class="mt-6 bg-white rounded-xl shadow border p-5" x-transition>
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold flex items-center gap-2">
+        <span x-text="timelineData?.project_name || timelineData?.project_slug || ''"></span>
+        <span class="text-xs text-gray-400 font-normal" x-text="'session:' + (timelineData?.session_id || '').slice(0,8)"></span>
+        <span x-show="timelineData?.platform === 'codex'" class="text-[10px] bg-green-500 text-white px-1.5 rounded">codex</span>
+      </h2>
+      <div class="flex items-center gap-2">
+        <button @click="showPlanHistory = !showPlanHistory"
+                x-show="timelineData?.plan_history?.length"
+                class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded hover:bg-purple-50 transition"
+                :class="showPlanHistory ? 'bg-purple-50' : ''">
+          Plan · <span x-text="timelineData?.plan_history?.length || 0"></span> 版本</button>
+        <button @click="expandedPid = null; expandedHistoryId = null; timelineData = null; planData = null"
+                class="text-gray-400 hover:text-gray-700 text-lg">&times;</button>
+      </div>
+    </div>
+    <!-- Plan version history -->
+    <div x-show="showPlanHistory && timelineData?.plan_history?.length" class="mb-4 bg-purple-50 rounded-lg p-4 border border-purple-200 text-sm" x-transition>
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <span class="font-semibold text-purple-800">Plan</span>
+          <button @click="showCurrentPlan(expandedPid || timelineData?.session_id)"
+                  class="text-xs border border-purple-400 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100 font-medium"
+                  :class="planData ? 'bg-purple-100' : ''">
+            查看当前 plan
+          </button>
+          <span class="text-xs text-gray-500" x-text="'· ' + (timelineData?.plan_history?.length || 0) + ' 个历史版本'"></span>
+        </div>
+        <button @click="showPlanHistory = false" class="text-purple-400 hover:text-purple-700">&times;</button>
+      </div>
+      <!-- Current plan file (full, copyable) -->
+      <div x-show="planData" class="mb-3 bg-white border border-purple-300 rounded p-3">
+        <div class="flex items-center justify-between mb-2">
+          <span class="font-medium text-purple-900 text-xs" x-text="planData?.plan?.name || ''"></span>
+          <div class="flex gap-2">
+            <button @click="copyPlanContent()"
+                    class="text-xs border border-purple-300 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100"
+                    x-text="copyButtonText">Copy</button>
+            <button @click="planData = null" class="text-purple-400 hover:text-purple-700">&times;</button>
+          </div>
+        </div>
+        <textarea readonly class="w-full text-xs text-purple-900 max-h-80 font-mono p-2 border rounded bg-purple-50/30"
+                  rows="12" x-ref="planTextarea"
+                  x-text="planData?.plan?.content || ''"></textarea>
+      </div>
+      <div class="space-y-2 max-h-[40vh] overflow-y-auto">
+        <template x-for="(ph, idx) in (timelineData?.plan_history||[]).slice().reverse()" :key="idx">
+          <div class="border border-purple-200 rounded bg-white">
+            <div class="px-3 py-2 flex items-center justify-between cursor-pointer hover:bg-purple-25"
+                 @click="ph._expanded = !ph._expanded">
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-purple-700 text-xs font-bold" x-text="ph.version_label"></span>
+                <span class="text-xs text-gray-500" x-text="ph.ts?.slice(0,19) || ''"></span>
+                <span class="text-[10px] px-1.5 rounded"
+                      :class="ph.operation==='write' ? 'bg-purple-200 text-purple-800' : 'bg-amber-100 text-amber-700'"
+                      x-text="ph.operation"></span>
+                <span class="text-xs text-gray-400" x-text="ph.plan_file"></span>
+              </div>
+              <span class="text-gray-400 text-xs" x-text="ph._expanded ? '▼' : '▶'"></span>
+            </div>
+            <div x-show="ph._expanded" class="px-3 pb-3 border-t border-purple-100" x-transition>
+              <template x-if="ph.operation === 'write' && ph.content">
+                <div class="mt-2">
+                  <button @click="copyText(ph.content)" class="text-xs border border-purple-300 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100 mb-1">Copy</button>
+                  <textarea readonly class="w-full text-xs text-purple-900 max-h-60 font-mono p-2 border rounded bg-purple-50/30"
+                            rows="8" x-text="ph.content"></textarea>
+                </div>
+              </template>
+              <template x-if="ph.operation === 'edit' && ph.diff">
+                <div class="mt-2 text-xs font-mono space-y-1">
+                  <div class="bg-red-50 text-red-700 p-1 rounded whitespace-pre-wrap" x-text="'- ' + (ph.diff.old || '')"></div>
+                  <div class="bg-green-50 text-green-700 p-1 rounded whitespace-pre-wrap" x-text="'+ ' + (ph.diff.new || '')"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+    <!-- Skill/Memory summary (clickable: skill → scroll to event, memory → show content) -->
+    <div class="mb-3 flex flex-wrap gap-2 text-xs"
+         x-show="timelineData?.skills_used?.length || timelineData?.memory_ops?.length">
+      <template x-for="sk in (timelineData?.skills_used||[])" :key="'s'+sk">
+        <span class="bg-purple-100 text-purple-700 px-2 py-0.5 rounded cursor-pointer hover:bg-purple-200 transition"
+              @click="scrollToSkill(sk)">skill: <span x-text="sk"></span></span>
+      </template>
+      <template x-for="m in (timelineData?.memory_ops||[])" :key="'m'+m.name+m.operation">
+        <span class="px-2 py-0.5 rounded cursor-pointer hover:opacity-80 transition"
+              :class="m.operation === 'read' ? 'bg-sky-100 text-sky-700 hover:bg-sky-200' : 'bg-pink-100 text-pink-700 hover:bg-pink-200'"
+              @click="showMemoryDetail(m.name, m.operation)"
+              x-text="(m.operation === 'read' ? 'mem↓ ' : 'mem↑ ') + m.name"></span>
+      </template>
+    </div>
+    <!-- Memory detail popup -->
+    <div x-show="memoryDetail" class="mb-3 bg-white border rounded-lg shadow-lg p-4 text-sm" x-transition>
+      <div class="flex items-center justify-between mb-2">
+        <span class="font-semibold" x-text="memoryDetail?.name || ''"></span>
+        <div class="flex items-center gap-2">
+          <span class="text-xs px-2 py-0.5 rounded"
+                :class="memoryDetail?.viewOp === 'read' ? 'bg-sky-100 text-sky-600' : 'bg-pink-100 text-pink-600'"
+                x-text="memoryDetail?.viewOp === 'read' ? 'referenced' : 'modified'"></span>
+          <button @click="memoryDetail = null" class="text-gray-400 hover:text-gray-700">&times;</button>
+        </div>
+      </div>
+      <div class="text-xs text-gray-500 mb-2" x-text="memoryDetail?.description || ''"></div>
+      <div class="text-xs font-mono bg-gray-50 rounded p-2 mb-1">type: <span x-text="memoryDetail?.type || ''"></span></div>
+      <pre class="text-xs text-gray-700 max-h-48 overflow-y-auto whitespace-pre-wrap bg-gray-50 rounded p-2"
+           x-text="memoryDetail?.content || '(loading...)'"></pre>
+    </div>
+    <div class="space-y-2 max-h-[32rem] overflow-y-auto">
+      <template x-for="(ev, idx) in (timelineData?.events || [])" :key="idx">
+        <div :id="'tl-ev-'+idx" class="text-sm border-l-2 pl-3 py-1"
+             :class="{
+               'border-blue-400': ev.kind==='user_text',
+               'border-emerald-400': ev.kind==='assistant_text',
+               'border-amber-400': ev.kind==='tool_use',
+               'border-purple-500': ev.kind==='skill_invoke',
+               'border-sky-400 border-dashed': ev.kind==='memory_read',
+               'border-pink-500': ev.kind==='memory_write',
+               'border-gray-300': ev.kind==='tool_result'||ev.kind==='system'
+             }">
+          <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
+            <span x-text="ev.ts?.slice(11,19) || ''"></span>
+            <template x-if="ev.kind==='skill_invoke'">
+              <span class="text-purple-600 font-medium">skill: <span x-text="ev.tool"></span></span>
+            </template>
+            <template x-if="ev.kind==='memory_read'">
+              <span class="text-sky-600 font-medium">mem↓ <span x-text="ev.tool"></span></span>
+            </template>
+            <template x-if="ev.kind==='memory_write'">
+              <span class="text-pink-600 font-medium">mem↑ <span x-text="ev.tool"></span></span>
+            </template>
+            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write'">
+              <span :class="{'text-blue-600': ev.kind==='user_text', 'text-emerald-600': ev.kind==='assistant_text', 'text-amber-600': ev.kind==='tool_use', 'text-gray-500': true}"
+                    class="font-medium"
+                    x-text="ev.kind==='tool_use' ? ev.tool : ev.kind.replace('_text','').replace('tool_result','result')"></span>
+            </template>
+          </div>
+          <!-- Skill args -->
+          <template x-if="ev.kind === 'skill_invoke'">
+            <div class="text-xs text-purple-600 truncate" x-text="ev.extra?.args || ''"></div>
+          </template>
+          <!-- Memory operation detail -->
+          <template x-if="ev.kind === 'memory_read' || ev.kind === 'memory_write'">
+            <div class="text-xs text-gray-500" x-text="ev.extra?.operation + ': ' + (ev.extra?.path || '').split('/').pop()"></div>
+          </template>
+          <!-- Generic tool_use -->
+          <template x-if="ev.kind === 'tool_use'">
+            <div class="text-xs text-gray-600 font-mono">
+              <template x-for="(v, k) in (ev.extra || {})" :key="k">
+                <span class="mr-2"><span class="text-gray-400" x-text="k+'='"></span><span x-text="typeof v==='string' ? v.slice(0,120) : JSON.stringify(v)"></span></span>
+              </template>
+            </div>
+          </template>
+          <template x-if="ev.kind !== 'tool_use'">
+            <pre class="text-xs text-gray-700 max-h-32 overflow-y-auto" x-text="ev.text?.slice(0,2000) || ''"></pre>
+          </template>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ===== History section ===== -->
+  <div class="mt-8 bg-white rounded-xl shadow-sm border">
+    <div class="px-5 py-3 border-b flex items-center justify-between">
+      <h2 class="font-semibold text-sm">History (<span x-text="historyTotal"></span>)</h2>
+      <div class="flex items-center gap-2">
+        <input type="text" placeholder="Search history..." x-model="historyQuery"
+               @keydown.enter="loadHistory(1)"
+               class="border rounded px-2 py-1 text-xs w-48 focus:outline-none focus:ring-1 focus:ring-blue-400">
+        <button @click="loadHistory(1)" class="text-xs text-blue-600 hover:underline">Go</button>
+        <button @click="historyQuery=''; loadHistory(1)" class="text-xs text-gray-400 hover:text-gray-600" x-show="historyQuery">Clear</button>
+        <select x-model.number="historyLimit" @change="loadHistory(1)" class="border rounded px-1 py-1 text-xs bg-white">
+          <option value="10">10</option>
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="500">All</option>
+        </select>
+      </div>
+    </div>
+    <div class="divide-y max-h-[28rem] overflow-y-auto" x-show="historySessions.length > 0">
+      <template x-for="s in historySessions" :key="s.session_id">
+        <div class="px-5 py-3 hover:bg-gray-50 cursor-pointer flex items-start gap-3 text-sm"
+             @click="openHistoryTimeline(s.session_id)">
+          <span class="mt-1 inline-block w-2 h-2 rounded-full shrink-0"
+                :class="s.is_alive ? 'bg-emerald-500' : 'bg-gray-300'"></span>
+          <div class="min-w-0 flex-1">
+            <div class="flex items-center gap-2">
+              <span class="px-1 rounded text-white text-[10px]"
+                    :class="s.platform==='codex' ? 'bg-green-500' : s.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                    x-text="s.platform || 'claude'"></span>
+              <span class="font-medium text-gray-800 truncate" x-text="s.first_input?.slice(0,80) || s.session_id.slice(0,8)"></span>
+            </div>
+            <div class="flex items-center gap-3 text-xs text-gray-400 mt-0.5 flex-wrap">
+              <span x-text="s.project_name"></span>
+              <span x-show="s.model" class="text-gray-400" x-text="s.model?.split('/').pop()?.split('-').slice(0,3).join('-')"></span>
+              <span x-text="s.first_ts?.slice(0,10) || ''"></span>
+              <span x-text="Math.round(s.transcript_size/1024) + ' KB'"></span>
+              <!-- Skill tags -->
+              <template x-for="sk in (s.skills_used||[]).slice(0,3)" :key="sk">
+                <span class="bg-blue-50 text-blue-600 rounded px-1" x-text="sk"></span>
+              </template>
+              <span x-show="(s.skills_used||[]).length > 3" class="text-gray-300" x-text="'+' + ((s.skills_used||[]).length - 3)"></span>
+              <template x-for="m in (s.memory_ops||[]).slice(0,3)" :key="m.name+m.operation">
+                <span class="rounded px-1" :class="m.operation==='read' ? 'bg-sky-50 text-sky-600' : 'bg-pink-50 text-pink-600'"
+                      x-text="(m.operation==='read'?'↓':'↑')+m.name"></span>
+              </template>
+            </div>
+            <!-- Match snippets (VS Code-style) -->
+            <div x-show="s.match_snippets?.length" class="mt-1 space-y-0.5">
+              <template x-for="(snip, si) in (s.match_snippets||[])" :key="si">
+                <div class="text-[11px] text-gray-500 bg-gray-50 rounded px-2 py-0.5 font-mono truncate"
+                     x-text="snip"></div>
+              </template>
+            </div>
+          </div>
+          <div class="flex gap-1 shrink-0" @click.stop>
+            <button x-show="s.is_alive" @click="resumeSession(s)"
+                    class="text-xs border border-gray-200 text-gray-500 px-2 py-0.5 rounded hover:bg-gray-100">
+              Focus</button>
+            <button x-show="!s.is_alive" @click="resumeSession(s)"
+                    class="text-xs border border-gray-200 text-gray-500 px-2 py-0.5 rounded hover:bg-gray-100">
+              Resume</button>
+            <button x-show="!s.is_alive" @click="forkHistorySession(s)"
+                    class="text-xs border border-green-200 text-green-600 px-2 py-0.5 rounded hover:bg-green-50">
+              Fork</button>
+          </div>
+        </div>
+      </template>
+    </div>
+    <div class="px-5 py-2 border-t flex items-center justify-between text-xs text-gray-500"
+         x-show="historyTotal > historyLimit">
+      <span>Page <span x-text="historyPage"></span> / <span x-text="Math.ceil(historyTotal / historyLimit)"></span></span>
+      <div class="flex gap-2">
+        <button @click="loadHistory(historyPage - 1)" :disabled="historyPage <= 1"
+                class="px-2 py-1 border rounded disabled:opacity-30 hover:bg-gray-100">Prev</button>
+        <button @click="loadHistory(historyPage + 1)" :disabled="historyPage * historyLimit >= historyTotal"
+                class="px-2 py-1 border rounded disabled:opacity-30 hover:bg-gray-100">Next</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- Toast -->
+<div class="fixed bottom-4 right-4 z-50 space-y-2">
+  <template x-for="(t, idx) in toasts" :key="idx">
+    <div class="toast-enter bg-gray-900 text-white text-sm rounded-lg px-4 py-2 shadow-lg max-w-sm"
+         x-text="t" x-show="true" x-transition
+         x-init="setTimeout(() => toasts.splice(idx, 1), 4000)"></div>
+  </template>
+</div>
+
+<script>
+function fleet() {
+  return {
+    windows: [],
+    counts: { total: 0, busy: 0, waiting: 0, idle: 0 },
+    statusFilter: '',
+    searchQuery: '',
+    searchResults: null,
+    expandedPid: null,
+    expandedHistoryId: null,
+    timelineData: null,
+    planData: null,
+    toasts: [],
+    evtSource: null,
+    historySessions: [],
+    historyTotal: 0,
+    historyPage: 1,
+    historyLimit: 20,
+    historyQuery: '',
+    showSkills: false,
+    skillsList: null,
+    showMemory: false,
+    memoryData: null,
+    reviewStatuses: {},
+    reviewVerdicts: {},
+    memoryDetail: null,
+    showPlanHistory: false,
+    copyButtonText: 'Copy',
+    expandedSkill: null,
+    skillSessions: {},
+    expandedMemory: null,
+    memorySessions: {},
+
+    get waitingWindows() {
+      return this.windows.filter(w => w.triage === 'waiting_perm');
+    },
+    get filteredWindows() {
+      if (!this.statusFilter) return this.windows;
+      return this.windows.filter(w => w.triage === this.statusFilter);
+    },
+
+    init() {
+      fetch('/api/windows').then(r => r.json()).then(d => this.applySnapshot(d));
+      this.loadHistory(1);
+      // ?snapshot renders a one-shot static view (no live SSE) — handy for
+      // embeds and for headless screenshots.
+      if (!new URLSearchParams(location.search).has('snapshot')) {
+        this.evtSource = new EventSource('/api/events');
+        this.evtSource.addEventListener('snapshot', (e) => {
+          this.applySnapshot(JSON.parse(e.data));
+        });
+        this.evtSource.onerror = () => {
+          setTimeout(() => {
+            if (this.evtSource) this.evtSource.close();
+            this.evtSource = new EventSource('/api/events');
+            this.evtSource.addEventListener('snapshot', (e) => {
+              this.applySnapshot(JSON.parse(e.data));
+            });
+          }, 5000);
+        };
+      }
+      this._applyHashRoute();
+      window.addEventListener('hashchange', () => this._applyHashRoute());
+    },
+
+    // Deep-link panels via URL hash: #skills, #memory, #search=<q>, #timeline=<sid>
+    _applyHashRoute() {
+      const h = decodeURIComponent((location.hash || '').replace(/^#/, ''));
+      if (!h) return;
+      if (h === 'skills') { this.showSkills = true; this.loadSkills(); }
+      else if (h === 'memory') { this.showMemory = true; this.loadMemory(); }
+      else if (h.startsWith('search=')) { this.searchQuery = h.slice(7); this.doSearch(); }
+      else if (h.startsWith('timeline=')) { this.openHistoryTimeline(h.slice(9)); }
+    },
+
+    applySnapshot(snap) {
+      this.windows = snap.windows || [];
+      this.counts = snap.counts || this.counts;
+    },
+
+    formatIdle(seconds) {
+      if (seconds < 60) return seconds + 's ago';
+      if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+      return Math.floor(seconds / 3600) + 'h ago';
+    },
+
+    async focusWindow(pid) {
+      const r = await fetch(`/api/windows/${pid}/focus`, { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) this.toast('Focus failed: ' + (d.error || ''));
+    },
+
+    async forkWindow(pid) {
+      const r = await fetch(`/api/windows/${pid}/fork`, { method: 'POST' });
+      const d = await r.json();
+      this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
+    },
+
+    async reviewWindow(pid) {
+      if (this.reviewStatuses[pid] === 'done') {
+        const r = await fetch(`/api/windows/${pid}/review`);
+        const d = await r.json();
+        this.reviewVerdicts[pid] = d.verdict || d.error || 'no result';
+        return;
+      }
+      this.toast('Starting background review...');
+      this.reviewStatuses[pid] = 'running';
+      const r = await fetch(`/api/windows/${pid}/review`, { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) {
+        this.toast('Review failed: ' + (d.error || ''));
+        this.reviewStatuses[pid] = null;
+        return;
+      }
+      this.toast('Review started for ' + (d.name || pid) + ', polling...');
+      this._pollReview(pid);
+    },
+
+    async _pollReview(pid) {
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const r = await fetch(`/api/windows/${pid}/review`);
+        const d = await r.json();
+        if (d.status === 'done') {
+          this.reviewStatuses[pid] = 'done';
+          this.reviewVerdicts[pid] = d.verdict || '';
+          this.toast('Review complete for ' + (d.name || pid));
+          return;
+        }
+        if (d.status === 'error') {
+          this.reviewStatuses[pid] = null;
+          this.toast('Review error: ' + (d.error || ''));
+          return;
+        }
+      }
+      this.reviewStatuses[pid] = null;
+      this.toast('Review timed out');
+    },
+
+    async closeWindow(pid) {
+      const r = await fetch(`/api/windows/${pid}/close`, { method: 'POST' });
+      const d = await r.json();
+      this.toast(d.ok ? 'Closed ' + (d.name || pid) : 'Failed: ' + (d.error || ''));
+    },
+
+    async exportWindow(pid) {
+      this.toast('Exporting...');
+      const r = await fetch(`/api/windows/${pid}/export`, { method: 'POST' });
+      const d = await r.json();
+      if (d.ok && d.doc_url) {
+        this.toast('Exported: ' + d.doc_url);
+        window.open(d.doc_url, '_blank');
+      } else if (d.ok) {
+        this.toast('Exported: ' + (d.title || ''));
+      } else {
+        this.toast('Export failed: ' + (d.stderr || d.error || ''));
+      }
+    },
+
+    async toggleExpand(pid) {
+      if (this.expandedPid === pid) {
+        this.expandedPid = null; this.timelineData = null; this.planData = null;
+        return;
+      }
+      this.expandedPid = pid;
+      this.expandedHistoryId = null;
+      this.planData = null;
+      this.showPlanHistory = false;
+      const r = await fetch(`/api/windows/${pid}/timeline`);
+      this.timelineData = await r.json();
+      this.$nextTick(() => this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+    },
+
+    async loadPlan(pid) {
+      const r = await fetch(`/api/windows/${pid}/plan`);
+      this.planData = await r.json();
+    },
+
+    async openTimelineForSession(sessionId) {
+      const w = this.windows.find(w => w.session_id === sessionId);
+      if (w) {
+        this.toggleExpand(w.pid);
+        this.searchResults = null;
+      } else {
+        await this.openHistoryTimeline(sessionId);
+        this.searchResults = null;
+      }
+    },
+
+    async doSearch() {
+      if (!this.searchQuery.trim()) { this.searchResults = null; return; }
+      const r = await fetch(`/api/search?q=${encodeURIComponent(this.searchQuery)}&limit=40`);
+      const d = await r.json();
+      this.searchResults = d.hits || [];
+    },
+
+    async loadHistory(page) {
+      if (page < 1) return;
+      const q = this.historyQuery ? `&q=${encodeURIComponent(this.historyQuery)}` : '';
+      const r = await fetch(`/api/history?page=${page}&limit=${this.historyLimit}${q}`);
+      const d = await r.json();
+      this.historySessions = d.sessions || [];
+      this.historyTotal = d.total || 0;
+      this.historyPage = d.page || 1;
+    },
+
+    async openHistoryTimeline(sessionId) {
+      this.expandedPid = null;
+      this.expandedHistoryId = sessionId;
+      this.planData = null;
+      const r = await fetch(`/api/history/${sessionId}/timeline`);
+      if (r.ok) {
+        this.timelineData = await r.json();
+        this.$nextTick(() => this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+      } else {
+        this.toast('No transcript for this session');
+        this.expandedHistoryId = null;
+      }
+    },
+
+    async resumeSession(s) {
+      const r = await fetch(`/api/history/${s.session_id}/resume`, { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) {
+        this.toast(d.action === 'focused' ? 'Focused existing window' : 'Resumed session');
+      } else {
+        this.toast('Resume failed: ' + (d.error || ''));
+      }
+    },
+
+    async forkHistorySession(s) {
+      const r = await fetch(`/api/history/${s.session_id}/fork`, { method: 'POST' });
+      const d = await r.json();
+      this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
+    },
+
+    scrollToSkill(skillName) {
+      const events = this.timelineData?.events || [];
+      const idx = events.findIndex(e => e.kind === 'skill_invoke' && e.tool === skillName);
+      if (idx >= 0) {
+        const el = document.getElementById('tl-ev-' + idx);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.classList.add('bg-purple-50');
+          setTimeout(() => el.classList.remove('bg-purple-50'), 2000);
+        }
+      } else {
+        this.toast('Skill event not in visible timeline');
+      }
+    },
+
+    async showMemoryDetail(name, operation) {
+      this.memoryDetail = { name, viewOp: operation, content: 'Loading...' };
+      try {
+        const r = await fetch(`/api/memory/${encodeURIComponent(name)}`);
+        if (r.ok) {
+          const d = await r.json();
+          this.memoryDetail = { ...d, viewOp: operation };
+        } else {
+          this.memoryDetail = { name, viewOp: operation, description: '', type: '', content: '(memory file not found)' };
+        }
+      } catch(e) {
+        this.memoryDetail = { name, viewOp: operation, description: '', type: '', content: 'Error: ' + e.message };
+      }
+    },
+
+    async showCurrentPlan(pidOrSid) {
+      // For active windows use /api/windows/{pid}/plan; for history sessions
+      // fall back to scanning plan_history for the latest write content.
+      if (this.expandedPid) {
+        const r = await fetch(`/api/windows/${this.expandedPid}/plan`);
+        this.planData = await r.json();
+        if (!this.planData?.plan) this.planData = null;
+      } else {
+        // history session: reconstruct latest from plan_history
+        const writes = (this.timelineData?.plan_history || []).filter(p => p.operation === 'write');
+        if (writes.length) {
+          const latest = writes[writes.length - 1];
+          this.planData = { plan: { name: latest.plan_file, content: latest.content } };
+        } else {
+          this.toast('No write snapshot available');
+        }
+      }
+    },
+
+    async copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text || '');
+        this.toast('Copied to clipboard');
+      } catch(e) {
+        this.toast('Copy failed: ' + e.message);
+      }
+    },
+
+    async copyPlanContent() {
+      const txt = this.planData?.plan?.content || '';
+      try {
+        await navigator.clipboard.writeText(txt);
+        this.copyButtonText = 'Copied ✓';
+        setTimeout(() => { this.copyButtonText = 'Copy'; }, 2000);
+      } catch(e) {
+        // Fallback: select textarea
+        const ta = this.$refs.planTextarea;
+        if (ta) { ta.select(); document.execCommand('copy'); }
+        this.copyButtonText = 'Copied (fallback)';
+        setTimeout(() => { this.copyButtonText = 'Copy'; }, 2000);
+      }
+    },
+
+    async toggleSkillExpand(name) {
+      if (this.expandedSkill === name) { this.expandedSkill = null; return; }
+      this.expandedSkill = name;
+      if (!this.skillSessions[name]) {
+        const r = await fetch(`/api/skills/${encodeURIComponent(name)}/sessions`);
+        const d = await r.json();
+        this.skillSessions[name] = d.sessions || [];
+      }
+    },
+
+    async toggleMemoryExpand(name) {
+      if (this.expandedMemory === name) { this.expandedMemory = null; return; }
+      this.expandedMemory = name;
+      if (!this.memorySessions[name]) {
+        const r = await fetch(`/api/memory/${encodeURIComponent(name)}/sessions`);
+        const d = await r.json();
+        this.memorySessions[name] = d.sessions || [];
+      }
+    },
+
+    async loadSkills() {
+      const r = await fetch('/api/skills');
+      const d = await r.json();
+      this.skillsList = d.skills || [];
+    },
+
+    async loadMemory() {
+      const r = await fetch('/api/memory');
+      const d = await r.json();
+      this.memoryData = d;
+    },
+
+    toast(msg) {
+      this.toasts.push(msg);
+      if (this.toasts.length > 5) this.toasts.shift();
+    },
+  };
+}
+</script>
+</body>
+</html>

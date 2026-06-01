@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+/tmp/
+*.output
+.DS_Store
+
+# generated demo data + public mirror clone
+fixtures/demo-home/
+.public-mirror/
