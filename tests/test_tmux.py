@@ -154,7 +154,8 @@ class NewWindowTests(unittest.TestCase):
         self.assertEqual(
             new_win_argv,
             ["tmux", "new-window", "-P", "-F", "#{pane_id}",
-             "-t", "mysess", "-c", "/home/u/proj", "claude"],
+             "-t", "mysess", "-c", "/home/u/proj",
+             "claude", "--dangerously-skip-permissions"],
         )
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%12")

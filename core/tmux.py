@@ -117,12 +117,17 @@ def _resolve_target() -> dict:
 
 
 def new_window(cwd: str) -> dict:
-    """Open a new tmux window running `claude` in `cwd`; returns {ok, pane_id, error?}."""
+    """Open a new tmux window running `claude` in `cwd`; returns {ok, pane_id, error?}.
+
+    Spawned sessions launch with `--dangerously-skip-permissions` so the fleet can
+    drive them non-interactively (no per-action permission prompts blocking the pane).
+    """
     target = _resolve_target()
     if not target["ok"]:
         return {"ok": False, "error": target["error"]}
     r = _run("new-window", "-P", "-F", "#{pane_id}",
-             "-t", target["target"], "-c", cwd, "claude")
+             "-t", target["target"], "-c", cwd,
+             "claude", "--dangerously-skip-permissions")
     if not r["ok"]:
         return {"ok": False, "error": r["error"]}
     return {"ok": True, "pane_id": r["stdout"].strip()}

@@ -345,9 +345,9 @@
           <div class="flex items-center gap-1 ml-auto" x-show="tmuxAvailable">
             <input type="text" x-model="promptDrafts[w.pid]" placeholder="Send a prompt…"
                    @keydown.enter="sendPrompt(w.pid)"
-                   :disabled="promptSending[w.pid]"
+                   :disabled="!!promptSending[w.pid]"
                    class="text-xs border border-gray-200 rounded px-2 py-1 w-44 focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50">
-            <button @click="sendPrompt(w.pid)" :disabled="promptSending[w.pid]"
+            <button @click="sendPrompt(w.pid)" :disabled="!!promptSending[w.pid]"
                     class="text-xs border border-emerald-200 text-emerald-600 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait">
               <span x-text="promptSending[w.pid] ? 'Sending…' : 'Send'"></span></button>
           </div>
@@ -557,7 +557,7 @@
             <div class="flex items-center gap-3 text-xs text-gray-400 mt-0.5 flex-wrap">
               <span x-text="s.project_name"></span>
               <span x-show="s.model" class="text-gray-400" x-text="s.model?.split('/').pop()?.split('-').slice(0,3).join('-')"></span>
-              <span x-text="s.first_ts?.slice(0,10) || ''"></span>
+              <span x-text="fmtDate(s.first_ts)"></span>
               <span x-text="Math.round(s.transcript_size/1024) + ' KB'"></span>
               <!-- Skill tags -->
               <template x-for="sk in (s.skills_used||[]).slice(0,3)" :key="sk">
@@ -713,6 +713,16 @@ function fleet() {
       if (seconds < 60) return seconds + 's ago';
       if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
       return Math.floor(seconds / 3600) + 'h ago';
+    },
+
+    // Render a YYYY-MM-DD date from either an epoch-ms number or an ISO string.
+    fmtDate(ts) {
+      if (ts == null || ts === '') return '';
+      if (typeof ts === 'number') {
+        const d = new Date(ts);
+        return isNaN(d) ? '' : d.toISOString().slice(0, 10);
+      }
+      return String(ts).slice(0, 10);
     },
 
     async focusWindow(pid) {
