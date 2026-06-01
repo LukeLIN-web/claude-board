@@ -135,6 +135,20 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     return {"ok": True, "pane_id": r["stdout"].strip()}
 
 
+def send_keys(pane: str, *keys: str) -> dict:
+    """Send tmux key names (e.g. "1", "Enter", "Escape") into `pane`.
+
+    Unlike send_text, these are interpreted as keys, not literal characters, so
+    they drive interactive menus such as Claude's permission prompt.
+    """
+    if not keys:
+        return {"ok": False, "error": "no keys"}
+    r = _run("send-keys", "-t", pane, *keys)
+    if not r["ok"]:
+        return {"ok": False, "error": r["error"]}
+    return {"ok": True}
+
+
 def send_text(pane: str, text: str) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it."""
     literal = _run("send-keys", "-t", pane, "-l", "--", text)

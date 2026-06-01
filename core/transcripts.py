@@ -367,6 +367,45 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
     return [t for tid, t in bg_by_id.items() if tid not in resolved_ids]
 
 
+def extract_pending_question(path: str | Path) -> Optional[dict]:
+    """Return the unanswered AskUserQuestion prompt, or None.
+
+    A question is pending when its tool_use has no matching tool_result yet —
+    i.e. the session is blocked waiting for the user to pick an answer. Returns
+    {tool_use_id, questions:[{question, header, multiSelect, options:[{label,
+    description}]}]} for the most recent pending prompt.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    q_by_id: dict[str, dict] = {}
+    order: list[str] = []
+    resolved_ids: set[str] = set()
+    for d in _iter_lines(p):
+        if d.get("type") == "assistant":
+            for c in ((d.get("message") or {}).get("content") or []):
+                if not isinstance(c, dict) or c.get("type") != "tool_use":
+                    continue
+                if c.get("name") != "AskUserQuestion":
+                    continue
+                tid = c.get("id", "")
+                if not tid:
+                    continue
+                questions = ((c.get("input") or {}).get("questions")) or []
+                if not isinstance(questions, list):
+                    continue
+                q_by_id[tid] = {"tool_use_id": tid, "questions": questions}
+                order.append(tid)
+        elif d.get("type") == "user":
+            for c in ((d.get("message") or {}).get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "tool_result":
+                    resolved_ids.add(c.get("tool_use_id", ""))
+    for tid in reversed(order):
+        if tid not in resolved_ids:
+            return q_by_id[tid]
+    return None
+
+
 def extract_plan_history(path: str | Path) -> list[dict]:
     """Extract chronological plan file mutations from a transcript.
 

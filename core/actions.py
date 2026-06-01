@@ -424,6 +424,69 @@ def create_session(cwd: str) -> dict:
     return tmux.new_window(resolved)
 
 
+# Claude's permission prompt is a numbered select list:
+#   ❯ 1. Yes
+#     2. Yes, and don't ask again …
+#     3. No, and tell Claude what to do differently (esc)
+# We drive it with the documented key shortcuts. "deny" uses Escape (cancel)
+# rather than "3", which would drop the session into a "tell me what to do"
+# text prompt.
+_PERM_KEYS = {
+    "approve": ["1"],
+    "approve_always": ["2"],
+    "deny": ["Escape"],
+}
+
+
+def respond_permission(pid: int, choice: str) -> dict:
+    """Answer the permission prompt in `pid`'s tmux pane via a menu keypress."""
+    keys = _PERM_KEYS.get(choice)
+    if keys is None:
+        return {"ok": False, "error": f"unknown choice '{choice}' (expected: {', '.join(_PERM_KEYS)})"}
+    w = find_window(pid)
+    if not w:
+        return {"ok": False, "error": f"no window pid={pid}"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+    r = tmux.send_keys(pane, *keys)
+    r["choice"] = choice
+    return r
+
+
+# Keys the dashboard is allowed to send into an interactive menu (e.g. the
+# AskUserQuestion picker). Restricted to navigation/selection tokens so the
+# endpoint can't be used to type arbitrary input — free text goes through
+# send_prompt instead.
+_MENU_KEYS = {"Enter", "Escape", "Up", "Down", "Space", "Tab"} | {str(n) for n in range(0, 10)}
+
+
+def send_menu_keys(pid: int, keys: list[str]) -> dict:
+    """Send a short sequence of whitelisted menu keys into `pid`'s tmux pane.
+
+    Used to answer the AskUserQuestion picker from the dashboard: a digit selects
+    an option, Enter submits, Escape cancels.
+    """
+    if not keys:
+        return {"ok": False, "error": "no keys"}
+    if len(keys) > 12:
+        return {"ok": False, "error": "too many keys"}
+    bad = [k for k in keys if k not in _MENU_KEYS]
+    if bad:
+        return {"ok": False, "error": f"disallowed keys: {', '.join(bad)}"}
+    w = find_window(pid)
+    if not w:
+        return {"ok": False, "error": f"no window pid={pid}"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+    return tmux.send_keys(pane, *keys)
+
+
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
     w = find_window(pid)

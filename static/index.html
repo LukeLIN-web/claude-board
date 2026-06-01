@@ -322,9 +322,6 @@
                   class="text-xs px-2 py-1 rounded border transition"
                   :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
             Focus</button>
-          <button @click="toggleExpand(w.pid)"
-                  class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
-            Timeline</button>
           <button x-show="w.triage === 'completed' || w.triage === 'stalled'"
                   @click="reviewWindow(w.pid)"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition"
@@ -340,6 +337,20 @@
           <button @click="exportWindow(w.pid)"
                   class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
             Export</button>
+          <!-- Permission prompt controls (only while this session is waiting on a prompt) -->
+          <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
+               x-show="w.triage === 'waiting_perm' && tmuxAvailable">
+            <span class="text-xs text-red-700 font-medium shrink-0">Permission:</span>
+            <button @click="respondPermission(w.pid, 'approve')" :disabled="!!permSending[w.pid]"
+                    class="text-xs border border-emerald-300 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50">
+              Approve</button>
+            <button @click="respondPermission(w.pid, 'approve_always')" :disabled="!!permSending[w.pid]"
+                    class="text-xs border border-emerald-300 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50">
+              Always</button>
+            <button @click="respondPermission(w.pid, 'deny')" :disabled="!!permSending[w.pid]"
+                    class="text-xs border border-gray-300 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition disabled:opacity-50">
+              Deny (Esc)</button>
+          </div>
           <!-- Send a single prompt into this session's tmux pane (hidden when tmux unavailable) -->
           <div class="flex items-end gap-2 w-full mt-1" x-show="tmuxAvailable">
             <textarea x-model="promptDrafts[w.pid]" rows="3"
@@ -384,6 +395,20 @@
                 class="text-gray-400 hover:text-gray-700 text-lg">&times;</button>
       </div>
     </div>
+    <!-- Permission prompt controls (only while the expanded session is waiting) -->
+    <div class="flex items-center gap-2 mb-4 bg-red-50 border border-red-200 rounded px-3 py-2"
+         x-show="expandedPid !== null && tmuxAvailable && !timelineData?.pending_question && windows.find(w => w.pid === expandedPid)?.triage === 'waiting_perm'">
+      <span class="text-sm text-red-700 font-medium shrink-0">Permission prompt:</span>
+      <button @click="respondPermission(expandedPid, 'approve')" :disabled="!!permSending[expandedPid]"
+              class="text-sm border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50">
+        Approve</button>
+      <button @click="respondPermission(expandedPid, 'approve_always')" :disabled="!!permSending[expandedPid]"
+              class="text-sm border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50">
+        Always</button>
+      <button @click="respondPermission(expandedPid, 'deny')" :disabled="!!permSending[expandedPid]"
+              class="text-sm border border-gray-300 text-gray-600 px-3 py-1 rounded hover:bg-gray-100 transition disabled:opacity-50">
+        Deny (Esc)</button>
+    </div>
     <!-- Send a single prompt into this live session's tmux pane (only for live sessions) -->
     <div class="flex items-end gap-2 mb-4" x-show="expandedPid !== null && tmuxAvailable">
       <textarea x-model="promptDrafts[expandedPid]" rows="3"
@@ -394,6 +419,44 @@
       <button @click="sendPrompt(expandedPid)" :disabled="!!promptSending[expandedPid]"
               class="text-sm border border-emerald-200 text-emerald-600 px-4 py-2 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait self-stretch shrink-0">
         <span x-text="promptSending[expandedPid] ? 'Sending…' : 'Send'"></span></button>
+    </div>
+    <!-- Pending AskUserQuestion: render the question + options so the user can answer from the panel -->
+    <div x-show="expandedPid !== null && tmuxAvailable && timelineData?.pending_question"
+         class="mb-4 bg-amber-50 border border-amber-300 rounded-lg p-4 text-sm" x-transition>
+      <div class="flex items-center gap-2 mb-2 flex-wrap">
+        <span class="text-amber-800 font-semibold">❓ Claude is asking</span>
+        <span class="text-xs text-amber-600">click an option to answer · the number is sent to the menu</span>
+        <span x-show="(timelineData?.pending_question?.questions || []).length > 1"
+              class="text-xs text-amber-700 bg-amber-100 px-1.5 rounded">多个问题：从上到下依次点选（每点一次回答当前那个）</span>
+      </div>
+      <template x-for="(q, qi) in (timelineData?.pending_question?.questions || [])" :key="qi">
+        <div class="mb-3 last:mb-0">
+          <div class="font-medium text-gray-800 mb-1">
+            <span class="text-xs text-amber-500 mr-1" x-show="(timelineData?.pending_question?.questions || []).length > 1" x-text="'Q'+(qi+1)+'.'"></span>
+            <span x-show="q.header" class="text-xs bg-amber-200 text-amber-800 px-1.5 rounded mr-1" x-text="q.header"></span>
+            <span x-text="q.question"></span>
+            <span x-show="q.multiSelect" class="text-xs text-amber-600">（多选：逐个点选后按 Submit）</span>
+          </div>
+          <div class="space-y-1">
+            <template x-for="(opt, oi) in (q.options || [])" :key="oi">
+              <button @click="answerQuestionKey(expandedPid, oi + 1)"
+                      class="block w-full text-left border border-amber-200 bg-white rounded px-2 py-1.5 hover:bg-amber-100 transition">
+                <span class="font-medium text-amber-800" x-text="(oi + 1) + '. ' + opt.label"></span>
+                <span x-show="opt.description" class="block text-xs text-gray-500" x-text="opt.description"></span>
+              </button>
+            </template>
+          </div>
+        </div>
+      </template>
+      <div class="flex items-center gap-2 mt-2">
+        <button @click="answerQuestionSubmit(expandedPid)"
+                class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
+          Submit (Enter)</button>
+        <button @click="answerQuestionCancel(expandedPid)"
+                class="text-xs border border-gray-300 text-gray-600 px-3 py-1 rounded hover:bg-gray-100 transition">
+          Cancel (Esc)</button>
+        <span class="text-xs text-gray-400">For "Other"/free text, use the prompt box above.</span>
+      </div>
     </div>
     <!-- Plan version history -->
     <div x-show="showPlanHistory && timelineData?.plan_history?.length" class="mb-4 bg-purple-50 rounded-lg p-4 border border-purple-200 text-sm" x-transition>
@@ -680,6 +743,7 @@ function fleet() {
     spawning: false,
     promptDrafts: {},
     promptSending: {},
+    permSending: {},
     assistantFontPx: Number(localStorage.getItem('assistantFontPx')) || 14,
 
     setAssistantFont(delta) {
@@ -861,6 +925,46 @@ function fleet() {
         this.promptSending[pid] = false;
       }
     },
+
+    async respondPermission(pid, choice) {
+      if (this.permSending[pid]) return;
+      this.permSending[pid] = true;
+      const labels = { approve: 'Approved', approve_always: 'Approved (always)', deny: 'Denied' };
+      try {
+        const r = await fetch(`/api/windows/${pid}/permission`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ choice }),
+        });
+        const d = await r.json();
+        this.toast(d.ok ? (labels[choice] || 'Sent') : 'Permission failed: ' + (d.error || ''));
+      } catch (e) {
+        this.toast('Permission failed: ' + e);
+      } finally {
+        this.permSending[pid] = false;
+      }
+    },
+
+    async sendKeys(pid, keys) {
+      try {
+        const r = await fetch(`/api/windows/${pid}/keys`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keys }),
+        });
+        const d = await r.json();
+        if (!d.ok) this.toast('Failed: ' + (d.error || ''));
+        return d.ok;
+      } catch (e) {
+        this.toast('Failed: ' + e);
+        return false;
+      }
+    },
+    // Press an option's number key in the AskUserQuestion menu. For single-select
+    // this also submits; for multi-select it toggles (then use Submit).
+    answerQuestionKey(pid, n) { this.sendKeys(pid, [String(n)]); },
+    answerQuestionSubmit(pid) { this.sendKeys(pid, ['Enter']); },
+    answerQuestionCancel(pid) { this.sendKeys(pid, ['Escape']); },
 
     async reviewWindow(pid) {
       if (this.reviewStatuses[pid] === 'done') {

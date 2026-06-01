@@ -124,7 +124,10 @@ app = FastAPI(title="Claude Fleet", lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     html = (STATIC_DIR / "index.html").read_text()
-    return HTMLResponse(html)
+    # The UI is a single hand-edited HTML file with no asset versioning, so tell
+    # the browser to always revalidate — otherwise a stale cached copy hides new
+    # features (e.g. the permission / question controls) until a hard refresh.
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
 @app.get("/api/windows")
@@ -149,6 +152,7 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
         "skills_used": transcripts.extract_skills_used(tp) if tp else [],
         "memory_ops": transcripts.extract_memory_ops(tp) if tp else [],
         "plan_history": transcripts.extract_plan_history(tp) if tp else [],
+        "pending_question": transcripts.extract_pending_question(tp) if tp else None,
     }
 
 
@@ -207,6 +211,24 @@ def api_window_create(body: CreateBody) -> dict:
 @app.post("/api/windows/{pid}/prompt")
 def api_window_prompt(pid: int, body: PromptBody) -> dict:
     return actions.send_prompt(pid, body.text)
+
+
+class PermissionBody(BaseModel):
+    choice: str  # approve | approve_always | deny
+
+
+@app.post("/api/windows/{pid}/permission")
+def api_window_permission(pid: int, body: PermissionBody) -> dict:
+    return actions.respond_permission(pid, body.choice)
+
+
+class MenuKeysBody(BaseModel):
+    keys: list[str]  # e.g. ["2"], ["Enter"], ["Escape"]
+
+
+@app.post("/api/windows/{pid}/keys")
+def api_window_keys(pid: int, body: MenuKeysBody) -> dict:
+    return actions.send_menu_keys(pid, body.keys)
 
 
 @app.post("/api/windows/{pid}/fork")
