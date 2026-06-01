@@ -331,8 +331,7 @@
                   :class="reviewStatuses[w.pid]==='running' ? 'opacity-50 cursor-wait' : ''"
                   :disabled="reviewStatuses[w.pid]==='running'">
             <span x-text="reviewStatuses[w.pid]==='running' ? 'Reviewing...' : (reviewStatuses[w.pid]==='done' ? 'See Review' : 'Review')"></span></button>
-          <button x-show="w.triage === 'closeable'"
-                  @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.pid)"
+          <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.pid)"
                   class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
             Close</button>
           <button @click="forkWindow(w.pid)"
