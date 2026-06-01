@@ -4,18 +4,20 @@ English | [中文](README.zh-CN.md)
 
 When you're vibe coding with 5–7 Claude Code windows open at once, you need one
 place to see what every window is doing — who's stuck, who's waiting on you, who's
-done.
+done — and to act on them without hunting for the right terminal tab.
 
 ![](docs/screenshot-hero.png)
 
 ## Run it in 30 seconds
 
 ```bash
-bash run.sh
+git clone https://github.com/LukeLIN-web/claude-board
+cd claude-board && bash run.sh
 # open http://127.0.0.1:7878 in your browser
 ```
 
-The first run creates a venv and installs dependencies automatically — nothing to set up.
+The first run creates a venv and installs dependencies automatically — nothing to
+set up. Change the port with `CLAUDE_FLEET_PORT=9000 bash run.sh`.
 
 ## What it solves
 
@@ -23,7 +25,8 @@ The everyday pain of multi-window vibe coding:
 
 - **Permission prompts flash by and you miss them** → a persistent red bar at the top; click it to jump back to that terminal.
 - **You don't know what each window is doing** → every card shows the current task, triage status, and background jobs.
-- **Finished windows get left open** → the patrol engine marks them `closeable`; close with one click.
+- **Finished windows get left open** → the patrol engine marks them `closeable`; close any session with one click.
+- **Switching terminals to type one line is tedious** → spawn a new session, or send a one-off prompt, straight from the dashboard (Linux + tmux).
 - **You can't find that session from last week** → full-text search returns in ~50ms with VS Code–style match context.
 - **You don't know how much a skill actually gets used** → 3-dimensional stats (invokes + file read/write + bash references).
 - **You don't know who touched a memory** → in-degree (↓ sessions that read it) + out-degree (↑ sessions that wrote it).
@@ -80,23 +83,44 @@ The memory panel groups by type (user / feedback / project / reference) and show
 
 ### Timeline + plan history
 
-Open any session to see the full conversation flow. Skill calls are purple,
-memory reads are dashed blue, memory writes are pink.
+Open any session to see the full conversation flow, opened scrolled to the most
+recent event. Skill calls are purple, memory reads are dashed blue, memory writes
+are pink.
 
 Plan version history: a session typically iterates on its plan 5–14 times — each
 Write is a full snapshot, each Edit is a red/green diff.
 
 ![](docs/screenshot-timeline.png)
 
+### Spawn & send (Linux + tmux)
+
+Claude Fleet is read-only by default, but two opt-in, tmux-backed controls let you
+drive sessions without leaving the dashboard. They appear only when tmux is
+available.
+
+- **Spawn a session** — pick a recent directory (or type one) in the header and
+  hit **Spawn**. Fleet runs `tmux new-window … claude --dangerously-skip-permissions`
+  so the new session starts fully non-interactive — no permission prompts blocking
+  the pane. The new window shows up on the next 2s poll.
+- **Send a prompt** — each card has a `Send a prompt…` box. Type a line, press
+  Enter, and Fleet injects it into that session's tmux pane via
+  `tmux send-keys` (literal text + a separate Enter to submit).
+
+> `--dangerously-skip-permissions` auto-approves everything in a spawned session.
+> It's the right trade-off for driving your own sessions locally — just don't spawn
+> in directories you don't trust.
+
 ### Actions
 
 | Button | What it does |
 |--------|--------------|
 | Focus | jump to that terminal tab |
+| Timeline | expand the full conversation timeline + plan history |
+| Send | inject a single-line prompt into the session's tmux pane (Linux + tmux) |
 | Fork | `claude --resume <sid> --fork-session` — new session inherits the history |
-| Resume | `claude --resume <sid>` — continue the original session |
+| Resume | `claude --resume <sid>` — continue the original session (from the history list) |
 | Review | run `claude -p` review in the background; the verdict (PASS/FAIL/PARTIAL) shows on the card |
-| Close | SIGTERM |
+| Close | SIGTERM — available on every card |
 | Export | export a conversation doc (timeline + plan history + skill/memory summary) |
 
 > **Focus setup (macOS).** Focus works out of the box on Terminal.app and iTerm2 —
@@ -111,7 +135,7 @@ Write is a full snapshot, each Edit is a red/green diff.
 Single-file frontend (Alpine.js + Tailwind via CDN — no npm). The Python backend
 never writes to the stored harness data under `~/.claude/` and `~/.codex/` — that
 data stays read-only. It is read-only **by default**: a few explicit,
-user-triggered actions (fork, close, review, and tmux-backed session spawn /
+user-triggered actions (fork, close, review, and the tmux-backed session spawn /
 single-prompt injection on Linux) act on live sessions, never on the stored data.
 
 ```
@@ -122,7 +146,8 @@ core/
   patrol.py           triage classification engine
   codex.py            Codex session parsing
   search.py           cross-platform ripgrep search
-  actions.py          focus / fork / review / close / export
+  actions.py          focus / fork / review / close / export / spawn / send-prompt
+  tmux.py             tmux backend: spawn window + inject prompt (Linux)
   history.py          unified index + full-text rg search
   skills.py           skill directory scan
   memory.py           memory file parsing

@@ -2,19 +2,19 @@
 
 # Claude Fleet
 
-同时开 5-7 个 Claude Code 窗口 vibe coding 的时候，你需要一个地方看到所有窗口在干嘛、谁卡了、谁做完了。
+同时开 5-7 个 Claude Code 窗口 vibe coding 的时候，你需要一个地方看到所有窗口在干嘛、谁卡了、谁做完了——并且不用满屏找终端 tab 就能直接操作它们。
 
 ![](docs/screenshot-hero.png)
 
 ## 30 秒跑起来
 
 ```bash
-git clone https://github.com/tianyilt/claude-fleet
-cd claude-fleet && bash run.sh
+git clone https://github.com/LukeLIN-web/claude-board
+cd claude-board && bash run.sh
 # 浏览器打开 http://127.0.0.1:7878
 ```
 
-首次运行自动建 venv 装依赖，不用管。
+首次运行自动建 venv 装依赖，不用管。换端口：`CLAUDE_FLEET_PORT=9000 bash run.sh`。
 
 ## 解决什么问题
 
@@ -22,7 +22,8 @@ cd claude-fleet && bash run.sh
 
 - **Permission 通知一闪而过** → 红条常驻顶部，点一下跳回对应终端
 - **不知道哪个窗口在干嘛** → 每张卡片显示当前任务、triage 状态、后台任务
-- **做完的窗口忘记关** → patrol 引擎自动标 closeable，一键关闭
+- **做完的窗口忘记关** → patrol 引擎自动标 closeable，任意 session 一键关闭
+- **为发一行字还得切终端很烦** → 直接在面板里新建 session、或给某个 session 发一条 prompt（Linux + tmux）
 - **想找上周某个 session** → 全文搜索 50ms 返回，带 VS Code 风格匹配上下文
 - **Skill 用了多少次不知道** → 三维统计（invoke + file read/write + bash 引用）
 - **Memory 被谁改过** → 入度（↓被几个 session 参考）+ 出度（↑被几个 session 修改）
@@ -70,21 +71,36 @@ Memory 面板按 type 分组（user/feedback/project/reference），每条显示
 
 ### 时间线 + Plan 历史
 
-点开任意 session 看完整对话流。Skill 调用紫色、Memory 读蓝色虚线、Memory 写粉红色。
+点开任意 session 看完整对话流，打开时自动定位到最新一条。Skill 调用紫色、Memory 读蓝色虚线、Memory 写粉红色。
 
 Plan 版本历史：一个 session 通常迭代 5-14 次 plan，每次 Write 是完整快照，Edit 是红绿 diff。
 
 ![](docs/screenshot-timeline.png)
+
+### 新建 & 发送（Linux + tmux）
+
+Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让你不离开面板就能驱动 session。只有 tmux 可用时才显示。
+
+- **新建 session** — 在顶部选一个最近用过的目录（或自己输），点 **Spawn**。Fleet 执行
+  `tmux new-window … claude --dangerously-skip-permissions`，新 session 全自动启动——不会卡在
+  permission 提示上。新窗口会在下一次 2s 轮询时出现。
+- **发送 prompt** — 每张卡片有个 `Send a prompt…` 输入框。输入一行、回车，Fleet 通过
+  `tmux send-keys` 把它注入该 session 的 tmux pane（字面文本 + 单独一个 Enter 提交）。
+
+> `--dangerously-skip-permissions` 会自动放行 spawn 出来的 session 里的所有操作。本地驱动自己的
+> session 时这个权衡是合理的——只是别在你不信任的目录里 spawn。
 
 ### 操作
 
 | 按钮 | 做什么 |
 |------|--------|
 | Focus | 跳到那个终端 tab |
+| Timeline | 展开完整对话时间线 + plan 历史 |
+| Send | 往 session 的 tmux pane 注入一行 prompt（Linux + tmux）|
 | Fork | `claude --resume <sid> --fork-session`，新 session 继承对话历史 |
-| Resume | `claude --resume <sid>`，继续原 session |
+| Resume | `claude --resume <sid>`，继续原 session（在历史列表里）|
 | Review | 后台跑 `claude -p` 审查，结论（PASS/FAIL/PARTIAL）显示在卡片上 |
-| Close | SIGTERM |
+| Close | SIGTERM——每张卡片都有 |
 | Export | 导出对话文档（带 timeline + plan 历史 + skill/memory 摘要）|
 
 > **Focus 设置（macOS）。** Focus 开箱即用，支持 Terminal.app 和 iTerm2——包括 session 跑在
@@ -104,7 +120,8 @@ core/
   patrol.py           triage 分类引擎
   codex.py            Codex session 解析
   search.py           ripgrep 跨平台搜索
-  actions.py          focus / fork / review / close / export
+  actions.py          focus / fork / review / close / export / 新建 / 发 prompt
+  tmux.py             tmux 后端：新建窗口 + 注入 prompt（Linux）
   history.py          统一索引 + 全文 rg 搜索
   skills.py           skill 目录扫描
   memory.py           memory 文件解析

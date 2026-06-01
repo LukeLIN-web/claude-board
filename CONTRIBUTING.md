@@ -5,8 +5,8 @@ Thanks for your interest in Claude Fleet! Contributions are welcome.
 ## Development setup
 
 ```bash
-git clone https://github.com/tianyilt/claude-fleet
-cd claude-fleet
+git clone https://github.com/LukeLIN-web/claude-board
+cd claude-board
 bash run.sh          # creates a venv, installs deps, starts the dashboard
 ```
 
