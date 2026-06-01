@@ -468,7 +468,7 @@
       <pre class="text-xs text-gray-700 max-h-48 overflow-y-auto whitespace-pre-wrap bg-gray-50 rounded p-2"
            x-text="memoryDetail?.content || '(loading...)'"></pre>
     </div>
-    <div class="space-y-2 max-h-[32rem] overflow-y-auto">
+    <div class="space-y-2 max-h-[32rem] overflow-y-auto" x-ref="eventsList">
       <template x-for="(ev, idx) in (timelineData?.events || [])" :key="idx">
         <div :id="'tl-ev-'+idx" class="text-sm border-l-2 pl-3 py-1"
              :class="{
@@ -858,7 +858,10 @@ function fleet() {
       this.showPlanHistory = false;
       const r = await fetch(`/api/windows/${pid}/timeline`);
       this.timelineData = await r.json();
-      this.$nextTick(() => this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+      this.$nextTick(() => {
+        this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        const el = this.$refs.eventsList; if (el) el.scrollTop = el.scrollHeight;
+      });
     },
 
     async loadPlan(pid) {
@@ -901,7 +904,10 @@ function fleet() {
       const r = await fetch(`/api/history/${sessionId}/timeline`);
       if (r.ok) {
         this.timelineData = await r.json();
-        this.$nextTick(() => this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+        this.$nextTick(() => {
+          this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          const el = this.$refs.eventsList; if (el) el.scrollTop = el.scrollHeight;
+        });
       } else {
         this.toast('No transcript for this session');
         this.expandedHistoryId = null;
