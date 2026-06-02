@@ -473,56 +473,99 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     if not text:
         return None
     lines = text.split("\n")
-    joined = "\n".join(lines)
-    is_question = ("to select" in joined and "navigate" in joined)
-    is_perm = "Do you want to proceed" in joined
+    HEADER_MARK = "☐"  # ☐ checkbox that precedes each AskUserQuestion
+    footer_idx = None
+    for i, ln in enumerate(lines):
+        if "to select" in ln and "navigate" in ln:
+            footer_idx = i  # last match wins — the current picker is the lowest
+    proceed_idx = None
+    for i, ln in enumerate(lines):
+        if "Do you want to proceed" in ln:
+            proceed_idx = i
+    is_question = footer_idx is not None
+    is_perm = proceed_idx is not None
     if not (is_question or is_perm):
         return None
 
-    opts: list[tuple[int, str]] = []
-    first_opt_line: Optional[int] = None
-    for i, ln in enumerate(lines):
-        m = _MENU_OPT_RE.match(ln)
+    if is_question:
+        # Anchor to the current question: the last header above the footer, so
+        # older pickers' options sitting in scrollback aren't merged in.
+        header_idx = None
+        for i in range(footer_idx):
+            if HEADER_MARK in lines[i]:
+                header_idx = i
+        lo = (header_idx + 1) if header_idx is not None else 0
+        hi = footer_idx
+    else:
+        header_idx = proceed_idx
+        lo, hi = proceed_idx + 1, len(lines)
+
+    opt_lines: list[tuple[int, int, str]] = []  # (line_idx, num, label)
+    for i in range(lo, hi):
+        m = _MENU_OPT_RE.match(lines[i])
         if m:
-            opts.append((int(m.group(1)), m.group(2).strip()))
-            if first_opt_line is None:
-                first_opt_line = i
-    starts = [i for i, (n, _) in enumerate(opts) if n == 1]
-    if not starts or first_opt_line is None:
+            opt_lines.append((i, int(m.group(1)), m.group(2).strip()))
+    if not opt_lines:
         return None
-    s = starts[-1]
-    run = [opts[s]]
-    for n, l in opts[s + 1:]:
-        if n == run[-1][0] + 1:
-            run.append((n, l))
+
+    # Start at the last option numbered 1 (current picker), then take the
+    # contiguous increasing run; fall back to all captured options if the "1."
+    # scrolled off entirely.
+    start_pos = next((k for k in range(len(opt_lines) - 1, -1, -1) if opt_lines[k][1] == 1), 0)
+    run = [opt_lines[start_pos]]
+    for tup in opt_lines[start_pos + 1:]:
+        if tup[1] == run[-1][1] + 1:
+            run.append(tup)
         else:
             break
+    first_opt_line = run[0][0]
 
-    prompt = ""
-    for ln in reversed(lines[:first_opt_line]):
-        t = ln.replace(" ", " ").strip().lstrip("☐").strip()
-        if t and not set(t) <= set("─-—=· "):
-            prompt = t
-            break
+    def _meaningful(s):
+        core = s.replace(" ", "")
+        if not core:
+            return False
+        # skip pure divider / box-drawing lines
+        return not all(c in "-=." or 0x2014 <= ord(c) <= 0x2027 or 0x2500 <= ord(c) <= 0x257F for c in core)
+
+    if is_perm:
+        prompt = lines[proceed_idx].replace("\xa0", " ").strip()
+    else:
+        start = header_idx if header_idx is not None else 0
+        parts = []
+        for i2 in range(start, first_opt_line):
+            t = lines[i2].replace("\xa0", " ").strip().lstrip(HEADER_MARK).strip()
+            if _meaningful(t):
+                parts.append(t)
+        prompt = " ".join(parts)
     return {
         "kind": "question" if is_question else "permission",
         "prompt": prompt,
-        "options": [{"num": n, "label": l} for n, l in run],
+        "options": [{"num": n, "label": l} for (_, n, l) in run],
     }
 
 
 def get_pane_menu(pid: int) -> Optional[dict]:
-    """Capture `pid`'s tmux pane and return the live interactive menu, or None."""
+    """Return the live interactive menu in `pid`'s pane, or None.
+
+    Two captures: the visible viewport confirms a menu is *currently* active
+    (an answered picker left in scrollback must not be reported), then a
+    scrollback capture recovers options that scrolled above the fold.
+    """
     w = find_window(pid)
     if not w or not w.tty:
         return None
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return None
-    cap = tmux.capture_pane(pane)
-    if not cap["ok"]:
+    visible = tmux.capture_pane(pane)
+    if not visible["ok"]:
         return None
-    return parse_pane_menu(cap["text"])
+    vis = visible["text"]
+    active = ("to select" in vis and "navigate" in vis) or ("Do you want to proceed" in vis)
+    if not active:
+        return None
+    full = tmux.capture_pane(pane, scrollback=80)
+    return parse_pane_menu(full["text"] if full["ok"] else vis)
 
 
 # Keys the dashboard is allowed to send into an interactive menu (e.g. the

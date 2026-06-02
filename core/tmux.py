@@ -135,9 +135,16 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     return {"ok": True, "pane_id": r["stdout"].strip()}
 
 
-def capture_pane(pane: str) -> dict:
-    """Return the visible text of `pane` as {ok, text} (never raises)."""
-    r = _run("capture-pane", "-p", "-t", pane)
+def capture_pane(pane: str, scrollback: int = 0) -> dict:
+    """Return the text of `pane` as {ok, text} (never raises).
+
+    `scrollback` > 0 includes that many lines of history above the visible area —
+    needed for tall interactive menus whose top options scroll off-screen.
+    """
+    args = ["capture-pane", "-p", "-t", pane]
+    if scrollback > 0:
+        args = ["capture-pane", "-p", "-S", f"-{scrollback}", "-t", pane]
+    r = _run(*args)
     if not r["ok"]:
         return {"ok": False, "error": r["error"], "text": ""}
     return {"ok": True, "text": r["stdout"]}

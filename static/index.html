@@ -778,6 +778,10 @@ function fleet() {
       }
       this._applyHashRoute();
       window.addEventListener('hashchange', () => this._applyHashRoute());
+      // Poll the open live timeline every 2.5s. SSE only fires on state changes,
+      // but a session can sit silently at a question/permission picker — polling
+      // guarantees the menu (captured from the pane) shows up and stays current.
+      setInterval(() => { if (this.expandedPid !== null) this.refreshTimeline(); }, 2500);
     },
 
     // Deep-link panels via URL hash: #skills, #memory, #search=<q>, #timeline=<sid>
@@ -819,13 +823,18 @@ function fleet() {
         if (!r.ok) return;
         const data = await r.json();
         if (this.expandedPid !== pid) return; // user navigated away mid-fetch
+        // Skip the re-render when nothing changed — the poller calls this every
+        // few seconds, and reassigning would flicker the list and fight scroll.
+        const sig = JSON.stringify(data);
+        if (sig === this._timelineSig) return;
+        this._timelineSig = sig;
         this.timelineData = data;
         if (stick) {
           this.$nextTick(() => {
             const e = this.$refs.eventsList; if (e) e.scrollTop = e.scrollHeight;
           });
         }
-      } catch (e) { /* transient fetch error; next snapshot retries */ }
+      } catch (e) { /* transient fetch error; next poll retries */ }
     },
 
     formatIdle(seconds) {
@@ -1025,8 +1034,10 @@ function fleet() {
       // Baseline the activity marker so the next bump (assistant reply, tool
       // call) triggers an auto-refresh via applySnapshot.
       this.expandedUpdatedAt = this.windows.find((w) => w.pid === pid)?.updated_at ?? null;
+      this._timelineSig = null; // force first poll/refresh to render this session
       const r = await fetch(`/api/windows/${pid}/timeline`);
       this.timelineData = await r.json();
+      this._timelineSig = JSON.stringify(this.timelineData);
       this.$nextTick(() => {
         this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         const el = this.$refs.eventsList; if (el) el.scrollTop = el.scrollHeight;

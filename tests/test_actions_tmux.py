@@ -116,3 +116,52 @@ class SendPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParsePaneMenuTests(unittest.TestCase):
+    """parse_pane_menu reads the live picker/permission menu off a captured pane."""
+
+    def test_single_question_picker(self):
+        cap = (
+            " \u2610 \u6d4b\u8bd5\n\u6d4b\u8bd5\u95ee\u9898\n"
+            "\u276f 1. A\n  2. B\n  3. C\n  4. Type something.\n"
+            "  5. Chat about this\n"
+            "Enter to select \u00b7 \u2191/\u2193 to navigate \u00b7 Esc to cancel"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual(m["kind"], "question")
+        self.assertEqual([o["num"] for o in m["options"]], [1, 2, 3, 4, 5])
+        self.assertEqual(m["options"][0]["label"], "A")
+
+    def test_permission_prompt(self):
+        cap = (
+            "Bash(rm x)\nDo you want to proceed?\n"
+            "\u276f 1. Yes\n  2. Yes, and don't ask again\n"
+            "  3. No, and tell Claude what to do differently (esc)"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual(m["kind"], "permission")
+        self.assertEqual(m["options"][0]["label"], "Yes")
+        self.assertEqual(len(m["options"]), 3)
+
+    def test_current_picker_isolated_from_older_one_in_scrollback(self):
+        # Two pickers in scrollback; the current one's first options are "above
+        # the fold". Must return ONLY the current picker, full 1..5.
+        cap = (
+            " \u2610 old\n\u276f 1. old-a\n  2. old-b\n  3. old-c\n"
+            "  4. Type something.\n  5. Chat about this\n"
+            "Enter to select \u00b7 \u2191/\u2193 to navigate \u00b7 Esc to cancel\n"
+            " \u2610 current\nthe real question\n"
+            "\u276f 1. cur-a\n     desc line\n  2. cur-b\n  3. cur-c\n"
+            "  4. Type something.\n  5. Chat about this\n"
+            "Enter to select \u00b7 \u2191/\u2193 to navigate \u00b7 Esc to cancel\n"
+            "  6 tasks (1 done)"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual([o["label"] for o in m["options"]],
+                         ["cur-a", "cur-b", "cur-c", "Type something.", "Chat about this"])
+        self.assertIn("the real question", m["prompt"])
+
+    def test_non_menu_output_returns_none(self):
+        self.assertIsNone(actions.parse_pane_menu("hello\n1. a list\n2. another\nnormal"))
+        self.assertIsNone(actions.parse_pane_menu(""))
