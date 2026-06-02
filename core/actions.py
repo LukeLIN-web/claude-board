@@ -462,18 +462,42 @@ def respond_permission(pid: int, choice: str) -> dict:
 _MENU_OPT_RE = re.compile(r"^[\s ❯>*]*(\d+)\.[\s ]+(.*\S)\s*$")
 
 
+# A multiSelect option carries a checkbox prefix, e.g. "[ ] Red" / "[✔] Green".
+# Group 1 = the marker char (empty/space ⇒ unchecked), group 2 = the real label.
+_CHECKBOX_RE = re.compile(r"^\[([^\]]?)\]\s+(.*\S)\s*$")
+
+# Tab/checkbox markers that head an AskUserQuestion picker: ☐ = an unanswered
+# question tab, ☒ = an answered one. Either anchors the *current* question.
+_HEADER_MARKS = ("☐", "☒")
+
+
+def _is_tabbar(line: str) -> bool:
+    """True for a picker's tab strip, e.g. '←  ☐ Colors  ✔ Submit  →'.
+
+    Recognized by the '✔ Submit' tab beside a navigation arrow; kept out of the
+    parsed prompt (it's chrome, not question text). The submit-review screen's
+    'Ready to submit your answers?' has no arrow or ✔, so it is never stripped.
+    """
+    return "Submit" in line and "✔" in line and ("←" in line or "→" in line)
+
+
 def parse_pane_menu(text: str) -> Optional[dict]:
-    """Parse an interactive menu (AskUserQuestion picker / permission prompt)
-    out of a captured tmux pane, or None if no menu is currently on screen.
+    """Parse an interactive menu (AskUserQuestion picker / permission prompt /
+    multiSelect submit-review) out of a captured tmux pane, or None if no menu
+    is currently on screen.
 
     The pending question/permission is NOT written to the transcript until it's
     resolved, so the live screen is the only place its options exist. Returns
-    {kind, prompt, options:[{num, label}]}.
+    {kind, prompt, options:[{num, label[, checked]}], multi}.
+
+    For a multiSelect picker `multi` is True and each option carries a `checked`
+    bool. There the digit key TOGGLES an option and Enter does NOT submit — Tab
+    advances to the footer-less "Ready to submit your answers?" review screen,
+    which this also parses (as a plain picker: "1. Submit answers / 2. Cancel").
     """
     if not text:
         return None
     lines = text.split("\n")
-    HEADER_MARK = "☐"  # ☐ checkbox that precedes each AskUserQuestion
     footer_idx = None
     for i, ln in enumerate(lines):
         if "to select" in ln and "navigate" in ln:
@@ -482,23 +506,36 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     for i, ln in enumerate(lines):
         if "Do you want to proceed" in ln:
             proceed_idx = i
-    is_question = footer_idx is not None
-    is_perm = proceed_idx is not None
-    if not (is_question or is_perm):
+    review_idx = None
+    for i, ln in enumerate(lines):
+        if "Ready to submit your answers" in ln:
+            review_idx = i
+
+    if footer_idx is not None:
+        mode = "question"
+    elif proceed_idx is not None:
+        mode = "permission"
+    elif review_idx is not None:
+        mode = "review"
+    else:
         return None
 
-    if is_question:
-        # Anchor to the current question: the last header above the footer, so
-        # older pickers' options sitting in scrollback aren't merged in.
+    if mode == "question":
+        # Anchor to the current question: the last tab header above the footer,
+        # so older pickers' options sitting in scrollback aren't merged in.
         header_idx = None
         for i in range(footer_idx):
-            if HEADER_MARK in lines[i]:
+            if any(mk in lines[i] for mk in _HEADER_MARKS):
                 header_idx = i
         lo = (header_idx + 1) if header_idx is not None else 0
         hi = footer_idx
-    else:
+    elif mode == "permission":
         header_idx = proceed_idx
         lo, hi = proceed_idx + 1, len(lines)
+    else:  # review — multiSelect confirmation ("1. Submit answers / 2. Cancel")
+        header_idx = next((i for i in range(review_idx + 1)
+                           if "Review your answers" in lines[i]), review_idx)
+        lo, hi = review_idx, len(lines)
 
     opt_lines: list[tuple[int, int, str]] = []  # (line_idx, num, label)
     for i in range(lo, hi):
@@ -520,6 +557,19 @@ def parse_pane_menu(text: str) -> Optional[dict]:
             break
     first_opt_line = run[0][0]
 
+    # multiSelect options carry a [ ]/[✔] checkbox; split it off the label so the
+    # dashboard renders the checked state instead of a literal "[✔] Foo".
+    options: list[dict] = []
+    multi = False
+    for (_, n, label) in run:
+        cb = _CHECKBOX_RE.match(label)
+        if cb:
+            multi = True
+            options.append({"num": n, "label": cb.group(2).strip(),
+                            "checked": bool(cb.group(1).strip())})
+        else:
+            options.append({"num": n, "label": label})
+
     def _meaningful(s):
         core = s.replace(" ", "")
         if not core:
@@ -527,20 +577,26 @@ def parse_pane_menu(text: str) -> Optional[dict]:
         # skip pure divider / box-drawing lines
         return not all(c in "-=." or 0x2014 <= ord(c) <= 0x2027 or 0x2500 <= ord(c) <= 0x257F for c in core)
 
-    if is_perm:
+    if mode == "permission":
         prompt = lines[proceed_idx].replace("\xa0", " ").strip()
     else:
         start = header_idx if header_idx is not None else 0
         parts = []
         for i2 in range(start, first_opt_line):
-            t = lines[i2].replace("\xa0", " ").strip().lstrip(HEADER_MARK).strip()
+            if _is_tabbar(lines[i2]):
+                continue  # drop the "✔ Submit" tab strip from the question text
+            t = lines[i2].replace("\xa0", " ").strip()
+            for mk in _HEADER_MARKS:
+                t = t.replace(mk, " ")
+            t = t.strip()
             if _meaningful(t):
                 parts.append(t)
-        prompt = " ".join(parts)
+        prompt = " ".join(parts).strip()
     return {
-        "kind": "question" if is_question else "permission",
+        "kind": "permission" if mode == "permission" else "question",
         "prompt": prompt,
-        "options": [{"num": n, "label": l} for (_, n, l) in run],
+        "options": options,
+        "multi": multi,
     }
 
 
@@ -561,7 +617,11 @@ def get_pane_menu(pid: int) -> Optional[dict]:
     if not visible["ok"]:
         return None
     vis = visible["text"]
-    active = ("to select" in vis and "navigate" in vis) or ("Do you want to proceed" in vis)
+    active = (
+        ("to select" in vis and "navigate" in vis)
+        or ("Do you want to proceed" in vis)
+        or ("Ready to submit your answers" in vis)  # multiSelect review screen (no footer)
+    )
     if not active:
         return None
     full = tmux.capture_pane(pane, scrollback=80)

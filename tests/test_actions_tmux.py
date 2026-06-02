@@ -130,8 +130,54 @@ class ParsePaneMenuTests(unittest.TestCase):
         )
         m = actions.parse_pane_menu(cap)
         self.assertEqual(m["kind"], "question")
+        self.assertFalse(m.get("multi"))
         self.assertEqual([o["num"] for o in m["options"]], [1, 2, 3, 4, 5])
         self.assertEqual(m["options"][0]["label"], "A")
+
+    def test_multiselect_picker_flags_multi_and_splits_checkboxes(self):
+        # Real layout of a multiSelect AskUserQuestion: a tab strip with a
+        # "\u2714 Submit" tab, checkboxes on each option, same picker footer.
+        cap = (
+            "\u2190  \u2610 Colors  \u2714 Submit  \u2192\n"
+            "\n"
+            "Which colors do you like?\n"
+            "\n"
+            "\u276f 1. [ ] Red\n  The color red.\n"
+            "  2. [\u2714] Green\n  The color green.\n"
+            "  3. [ ] Blue\n  The color blue.\n"
+            "  4. [ ] Yellow\n  The color yellow.\n"
+            "  5. [ ] Type something\n     Submit\n"
+            "  6. Chat about this\n"
+            "Enter to select \u00b7 \u2191/\u2193 to navigate \u00b7 Esc to cancel"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual(m["kind"], "question")
+        self.assertTrue(m["multi"])
+        self.assertEqual([o["num"] for o in m["options"]], [1, 2, 3, 4, 5, 6])
+        # checkbox prefix is stripped from the label and surfaced as `checked`
+        self.assertEqual(m["options"][0]["label"], "Red")
+        self.assertFalse(m["options"][0]["checked"])
+        self.assertEqual(m["options"][1]["label"], "Green")
+        self.assertTrue(m["options"][1]["checked"])
+        # the "\u2714 Submit" tab strip is chrome, not part of the question text
+        self.assertIn("Which colors do you like?", m["prompt"])
+        self.assertNotIn("Submit", m["prompt"])
+
+    def test_submit_review_screen_detected_as_picker(self):
+        # After Tab on a multiSelect picker, Claude shows a footer-less review
+        # screen. The current parser missed it (no "to select"/"proceed" line).
+        cap = (
+            "\u2190  \u2612 Colors  \u2714 Submit  \u2192\n\n"
+            "Review your answers\n\n"
+            " \u25cf Which colors do you like?\n   \u2192 Blue, Green\n\n"
+            "Ready to submit your answers?\n\n"
+            "\u276f 1. Submit answers\n  2. Cancel"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual(m["kind"], "question")
+        self.assertFalse(m.get("multi"))
+        self.assertEqual([o["label"] for o in m["options"]], ["Submit answers", "Cancel"])
+        self.assertIn("Ready to submit", m["prompt"])
 
     def test_permission_prompt(self):
         cap = (

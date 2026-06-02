@@ -401,7 +401,7 @@
       <div class="flex items-center gap-2 mb-2 flex-wrap">
         <span class="font-semibold" :class="timelineData?.menu?.kind === 'permission' ? 'text-red-700' : 'text-amber-800'"
               x-text="timelineData?.menu?.kind === 'permission' ? '🔐 Permission needed' : '❓ Claude is asking'"></span>
-        <span class="text-xs text-gray-500">click an option (its number is sent to the menu)</span>
+        <span class="text-xs text-gray-500" x-text="timelineData?.menu?.multi ? 'click options to toggle, then Continue →' : 'click an option (its number is sent to the menu)'"></span>
       </div>
       <div class="font-medium text-gray-800 mb-2" x-text="timelineData?.menu?.prompt"></div>
       <div class="space-y-1">
@@ -409,22 +409,30 @@
           <button @click="answerMenuKey(expandedPid, opt.num)"
                   class="block w-full text-left border bg-white rounded px-2 py-1.5 hover:bg-gray-50 transition"
                   :class="timelineData?.menu?.kind === 'permission' ? 'border-red-200' : 'border-amber-200'">
+            <span x-show="opt.checked !== undefined" class="mr-1" x-text="opt.checked ? '☑' : '☐'"></span>
             <span class="font-medium" :class="timelineData?.menu?.kind === 'permission' ? 'text-red-800' : 'text-amber-800'"
                   x-text="opt.num + '. ' + opt.label"></span>
           </button>
         </template>
       </div>
       <div class="flex items-center gap-2 mt-2 flex-wrap">
-        <button @click="answerQuestionSubmit(expandedPid)"
+        <!-- Single-select / review: Enter confirms the highlighted option. -->
+        <button x-show="!timelineData?.menu?.multi" @click="answerQuestionSubmit(expandedPid)"
                 class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
           Submit (Enter)</button>
+        <!-- multiSelect: Enter only TOGGLES the highlighted row, so advance with
+             Tab to the next question / the "Ready to submit" review screen. -->
+        <button x-show="timelineData?.menu?.multi" @click="answerMenuAdvance(expandedPid)"
+                class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
+          Continue → (Tab)</button>
         <button @click="answerQuestionCancel(expandedPid)"
                 class="text-xs border border-gray-300 text-gray-600 px-3 py-1 rounded hover:bg-gray-100 transition">
           Cancel (Esc)</button>
         <button @click="refreshTimeline()"
                 class="text-xs border border-gray-300 text-gray-600 px-3 py-1 rounded hover:bg-gray-100 transition">
           ⟳ Refresh</button>
-        <span class="text-xs text-gray-400">多个问题：答完一题会自动跳到下一题（点 Refresh 刷新）。"Other"/自由文本用上方输入框。</span>
+        <span x-show="timelineData?.menu?.multi" class="text-xs text-gray-400">多选题：点选项勾选/取消，选完点 "Continue →"，再在确认页点 "Submit answers"。</span>
+        <span x-show="!timelineData?.menu?.multi" class="text-xs text-gray-400">多个问题：答完一题会自动跳到下一题（点 Refresh 刷新）。"Other"/自由文本用上方输入框。</span>
       </div>
     </div>
     <!-- Send a single prompt into this live session's tmux pane (only for live sessions) -->
@@ -950,13 +958,17 @@ function fleet() {
       }
     },
     // Press an option's number key in the live menu (question or permission).
-    // For a single-question picker this selects + submits immediately.
+    // Single-select: the digit selects + submits immediately. multiSelect: the
+    // digit just toggles that option's checkbox, so refresh to redraw the state.
     async answerMenuKey(pid, n) {
       if (await this.sendKeys(pid, [String(n)])) {
-        // Pull the next screen state (next question, or menu gone) after a beat.
+        // Pull the next screen state (next question, toggled state, or menu gone).
         setTimeout(() => this.refreshTimeline(), 400);
       }
     },
+    // multiSelect advance: Enter only toggles a row, so Tab moves on to the next
+    // question / the "Ready to submit" review screen (which renders as a picker).
+    answerMenuAdvance(pid) { this.sendKeys(pid, ['Tab']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     answerQuestionSubmit(pid) { this.sendKeys(pid, ['Enter']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     answerQuestionCancel(pid) { this.sendKeys(pid, ['Escape']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
 
