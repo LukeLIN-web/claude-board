@@ -290,6 +290,13 @@
           <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
           <!-- Background tasks -->
           <div x-show="w.background_tasks?.length" class="space-y-0.5">
+            <div class="flex items-center gap-1">
+              <span class="text-[10px] font-medium text-amber-800 bg-amber-100 rounded px-1.5 py-0.5"
+                    x-text="'🐚 ' + (w.background_tasks||[]).filter(t => t.type === 'bash_bg').length + ' bg shell'"></span>
+              <span x-show="(w.background_tasks||[]).some(t => t.type === 'monitor')"
+                    class="text-[10px] font-medium text-amber-800 bg-amber-100 rounded px-1.5 py-0.5"
+                    x-text="'👁 ' + (w.background_tasks||[]).filter(t => t.type === 'monitor').length + ' monitor'"></span>
+            </div>
             <template x-for="(bt, i) in (w.background_tasks||[])" :key="i">
               <div class="text-[10px] text-amber-700 bg-amber-50 rounded px-1.5 py-0.5 truncate">
                 <span class="font-medium" x-text="bt.type === 'monitor' ? 'Monitor' : 'Bash bg'"></span>:
