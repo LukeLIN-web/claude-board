@@ -444,6 +444,11 @@
         <span x-show="!timelineData?.menu?.multi" class="text-xs text-gray-400">多个问题：答完一题会自动跳到下一题（点 Refresh 刷新）。"Other"/自由文本用上方输入框。</span>
       </div>
     </div>
+    <!-- Most recent prompt the user sent — always visible while a session is open -->
+    <div class="mb-3 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2" x-show="timelineData && lastUserPrompt()">
+      <div class="text-[10px] font-semibold text-blue-700 uppercase tracking-wide mb-1">最近发送的 prompt</div>
+      <pre class="text-xs text-blue-900 whitespace-pre-wrap break-words max-h-32 overflow-y-auto m-0 font-sans" x-text="lastUserPrompt()"></pre>
+    </div>
     <!-- Send a single prompt into this live session's tmux pane (only for live sessions) -->
     <div class="flex items-end gap-2 mb-4" x-show="expandedPid !== null && tmuxAvailable">
       <textarea x-model="promptDrafts[expandedPid]" rows="3"
@@ -928,6 +933,17 @@ function fleet() {
       } finally {
         this.promptSending[pid] = false;
       }
+    },
+
+    // Most recent prompt the user typed into this session (last user_text event).
+    lastUserPrompt() {
+      const events = this.timelineData?.events || [];
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i].kind === 'user_text' && (events[i].text || '').trim()) {
+          return events[i].text.trim();
+        }
+      }
+      return '';
     },
 
     async sendClear(pid) {
