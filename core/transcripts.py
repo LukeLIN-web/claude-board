@@ -2,10 +2,30 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+_CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
+_CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
+
+
+def _clean_command_text(text: str) -> str:
+    """Render a slash-command envelope as a bare command label.
+
+    Claude logs `/clear` as `<command-name>/clear</command-name>...`. The board
+    shows the raw text, so strip the envelope down to `clear` (no leading slash),
+    appending any command args. Non-command text is returned unchanged.
+    """
+    m = _CMD_NAME_RE.search(text)
+    if not m:
+        return text
+    name = m.group(1).lstrip("/")
+    args_m = _CMD_ARGS_RE.search(text)
+    args = args_m.group(1).strip() if args_m else ""
+    return f"{name} {args}".strip()
 
 
 @dataclass
@@ -94,14 +114,14 @@ def _flatten_user(msg: dict) -> list[TurnEvent]:
     content = msg.get("content") or []
     ts = msg.get("timestamp") or ""
     if isinstance(content, str):
-        out.append(TurnEvent(ts, "user_text", content[:4000], None, "user", {}))
+        out.append(TurnEvent(ts, "user_text", _clean_command_text(content)[:4000], None, "user", {}))
         return out
     if not isinstance(content, list):
         return out
     for c in content:
         ct = c.get("type")
         if ct == "text":
-            out.append(TurnEvent(ts, "user_text", (c.get("text") or "")[:4000], None, "user", {}))
+            out.append(TurnEvent(ts, "user_text", _clean_command_text(c.get("text") or "")[:4000], None, "user", {}))
         elif ct == "tool_result":
             # Sensitive: don't dump full stdout. Just first 200 chars.
             content_val = c.get("content")
