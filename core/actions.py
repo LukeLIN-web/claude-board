@@ -1,4 +1,4 @@
-"""Side-effectful actions: focus, fork, export, close, review."""
+"""Side-effectful actions: focus, fork, export, close, spawn, send-prompt."""
 from __future__ import annotations
 
 import os
@@ -274,92 +274,6 @@ def close_session(pid: int) -> dict:
     return {"ok": True, "pid": pid, "name": w.name or w.project_name}
 
 
-_review_results: dict[int, dict] = {}
-
-
-def _build_review_summary(transcript_path: str, limit: int = 40) -> str:
-    """Extract last N turns as compact text for review prompt."""
-    from .transcripts import timeline
-    events = timeline(transcript_path, limit=limit)
-    lines: list[str] = []
-    for ev in events:
-        kind = ev.get("kind", "")
-        ts = (ev.get("ts") or "")[:19]
-        if kind == "user_text":
-            lines.append(f"[USER {ts}] {ev.get('text','')[:500]}")
-        elif kind == "assistant_text":
-            lines.append(f"[ASSISTANT {ts}] {ev.get('text','')[:500]}")
-        elif kind == "tool_use":
-            extra = ", ".join(f"{k}={v!r}" for k, v in list(ev.get("extra", {}).items())[:2])
-            lines.append(f"[TOOL {ts}] {ev.get('tool','')}({extra})")
-        elif kind == "tool_result":
-            lines.append(f"[RESULT] {ev.get('text','')[:200]}")
-    return "\n".join(lines)
-
-
-def review_session_start(pid: int) -> dict:
-    """Start a background `claude -p` review (non-interactive, no new window)."""
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-    if pid in _review_results and _review_results[pid].get("status") == "running":
-        return {"ok": True, "status": "already_running"}
-
-    name = w.name or w.project_name or "session"
-    transcript = w.transcript_path or ""
-    if not transcript:
-        return {"ok": False, "error": "no transcript to review"}
-
-    summary = _build_review_summary(transcript, limit=40)
-
-    prompt = (
-        f"请 review 以下 Claude Code session 的工作成果。\n"
-        f"Session: {name}\n"
-        f"CWD: {w.cwd}\n\n"
-        f"## 最近对话记录\n\n{summary}\n\n"
-        f"请检查：\n"
-        f"1. 任务是否完成\n"
-        f"2. 有无低级错误或遗漏\n"
-        f"3. 有无安全问题\n"
-        f"4. 给出结论：PASS（可以关闭） / FAIL（需要继续或修复） / PARTIAL（部分完成）\n"
-        f"用中文回答，200字以内。"
-    )
-
-    prompt_file = Path(f"/tmp/fleet-review-{pid}.txt")
-    prompt_file.write_text(prompt, encoding="utf-8")
-
-    _review_results[pid] = {"status": "running", "name": name}
-
-    import threading
-
-    def _run():
-        try:
-            cmd = f'cat {shlex.quote(str(prompt_file))} | claude -p --output-format text'
-            proc = subprocess.run(
-                ["zsh", "-c", f"source ~/.zshrc 2>/dev/null; cd {shlex.quote(w.cwd)} && {cmd}"],
-                capture_output=True, text=True, timeout=120,
-            )
-            _review_results[pid] = {
-                "status": "done",
-                "name": name,
-                "verdict": proc.stdout.strip()[-3000:],
-                "rc": proc.returncode,
-                "error": proc.stderr.strip()[-500:] if proc.returncode != 0 else "",
-            }
-        except Exception as e:
-            _review_results[pid] = {"status": "error", "name": name, "error": str(e)}
-        finally:
-            prompt_file.unlink(missing_ok=True)
-
-    threading.Thread(target=_run, daemon=True).start()
-    return {"ok": True, "status": "started", "name": name}
-
-
-def review_session_result(pid: int) -> dict:
-    """Get the result of a background review."""
-    return _review_results.get(pid, {"status": "not_found"})
-
-
 def close_session(pid: int) -> dict:
     """Send SIGTERM to a Claude Code session for graceful shutdown."""
     import signal
@@ -377,42 +291,6 @@ def close_session(pid: int) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "pid": pid, "message": f"SIGTERM sent to {pid}"}
-
-
-_REVIEW_PROMPT = "请 review 你刚才做的工作，检查是否有低级错误、遗漏、安全问题。列出发现的问题和修复建议。"
-
-
-def review_session(pid: int) -> dict:
-    """Open a new iTerm2 window, resume the session, and send a review prompt."""
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-
-    resume_cmd = f"cd {shlex.quote(w.cwd)} && claude --resume {shlex.quote(w.session_id)}"
-    # AppleScript: open new window → type resume command → wait a bit → type review prompt
-    escaped_resume = resume_cmd.replace('\\', '\\\\').replace('"', '\\"')
-    escaped_review = _REVIEW_PROMPT.replace('\\', '\\\\').replace('"', '\\"')
-    script = f'''tell application "iTerm2"
-    activate
-    set newWin to (create window with default profile)
-    tell current session of newWin
-        write text "{escaped_resume}"
-        delay 3
-        write text "{escaped_review}"
-    end tell
-end tell'''
-    try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=15,
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {
-        "ok": proc.returncode == 0,
-        "pid": pid,
-        "session_id": w.session_id,
-    }
 
 
 def create_session(cwd: str) -> dict:

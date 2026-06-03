@@ -119,7 +119,7 @@ available.
 | Send | inject a single-line prompt into the session's tmux pane (Linux + tmux) |
 | Fork | `claude --resume <sid> --fork-session` — new session inherits the history |
 | Resume | `claude --resume <sid>` — continue the original session (from the history list) |
-| Review | run `claude -p` review in the background; the verdict (PASS/FAIL/PARTIAL) shows on the card |
+| Review | send `/humanize:ask-codex review` into the session (Linux + tmux) |
 | Close | SIGTERM — available on every card |
 | Export | export a conversation doc (timeline + plan history + skill/memory summary) |
 
@@ -135,8 +135,9 @@ available.
 Single-file frontend (Alpine.js + Tailwind via CDN — no npm). The Python backend
 never writes to the stored harness data under `~/.claude/` and `~/.codex/` — that
 data stays read-only. It is read-only **by default**: a few explicit,
-user-triggered actions (fork, close, review, and the tmux-backed session spawn /
-single-prompt injection on Linux) act on live sessions, never on the stored data.
+user-triggered actions (fork, close, and the tmux-backed session spawn /
+single-prompt injection on Linux, including the Clear/Commit/Review prompt
+shortcuts) act on live sessions, never on the stored data.
 
 ```
 app.py                FastAPI + SSE (2s polling)
@@ -146,7 +147,7 @@ core/
   patrol.py           triage classification engine
   codex.py            Codex session parsing
   search.py           cross-platform ripgrep search
-  actions.py          focus / fork / review / close / export / spawn / send-prompt
+  actions.py          focus / fork / close / export / spawn / send-prompt
   tmux.py             tmux backend: spawn window + inject prompt (Linux)
   history.py          unified index + full-text rg search
   skills.py           skill directory scan

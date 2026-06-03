@@ -288,10 +288,6 @@
         <div class="px-4 pb-2 text-xs space-y-1">
           <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
           <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
-          <!-- Review verdict -->
-          <div x-show="reviewVerdicts[w.pid]"
-               class="bg-blue-50 border border-blue-200 rounded p-2 text-xs text-blue-800 max-h-32 overflow-y-auto whitespace-pre-wrap"
-               x-text="reviewVerdicts[w.pid]"></div>
           <!-- Background tasks -->
           <div x-show="w.background_tasks?.length" class="space-y-0.5">
             <template x-for="(bt, i) in (w.background_tasks||[])" :key="i">
@@ -322,12 +318,10 @@
                   class="text-xs px-2 py-1 rounded border transition"
                   :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
             Focus</button>
-          <button x-show="w.triage === 'completed' || w.triage === 'stalled'"
-                  @click="reviewWindow(w.pid)"
-                  class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition"
-                  :class="reviewStatuses[w.pid]==='running' ? 'opacity-50 cursor-wait' : ''"
-                  :disabled="reviewStatuses[w.pid]==='running'">
-            <span x-text="reviewStatuses[w.pid]==='running' ? 'Reviewing...' : (reviewStatuses[w.pid]==='done' ? 'See Review' : 'Review')"></span></button>
+          <button x-show="tmuxAvailable" @click="sendReview(w.pid)" :disabled="!!promptSending[w.pid]"
+                  class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
+                  title="Send /humanize:ask-codex review to this session">
+            Review</button>
           <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.pid)"
                   class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
             Close</button>
@@ -723,8 +717,6 @@ function fleet() {
     skillsList: null,
     showMemory: false,
     memoryData: null,
-    reviewStatuses: {},
-    reviewVerdicts: {},
     memoryDetail: null,
     showPlanHistory: false,
     copyButtonText: 'Copy',
@@ -967,6 +959,24 @@ function fleet() {
       }
     },
 
+    async sendReview(pid) {
+      if (this.promptSending[pid]) return;
+      this.promptSending[pid] = true;
+      try {
+        const r = await fetch(`/api/windows/${pid}/prompt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: '/humanize:ask-codex review' }),
+        });
+        const d = await r.json();
+        this.toast(d.ok ? 'Sent /humanize:ask-codex review' : 'Review failed: ' + (d.error || ''));
+      } catch (e) {
+        this.toast('Review failed: ' + e);
+      } finally {
+        this.promptSending[pid] = false;
+      }
+    },
+
     async respondPermission(pid, choice) {
       if (this.permSending[pid]) return;
       this.permSending[pid] = true;
@@ -1015,47 +1025,6 @@ function fleet() {
     answerMenuAdvance(pid) { this.sendKeys(pid, ['Tab']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     answerQuestionSubmit(pid) { this.sendKeys(pid, ['Enter']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     answerQuestionCancel(pid) { this.sendKeys(pid, ['Escape']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
-
-    async reviewWindow(pid) {
-      if (this.reviewStatuses[pid] === 'done') {
-        const r = await fetch(`/api/windows/${pid}/review`);
-        const d = await r.json();
-        this.reviewVerdicts[pid] = d.verdict || d.error || 'no result';
-        return;
-      }
-      this.toast('Starting background review...');
-      this.reviewStatuses[pid] = 'running';
-      const r = await fetch(`/api/windows/${pid}/review`, { method: 'POST' });
-      const d = await r.json();
-      if (!d.ok) {
-        this.toast('Review failed: ' + (d.error || ''));
-        this.reviewStatuses[pid] = null;
-        return;
-      }
-      this.toast('Review started for ' + (d.name || pid) + ', polling...');
-      this._pollReview(pid);
-    },
-
-    async _pollReview(pid) {
-      for (let i = 0; i < 60; i++) {
-        await new Promise(r => setTimeout(r, 3000));
-        const r = await fetch(`/api/windows/${pid}/review`);
-        const d = await r.json();
-        if (d.status === 'done') {
-          this.reviewStatuses[pid] = 'done';
-          this.reviewVerdicts[pid] = d.verdict || '';
-          this.toast('Review complete for ' + (d.name || pid));
-          return;
-        }
-        if (d.status === 'error') {
-          this.reviewStatuses[pid] = null;
-          this.toast('Review error: ' + (d.error || ''));
-          return;
-        }
-      }
-      this.reviewStatuses[pid] = null;
-      this.toast('Review timed out');
-    },
 
     async closeWindow(pid) {
       const r = await fetch(`/api/windows/${pid}/close`, { method: 'POST' });

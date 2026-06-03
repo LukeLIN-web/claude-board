@@ -248,16 +248,6 @@ def api_close(pid: int) -> dict:
     return actions.close_session(pid)
 
 
-@app.post("/api/windows/{pid}/review")
-def api_review(pid: int) -> dict:
-    return actions.review_session_start(pid)
-
-
-@app.get("/api/windows/{pid}/review")
-def api_review_result(pid: int) -> dict:
-    return actions.review_session_result(pid)
-
-
 @app.get("/api/history")
 def api_history(q: str = "", page: int = 1, limit: int = 30) -> dict:
     return history.list_sessions(q=q or None, page=page, limit=limit)
