@@ -341,6 +341,10 @@
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
             Clear</button>
+          <button x-show="tmuxAvailable" @click="sendCommit(w.pid)" :disabled="!!promptSending[w.pid]"
+                  class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
+                  title="Ask this session to commit and push">
+            Commit</button>
           <!-- Waiting on a prompt: open the timeline to see the actual options and respond -->
           <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
                x-show="w.triage === 'waiting_perm' && tmuxAvailable">
@@ -940,6 +944,24 @@ function fleet() {
         this.toast(d.ok ? 'Sent /clear' : 'Clear failed: ' + (d.error || ''));
       } catch (e) {
         this.toast('Clear failed: ' + e);
+      } finally {
+        this.promptSending[pid] = false;
+      }
+    },
+
+    async sendCommit(pid) {
+      if (this.promptSending[pid]) return;
+      this.promptSending[pid] = true;
+      try {
+        const r = await fetch(`/api/windows/${pid}/prompt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: 'commit and push' }),
+        });
+        const d = await r.json();
+        this.toast(d.ok ? 'Sent commit and push' : 'Commit failed: ' + (d.error || ''));
+      } catch (e) {
+        this.toast('Commit failed: ' + e);
       } finally {
         this.promptSending[pid] = false;
       }
