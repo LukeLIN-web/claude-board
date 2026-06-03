@@ -60,6 +60,58 @@ def _pid_tty(pid: int) -> Optional[str]:
 
 _TTY_CACHE: dict[int, Optional[str]] = {}
 
+# Process names treated as a "shell" when counting background shells per session.
+_SHELL_COMMS = {"bash", "sh", "zsh", "dash", "fish", "ksh", "tcsh", "csh", "ash"}
+
+
+def shell_descendant_counts(pids: list[int]) -> dict[int, int]:
+    """Count descendant shell processes for each pid via a single `ps` call.
+
+    Walks the full process tree once and, for every requested pid, counts how
+    many of its descendants are shell processes (bash/sh/zsh/...). Used to show
+    how many background shells a Claude Code session currently has running.
+    Returns {pid: count}; all-zero on any failure (e.g. `ps` unavailable).
+    """
+    targets = set(pids)
+    if not targets:
+        return {}
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid=,ppid=,comm="],
+            stderr=subprocess.DEVNULL, timeout=5,
+        ).decode("utf-8", "replace")
+    except Exception:
+        return {pid: 0 for pid in targets}
+
+    children: dict[int, list[int]] = {}
+    comm: dict[int, str] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            cpid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        comm[cpid] = parts[2].rsplit("/", 1)[-1]
+        children.setdefault(ppid, []).append(cpid)
+
+    result: dict[int, int] = {}
+    for pid in targets:
+        count = 0
+        stack = list(children.get(pid, []))
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if comm.get(cur, "") in _SHELL_COMMS:
+                count += 1
+            stack.extend(children.get(cur, []))
+        result[pid] = count
+    return result
+
 
 def get_tty(pid: int) -> Optional[str]:
     if pid not in _TTY_CACHE:

@@ -288,11 +288,12 @@
         <div class="px-4 pb-2 text-xs space-y-1">
           <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
           <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
-          <!-- Background tasks -->
-          <div x-show="w.background_tasks?.length" class="space-y-0.5">
-            <div class="flex items-center gap-1">
-              <span class="text-[10px] font-medium text-amber-800 bg-amber-100 rounded px-1.5 py-0.5"
-                    x-text="'🐚 ' + (w.background_tasks||[]).filter(t => t.type === 'bash_bg').length + ' bg shell'"></span>
+          <!-- Background shells / tasks -->
+          <div x-show="w.shell_proc_count > 0 || w.background_tasks?.length" class="space-y-0.5">
+            <div class="flex items-center gap-1 flex-wrap">
+              <span x-show="w.shell_proc_count > 0"
+                    class="text-[10px] font-medium text-amber-800 bg-amber-100 rounded px-1.5 py-0.5"
+                    x-text="'🐚 ' + w.shell_proc_count + ' shell'"></span>
               <span x-show="(w.background_tasks||[]).some(t => t.type === 'monitor')"
                     class="text-[10px] font-medium text-amber-800 bg-amber-100 rounded px-1.5 py-0.5"
                     x-text="'👁 ' + (w.background_tasks||[]).filter(t => t.type === 'monitor').length + ' monitor'"></span>

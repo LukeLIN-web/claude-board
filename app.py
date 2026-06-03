@@ -42,7 +42,11 @@ state = State()
 def _enriched_snapshot() -> dict:
     snap = sessions.snapshot()
     perm_by_tty = perms.pending_by_tty()
+    shell_counts = sessions.shell_descendant_counts(
+        [w["pid"] for w in snap["windows"] if isinstance(w.get("pid"), int)]
+    )
     for w in snap["windows"]:
+        w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
         tty = w.get("tty")
         if tty and tty in perm_by_tty:
             ev = perm_by_tty[tty]
