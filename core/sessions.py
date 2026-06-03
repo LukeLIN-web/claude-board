@@ -27,6 +27,13 @@ def _cwd_to_project_slug(cwd: str) -> str:
     return cwd.replace("/", "-").replace("_", "-").replace(".", "-")
 
 
+def _is_hidden_cwd(cwd: str) -> bool:
+    """Hide internal agent sub-sessions: SDK-spawned agents live under a
+    `.slock/agents/...` working dir and are noise on the dashboard, not real
+    user windows."""
+    return ".slock" in Path(cwd).parts
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -124,6 +131,8 @@ def list_windows(include_dead: bool = False) -> list[Window]:
 
         session_id = data.get("sessionId", "")
         cwd = data.get("cwd", "")
+        if _is_hidden_cwd(cwd):
+            continue
         slug = _cwd_to_project_slug(cwd)
         transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
 
