@@ -199,7 +199,10 @@ def list_windows(include_dead: bool = False) -> list[Window]:
                 status=data.get("status", "unknown"),
                 waiting_for=data.get("waitingFor"),
                 started_at=int(data.get("startedAt", 0)),
-                updated_at=int(data.get("updatedAt", 0)),
+                # `.slock` agent sub-sessions only write `startedAt` (no
+                # `updatedAt` heartbeat); fall back so idle isn't computed
+                # from the epoch (which renders as ~494593h ago).
+                updated_at=int(data.get("updatedAt") or data.get("startedAt", 0)),
                 version=str(data.get("version", "")),
                 tty=get_tty(pid) if alive else None,
                 transcript_path=str(transcript) if transcript.exists() else None,

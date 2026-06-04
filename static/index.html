@@ -712,11 +712,15 @@
               <span class="inline-block w-2.5 h-2.5 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
               <span class="font-medium text-xs truncate text-gray-600"
                     x-text="w.name || w.first_input || w.project_name"></span>
+              <span class="text-[9px] px-1.5 rounded-full text-white shrink-0" :class="'triage-' + w.triage"
+                    x-text="w.triage"></span>
             </div>
             <div class="text-[11px] text-gray-400 truncate" x-text="w.cwd"></div>
           </div>
-          <div class="px-3 pb-3 text-[11px] text-gray-400">
-            <span x-text="formatIdle(w.idle_seconds)"></span> · pid <span x-text="w.pid"></span>
+          <div class="px-3 pb-3 text-[11px] text-gray-400 space-y-0.5">
+            <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
+            <div class="text-gray-500 italic truncate" x-show="w.triage_reason" x-text="w.triage_reason"></div>
+            <div><span x-text="formatIdle(w.idle_seconds)"></span> · pid <span x-text="w.pid"></span></div>
           </div>
         </div>
       </template>
