@@ -693,6 +693,35 @@
       </div>
     </div>
   </div>
+
+  <!-- ===== Hidden internal agent sub-sessions (.slock) ===== -->
+  <div class="mt-8" x-show="hiddenWindows.length">
+    <h2 class="text-sm font-semibold text-gray-400 mb-2 flex items-center gap-2">
+      Hidden agent sessions
+      <span class="text-[10px] bg-gray-200 text-gray-500 rounded-full px-2 py-0.5"
+            x-text="hiddenWindows.length"></span>
+      <span class="text-xs font-normal text-gray-400">internal <code>.slock</code> agent sub-sessions</span>
+    </h2>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 opacity-70">
+      <template x-for="w in hiddenWindows" :key="w.pid">
+        <div class="bg-gray-50 rounded-xl border border-dashed border-gray-300 hover:shadow-sm transition cursor-pointer relative"
+             :class="{ 'ring-2 ring-blue-400': expandedPid === w.pid }"
+             @click="toggleExpand(w.pid)">
+          <div class="p-3 pb-2">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="inline-block w-2.5 h-2.5 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
+              <span class="font-medium text-xs truncate text-gray-600"
+                    x-text="w.name || w.first_input || w.project_name"></span>
+            </div>
+            <div class="text-[11px] text-gray-400 truncate" x-text="w.cwd"></div>
+          </div>
+          <div class="px-3 pb-3 text-[11px] text-gray-400">
+            <span x-text="formatIdle(w.idle_seconds)"></span> · pid <span x-text="w.pid"></span>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
 </main>
 
 <!-- Toast -->
@@ -764,15 +793,23 @@ function fleet() {
       return this.windows.filter(w => w.triage === 'waiting_perm');
     },
     get filteredWindows() {
+      const base = this.windows.filter(w => !w.hidden);
       const list = this.statusFilter
-        ? this.windows.filter(w => w.triage === this.statusFilter)
-        : this.windows;
+        ? base.filter(w => w.triage === this.statusFilter)
+        : base;
       // Pin each card to a fixed position by creation time so panels never
       // jump when a session's status flips (working ↔ completed) — the server
       // sorts by recent activity, which reshuffles cards and is easy to
       // misclick. started_at is immutable per session; pid is the tiebreaker
       // (and fallback for sessions with no recorded start time).
       return list.slice().sort(
+        (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid
+      );
+    },
+    // Internal `.slock` agent sub-sessions — rendered at the very bottom of the
+    // page, separated from real user windows.
+    get hiddenWindows() {
+      return this.windows.filter(w => w.hidden).slice().sort(
         (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid
       );
     },

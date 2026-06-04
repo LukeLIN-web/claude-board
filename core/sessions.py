@@ -141,6 +141,7 @@ class Window:
     tty: Optional[str]
     transcript_path: Optional[str]
     alive: bool
+    hidden: bool          # internal `.slock` agent sub-session, shown at page bottom
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -183,8 +184,7 @@ def list_windows(include_dead: bool = False) -> list[Window]:
 
         session_id = data.get("sessionId", "")
         cwd = data.get("cwd", "")
-        if _is_hidden_cwd(cwd):
-            continue
+        hidden = _is_hidden_cwd(cwd)
         slug = _cwd_to_project_slug(cwd)
         transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
 
@@ -204,6 +204,7 @@ def list_windows(include_dead: bool = False) -> list[Window]:
                 tty=get_tty(pid) if alive else None,
                 transcript_path=str(transcript) if transcript.exists() else None,
                 alive=alive,
+                hidden=hidden,
             )
         )
 
@@ -224,15 +225,18 @@ def find_window(pid: int) -> Optional[Window]:
 def snapshot() -> dict:
     """Top-level state for the dashboard."""
     wins = list_windows()
-    waiting = [w for w in wins if w.status == "waiting"]
-    busy = [w for w in wins if w.status == "busy"]
+    # Counts cover only real user windows; `.slock` agent sub-sessions are
+    # rendered separately at the bottom of the dashboard and excluded here.
+    visible = [w for w in wins if not w.hidden]
+    waiting = [w for w in visible if w.status == "waiting"]
+    busy = [w for w in visible if w.status == "busy"]
     return {
         "windows": [w.to_dict() for w in wins],
         "counts": {
-            "total": len(wins),
+            "total": len(visible),
             "busy": len(busy),
             "waiting": len(waiting),
-            "idle": len(wins) - len(busy) - len(waiting),
+            "idle": len(visible) - len(busy) - len(waiting),
         },
         "ts": int(time.time() * 1000),
     }
