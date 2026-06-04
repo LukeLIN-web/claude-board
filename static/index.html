@@ -702,9 +702,9 @@
             x-text="hiddenWindows.length"></span>
       <span class="text-xs font-normal text-gray-400">internal <code>.slock</code> agent sub-sessions</span>
     </h2>
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 opacity-70">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
       <template x-for="w in hiddenWindows" :key="w.pid">
-        <div class="bg-gray-50 rounded-xl border border-dashed border-gray-300 hover:shadow-sm transition cursor-pointer relative"
+        <div class="bg-white rounded-xl shadow-sm border hover:shadow-md transition cursor-pointer relative"
              :class="{ 'ring-2 ring-blue-400': expandedPid === w.pid }"
              @click="toggleExpand(w.pid)">
           <div class="p-3 pb-2">
