@@ -844,6 +844,15 @@ function fleet() {
       }
       this._applyHashRoute();
       window.addEventListener('hashchange', () => this._applyHashRoute());
+      // Pressing Esc with a card selected (expanded) interrupts that session —
+      // same as clicking the card's Esc button. Skip when typing in an input so
+      // Esc keeps its normal meaning inside text fields / pickers.
+      window.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape' || this.expandedPid === null || !this.tmuxAvailable) return;
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+        this.sendEscape(this.expandedPid);
+      });
       // Poll the open live timeline every 2.5s. SSE only fires on state changes,
       // but a session can sit silently at a question/permission picker — polling
       // guarantees the menu (captured from the pane) shows up and stays current.
