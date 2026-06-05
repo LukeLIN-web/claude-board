@@ -130,6 +130,23 @@ class PromptQueueTests(unittest.TestCase):
             out = promptqueue.pending(1, "t.jsonl", "busy")
         self.assertEqual([o["text"] for o in out], ["ping"])  # one still queued
 
+    def test_slash_command_reconciles_against_bare_label(self):
+        # The dashboard sends "/btw"; the transcript logs it as the bare label
+        # "btw" (transcripts._clean_command_text drops the envelope + slash). The
+        # two must still match or the command sticks in the queue forever.
+        promptqueue.record_sent(1, "/btw")
+        future = time.time() + 10
+        with mock.patch.object(promptqueue.transcripts, "recent_user_texts",
+                               return_value=[(future, "btw")]):
+            out = promptqueue.pending(1, "t.jsonl", "busy")
+        self.assertEqual(out, [])
+
+    def test_slash_command_display_text_keeps_slash(self):
+        # Match is slash-insensitive, but the card label keeps the "/" the user typed.
+        promptqueue.record_sent(1, "/btw")
+        out = promptqueue.pending(1, None, "busy")
+        self.assertEqual([o["text"] for o in out], ["/btw"])
+
 
 if __name__ == "__main__":
     unittest.main()

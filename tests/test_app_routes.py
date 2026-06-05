@@ -55,5 +55,39 @@ class SnapshotFlagTests(unittest.TestCase):
         self.assertFalse(snap["tmux_available"])
 
 
+class HiddenAgentQueueTests(unittest.TestCase):
+    """`.slock` agent sub-sessions never write a `status` field (it normalizes to
+    "unknown"), yet their pid+tty still back the queue. The Queued list must
+    render for them, not only for windows that report `status == "busy"`."""
+
+    def _run(self, win):
+        snap = {"windows": [win], "counts": {}, "ts": 0}
+        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
+             mock.patch.object(appmod.tmux, "available", return_value=True), \
+             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
+             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
+             mock.patch.object(appmod.patrol, "classify",
+                               return_value={"triage": "", "reason": "", "suggestion": ""}), \
+             mock.patch.object(appmod.promptqueue, "pending",
+                               return_value=[{"id": 1, "text": "/btw"}]), \
+             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]):
+            return appmod._enriched_snapshot()
+
+    def test_queue_renders_for_hidden_agent_without_busy_status(self):
+        win = {"pid": 4163977, "status": "unknown", "hidden": True, "alive": True,
+               "tty": "pts/14", "transcript_path": None, "name": "agent", "cwd": "/x",
+               "updated_at": 0}
+        out = self._run(win)
+        self.assertEqual(out["windows"][0]["queued"],
+                         [{"text": "/btw", "source": "dashboard"}])
+
+    def test_dead_hidden_agent_has_no_queue(self):
+        win = {"pid": 4163977, "status": "unknown", "hidden": True, "alive": False,
+               "tty": None, "transcript_path": None, "name": "agent", "cwd": "/x",
+               "updated_at": 0}
+        out = self._run(win)
+        self.assertEqual(out["windows"][0]["queued"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

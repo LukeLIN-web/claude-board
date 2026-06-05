@@ -81,8 +81,16 @@ def _enriched_snapshot() -> dict:
         # transcript) plus best-effort TUI-typed items scraped from the pane.
         # A queue only exists while busy, which also bounds the extra capture.
         pid = w.get("pid")
-        if w.get("status") == "busy" and isinstance(pid, int):
-            dash = promptqueue.pending(pid, tp, "busy")
+        status = w.get("status")
+        # A queue only exists while the session is working. Real windows report
+        # "busy"; hidden `.slock` agent sub-sessions never write a status field
+        # (it normalizes to "unknown"), so gate those on being alive instead —
+        # their pid+tty still back both the tracker and the pane scrape.
+        show_queue = isinstance(pid, int) and (
+            status == "busy" or (w.get("hidden") and w.get("alive"))
+        )
+        if show_queue:
+            dash = promptqueue.pending(pid, tp, status)
             queued = [{"text": it["text"], "source": "dashboard"} for it in dash]
             seen = {promptqueue.norm(it["text"]) for it in dash}
             try:
@@ -95,7 +103,7 @@ def _enriched_snapshot() -> dict:
                 pass  # scrape failures degrade to dashboard-only
             w["queued"] = queued
         else:
-            if w.get("status") == "idle" and isinstance(pid, int):
+            if status == "idle" and isinstance(pid, int):
                 promptqueue.clear(pid)  # a queue can't outlive an idle session
             w["queued"] = []
     # Sort by triage priority (most urgent first), then by idle time.

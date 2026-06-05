@@ -21,9 +21,23 @@ _sent: dict[int, list[dict]] = {}
 _ids = itertools.count(1)
 
 
+def _bare_command(text: str) -> str:
+    """Drop a single leading slash so a "/cmd" send matches the transcript.
+
+    Claude logs a slash command as a `<command-name>` envelope that
+    transcripts._clean_command_text renders as a bare label (no leading slash).
+    record_sent stores the raw "/cmd", so without shedding the slash here the two
+    never reconcile and the command sticks in the queue until the session idles.
+    Applied symmetrically (both the send and the transcript side run through
+    norm), so non-command prompts that merely start with "/" still match.
+    """
+    return text[1:] if text.startswith("/") else text
+
+
 def norm(text: str) -> str:
-    """Whitespace-collapsed form, for matching our send against the transcript."""
-    return " ".join((text or "").split())
+    """Whitespace-collapsed, slash-command-bare form, for matching our send
+    against the transcript (which stores slash commands as bare labels)."""
+    return " ".join(_bare_command((text or "").strip()).split())
 
 
 def record_sent(pid: int, text: str) -> None:
@@ -31,8 +45,11 @@ def record_sent(pid: int, text: str) -> None:
     n = norm(text)
     if not n:
         return
+    # `norm` is the slash-insensitive match key; `text` keeps the "/" the user
+    # typed so the card label still reads "/btw", not "btw".
+    display = " ".join((text or "").split())
     _sent.setdefault(pid, []).append(
-        {"id": next(_ids), "norm": n, "text": n, "ts": time.time()}
+        {"id": next(_ids), "norm": n, "text": display, "ts": time.time()}
     )
 
 
