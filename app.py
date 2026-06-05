@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, codex, history, memory, patrol, perms, plans, search, sessions, skills, transcripts, tmux
+from core import actions, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -77,6 +77,27 @@ def _enriched_snapshot() -> dict:
             w["skills_used"] = []
             w["memory_ops"] = []
             w["background_tasks"] = []
+        # Queued prompts: reliable dashboard-sent items (reconciled against the
+        # transcript) plus best-effort TUI-typed items scraped from the pane.
+        # A queue only exists while busy, which also bounds the extra capture.
+        pid = w.get("pid")
+        if w.get("status") == "busy" and isinstance(pid, int):
+            dash = promptqueue.pending(pid, tp, "busy")
+            queued = [{"text": it["text"], "source": "dashboard"} for it in dash]
+            seen = {promptqueue.norm(it["text"]) for it in dash}
+            try:
+                for t in actions.get_pane_queue(pid):
+                    nt = promptqueue.norm(t)
+                    if nt and nt not in seen:
+                        seen.add(nt)
+                        queued.append({"text": t, "source": "tui"})
+            except Exception:
+                pass  # scrape failures degrade to dashboard-only
+            w["queued"] = queued
+        else:
+            if w.get("status") == "idle" and isinstance(pid, int):
+                promptqueue.clear(pid)  # a queue can't outlive an idle session
+            w["queued"] = []
     # Sort by triage priority (most urgent first), then by idle time.
     snap["windows"].sort(key=lambda w: (
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
@@ -216,7 +237,10 @@ def api_window_create(body: CreateBody) -> dict:
 
 @app.post("/api/windows/{pid}/prompt")
 def api_window_prompt(pid: int, body: PromptBody) -> dict:
-    return actions.send_prompt(pid, body.text)
+    r = actions.send_prompt(pid, body.text)
+    if r.get("ok"):
+        promptqueue.record_sent(pid, body.text)
+    return r
 
 
 class PermissionBody(BaseModel):

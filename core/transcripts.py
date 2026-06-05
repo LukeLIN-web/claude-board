@@ -166,6 +166,36 @@ def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     return [e.__dict__ for e in events[-limit:]]
 
 
+def _parse_ts(ts: str) -> float:
+    """ISO-8601 timestamp string -> epoch seconds, or 0.0 if unparseable."""
+    if not ts:
+        return 0.0
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def recent_user_texts(path: str | Path, n: int = 40) -> list[tuple[float, str]]:
+    """Recent real user messages as (epoch_ts, text), oldest first.
+
+    Used to reconcile the dashboard's sent-prompt queue: once a queued prompt
+    shows up here, Claude has picked it up. tool_result rows (role user but not
+    typed prompts) are excluded.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    raw = _tail_lines(p, max(n * 2, 100))
+    out: list[tuple[float, str]] = []
+    for d in raw:
+        for ev in _normalize(d):
+            if ev.kind == "user_text" and ev.text.strip():
+                out.append((_parse_ts(ev.ts), ev.text))
+    return out[-n:]
+
+
 def current_task_hint(path: str | Path) -> Optional[str]:
     """Best-effort one-liner of what this session is currently doing."""
     p = Path(path)

@@ -542,6 +542,55 @@ def get_pane_menu(pid: int) -> Optional[dict]:
     return parse_pane_menu(full["text"] if full["ok"] else vis)
 
 
+# A horizontal rule (the input box's top/bottom border); ≥8 box/dash chars only.
+_HRULE_RE = re.compile(r"^\s*[─—\-]{8,}\s*$")
+# A queued message line: indented "❯ <text>". The leading whitespace is what
+# distinguishes it from the column-0 active prompt and the in-box input line.
+_QUEUED_RE = re.compile(r"^\s+❯[ \t]+(\S.*?)\s*$")
+
+
+def parse_pane_queue(text: str) -> list[str]:
+    """Best-effort list of prompts Claude shows as queued, from a captured pane.
+
+    Claude renders the 2nd-and-later queued messages as indented "❯ <text>"
+    lines stacked directly above the input box (whose placeholder becomes "Press
+    up to edit queued messages"). We take the contiguous block of such lines
+    immediately above the box's top border. The *first* queued message renders
+    inconsistently (column-0 "❯ …" mixed into the output, or indented with no
+    "❯") and is not reliably recoverable, so it may be missed — by design the
+    reliable half of the queue comes from core.promptqueue, not this scrape.
+    """
+    if not text:
+        return []
+    lines = text.split("\n")
+    rules = [i for i, ln in enumerate(lines) if _HRULE_RE.match(ln)]
+    if len(rules) < 2:
+        return []
+    top_border = rules[-2]  # the two lowest rules bracket the input box
+    items: list[str] = []
+    for i in range(top_border - 1, -1, -1):
+        m = _QUEUED_RE.match(lines[i])
+        if not m:
+            break  # block is contiguous; first non-queued line ends it
+        items.append(m.group(1).strip())
+    items.reverse()
+    return items
+
+
+def get_pane_queue(pid: int) -> list[str]:
+    """Queued-message texts scraped live from `pid`'s pane (empty on any miss)."""
+    w = find_window(pid)
+    if not w or not w.tty:
+        return []
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return []
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return []
+    return parse_pane_queue(cap["text"])
+
+
 # Keys the dashboard is allowed to send into an interactive menu (e.g. the
 # AskUserQuestion picker). Restricted to navigation/selection tokens so the
 # endpoint can't be used to type arbitrary input — free text goes through
