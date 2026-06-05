@@ -89,5 +89,24 @@ class HiddenAgentQueueTests(unittest.TestCase):
         self.assertEqual(out["windows"][0]["queued"], [])
 
 
+class DiffSignatureTests(unittest.TestCase):
+    """The SSE watcher only broadcasts when `diff_signature` changes. A queued
+    prompt being consumed (or added) while status/updated_at stay the same must
+    still change the signature, or the card keeps showing a stale queue."""
+
+    def _win(self, queued):
+        return {"pid": 100, "status": "busy", "waiting_for": None,
+                "updated_at": 5, "queued": queued}
+
+    def test_queue_change_alone_changes_signature(self):
+        st = appmod.State()
+        before = {"windows": [self._win(
+            [{"text": "/btw", "source": "dashboard"}])], "counts": {}, "ts": 0}
+        after = {"windows": [self._win([])], "counts": {}, "ts": 0}
+        self.assertNotEqual(
+            st.diff_signature(before), st.diff_signature(after),
+            "consuming a queued prompt must change the broadcast signature")
+
+
 if __name__ == "__main__":
     unittest.main()

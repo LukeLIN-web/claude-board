@@ -28,10 +28,17 @@ class State:
         self.subscribers: set[asyncio.Queue] = set()
 
     def diff_signature(self, snap: dict) -> tuple:
-        # Tuple of (pid, status, waiting_for, updated_at) lets us tell whether
-        # anything dashboard-visible has changed.
+        # Tuple of (pid, status, waiting_for, updated_at, queued) lets us tell
+        # whether anything dashboard-visible has changed. The queued list is
+        # included so consuming/adding a queued prompt re-broadcasts even when
+        # status and updated_at are otherwise unchanged (the session stays
+        # "busy" while Claude works through the queue).
         return tuple(
-            (w["pid"], w["status"], w["waiting_for"], w["updated_at"])
+            (
+                w["pid"], w["status"], w["waiting_for"], w["updated_at"],
+                tuple((q.get("source"), q.get("text"))
+                      for q in w.get("queued", [])),
+            )
             for w in snap["windows"]
         )
 
