@@ -347,6 +347,10 @@
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Ask this session to commit and push">
             Commit</button>
+          <button x-show="tmuxAvailable" @click="sendEscape(w.pid)"
+                  class="text-xs border border-orange-200 text-orange-600 px-2 py-1 rounded hover:bg-orange-50 transition"
+                  title="Press Esc in this session to interrupt what it's doing">
+            Esc</button>
           <!-- Waiting on a prompt: open the timeline to see the actual options and respond -->
           <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
                x-show="w.triage === 'waiting_perm' && tmuxAvailable">
@@ -1090,6 +1094,13 @@ function fleet() {
     answerMenuAdvance(pid) { this.sendKeys(pid, ['Tab']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     answerQuestionSubmit(pid) { this.sendKeys(pid, ['Enter']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     answerQuestionCancel(pid) { this.sendKeys(pid, ['Escape']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
+    // Interrupt whatever the session is doing — same as pressing Esc in the terminal.
+    async sendEscape(pid) {
+      if (await this.sendKeys(pid, ['Escape'])) {
+        this.toast('Esc sent');
+        setTimeout(() => this.refreshTimeline(), 400);
+      }
+    },
 
     async closeWindow(pid) {
       const r = await fetch(`/api/windows/${pid}/close`, { method: 'POST' });
