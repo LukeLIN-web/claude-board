@@ -208,6 +208,32 @@ class ParsePaneMenuTests(unittest.TestCase):
                          ["cur-a", "cur-b", "cur-c", "Type something.", "Chat about this"])
         self.assertIn("the real question", m["prompt"])
 
+    def test_side_by_side_preview_box_is_stripped(self):
+        # AskUserQuestion options with previews render side-by-side: the option
+        # list on the left, a box-drawn preview panel on the right that Claude
+        # folds with "✂ N lines hidden". Captured into one pane, each option
+        # row also carries the panel border; it must not leak into the labels.
+        cap = (
+            " ☐ Rung definition\n\n"
+            "What does the cheapest-correct sweep actually produce as its short/long\n"
+            "rungs — fixed absolute token caps, or per-item-adaptive caps?\n\n"
+            " 1. Per-item adaptive             ┌────────┐\n"
+            "   (two-pass)                     │ rung space = full │\n"
+            " 2. Fixed absolute ladder         ├─ ✂ ─ 5 lines hidden ─┤\n"
+            "   (as-is)                        └────────┘\n\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual(m["kind"], "question")
+        self.assertEqual([o["label"] for o in m["options"]],
+                         ["Per-item adaptive", "Fixed absolute ladder"])
+        # box-drawing chrome and the fold marker never reach the dashboard
+        self.assertNotIn("✂", m["options"][0]["label"])
+        self.assertNotIn("┌", m["options"][0]["label"])
+        self.assertNotIn("hidden", m["prompt"])
+        # the full-width question text above the box is preserved, not cropped
+        self.assertIn("per-item-adaptive caps?", m["prompt"])
+
     def test_non_menu_output_returns_none(self):
         self.assertIsNone(actions.parse_pane_menu("hello\n1. a list\n2. another\nnormal"))
         self.assertIsNone(actions.parse_pane_menu(""))

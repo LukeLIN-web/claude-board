@@ -359,6 +359,42 @@ def _is_tabbar(line: str) -> bool:
     return "Submit" in line and "✔" in line and ("←" in line or "→" in line)
 
 
+# Top-left / bottom-left corners of a box-drawn panel (square or rounded).
+_BOX_TL = ("┌", "╭")
+_BOX_BL = ("└", "╰")
+
+
+def _strip_side_preview(lines: list[str]) -> list[str]:
+    """Crop a right-aligned preview/description panel out of a picker capture.
+
+    AskUserQuestion options that carry a preview render side-by-side: the option
+    list on the left, a box-drawn panel on the right that Claude often folds with
+    '✂ N lines hidden'. Captured into one pane, each option row also carries the
+    panel border, e.g. '1. Per-item adaptive        ┌──────────┐'. Left as-is the
+    border (and the '5 lines hidden' chrome) leaks into the parsed option labels.
+
+    We locate the panel by its top-left and bottom-left corners sharing a column
+    (> 0, so a full-width frame is ignored) and cut every row of that block at
+    that column. Only the panel's own rows are touched, so the question text above
+    and the footer below — which span the full width — are never truncated.
+    """
+    top_row = top_col = bot_row = None
+    for i, ln in enumerate(lines):
+        if top_row is None:
+            j = min((ln.find(c) for c in _BOX_TL if ln.find(c) > 0), default=-1)
+            if j > 0:
+                top_row, top_col = i, j
+        if top_row is not None and i >= top_row:
+            if any(ln.find(c) == top_col for c in _BOX_BL):
+                bot_row = i
+    if top_row is None or bot_row is None or bot_row < top_row:
+        return lines
+    out = list(lines)
+    for i in range(top_row, bot_row + 1):
+        out[i] = out[i][:top_col].rstrip()
+    return out
+
+
 def parse_pane_menu(text: str) -> Optional[dict]:
     """Parse an interactive menu (AskUserQuestion picker / permission prompt /
     multiSelect submit-review) out of a captured tmux pane, or None if no menu
@@ -375,7 +411,7 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     """
     if not text:
         return None
-    lines = text.split("\n")
+    lines = _strip_side_preview(text.split("\n"))
     footer_idx = None
     for i, ln in enumerate(lines):
         if "to select" in ln and "navigate" in ln:
