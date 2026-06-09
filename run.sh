@@ -17,4 +17,13 @@ fi
 
 PORT="${CLAUDE_FLEET_PORT:-7878}"
 echo "[claude-fleet] listening on http://127.0.0.1:${PORT}"
-exec uvicorn app:app --host 127.0.0.1 --port "$PORT" --reload
+
+# By default run detached so the server survives the launching shell/session.
+# Set CLAUDE_FLEET_FOREGROUND=1 to run in the foreground instead.
+if [ -n "$CLAUDE_FLEET_FOREGROUND" ]; then
+    exec uvicorn app:app --host 127.0.0.1 --port "$PORT" --reload
+fi
+
+setsid uvicorn app:app --host 127.0.0.1 --port "$PORT" --reload \
+    > uvicorn.log 2>&1 < /dev/null &
+echo "[claude-fleet] started detached (pid $!), logs -> uvicorn.log"
