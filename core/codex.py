@@ -484,8 +484,52 @@ def _top_codex_ancestor(fd_pid: int, table: dict[int, dict]) -> int:
     return cur
 
 
+# Codex subcommands that run headless/background, not an interactive TUI — these
+# are spawned by editors or by Claude's codex MCP and shouldn't appear as cards.
+_BG_SUBCOMMANDS = {"mcp-server", "app-server", "exec"}
+
+
+def _codex_exe_index(tokens: list[str]) -> int:
+    """Index of the `codex` executable token, or -1.
+
+    Covers both the node launcher (`node …/bin/codex …`) and the inner binary
+    (`…/bin/codex …`); the executable is among the first two tokens.
+    """
+    for i, t in enumerate(tokens[:2]):
+        if os.path.basename(t) == "codex":
+            return i
+    return -1
+
+
+def _is_interactive_codex(args: str) -> bool:
+    """True for an interactive Codex TUI process (`codex`, `codex --yolo`,
+    `codex resume …`); False for non-codex procs and background subcommands."""
+    toks = args.split()
+    i = _codex_exe_index(toks)
+    if i < 0:
+        return False
+    for t in toks[i + 1:]:
+        if t.startswith("-"):
+            continue  # skip flags to reach the subcommand, if any
+        return t not in _BG_SUBCOMMANDS
+    return True  # bare `codex` with no subcommand → interactive TUI
+
+
+def _proc_start_ms(pid: int) -> int:
+    """Approximate process start time (ms) from the /proc/<pid> dir mtime."""
+    try:
+        return int(os.stat(f"/proc/{pid}").st_mtime * 1000)
+    except Exception:
+        return 0
+
+
 def list_codex_windows() -> list[Window]:
     """Discover running interactive Codex sessions as Window objects.
+
+    Detection is process-first (grouped by controlling tty) rather than purely
+    fd-based: a freshly launched `codex` doesn't open its rollout transcript
+    until the first turn, so a card must appear from the live process alone and
+    get its session_id/transcript filled in once the rollout exists.
 
     Linux-only (reads /proc); returns [] on any platform without it.
     """
@@ -495,52 +539,79 @@ def list_codex_windows() -> list[Window]:
     if not table:
         return []
 
-    # rollout path -> fd-holding pid (dedup multiple fds / dup processes)
-    rollouts: dict[str, int] = {}
+    # Group interactive codex processes (launcher + inner binary) by their tty;
+    # one foreground tty == one session.
+    by_tty: dict[str, list[int]] = {}
     for pid, info in table.items():
-        if "codex" not in info.get("args", ""):
+        tty = info.get("tty", "")
+        if not tty or tty in ("?", "??"):
             continue
-        rp = _rollout_fd(pid)
-        if rp and rp not in rollouts:
-            rollouts[rp] = pid
+        if not _is_interactive_codex(info.get("args", "")):
+            continue
+        by_tty.setdefault(tty, []).append(pid)
 
     windows: list[Window] = []
-    for rollout, fd_pid in rollouts.items():
-        rp = Path(rollout)
-        try:
-            st = rp.stat()
-        except Exception:
+    seen: set[int] = set()
+    for tty, pids in by_tty.items():
+        # The inner binary holds the rollout fd once a turn has happened.
+        rollout = None
+        fd_pid = None
+        for pid in pids:
+            rp = _rollout_fd(pid)
+            if rp:
+                rollout, fd_pid = rp, pid
+                break
+        anchor = fd_pid or min(pids)
+        card_pid = _top_codex_ancestor(anchor, table)
+        if card_pid in seen or not _pid_alive(card_pid):
             continue
-        card_pid = _top_codex_ancestor(fd_pid, table)
-        if not _pid_alive(card_pid):
-            continue
+        seen.add(card_pid)
 
-        meta = _parse_session_meta(rp) or {}
-        # cwd from the running process is authoritative; fall back to meta.
         cwd = ""
-        try:
-            cwd = os.readlink(f"/proc/{fd_pid}/cwd")
-        except Exception:
-            cwd = meta.get("cwd", "") or ""
+        for pid in (anchor, card_pid, *pids):
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                break
+            except Exception:
+                continue
 
-        mtime = st.st_mtime
-        status = _infer_codex_status(rp, mtime)
-        started_at = _parse_iso_ms(meta.get("timestamp", "")) or int(mtime * 1000)
+        if rollout:
+            rp = Path(rollout)
+            try:
+                mtime = rp.stat().st_mtime
+            except Exception:
+                mtime = None
+            meta = _parse_session_meta(rp) or {}
+            cwd = cwd or meta.get("cwd", "") or ""
+            status = _infer_codex_status(rp, mtime) if mtime else "idle"
+            updated_at = int(mtime * 1000) if mtime else _proc_start_ms(card_pid)
+            started_at = _parse_iso_ms(meta.get("timestamp", "")) or updated_at
+            session_id = meta.get("id", rp.stem)
+            version = str(meta.get("cli_version", ""))
+            transcript = str(rp)
+        else:
+            # Just launched: no rollout yet. Show the card anyway, keyed by pid.
+            start = _proc_start_ms(card_pid)
+            status = "idle"
+            updated_at = started_at = start
+            session_id = f"codex-{card_pid}"
+            version = ""
+            transcript = None
 
         windows.append(Window(
             pid=card_pid,
-            session_id=meta.get("id", rp.stem),
+            session_id=session_id,
             cwd=cwd,
-            project_name=os.path.basename(cwd) or (cwd or rp.stem),
+            project_name=os.path.basename(cwd) or (cwd or session_id),
             project_slug=_cwd_to_project_slug(cwd),
             name=None,
             status=status,
             waiting_for=None,
             started_at=started_at,
-            updated_at=int(mtime * 1000),
-            version=str(meta.get("cli_version", "")),
+            updated_at=updated_at,
+            version=version,
             tty=get_tty(card_pid),
-            transcript_path=str(rp),
+            transcript_path=transcript,
             alive=True,
             hidden=False,
             platform="codex",

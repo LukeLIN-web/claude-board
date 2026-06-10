@@ -58,6 +58,7 @@ class SnapshotFlagTests(unittest.TestCase):
     def test_tmux_available_present_with_zero_windows(self):
         empty = {"windows": [], "counts": {}, "ts": 0}
         with mock.patch.object(appmod.sessions, "snapshot", return_value=empty), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
              mock.patch.object(appmod.tmux, "available", return_value=True):
             snap = appmod._enriched_snapshot()
         self.assertIn("tmux_available", snap)
@@ -66,6 +67,7 @@ class SnapshotFlagTests(unittest.TestCase):
     def test_tmux_available_reflects_false(self):
         empty = {"windows": [], "counts": {}, "ts": 0}
         with mock.patch.object(appmod.sessions, "snapshot", return_value=empty), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
              mock.patch.object(appmod.tmux, "available", return_value=False):
             snap = appmod._enriched_snapshot()
         self.assertFalse(snap["tmux_available"])
@@ -79,6 +81,7 @@ class HiddenAgentQueueTests(unittest.TestCase):
     def _run(self, win):
         snap = {"windows": [win], "counts": {}, "ts": 0}
         with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
              mock.patch.object(appmod.tmux, "available", return_value=True), \
              mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
              mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
