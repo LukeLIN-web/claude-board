@@ -260,6 +260,34 @@ class SendTextTests(unittest.TestCase):
         self.assertEqual(sleeps, [tmux._SLASH_SETTLE])
         self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
 
+    def test_settle_before_enter_pauses_plain_text(self):
+        calls = []
+        sleeps = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
+            r = tmux.send_text("%5", "hello", settle_before_enter=tmux._CODEX_ENTER_SETTLE)
+        self.assertTrue(r["ok"])
+        self.assertEqual(sleeps, [tmux._CODEX_ENTER_SETTLE])
+        self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
+
+    def test_slash_settle_wins_when_longer_than_caller_settle(self):
+        # A slash prompt with a smaller caller settle still waits the slash time.
+        sleeps = []
+
+        def fake_run(argv, **kw):
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
+            r = tmux.send_text("%5", "/foo", settle_before_enter=0.1)
+        self.assertTrue(r["ok"])
+        self.assertEqual(sleeps, [tmux._SLASH_SETTLE])
+
     def test_plain_text_does_not_sleep(self):
         def fake_run(argv, **kw):
             return FakeProc(returncode=0)

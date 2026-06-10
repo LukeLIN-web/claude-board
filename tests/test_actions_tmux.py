@@ -8,8 +8,8 @@ from unittest import mock
 from core import actions
 
 
-def _fake_window(tty):
-    return types.SimpleNamespace(tty=tty)
+def _fake_window(tty, platform="claude"):
+    return types.SimpleNamespace(tty=tty, platform=platform)
 
 
 class CreateSessionTests(unittest.TestCase):
@@ -60,7 +60,19 @@ class SendPromptTests(unittest.TestCase):
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, "hello")
         pf.assert_called_once_with("/dev/pts/3")
-        st.assert_called_once_with("%5", "hello")
+        # Claude gets no settle before Enter.
+        st.assert_called_once_with("%5", "hello", settle_before_enter=0.0)
+        self.assertTrue(r["ok"])
+
+    def test_codex_window_gets_settle_before_enter(self):
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/3", platform="codex")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
+            r = actions.send_prompt(1234, "hello")
+        st.assert_called_once_with(
+            "%5", "hello", settle_before_enter=actions.tmux._CODEX_ENTER_SETTLE,
+        )
         self.assertTrue(r["ok"])
 
     def test_newlines_collapsed_to_spaces(self):

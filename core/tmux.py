@@ -170,14 +170,32 @@ def send_keys(pane: str, *keys: str) -> dict:
 # Waiting this long before Enter lets the popup settle on the typed text.
 _SLASH_SETTLE = 0.5
 
+# Codex's TUI composer batches a fast literal-text burst with an Enter that
+# lands in the same instant and swallows the Enter — the text stays in the
+# composer unsubmitted. A short settle splits the burst from the Enter so it
+# registers as a real submit. Applies to EVERY Codex prompt (not just slash),
+# so callers pass it explicitly via send_text(settle_before_enter=...).
+_CODEX_ENTER_SETTLE = 0.4
 
-def send_text(pane: str, text: str) -> dict:
-    """Send `text` literally into `pane`, then a separate Enter to submit it."""
+
+def send_text(pane: str, text: str, settle_before_enter: float = 0.0) -> dict:
+    """Send `text` literally into `pane`, then a separate Enter to submit it.
+
+    `settle_before_enter` pauses between the pasted text and the Enter. Some TUIs
+    (Codex always; Claude when a slash-command popup is open) coalesce a rapid
+    text burst with an immediately-following Enter and drop the Enter instead of
+    submitting; the settle lets the composer catch up. The slash case is detected
+    here; platform-wide needs (e.g. Codex) are passed in by the caller. When both
+    apply, the longer wait wins.
+    """
     literal = _run("send-keys", "-t", pane, "-l", "--", text)
     if not literal["ok"]:
         return {"ok": False, "error": literal["error"]}
+    delay = settle_before_enter
     if text.lstrip().startswith("/"):
-        time.sleep(_SLASH_SETTLE)
+        delay = max(delay, _SLASH_SETTLE)
+    if delay > 0:
+        time.sleep(delay)
     enter = _run("send-keys", "-t", pane, "Enter")
     if not enter["ok"]:
         return {"ok": False, "error": enter["error"]}
