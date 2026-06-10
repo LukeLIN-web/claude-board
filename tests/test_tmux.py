@@ -245,6 +245,31 @@ class SendTextTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertEqual(len(calls), 1)  # Enter never sent
 
+    def test_slash_prefix_settles_before_enter(self):
+        calls = []
+        sleeps = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
+            r = tmux.send_text("%5", "/research-pipeline")
+        self.assertTrue(r["ok"])
+        self.assertEqual(sleeps, [tmux._SLASH_SETTLE])
+        self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
+
+    def test_plain_text_does_not_sleep(self):
+        def fake_run(argv, **kw):
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep") as sl:
+            r = tmux.send_text("%5", "research-pipeline")
+        self.assertTrue(r["ok"])
+        sl.assert_not_called()
+
     def test_enter_failure_is_reported(self):
         def fake_run(argv, **kw):
             if argv[-1] == "Enter":

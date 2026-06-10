@@ -74,7 +74,19 @@
         + New session</button>
       <div x-show="showSpawn" x-cloak
            class="absolute left-0 mt-1 w-80 bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-2">
-        <label class="text-xs text-gray-500">Spawn <code>claude</code> in a directory</label>
+        <label class="text-xs text-gray-500">Agent</label>
+        <div class="flex gap-1">
+          <button @click="spawnPlatform = 'claude'"
+                  class="flex-1 text-xs px-2 py-1 rounded border transition"
+                  :class="spawnPlatform === 'claude' ? 'border-blue-400 text-blue-700 bg-blue-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
+            Claude Code</button>
+          <button @click="spawnPlatform = 'codex'"
+                  class="flex-1 text-xs px-2 py-1 rounded border transition"
+                  :class="spawnPlatform === 'codex' ? 'border-green-400 text-green-700 bg-green-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
+            Codex</button>
+        </div>
+        <label class="text-xs text-gray-500">Spawn
+          <code x-text="spawnPlatform === 'codex' ? 'codex --yolo' : 'claude'"></code> in a directory</label>
         <select x-model="spawnCwdSelect" class="border rounded px-2 py-1 text-sm bg-white">
           <option value="">— recent directory —</option>
           <template x-for="d in recentCwds" :key="d">
@@ -280,6 +292,9 @@
           <div class="flex items-center gap-2 mb-1">
             <span class="inline-block w-3 h-3 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
             <span class="font-semibold text-sm truncate" x-text="w.name || w.first_input || w.project_name"></span>
+            <span class="text-[10px] text-white px-1.5 rounded-full shrink-0 font-medium"
+                  :class="w.platform === 'codex' ? 'bg-green-500' : 'bg-blue-500'"
+                  x-text="w.platform === 'codex' ? 'codex' : 'cc'"></span>
             <span class="text-[10px] px-1.5 rounded-full text-white shrink-0" :class="'triage-' + w.triage"
                   x-text="w.triage"></span>
           </div>
@@ -339,20 +354,20 @@
                   class="text-xs px-2 py-1 rounded border transition"
                   :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
             Focus</button>
-          <button x-show="tmuxAvailable" @click="sendReview(w.pid)" :disabled="!!promptSending[w.pid]"
+          <button x-show="tmuxAvailable && w.platform !== 'codex'" @click="sendReview(w.pid)" :disabled="!!promptSending[w.pid]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /humanize:ask-codex review to this session">
             Review</button>
           <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.pid)"
                   class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
             Close</button>
-          <button @click="forkWindow(w.pid)"
+          <button x-show="w.platform !== 'codex'" @click="forkWindow(w.pid)"
                   class="text-xs border border-green-200 text-green-600 px-2 py-1 rounded hover:bg-green-50 transition">
             Fork</button>
           <button x-show="false" @click="exportWindow(w.pid)"
                   class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
             Export</button>
-          <button x-show="tmuxAvailable" @click="sendClear(w.pid)" :disabled="!!promptSending[w.pid]"
+          <button x-show="tmuxAvailable && w.platform !== 'codex'" @click="sendClear(w.pid)" :disabled="!!promptSending[w.pid]"
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
             Clear</button>
@@ -789,6 +804,7 @@ function fleet() {
     memorySessions: {},
     tmuxAvailable: false,
     showSpawn: false,
+    spawnPlatform: 'claude',   // 'claude' | 'codex'
     spawnCwd: '',
     spawnCwdSelect: '',
     spawning: false,
@@ -962,11 +978,11 @@ function fleet() {
         const r = await fetch('/api/windows/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cwd }),
+          body: JSON.stringify({ cwd, platform: this.spawnPlatform }),
         });
         const d = await r.json();
         if (d.ok) {
-          this.toast('Spawned claude in ' + cwd);
+          this.toast('Spawned ' + (this.spawnPlatform === 'codex' ? 'codex' : 'claude') + ' in ' + cwd);
           this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = '';
         } else {
           this.toast('Spawn failed: ' + (d.error || ''));

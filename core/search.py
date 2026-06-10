@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from . import sessions
 from .sessions import CLAUDE_HOME, HOME_BASE, PROJECTS_DIR
 
 CODEX_HOME = HOME_BASE / ".codex"
@@ -168,6 +169,11 @@ def search(query: str, limit: int = 60) -> list[dict]:
         seen.add(key)
 
         p = Path(path)
+        # Hide hits from projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/
+        # EXCLUDE. Claude transcripts live under projects/<cwd-slug>/; codex
+        # sessions aren't cwd-addressable, so they're left untouched.
+        if _detect_platform(p) == "claude" and not sessions.slug_visible(_project_slug_from_file(p)):
+            continue
         raw = _read_line(p, line_no) or (text_info.get("text") or "")
         try:
             d = json.loads(raw)

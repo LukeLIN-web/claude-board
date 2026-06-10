@@ -34,6 +34,75 @@ def _is_hidden_cwd(cwd: str) -> bool:
     return ".slock" in Path(cwd).parts
 
 
+def _parse_prefixes(env_value: str) -> list[str]:
+    """Split a colon/comma-separated list of path prefixes into normalized
+    absolute paths. Blank entries are dropped."""
+    out: list[str] = []
+    for chunk in env_value.replace(",", ":").split(":"):
+        chunk = chunk.strip()
+        if chunk:
+            out.append(os.path.normpath(os.path.expanduser(chunk)))
+    return out
+
+
+# Machine-local visibility filter (default: show everything, so any host that
+# leaves these env vars unset is unaffected). Set them per-host — e.g. in a
+# gitignored .env.local sourced by run.sh — not in committed code.
+#   CLAUDE_FLEET_CWD_INCLUDE — if set, only sessions whose cwd is under one of
+#                             these path prefixes are shown.
+#   CLAUDE_FLEET_CWD_EXCLUDE — sessions under any of these prefixes are hidden.
+# Exclude wins over include. Both are colon/comma-separated prefix lists.
+_CWD_INCLUDE: list[str] = []
+_CWD_EXCLUDE: list[str] = []
+# Slugified mirrors (cwd → project-dir name), so callers that only have the
+# `projects/<slug>` dir name (e.g. search hits) can apply the same filter.
+_CWD_INCLUDE_SLUGS: list[str] = []
+_CWD_EXCLUDE_SLUGS: list[str] = []
+
+
+def _reload_cwd_filters() -> None:
+    """(Re)read the cwd filter env vars. Called at import; exposed for tests."""
+    global _CWD_INCLUDE, _CWD_EXCLUDE, _CWD_INCLUDE_SLUGS, _CWD_EXCLUDE_SLUGS
+    _CWD_INCLUDE = _parse_prefixes(os.environ.get("CLAUDE_FLEET_CWD_INCLUDE", ""))
+    _CWD_EXCLUDE = _parse_prefixes(os.environ.get("CLAUDE_FLEET_CWD_EXCLUDE", ""))
+    _CWD_INCLUDE_SLUGS = [_cwd_to_project_slug(p) for p in _CWD_INCLUDE]
+    _CWD_EXCLUDE_SLUGS = [_cwd_to_project_slug(p) for p in _CWD_EXCLUDE]
+
+
+_reload_cwd_filters()
+
+
+def _under(cwd: str, prefix: str) -> bool:
+    cwd_n = os.path.normpath(cwd)
+    return cwd_n == prefix or cwd_n.startswith(prefix + os.sep)
+
+
+def _cwd_visible(cwd: str) -> bool:
+    """Whether a session with this working dir passes the machine-local filter."""
+    if _CWD_EXCLUDE and any(_under(cwd, p) for p in _CWD_EXCLUDE):
+        return False
+    if _CWD_INCLUDE and not any(_under(cwd, p) for p in _CWD_INCLUDE):
+        return False
+    return True
+
+
+def _slug_under(slug: str, prefix_slug: str) -> bool:
+    return slug == prefix_slug or slug.startswith(prefix_slug + "-")
+
+
+def slug_visible(slug: str) -> bool:
+    """Same filter as `_cwd_visible`, but for a `projects/<slug>` dir name.
+
+    The slug is a lossy encoding of the cwd (/ _ . all become -), so this can
+    over-match in rare cases (e.g. `a/b` vs `a_b`); good enough for hiding
+    search hits from filtered projects."""
+    if _CWD_EXCLUDE_SLUGS and any(_slug_under(slug, p) for p in _CWD_EXCLUDE_SLUGS):
+        return False
+    if _CWD_INCLUDE_SLUGS and not any(_slug_under(slug, p) for p in _CWD_INCLUDE_SLUGS):
+        return False
+    return True
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -142,6 +211,7 @@ class Window:
     transcript_path: Optional[str]
     alive: bool
     hidden: bool          # internal `.slock` agent sub-session, shown at page bottom
+    platform: str = "claude"   # "claude" | "codex" — which CLI owns this window
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -175,6 +245,11 @@ def list_windows(include_dead: bool = False) -> list[Window]:
         if not data:
             continue
 
+        cwd = data.get("cwd", "")
+        # Machine-local visibility filter (CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE).
+        if not _cwd_visible(cwd):
+            continue
+
         pid = int(data["pid"])
         alive = _pid_alive(pid)
         if alive:
@@ -183,7 +258,6 @@ def list_windows(include_dead: bool = False) -> list[Window]:
             continue
 
         session_id = data.get("sessionId", "")
-        cwd = data.get("cwd", "")
         hidden = _is_hidden_cwd(cwd)
         slug = _cwd_to_project_slug(cwd)
         transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
@@ -222,6 +296,16 @@ def find_window(pid: int) -> Optional[Window]:
     for w in list_windows(include_dead=True):
         if w.pid == pid:
             return w
+    # Live Codex sessions aren't backed by ~/.claude/sessions files; they're
+    # discovered from running processes. Late import to avoid a circular
+    # dependency (codex imports HOME_BASE from this module).
+    try:
+        from . import codex
+        for w in codex.list_codex_windows():
+            if w.pid == pid:
+                return w
+    except Exception:
+        pass
     return None
 
 

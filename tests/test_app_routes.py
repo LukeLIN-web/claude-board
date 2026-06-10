@@ -26,16 +26,32 @@ class CreateRouteTests(unittest.TestCase):
     def test_dispatches_to_create_session(self):
         with mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
             r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp"))
-        m.assert_called_once_with("/tmp")
+        m.assert_called_once_with("/tmp", "claude")
+        self.assertTrue(r["ok"])
+
+    def test_dispatches_codex_platform(self):
+        with mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
+            r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp", platform="codex"))
+        m.assert_called_once_with("/tmp", "codex")
         self.assertTrue(r["ok"])
 
 
 class PromptRouteTests(unittest.TestCase):
     def test_dispatches_to_send_prompt(self):
-        with mock.patch.object(appmod.actions, "send_prompt", return_value={"ok": True}) as m:
+        # The route now guards on a visible window before sending.
+        with mock.patch.object(appmod.sessions, "find_window", return_value=object()), \
+             mock.patch.object(appmod.actions, "send_prompt", return_value={"ok": True}) as m:
             r = appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"))
         m.assert_called_once_with(4321, "hi there")
         self.assertTrue(r["ok"])
+
+    def test_prompt_blocked_for_hidden_window(self):
+        import fastapi
+        with mock.patch.object(appmod.sessions, "find_window", return_value=None), \
+             mock.patch.object(appmod.actions, "send_prompt") as m:
+            with self.assertRaises(fastapi.HTTPException):
+                appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"))
+        m.assert_not_called()
 
 
 class SnapshotFlagTests(unittest.TestCase):

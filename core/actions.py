@@ -131,13 +131,54 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     }
 
 
+def open_codex_window(cwd: str, codex_args: list[str]) -> dict:
+    """Open `codex <codex_args>` in a new window, cwd-anchored (tmux/iTerm2).
+
+    Mirrors open_claude_window but launches the Codex CLI; used to fork/resume a
+    Codex session into a fresh window.
+    """
+    if tmux.available():
+        r = tmux.new_window(cwd, ["codex", *codex_args])
+        if r["ok"]:
+            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
+        return {"ok": False, "error": r["error"], "backend": "tmux"}
+
+    if not shutil.which("osascript"):
+        return {
+            "ok": False,
+            "error": "no terminal backend: start a tmux server (Linux) "
+                     "or run on macOS with iTerm2 (osascript not found)",
+        }
+
+    args_str = " ".join(shlex.quote(a) for a in codex_args)
+    inner = f"cd {shlex.quote(cwd)} && codex {args_str}"
+    quoted_for_applescript = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    script = _FORK_APPLESCRIPT_ITERM.format(cmd=quoted_for_applescript)
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": proc.returncode == 0, "cwd": cwd, "backend": "iterm",
+            "stdout": proc.stdout, "stderr": proc.stderr}
+
+
 def fork_session(pid: int) -> dict:
-    """Open a new window and fork the session (new ID, inherits history)."""
+    """Open a new window and fork the session (new ID, inherits history).
+
+    Codex has no `--fork-session`; the closest is resuming the rollout into a
+    fresh window, so codex sessions branch to `codex resume <session_id>`.
+    """
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
 
-    r = open_claude_window(w.cwd, ["--resume", w.session_id, "--fork-session"])
+    if getattr(w, "platform", "claude") == "codex":
+        r = open_codex_window(w.cwd, ["resume", w.session_id])
+    else:
+        r = open_claude_window(w.cwd, ["--resume", w.session_id, "--fork-session"])
     r.setdefault("session_id", w.session_id)
     return r
 
@@ -293,13 +334,20 @@ def close_session(pid: int) -> dict:
     return {"ok": True, "pid": pid, "message": f"SIGTERM sent to {pid}"}
 
 
-def create_session(cwd: str) -> dict:
-    """Spawn a new tmux window running `claude` in `cwd` (validated server-side)."""
+def create_session(cwd: str, platform: str = "claude") -> dict:
+    """Spawn a new tmux window in `cwd` (validated server-side).
+
+    `platform` selects the CLI: "claude" (default) launches Claude Code with
+    permission prompts skipped; "codex" launches the Codex TUI in `--yolo` mode
+    so the fleet can drive it without per-action approval prompts.
+    """
     if not cwd or not cwd.strip():
         return {"ok": False, "error": "cwd is required"}
     resolved = os.path.expanduser(cwd.strip())
     if not os.path.isdir(resolved):
         return {"ok": False, "error": f"not a directory: {resolved}"}
+    if platform == "codex":
+        return tmux.new_window(resolved, ["codex", "--yolo"])
     return tmux.new_window(resolved)
 
 

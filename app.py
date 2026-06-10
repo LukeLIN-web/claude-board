@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -49,9 +50,16 @@ state = State()
 def _enriched_snapshot() -> dict:
     snap = sessions.snapshot()
     perm_by_tty = perms.pending_by_tty()
+    # Live Codex sessions arrive pre-enriched (codex transcripts have a different
+    # shape than Claude's, so they can't go through the loop below). Shell-process
+    # counts are platform-agnostic, so we fold their pids into the single ps walk.
+    codex_windows = codex.codex_window_dicts()
     shell_counts = sessions.shell_descendant_counts(
-        [w["pid"] for w in snap["windows"] if isinstance(w.get("pid"), int)]
+        [w["pid"] for w in snap["windows"] + codex_windows
+         if isinstance(w.get("pid"), int)]
     )
+    for cw in codex_windows:
+        cw["shell_proc_count"] = shell_counts.get(cw.get("pid"), 0)
     for w in snap["windows"]:
         w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
         tty = w.get("tty")
@@ -113,6 +121,18 @@ def _enriched_snapshot() -> dict:
             if status == "idle" and isinstance(pid, int):
                 promptqueue.clear(pid)  # a queue can't outlive an idle session
             w["queued"] = []
+    # Merge live Codex windows in, then recompute the header counts over every
+    # visible (non-hidden) window across both platforms.
+    snap["windows"].extend(codex_windows)
+    visible = [w for w in snap["windows"] if not w.get("hidden")]
+    busy = [w for w in visible if w.get("status") == "busy"]
+    waiting = [w for w in visible if w.get("status") == "waiting"]
+    snap["counts"] = {
+        "total": len(visible),
+        "busy": len(busy),
+        "waiting": len(waiting),
+        "idle": len(visible) - len(busy) - len(waiting),
+    }
     # Sort by triage priority (most urgent first), then by idle time.
     snap["windows"].sort(key=lambda w: (
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
@@ -164,10 +184,31 @@ app = FastAPI(title="Claude Fleet", lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     html = (STATIC_DIR / "index.html").read_text()
+    html = _apply_instance_label(html)
     # The UI is a single hand-edited HTML file with no asset versioning, so tell
     # the browser to always revalidate — otherwise a stale cached copy hides new
     # features (e.g. the permission / question controls) until a hard refresh.
     return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+def _apply_instance_label(html: str) -> str:
+    """Stamp a per-host label (CLAUDE_FLEET_LABEL, e.g. "fw71") into the tab
+    title and header so multiple dashboards are tellable apart. No label set ⇒
+    HTML is returned unchanged."""
+    label = os.environ.get("CLAUDE_FLEET_LABEL", "").strip()
+    if not label:
+        return html
+    html = html.replace(
+        "<title>Claude Fleet</title>",
+        f"<title>Claude Fleet · {label}</title>",
+    )
+    html = html.replace(
+        '<h1 class="text-xl font-bold tracking-tight">Claude Fleet</h1>',
+        '<h1 class="text-xl font-bold tracking-tight">Claude Fleet'
+        ' <span class="text-xs font-normal align-middle bg-slate-200'
+        ' text-slate-700 px-2 py-0.5 rounded-full">' + label + "</span></h1>",
+    )
+    return html
 
 
 @app.get("/api/windows")
@@ -183,11 +224,27 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
     if not w:
         raise HTTPException(404, "window not found")
     tp = w.transcript_path or ""
+    if w.platform == "codex":
+        # Codex transcripts have their own shape and no Claude-style interactive
+        # menu to scrape from the pane.
+        activity = codex.extract_codex_session_activity(tp) if tp else {}
+        return {
+            "pid": pid,
+            "session_id": w.session_id,
+            "project_name": w.project_name,
+            "platform": "codex",
+            "events": codex.codex_timeline(tp, limit=limit) if tp else [],
+            "skills_used": activity.get("skills_used", []),
+            "memory_ops": activity.get("memory_ops", []),
+            "plan_history": [],
+            "menu": None,
+        }
     events = transcripts.timeline(tp, limit=limit) if tp else []
     return {
         "pid": pid,
         "session_id": w.session_id,
         "project_name": w.project_name,
+        "platform": "claude",
         "events": events,
         "skills_used": transcripts.extract_skills_used(tp) if tp else [],
         "memory_ops": transcripts.extract_memory_ops(tp) if tp else [],
@@ -227,11 +284,19 @@ def api_plan_by_name(name: str) -> dict:
     return p
 
 
-@app.post("/api/windows/{pid}/focus")
-def api_focus(pid: int) -> dict:
+def _require_window(pid: int):
+    """Resolve a pid to a *visible* window or 404. `find_window` already honors
+    the CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE filter, so this also blocks actions
+    against hidden sessions, not just unknown pids."""
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
+    return w
+
+
+@app.post("/api/windows/{pid}/focus")
+def api_focus(pid: int) -> dict:
+    w = _require_window(pid)
     if not w.tty:
         return {"ok": False, "error": "no tty available for this pid"}
     return actions.focus_terminal(w.tty)
@@ -239,6 +304,7 @@ def api_focus(pid: int) -> dict:
 
 class CreateBody(BaseModel):
     cwd: str
+    platform: str = "claude"  # "claude" | "codex"
 
 
 class PromptBody(BaseModel):
@@ -247,11 +313,14 @@ class PromptBody(BaseModel):
 
 @app.post("/api/windows/create")
 def api_window_create(body: CreateBody) -> dict:
-    return actions.create_session(body.cwd)
+    if not sessions._cwd_visible(body.cwd):
+        raise HTTPException(403, "cwd is hidden by the dashboard filter")
+    return actions.create_session(body.cwd, body.platform)
 
 
 @app.post("/api/windows/{pid}/prompt")
 def api_window_prompt(pid: int, body: PromptBody) -> dict:
+    _require_window(pid)
     r = actions.send_prompt(pid, body.text)
     if r.get("ok"):
         promptqueue.record_sent(pid, body.text)
@@ -264,6 +333,7 @@ class PermissionBody(BaseModel):
 
 @app.post("/api/windows/{pid}/permission")
 def api_window_permission(pid: int, body: PermissionBody) -> dict:
+    _require_window(pid)
     return actions.respond_permission(pid, body.choice)
 
 
@@ -273,21 +343,25 @@ class MenuKeysBody(BaseModel):
 
 @app.post("/api/windows/{pid}/keys")
 def api_window_keys(pid: int, body: MenuKeysBody) -> dict:
+    _require_window(pid)
     return actions.send_menu_keys(pid, body.keys)
 
 
 @app.post("/api/windows/{pid}/fork")
 def api_fork(pid: int) -> dict:
+    _require_window(pid)
     return actions.fork_session(pid)
 
 
 @app.post("/api/windows/{pid}/export")
 def api_export(pid: int) -> dict:
+    _require_window(pid)
     return actions.export_to_feishu(pid)
 
 
 @app.post("/api/windows/{pid}/close")
 def api_close(pid: int) -> dict:
+    _require_window(pid)
     return actions.close_session(pid)
 
 
@@ -305,6 +379,8 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
             continue
         f = proj_dir / f"{session_id}.jsonl"
         if f.exists():
+            if not sessions.slug_visible(proj_dir.name):
+                raise HTTPException(404, "session not found")
             fp = str(f)
             events = transcripts.timeline(fp, limit=limit)
             return {
