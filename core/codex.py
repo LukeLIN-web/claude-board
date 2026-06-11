@@ -41,6 +41,16 @@ _BUSY_MTIME_WINDOW = 5.0
 _SKILL_PATH_RE = re.compile(r'/\.(?:claude|codex)/skills/([A-Za-z0-9_-]+)(?:/|\b)')
 _MEMORY_PATH_RE = re.compile(r'/memory/([A-Za-z0-9_-]+)\.md')
 
+# Codex reuses the role=user message shape for synthetic, non-prompt turns it
+# injects itself — each wrapped in a lowercase XML-ish tag (<environment_context>,
+# <turn_aborted>, <subagent_notification>, <skill>, …). These are not the user's
+# prompt and must be skipped when surfacing "what the user said".
+_SYNTHETIC_USER_RE = re.compile(r'^<[a-z_]+>')
+
+
+def _is_synthetic_user_text(text: str) -> bool:
+    return bool(_SYNTHETIC_USER_RE.match(text.lstrip()))
+
 
 @dataclass
 class CodexSession:
@@ -94,7 +104,15 @@ def _parse_session_meta(path: Path) -> Optional[dict]:
 
 
 def _extract_first_user_input(path: Path) -> str:
-    """Try user input first, fall back to first assistant response text."""
+    """Return the user's first real prompt; fall back to the first assistant reply.
+
+    Codex logs a submitted prompt two ways: a clean `event_msg`/`user_message`
+    (the text typed into the TUI) and a `response_item` message with role=user
+    carrying `input_text`. The role=user shape is *also* used for synthetic
+    injections (`<environment_context>`, …), so those are skipped. If no user
+    text is found at all, the first assistant `output_text` is returned.
+    """
+    fallback = ""
     try:
         with path.open() as f:
             for line in f:
@@ -102,29 +120,30 @@ def _extract_first_user_input(path: Path) -> str:
                     d = json.loads(line)
                 except Exception:
                     continue
-                if d.get("type") == "event_msg":
-                    payload = d.get("payload") or {}
-                    if payload.get("role") == "user":
-                        content = payload.get("content")
-                        if isinstance(content, str) and content.strip():
-                            return content[:300]
-                        if isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "input_text":
-                                    t = (c.get("text") or "").strip()
-                                    if t:
-                                        return t[:300]
-                if d.get("type") == "response_item":
-                    payload = d.get("payload") or {}
-                    if payload.get("type") == "message":
-                        for c in (payload.get("content") or []):
-                            if isinstance(c, dict) and c.get("type") == "output_text":
-                                t = (c.get("text") or "").strip()
-                                if t:
-                                    return t[:300]
+                t = d.get("type")
+                payload = d.get("payload") or {}
+
+                if t == "event_msg" and payload.get("type") == "user_message":
+                    msg = (payload.get("message") or "").strip()
+                    if msg:
+                        return msg[:300]
+
+                if t == "response_item" and payload.get("type") == "message":
+                    role = payload.get("role")
+                    for c in (payload.get("content") or []):
+                        if not isinstance(c, dict):
+                            continue
+                        if role == "user" and c.get("type") == "input_text":
+                            txt = (c.get("text") or "").strip()
+                            if txt and not _is_synthetic_user_text(txt):
+                                return txt[:300]
+                        elif c.get("type") == "output_text" and not fallback:
+                            txt = (c.get("text") or "").strip()
+                            if txt:
+                                fallback = txt[:300]
     except Exception:
         pass
-    return ""
+    return fallback
 
 
 def extract_codex_session_activity(path: Path | str) -> dict:
@@ -276,22 +295,17 @@ def codex_timeline(path: str | Path, limit: int = 60) -> list[dict]:
                 payload = d.get("payload") or {}
 
                 if t == "event_msg":
-                    role = payload.get("role", "")
-                    content = payload.get("content")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        for c in content:
-                            if isinstance(c, dict) and c.get("type") == "input_text":
-                                text = c.get("text", "")
-                                break
-                    if text and role == "user":
-                        events.append({
-                            "ts": ts, "kind": "user_text",
-                            "text": text[:4000], "tool": None,
-                            "role": "user", "extra": {},
-                        })
+                    # The user's typed prompt is logged as a `user_message`
+                    # event with the text in `message` (role=user response_item
+                    # turns are reserved for synthetic injections, handled below).
+                    if payload.get("type") == "user_message":
+                        text = (payload.get("message") or "").strip()
+                        if text:
+                            events.append({
+                                "ts": ts, "kind": "user_text",
+                                "text": text[:4000], "tool": None,
+                                "role": "user", "extra": {},
+                            })
 
                 elif t == "response_item":
                     item_type = payload.get("type", "")
