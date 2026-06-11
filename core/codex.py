@@ -52,6 +52,37 @@ def _is_synthetic_user_text(text: str) -> bool:
     return bool(_SYNTHETIC_USER_RE.match(text.lstrip()))
 
 
+# Codex's `/clear` wipes the TUI screen and conversation context, but it does
+# NOT erase the rollout JSONL the card is rendered from — so the card would keep
+# showing the pre-clear prompt/response. We record when each session (keyed by
+# the stable card pid) was cleared and hide rollout events older than that, so
+# the card blanks immediately and refills once a new prompt is sent. In-memory:
+# a server restart forgets it, which at worst re-shows old preview text briefly.
+_cleared_at_ms: dict[int, int] = {}
+
+
+def mark_cleared(pid: int) -> None:
+    """Record that the card for `pid` was cleared now; older rollout events hide."""
+    _cleared_at_ms[pid] = int(time.time() * 1000)
+
+
+def cleared_at_ms(pid: int) -> int:
+    """Epoch-ms the card for `pid` was last cleared, or 0 if never."""
+    return _cleared_at_ms.get(pid, 0)
+
+
+def _before_clear(ts: str, since_ms: int) -> bool:
+    """True if rollout-event timestamp `ts` predates the clear cutoff `since_ms`.
+
+    Unparseable timestamps (returns 0) are never hidden — better to show a stray
+    line than to blank a card we can't reason about.
+    """
+    if since_ms <= 0:
+        return False
+    t = _parse_iso_ms(ts)
+    return 0 < t < since_ms
+
+
 @dataclass
 class CodexSession:
     session_id: str
@@ -103,7 +134,7 @@ def _parse_session_meta(path: Path) -> Optional[dict]:
         return None
 
 
-def _extract_first_user_input(path: Path) -> str:
+def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
     """Return the user's first real prompt; fall back to the first assistant reply.
 
     Codex logs a submitted prompt two ways: a clean `event_msg`/`user_message`
@@ -119,6 +150,8 @@ def _extract_first_user_input(path: Path) -> str:
                 try:
                     d = json.loads(line)
                 except Exception:
+                    continue
+                if _before_clear(d.get("timestamp", ""), since_ms):
                     continue
                 t = d.get("type")
                 payload = d.get("payload") or {}
@@ -277,8 +310,12 @@ def list_codex_sessions() -> list[CodexSession]:
     return sessions
 
 
-def codex_timeline(path: str | Path, limit: int = 60) -> list[dict]:
-    """Parse Codex JSONL into TurnEvent-compatible dicts."""
+def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list[dict]:
+    """Parse Codex JSONL into TurnEvent-compatible dicts.
+
+    `since_ms` (set after a card's Clear) drops events older than the clear, so
+    the timeline reflects the cleared session rather than the untouched rollout.
+    """
     p = Path(path)
     if not p.exists():
         return []
@@ -292,6 +329,8 @@ def codex_timeline(path: str | Path, limit: int = 60) -> list[dict]:
                     continue
                 t = d.get("type")
                 ts = d.get("timestamp", "")
+                if _before_clear(ts, since_ms):
+                    continue
                 payload = d.get("payload") or {}
 
                 if t == "event_msg":
@@ -366,10 +405,12 @@ def _read_tail_events(path: Path, max_lines: int = 60) -> list[dict]:
     return out
 
 
-def _last_assistant_text(path: Path) -> str:
+def _last_assistant_text(path: Path, since_ms: int = 0) -> str:
     """Most recent assistant output_text, used as the card's current-task hint."""
     for d in reversed(_read_tail_events(path, max_lines=120)):
         if d.get("type") != "response_item":
+            continue
+        if _before_clear(d.get("timestamp", ""), since_ms):
             continue
         payload = d.get("payload") or {}
         if payload.get("type") != "message":
@@ -644,16 +685,17 @@ def codex_window_dicts() -> list[dict]:
     for w in list_codex_windows():
         d = w.to_dict()
         tp = Path(w.transcript_path) if w.transcript_path else None
+        since = cleared_at_ms(w.pid)
         activity = extract_codex_session_activity(tp) if tp else {
             "skills_used": [], "memory_ops": [], "model": "",
         }
-        current_task = _last_assistant_text(tp) if tp else ""
+        current_task = _last_assistant_text(tp, since) if tp else ""
         tri = _classify_codex(w.status, d.get("idle_seconds", 0), current_task)
         d.update({
             "shell_proc_count": 0,            # caller overwrites via one ps walk
             "permission_msg": None,
             "permission_ts": None,
-            "first_input": (_extract_first_user_input(tp) if tp else "")[:100],
+            "first_input": (_extract_first_user_input(tp, since) if tp else "")[:100],
             "current_task": current_task or None,
             "triage": tri["triage"],
             "triage_reason": tri["reason"],

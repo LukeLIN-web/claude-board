@@ -233,7 +233,7 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
             "session_id": w.session_id,
             "project_name": w.project_name,
             "platform": "codex",
-            "events": codex.codex_timeline(tp, limit=limit) if tp else [],
+            "events": codex.codex_timeline(tp, limit=limit, since_ms=codex.cleared_at_ms(pid)) if tp else [],
             "skills_used": activity.get("skills_used", []),
             "memory_ops": activity.get("memory_ops", []),
             "plan_history": [],
@@ -324,6 +324,22 @@ def api_window_prompt(pid: int, body: PromptBody) -> dict:
     r = actions.send_prompt(pid, body.text)
     if r.get("ok"):
         promptqueue.record_sent(pid, body.text)
+    return r
+
+
+@app.post("/api/windows/{pid}/clear")
+def api_window_clear(pid: int) -> dict:
+    """Send /clear and blank the card's pre-clear preview.
+
+    Both Claude and Codex have /clear. Claude starts a fresh transcript so its
+    card empties on its own, but Codex's /clear leaves the rollout JSONL intact —
+    so we also stamp a per-pid clear time that hides older rollout events from the
+    card and timeline (see codex.mark_cleared)."""
+    _require_window(pid)
+    r = actions.send_prompt(pid, "/clear")
+    if r.get("ok"):
+        promptqueue.record_sent(pid, "/clear")
+        codex.mark_cleared(pid)
     return r
 
 

@@ -91,5 +91,66 @@ class TestCodexTimeline(unittest.TestCase):
         self.assertEqual(user_texts.count(REAL_PROMPT), 1)
 
 
+# A rollout straddling a /clear: an old prompt+reply, then a new prompt+reply.
+# Every line carries a top-level timestamp, as real Codex rollouts do.
+CLEAR_ROLLOUT = [
+    {"timestamp": "2026-06-11T10:00:00Z", "type": "event_msg",
+     "payload": {"type": "user_message", "message": "OLD prompt before clear"}},
+    {"timestamp": "2026-06-11T10:00:05Z", "type": "response_item",
+     "payload": {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "OLD assistant reply"}]}},
+    {"timestamp": "2026-06-11T12:00:00Z", "type": "event_msg",
+     "payload": {"type": "user_message", "message": "NEW prompt after clear"}},
+    {"timestamp": "2026-06-11T12:00:05Z", "type": "response_item",
+     "payload": {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "NEW assistant reply"}]}},
+]
+CLEAR_CUTOFF_MS = codex._parse_iso_ms("2026-06-11T11:00:00Z")  # between old and new
+
+
+class TestClearHidesPreClearEvents(unittest.TestCase):
+    """Codex /clear leaves the rollout intact, so the card filters events older
+    than the clear time (see codex.mark_cleared / cleared_at_ms)."""
+
+    def setUp(self):
+        self.path = _write_rollout(CLEAR_ROLLOUT)
+
+    def tearDown(self):
+        self.path.unlink(missing_ok=True)
+        codex._cleared_at_ms.clear()
+
+    def test_first_input_skips_pre_clear_prompt(self):
+        self.assertEqual(
+            codex._extract_first_user_input(self.path, since_ms=CLEAR_CUTOFF_MS),
+            "NEW prompt after clear")
+
+    def test_first_input_without_cutoff_shows_old(self):
+        self.assertEqual(
+            codex._extract_first_user_input(self.path),
+            "OLD prompt before clear")
+
+    def test_timeline_drops_pre_clear_events(self):
+        evs = codex.codex_timeline(self.path, since_ms=CLEAR_CUTOFF_MS)
+        texts = [e["text"] for e in evs]
+        self.assertNotIn("OLD prompt before clear", texts)
+        self.assertNotIn("OLD assistant reply", texts)
+        self.assertIn("NEW prompt after clear", texts)
+
+    def test_last_assistant_text_skips_pre_clear(self):
+        self.assertEqual(
+            codex._last_assistant_text(self.path, since_ms=CLEAR_CUTOFF_MS),
+            "NEW assistant reply")
+
+    def test_unparseable_timestamp_is_not_hidden(self):
+        # A line we can't date should be shown rather than silently dropped.
+        self.assertFalse(codex._before_clear("", CLEAR_CUTOFF_MS))
+        self.assertFalse(codex._before_clear("not-a-date", CLEAR_CUTOFF_MS))
+
+    def test_mark_cleared_roundtrip(self):
+        self.assertEqual(codex.cleared_at_ms(99999), 0)
+        codex.mark_cleared(99999)
+        self.assertGreater(codex.cleared_at_ms(99999), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

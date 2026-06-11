@@ -137,9 +137,10 @@ available.
 | Export | export a conversation doc (timeline + plan history + skill/memory summary) |
 
 On **Codex** cards the platform-agnostic controls (Close, Send a prompt, Esc,
-Commit) work the same way; the Claude-specific ones (Fork, Review, Clear, and the
-permission quick-approve) are hidden, since they rely on Claude slash commands or
-the `claude` binary.
+Commit, Clear) work the same way — Codex has its own `/clear` ("clear the
+terminal and start a new chat"), so the same command serves both. The
+Claude-specific controls (Fork, Review, and the permission quick-approve) are
+hidden, since they rely on Claude slash commands or the `claude` binary.
 
 > **Focus setup (macOS).** Focus works out of the box on Terminal.app and iTerm2 —
 > including when your sessions run inside **tmux** (the bundled
