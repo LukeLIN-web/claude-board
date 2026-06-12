@@ -80,6 +80,16 @@ def _enriched_snapshot() -> dict:
             w["current_task"] = transcripts.current_task_hint(tp)
         else:
             w["current_task"] = None
+        # Claude reports waitingFor="dialog open" for ANY open overlay — the
+        # /goal panel included, which has nothing to answer and doesn't block
+        # the agent. Only a verifiable picker in the pane earns the waiting
+        # card (Quick Approve types "1" into the input box otherwise); when
+        # the pane shows none, treat the session as busy. An unverifiable
+        # pane (no tmux) keeps the conservative waiting card.
+        if (w.get("status") == "waiting" and w.get("waiting_for") == "dialog open"
+                and actions.pane_menu_active(w.get("tty")) is False):
+            w["status"] = "busy"
+            w["waiting_for"] = None
         tri = patrol.classify(w)
         w["triage"] = tri["triage"]
         w["triage_reason"] = tri["reason"]

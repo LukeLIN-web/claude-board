@@ -127,5 +127,46 @@ class DiffSignatureTests(unittest.TestCase):
             "consuming a queued prompt must change the broadcast signature")
 
 
+class StaleDialogOpenTests(unittest.TestCase):
+    """Claude writes status="waiting" / waitingFor="dialog open" for ANY open
+    overlay — including the /goal panel, which has nothing to answer and does
+    not block the agent. Such a window must not raise the red waiting card
+    (Quick Approve would type "1" into the input box) nor count as waiting in
+    the header; a verifiable picker in the pane keeps the normal behavior."""
+
+    def _run(self, menu_active):
+        import time
+        win = {"pid": 100, "status": "waiting", "waiting_for": "dialog open",
+               "hidden": False, "alive": True, "tty": "/dev/pts/9",
+               "transcript_path": None, "name": "w", "cwd": "/x",
+               "updated_at": int(time.time() * 1000), "idle_seconds": 0}
+        snap = {"windows": [win], "counts": {}, "ts": 0}
+        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
+             mock.patch.object(appmod.tmux, "available", return_value=True), \
+             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
+             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
+             mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
+             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
+             mock.patch.object(appmod.actions, "pane_menu_active", return_value=menu_active):
+            return appmod._enriched_snapshot()["windows"][0]
+
+    def test_dialog_without_menu_is_not_waiting(self):
+        w = self._run(menu_active=False)
+        self.assertNotEqual(w["triage"], "waiting_perm")
+        self.assertNotEqual(w["status"], "waiting")
+
+    def test_dialog_with_real_menu_stays_waiting(self):
+        w = self._run(menu_active=True)
+        self.assertEqual(w["triage"], "waiting_perm")
+        self.assertEqual(w["status"], "waiting")
+
+    def test_unverifiable_pane_stays_waiting(self):
+        # tmux can't see the pane: keep the conservative waiting card.
+        w = self._run(menu_active=None)
+        self.assertEqual(w["triage"], "waiting_perm")
+        self.assertEqual(w["status"], "waiting")
+
+
 if __name__ == "__main__":
     unittest.main()

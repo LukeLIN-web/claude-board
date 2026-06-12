@@ -562,6 +562,36 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     }
 
 
+def _menu_markers_present(text: str) -> bool:
+    """Whether a captured viewport shows a live answerable menu."""
+    return (
+        ("to select" in text and "navigate" in text)
+        or ("Do you want to proceed" in text)
+        or ("Ready to submit your answers" in text)  # multiSelect review screen (no footer)
+    )
+
+
+def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
+    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable.
+
+    Claude's session registry reports waitingFor="dialog open" for ANY open
+    overlay — including informational ones like the /goal panel, which has no
+    options and doesn't block the agent. This is the pane-level ground truth
+    the triage uses to tell a real picker from such an overlay. The
+    three-valued return matters: None (no tty / no pane / failed capture)
+    means "can't verify", and callers should keep trusting the registry.
+    """
+    if not tty:
+        return None
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return None
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return None
+    return _menu_markers_present(cap["text"])
+
+
 def get_pane_menu(pid: int) -> Optional[dict]:
     """Return the live interactive menu in `pid`'s pane, or None.
 
@@ -579,12 +609,7 @@ def get_pane_menu(pid: int) -> Optional[dict]:
     if not visible["ok"]:
         return None
     vis = visible["text"]
-    active = (
-        ("to select" in vis and "navigate" in vis)
-        or ("Do you want to proceed" in vis)
-        or ("Ready to submit your answers" in vis)  # multiSelect review screen (no footer)
-    )
-    if not active:
+    if not _menu_markers_present(vis):
         return None
     full = tmux.capture_pane(pane, scrollback=80)
     return parse_pane_menu(full["text"] if full["ok"] else vis)

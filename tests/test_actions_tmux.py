@@ -249,3 +249,53 @@ class ParsePaneMenuTests(unittest.TestCase):
     def test_non_menu_output_returns_none(self):
         self.assertIsNone(actions.parse_pane_menu("hello\n1. a list\n2. another\nnormal"))
         self.assertIsNone(actions.parse_pane_menu(""))
+
+
+class PaneMenuActiveTests(unittest.TestCase):
+    """pane_menu_active: pane-level ground truth for whether a session's
+    "waiting / dialog open" registry status is actionable. Claude writes
+    waitingFor="dialog open" for ANY overlay — including the /goal panel,
+    which has nothing to answer — so the dashboard must verify the pane."""
+
+    GOAL_OVERLAY = (
+        "──────────────\n"
+        "  Goal\n\n"
+        "  No goal set\n"
+        "  /goal <condition> to set one\n\n"
+        "  Esc to dismiss\n"
+        "──────────────\n"
+        "❯ \n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"
+    )
+    PERMISSION = (
+        "Bash(rm x)\nDo you want to proceed?\n"
+        "❯ 1. Yes\n  2. No, and tell Claude what to do differently (esc)"
+    )
+    PICKER = (
+        "Which one?\n❯ 1. A\n  2. B\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel"
+    )
+
+    def _run(self, text, pane="%9", ok=True):
+        with mock.patch.object(actions.tmux, "pane_for_tty", return_value=pane), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": ok, "text": text}):
+            return actions.pane_menu_active("/dev/pts/9")
+
+    def test_goal_overlay_is_not_an_active_menu(self):
+        self.assertIs(self._run(self.GOAL_OVERLAY), False)
+
+    def test_permission_prompt_is_active(self):
+        self.assertIs(self._run(self.PERMISSION), True)
+
+    def test_question_picker_is_active(self):
+        self.assertIs(self._run(self.PICKER), True)
+
+    def test_no_tty_is_unknown(self):
+        self.assertIsNone(actions.pane_menu_active(None))
+
+    def test_no_pane_is_unknown(self):
+        self.assertIsNone(self._run(self.GOAL_OVERLAY, pane=None))
+
+    def test_failed_capture_is_unknown(self):
+        self.assertIsNone(self._run(self.GOAL_OVERLAY, ok=False))
