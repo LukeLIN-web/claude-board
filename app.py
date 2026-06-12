@@ -381,6 +381,24 @@ def api_close(pid: int) -> dict:
     return actions.close_session(pid)
 
 
+@app.get("/api/locate/{session_id}")
+def api_locate(session_id: str) -> dict:
+    """Reverse lookup: session id (or unique >=8-char prefix) → tmux pane.
+
+    External tools that hold a session id — overseer skills, scripts, humans
+    reading a transcript filename — use this to find where the session lives
+    instead of reverse-engineering pane contents."""
+    w = sessions.find_window_by_session(session_id)
+    if not w:
+        raise HTTPException(404, "no session matches that id")
+    pane = tmux.pane_for_tty(w.tty) if w.tty else None
+    return {
+        "window": w.to_dict(),
+        "tmux_pane": pane,
+        "tmux_target": tmux.pane_target(pane) if pane else None,
+    }
+
+
 @app.get("/api/history")
 def api_history(q: str = "", page: int = 1, limit: int = 30) -> dict:
     return history.list_sessions(q=q or None, page=page, limit=limit)

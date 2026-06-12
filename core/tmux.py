@@ -96,6 +96,17 @@ def pane_for_tty(tty: str) -> Optional[str]:
     return None
 
 
+def pane_target(pane: str) -> Optional[str]:
+    """Human-addressable target ("session:window.pane") for a pane id, or None."""
+    if not pane:
+        return None
+    r = _run("display-message", "-p", "-t", pane,
+             "#{session_name}:#{window_index}.#{pane_index}")
+    if not r["ok"]:
+        return None
+    return r["stdout"].strip() or None
+
+
 def _session_names() -> list[str]:
     r = _run("list-sessions", "-F", "#{session_name}")
     if not r["ok"]:

@@ -309,6 +309,40 @@ def find_window(pid: int) -> Optional[Window]:
     return None
 
 
+def find_window_by_session(session_id: str) -> Optional[Window]:
+    """Resolve a window by its Claude/Codex session id, or a unique prefix.
+
+    This is the reverse lookup of `find_window`: humans and external tools
+    (skills, monitors, scripts) usually hold a session id — e.g. from a
+    transcript filename — not a pid. Prefixes must be >= 8 chars to avoid
+    accidental matches; an ambiguous prefix resolves to nothing rather than
+    to the wrong session.
+    """
+    sid = (session_id or "").strip().lower()
+    if not sid:
+        return None
+
+    def _candidates():
+        yield from list_windows(include_dead=True)
+        # Live Codex sessions come from process discovery (see find_window).
+        try:
+            from . import codex
+            yield from codex.list_codex_windows()
+        except Exception:
+            pass
+
+    prefix_matches: list[Window] = []
+    for w in _candidates():
+        wid = (w.session_id or "").lower()
+        if wid == sid:
+            return w
+        if len(sid) >= 8 and wid.startswith(sid):
+            prefix_matches.append(w)
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+    return None
+
+
 def snapshot() -> dict:
     """Top-level state for the dashboard."""
     wins = list_windows()

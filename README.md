@@ -142,6 +142,27 @@ terminal and start a new chat"), so the same command serves both. The
 Claude-specific controls (Fork, Review, and the permission quick-approve) are
 hidden, since they rely on Claude slash commands or the `claude` binary.
 
+### Locate a session by id
+
+External tools (overseer skills, scripts, you reading a transcript filename)
+usually hold a *session id*, not a pid or pane. Two equivalent reverse lookups
+resolve `session id → pid → tty → tmux pane`:
+
+- **API** — `GET /api/locate/<session-id>` (a unique prefix of ≥ 8 chars works
+  too) returns the window plus `tmux_pane` / `tmux_target`. Covers live Claude
+  *and* Codex sessions.
+- **Standalone** — [`scripts/locate-session.sh`](scripts/locate-session.sh)
+  does the same for Claude sessions with just bash+jq+tmux, no server needed:
+
+  ```console
+  $ scripts/locate-session.sh 8ce5b822
+  {"session_id":"8ce5b822-…","pid":116440,"tty":"/dev/pts/7","tmux_pane":"%3","tmux_target":"j1:2.0",…}
+  ```
+
+Both lean on the fact that Claude Code registers every live session in
+`~/.claude/sessions/<pid>.json` (`{pid, sessionId, cwd, …}`), so the mapping is
+a lookup, not a heuristic.
+
 > **Focus setup (macOS).** Focus works out of the box on Terminal.app and iTerm2 —
 > including when your sessions run inside **tmux** (the bundled
 > [`scripts/focus-tty.sh`](scripts/focus-tty.sh) maps the process tty → the owning
