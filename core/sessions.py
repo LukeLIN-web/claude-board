@@ -332,7 +332,49 @@ def _parse_claude_proc(args: str) -> Optional[dict]:
     return {"session_id": session_id}
 
 
-def list_claude_proc_windows(known_pids: set[int], known_ttys: set[str]) -> list[Window]:
+def _discover_proc_transcript(slug: str, start_ms: int, claimed_sids: set[str]):
+    """Link a process-discovered Claude session that has NO `--resume` id (a
+    fresh spawn) to the transcript it is writing, so the card and the prompt
+    queue aren't permanently blank.
+
+    A fresh `claude` writes no `~/.claude/sessions/<pid>.json` in some setups, so
+    its only on-disk trace is the transcript it starts once it completes its
+    first turn. That file lives in this cwd's project dir (the dir *is* the cwd
+    filter — transcript records carry no `cwd` field) and is modified at/after
+    the process started. Pick the newest such file not already claimed by another
+    window. Returns (session_id, path) or (None, None) when nothing matches yet —
+    e.g. the session is still parked on a menu and hasn't written a turn.
+    """
+    proj = PROJECTS_DIR / slug
+    if not proj.is_dir():
+        return None, None
+    best = None  # (mtime_ms, session_id, path)
+    try:
+        candidates = list(proj.glob("*.jsonl"))
+    except Exception:
+        return None, None
+    for f in candidates:
+        sid = f.stem
+        if sid in claimed_sids:
+            continue
+        try:
+            mtime_ms = f.stat().st_mtime * 1000
+        except OSError:
+            continue
+        # A 2-min grace absorbs /proc start-time vs first-write skew; anything
+        # older than that belongs to an earlier session in the same cwd.
+        if mtime_ms < start_ms - 120_000:
+            continue
+        if best is None or mtime_ms > best[0]:
+            best = (mtime_ms, sid, str(f))
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
+def list_claude_proc_windows(
+    known_pids: set[int], known_ttys: set[str], known_sids: set[str] = frozenset()
+) -> list[Window]:
     """Discover running interactive `claude` processes that have NOT yet written
     a `~/.claude/sessions/<pid>.json` file — a freshly spawned session, or a
     `claude --resume <id>` parked on Claude's "resume from summary?" picker, both
@@ -353,6 +395,20 @@ def list_claude_proc_windows(known_pids: set[int], known_ttys: set[str]) -> list
 
     windows: list[Window] = []
     seen_ttys: set[str] = set(known_ttys)
+    # Transcripts already owned by a file-based window (or an earlier proc here)
+    # are off-limits, so a fresh spawn can't steal another session's transcript.
+    claimed_sids: set[str] = set(known_sids)
+    # Pre-claim every live `claude --resume <id>` transcript up front: those
+    # resumed sessions are themselves process-discovered here (no session file,
+    # so absent from known_sids), and the ps scan order is arbitrary — without
+    # this a fresh spawn processed first would adopt a resumed session's
+    # transcript (its file's mtime is refreshed by the resume itself).
+    for _line in out.splitlines():
+        _parts = _line.split(None, 2)
+        if len(_parts) >= 3:
+            _p = _parse_claude_proc(_parts[2])
+            if _p and _p.get("session_id"):
+                claimed_sids.add(_p["session_id"])
     for line in out.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3:
@@ -385,13 +441,27 @@ def list_claude_proc_windows(known_pids: set[int], known_ttys: set[str]) -> list
 
         session_id = parsed["session_id"]
         slug = _cwd_to_project_slug(cwd)
-        transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl" if session_id else None
         try:
             start = int(os.stat(f"/proc/{pid}").st_mtime * 1000)
         except Exception:
             start = int(time.time() * 1000)
-        # Prefer the (resumed) transcript's mtime as the activity time when it
-        # already exists; otherwise fall back to the process start time.
+
+        if session_id:
+            transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
+        else:
+            # Fresh spawn (no --resume id, no session file): recover the
+            # transcript it's writing so the card and prompt-queue reconciliation
+            # have something to read instead of a permanent blank.
+            disc_sid, disc_path = _discover_proc_transcript(slug, start, claimed_sids)
+            if disc_sid:
+                session_id = disc_sid
+                transcript = Path(disc_path)
+            else:
+                transcript = None
+        if session_id:
+            claimed_sids.add(session_id)
+        # Prefer the (resumed/discovered) transcript's mtime as the activity time
+        # when it already exists; otherwise fall back to the process start time.
         updated = start
         if transcript and transcript.exists():
             try:
@@ -493,7 +563,8 @@ def snapshot() -> dict:
     # (fresh spawns / resume parked on the summary picker) so they still card.
     known_pids = {w.pid for w in wins}
     known_ttys = {w.tty for w in wins if w.tty}
-    wins.extend(list_claude_proc_windows(known_pids, known_ttys))
+    known_sids = {w.session_id for w in wins if w.session_id}
+    wins.extend(list_claude_proc_windows(known_pids, known_ttys, known_sids))
     # Counts cover only real user windows; `.slock` agent sub-sessions are
     # rendered separately at the bottom of the dashboard and excluded here.
     visible = [w for w in wins if not w.hidden]

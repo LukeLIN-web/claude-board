@@ -104,5 +104,56 @@ class FindWindowProcFallbackTests(unittest.TestCase):
         self.assertEqual(w.session_id, "f0eb279f-aaaa")
 
 
+class DiscoverProcTranscriptTests(unittest.TestCase):
+    """A fresh `claude` spawn (no --resume id, no session file) must still link
+    to the transcript it writes, so the card and prompt queue aren't blank."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = tempfile.TemporaryDirectory()
+        self.projects = Path(self._tmp.name)
+        self.slug = "-work-qwen3-Omni"
+        (self.projects / self.slug).mkdir()
+        self._patch = mock.patch("core.sessions.PROJECTS_DIR", self.projects)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _touch(self, sid, mtime_s):
+        f = self.projects / self.slug / f"{sid}.jsonl"
+        f.write_text('{"type":"summary","sessionId":"%s"}\n' % sid)
+        os.utime(f, (mtime_s, mtime_s))
+        return f
+
+    def test_picks_newest_transcript_after_process_start(self):
+        self._touch("old-session", mtime_s=1000)
+        self._touch("new-session", mtime_s=5000)
+        sid, path = sessions._discover_proc_transcript(
+            self.slug, start_ms=4000 * 1000, claimed_sids=set())
+        self.assertEqual(sid, "new-session")
+        self.assertTrue(path.endswith("new-session.jsonl"))
+
+    def test_skips_transcripts_older_than_process_start(self):
+        # Predates start by more than the 2-min grace -> a prior session.
+        self._touch("stale", mtime_s=1000)
+        sid, path = sessions._discover_proc_transcript(
+            self.slug, start_ms=5000 * 1000, claimed_sids=set())
+        self.assertIsNone(sid)
+        self.assertIsNone(path)
+
+    def test_skips_already_claimed_sid(self):
+        self._touch("taken", mtime_s=5000)
+        sid, _ = sessions._discover_proc_transcript(
+            self.slug, start_ms=4000 * 1000, claimed_sids={"taken"})
+        self.assertIsNone(sid)
+
+    def test_no_match_returns_none(self):
+        sid, path = sessions._discover_proc_transcript(
+            self.slug, start_ms=1000, claimed_sids=set())
+        self.assertIsNone(sid)
+        self.assertIsNone(path)
+
+
 if __name__ == "__main__":
     unittest.main()
