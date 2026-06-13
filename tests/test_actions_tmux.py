@@ -191,6 +191,29 @@ class ParsePaneMenuTests(unittest.TestCase):
         self.assertEqual([o["label"] for o in m["options"]], ["Submit answers", "Cancel"])
         self.assertIn("Ready to submit", m["prompt"])
 
+    def test_resume_summary_confirm_picker(self):
+        # Startup "resume from summary?" picker: footer is "Enter to confirm",
+        # and the transcript text above the divider rule must NOT leak into the
+        # prompt \u2014 only the lines between the rule and the options.
+        cap = (
+            "  #### Active Tasks\n"
+            "  | 0 | some stale transcript row that must be excluded |\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "  This session is 4h 21m old and 264.3k tokens.\n\n"
+            "  We recommend resuming from a summary.\n\n"
+            "  \u276f 1. Resume from summary (recommended)\n"
+            "    2. Resume full session as-is\n"
+            "    3. Don't ask me again\n\n"
+            "  Enter to confirm \u00b7 Esc to cancel"
+        )
+        m = actions.parse_pane_menu(cap)
+        self.assertEqual(m["kind"], "question")
+        self.assertFalse(m.get("multi"))
+        self.assertEqual([o["num"] for o in m["options"]], [1, 2, 3])
+        self.assertEqual(m["options"][0]["label"], "Resume from summary (recommended)")
+        self.assertIn("This session is 4h 21m old", m["prompt"])
+        self.assertNotIn("stale transcript row", m["prompt"])
+
     def test_permission_prompt(self):
         cap = (
             "Bash(rm x)\nDo you want to proceed?\n"
@@ -275,6 +298,13 @@ class PaneMenuActiveTests(unittest.TestCase):
         "Which one?\n❯ 1. A\n  2. B\n"
         "Enter to select · ↑/↓ to navigate · Esc to cancel"
     )
+    RESUME_PICKER = (
+        "  This session is 4h 25m old and 264.3k tokens.\n\n"
+        "  ❯ 1. Resume from summary (recommended)\n"
+        "    2. Resume full session as-is\n"
+        "    3. Don't ask me again\n\n"
+        "  Enter to confirm · Esc to cancel"
+    )
 
     def _run(self, text, pane="%9", ok=True):
         with mock.patch.object(actions.tmux, "pane_for_tty", return_value=pane), \
@@ -290,6 +320,9 @@ class PaneMenuActiveTests(unittest.TestCase):
 
     def test_question_picker_is_active(self):
         self.assertIs(self._run(self.PICKER), True)
+
+    def test_resume_summary_picker_is_active(self):
+        self.assertIs(self._run(self.RESUME_PICKER), True)
 
     def test_no_tty_is_unknown(self):
         self.assertIsNone(actions.pane_menu_active(None))

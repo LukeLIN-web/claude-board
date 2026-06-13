@@ -472,6 +472,10 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     for i, ln in enumerate(lines):
         if "Ready to submit your answers" in ln:
             review_idx = i
+    confirm_idx = None
+    for i, ln in enumerate(lines):
+        if "Enter to confirm" in ln:  # startup "resume from summary?" picker
+            confirm_idx = i
 
     if footer_idx is not None:
         mode = "question"
@@ -479,6 +483,8 @@ def parse_pane_menu(text: str) -> Optional[dict]:
         mode = "permission"
     elif review_idx is not None:
         mode = "review"
+    elif confirm_idx is not None:
+        mode = "confirm"
     else:
         return None
 
@@ -494,6 +500,12 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     elif mode == "permission":
         header_idx = proceed_idx
         lo, hi = proceed_idx + 1, len(lines)
+    elif mode == "confirm":  # startup picker; options sit above the footer
+        # Anchor the prompt to the divider rule just above the options so the
+        # transcript text scrolled in above it isn't swept into the prompt.
+        header_idx = next((i for i in range(confirm_idx - 1, -1, -1)
+                           if _HRULE_RE.match(lines[i])), None)
+        lo, hi = (header_idx + 1 if header_idx is not None else 0), confirm_idx
     else:  # review — multiSelect confirmation ("1. Submit answers / 2. Cancel")
         header_idx = next((i for i in range(review_idx + 1)
                            if "Review your answers" in lines[i]), review_idx)
@@ -568,6 +580,10 @@ def _menu_markers_present(text: str) -> bool:
         ("to select" in text and "navigate" in text)
         or ("Do you want to proceed" in text)
         or ("Ready to submit your answers" in text)  # multiSelect review screen (no footer)
+        # Startup "resume from summary vs full" picker — a different footer than
+        # the tool-permission menus. "Enter to confirm" marks a choice awaiting
+        # an answer (informational overlays say "Esc to dismiss", not confirm).
+        or ("Enter to confirm" in text)
     )
 
 

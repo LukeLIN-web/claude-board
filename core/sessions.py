@@ -292,8 +292,147 @@ def list_windows(include_dead: bool = False) -> list[Window]:
     return windows
 
 
+# Claude CLI subcommands / flags that are headless (no interactive TUI) and so
+# must never earn a card: `claude mcp …`, `claude -p/--print …` (scripted runs).
+_CLAUDE_BG_SUBCOMMANDS = {"mcp", "config", "doctor", "update", "install", "migrate-installer"}
+
+
+def _claude_exe_index(tokens: list[str]) -> int:
+    """Index of the `claude` executable token, or -1. Covers both a bare
+    `claude …` and a node launcher (`node …/bin/claude …`)."""
+    for i, t in enumerate(tokens[:2]):
+        if os.path.basename(t) == "claude":
+            return i
+    return -1
+
+
+def _parse_claude_proc(args: str) -> Optional[dict]:
+    """Classify a process command line. Returns {session_id} for an interactive
+    Claude TUI process (resume id parsed when present), or None otherwise."""
+    toks = args.split()
+    i = _claude_exe_index(toks)
+    if i < 0:
+        return None
+    rest = toks[i + 1:]
+    session_id = ""
+    j = 0
+    while j < len(rest):
+        t = rest[j]
+        if t in ("-p", "--print"):
+            return None  # headless scripted run, not a TUI
+        if t in ("--resume", "-r", "--continue", "-c"):
+            if j + 1 < len(rest) and not rest[j + 1].startswith("-"):
+                session_id = rest[j + 1]
+                j += 2
+                continue
+        elif not t.startswith("-"):
+            if t in _CLAUDE_BG_SUBCOMMANDS:
+                return None  # `claude mcp`, `claude config`, … → headless
+        j += 1
+    return {"session_id": session_id}
+
+
+def list_claude_proc_windows(known_pids: set[int], known_ttys: set[str]) -> list[Window]:
+    """Discover running interactive `claude` processes that have NOT yet written
+    a `~/.claude/sessions/<pid>.json` file — a freshly spawned session, or a
+    `claude --resume <id>` parked on Claude's "resume from summary?" picker, both
+    of which register no session file until the session actually starts. Without
+    this they'd be invisible on the dashboard. Keyed by the live pid; dedup'd
+    against the file-based windows by pid and tty so a session that has written
+    its file is never double-carded. Linux-only (reads /proc); [] elsewhere.
+    """
+    if not Path("/proc").is_dir():
+        return []
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid=,tty=,args="],
+            stderr=subprocess.DEVNULL, timeout=5,
+        ).decode("utf-8", "replace")
+    except Exception:
+        return []
+
+    windows: list[Window] = []
+    seen_ttys: set[str] = set(known_ttys)
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        tty_raw, args = parts[1], parts[2]
+        if tty_raw in ("?", "??") or not tty_raw:
+            continue  # no controlling terminal → background/daemon, not a window
+        if pid in known_pids:
+            continue  # already carded from its session file
+        parsed = _parse_claude_proc(args)
+        if parsed is None:
+            continue
+        tty = f"/dev/{tty_raw}"
+        if tty in seen_ttys:
+            continue  # one card per terminal; file-based window or earlier proc wins
+        if not _pid_alive(pid):
+            continue
+
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except Exception:
+            cwd = ""
+        if not _cwd_visible(cwd):
+            continue
+        seen_ttys.add(tty)
+
+        session_id = parsed["session_id"]
+        slug = _cwd_to_project_slug(cwd)
+        transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl" if session_id else None
+        try:
+            start = int(os.stat(f"/proc/{pid}").st_mtime * 1000)
+        except Exception:
+            start = int(time.time() * 1000)
+        # Prefer the (resumed) transcript's mtime as the activity time when it
+        # already exists; otherwise fall back to the process start time.
+        updated = start
+        if transcript and transcript.exists():
+            try:
+                updated = int(transcript.stat().st_mtime * 1000)
+            except Exception:
+                pass
+
+        windows.append(Window(
+            pid=pid,
+            session_id=session_id or f"claude-{pid}",
+            cwd=cwd,
+            project_name=os.path.basename(cwd) or (cwd or f"claude-{pid}"),
+            project_slug=slug,
+            name=None,
+            # Seed as a verifiable "dialog open": _enriched_snapshot checks the
+            # pane and keeps it waiting when a menu is really up (e.g. the resume
+            # "summary vs full" picker — genuinely waiting on the user), or flips
+            # it to busy when the pane shows no menu (a session already running).
+            status="waiting",
+            waiting_for="dialog open",
+            started_at=start,
+            updated_at=updated,
+            version="",
+            tty=tty,
+            transcript_path=str(transcript) if transcript and transcript.exists() else None,
+            alive=True,
+            hidden=_is_hidden_cwd(cwd),
+            platform="claude",
+        ))
+    return windows
+
+
 def find_window(pid: int) -> Optional[Window]:
     for w in list_windows(include_dead=True):
+        if w.pid == pid:
+            return w
+    # Freshly spawned / resume-picker Claude sessions aren't backed by a
+    # ~/.claude/sessions file yet — resolve them from the live process so the
+    # card's actions (timeline, menu, prompt, keys, close) work, not just the
+    # card's display. Empty known-sets ⇒ no dedup; we already missed above.
+    for w in list_claude_proc_windows(set(), set()):
         if w.pid == pid:
             return w
     # Live Codex sessions aren't backed by ~/.claude/sessions files; they're
@@ -324,6 +463,10 @@ def find_window_by_session(session_id: str) -> Optional[Window]:
 
     def _candidates():
         yield from list_windows(include_dead=True)
+        # Process-discovered Claude sessions (no session file yet) — e.g. a
+        # `claude --resume <id>` parked on the summary picker, whose id we want
+        # resume/fork/locate to resolve. See find_window.
+        yield from list_claude_proc_windows(set(), set())
         # Live Codex sessions come from process discovery (see find_window).
         try:
             from . import codex
@@ -346,6 +489,11 @@ def find_window_by_session(session_id: str) -> Optional[Window]:
 def snapshot() -> dict:
     """Top-level state for the dashboard."""
     wins = list_windows()
+    # Surface live `claude` processes that haven't registered a session file yet
+    # (fresh spawns / resume parked on the summary picker) so they still card.
+    known_pids = {w.pid for w in wins}
+    known_ttys = {w.tty for w in wins if w.tty}
+    wins.extend(list_claude_proc_windows(known_pids, known_ttys))
     # Counts cover only real user windows; `.slock` agent sub-sessions are
     # rendered separately at the bottom of the dashboard and excluded here.
     visible = [w for w in wins if not w.hidden]
