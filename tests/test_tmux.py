@@ -71,7 +71,9 @@ class AvailableTests(unittest.TestCase):
                 self.assertTrue(tmux.available())
             m.assert_not_called()
 
-    def test_available_true_when_list_sessions_exits_zero(self):
+    def test_available_true_when_start_server_exits_zero(self):
+        # start-server succeeds even with zero sessions, so the spawn UI stays
+        # available for creating the first session.
         with mock.patch.dict("os.environ", {}, clear=True):
             with _patch_run(returncode=0):
                 self.assertTrue(tmux.available())
@@ -176,17 +178,30 @@ class NewWindowTests(unittest.TestCase):
         self.assertIn("alpha", new_win_argv)
         self.assertTrue(r["ok"])
 
-    def test_no_target_resolvable_returns_error_without_new_window(self):
+    def test_cold_start_creates_session_instead_of_new_window(self):
+        # Zero sessions: must bootstrap a host session running cmd directly,
+        # not dead-end. new-window has nothing to attach to.
+        calls = []
+
         def fake_run(argv, **kw):
+            calls.append(argv)
             if "list-sessions" in argv:
                 return FakeProc(returncode=1, stdout="", stderr="no server")
-            raise AssertionError("new-window must not be attempted")
+            return FakeProc(returncode=0, stdout="%1\n")
 
         with mock.patch.dict("os.environ", {}, clear=True):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/tmp")
-        self.assertFalse(r["ok"])
-        self.assertTrue(r["error"])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["pane_id"], "%1")
+        self.assertFalse(any("new-window" in a for a in calls))
+        new_sess_argv = [a for a in calls if "new-session" in a][0]
+        self.assertEqual(
+            new_sess_argv,
+            ["tmux", "new-session", "-d", "-s", "fleet",
+             "-P", "-F", "#{pane_id}", "-c", "/tmp",
+             "claude", "--dangerously-skip-permissions"],
+        )
 
     def test_new_window_nonzero_exit_returns_error(self):
         def fake_run(argv, **kw):
@@ -200,17 +215,24 @@ class NewWindowTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("create window", r["error"])
 
-    def test_env_target_missing_from_sessions_errors_clearly(self):
+    def test_env_target_missing_from_sessions_is_created_on_demand(self):
+        # A pinned FLEET_TMUX_SESSION that doesn't exist yet is created (named),
+        # not treated as an error — the env var names the host session to use.
+        calls = []
+
         def fake_run(argv, **kw):
+            calls.append(argv)
             if "list-sessions" in argv:
                 return FakeProc(returncode=0, stdout="alpha\nbeta\n")
-            raise AssertionError("new-window must not be attempted for a missing target")
+            return FakeProc(returncode=0, stdout="%7\n")
 
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "ghost"}, clear=True):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/tmp")
-        self.assertFalse(r["ok"])
-        self.assertIn("ghost", r["error"])
+        self.assertTrue(r["ok"])
+        new_sess_argv = [a for a in calls if "new-session" in a][0]
+        self.assertIn("ghost", new_sess_argv)
+        self.assertFalse(any("new-window" in a for a in calls))
 
 
 class SendTextTests(unittest.TestCase):
