@@ -91,6 +91,40 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
                     ts, kind, "", mem_name, "assistant",
                     {"operation": tool_name.lower(), "path": file_path},
                 ))
+            elif tool_name == "AskUserQuestion":
+                # `questions` is a list, so the generic branch below would collapse
+                # it to `<list>` and drop every option. Expand it into a structured
+                # payload (+ readable text fallback) so the transcript shows the
+                # full question and each option's label/description.
+                q_payload: list[dict] = []
+                text_lines: list[str] = []
+                raw_qs = inp.get("questions") if isinstance(inp, dict) else None
+                for q in (raw_qs or []):
+                    if not isinstance(q, dict):
+                        continue
+                    opts = []
+                    for o in (q.get("options") or []):
+                        if isinstance(o, dict):
+                            opts.append({
+                                "label": str(o.get("label", ""))[:200],
+                                "desc": str(o.get("description", ""))[:400],
+                            })
+                    qtext = str(q.get("question", ""))[:1000]
+                    q_payload.append({
+                        "q": qtext,
+                        "header": str(q.get("header", ""))[:60],
+                        "multi": bool(q.get("multiSelect", False)),
+                        "options": opts,
+                    })
+                    text_lines.append(qtext)
+                    for o in opts:
+                        text_lines.append(
+                            f"  • {o['label']}" + (f" — {o['desc']}" if o["desc"] else "")
+                        )
+                out.append(TurnEvent(
+                    ts, "ask_question", "\n".join(text_lines)[:4000], tool_name,
+                    "assistant", {"questions": q_payload},
+                ))
             else:
                 preview: dict = {}
                 for k, v in (inp.items() if isinstance(inp, dict) else []):
@@ -123,14 +157,17 @@ def _flatten_user(msg: dict) -> list[TurnEvent]:
         if ct == "text":
             out.append(TurnEvent(ts, "user_text", _clean_command_text(c.get("text") or "")[:4000], None, "user", {}))
         elif ct == "tool_result":
-            # Sensitive: don't dump full stdout. Just first 200 chars.
             content_val = c.get("content")
             if isinstance(content_val, list):
                 text_parts = [x.get("text", "") for x in content_val if isinstance(x, dict)]
-                snippet = " ".join(text_parts)[:200]
+                full = " ".join(text_parts)
             else:
-                snippet = str(content_val)[:200]
-            out.append(TurnEvent(ts, "tool_result", snippet, None, "user", {}))
+                full = str(content_val)
+            # Sensitive: don't dump full stdout. Cap at 200 chars — except the
+            # AskUserQuestion answer echo, which is just the user's own selection
+            # (question + chosen option), not tool output, and is worth seeing whole.
+            limit = 4000 if full.startswith("Your questions have been answered") else 200
+            out.append(TurnEvent(ts, "tool_result", full[:limit], None, "user", {}))
     return out
 
 

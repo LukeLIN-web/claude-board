@@ -595,6 +595,7 @@
                'border-blue-400': ev.kind==='user_text',
                'border-emerald-400': ev.kind==='assistant_text',
                'border-amber-400': ev.kind==='tool_use',
+               'border-amber-500': ev.kind==='ask_question',
                'border-purple-500': ev.kind==='skill_invoke',
                'border-sky-400 border-dashed': ev.kind==='memory_read',
                'border-pink-500': ev.kind==='memory_write',
@@ -611,7 +612,10 @@
             <template x-if="ev.kind==='memory_write'">
               <span class="text-pink-600 font-medium">mem↑ <span x-text="ev.tool"></span></span>
             </template>
-            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write'">
+            <template x-if="ev.kind==='ask_question'">
+              <span class="text-amber-700 font-medium">❓ <span x-text="ev.tool"></span></span>
+            </template>
+            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write' && ev.kind!=='ask_question'">
               <span :class="{'text-blue-600': ev.kind==='user_text', 'text-emerald-600': ev.kind==='assistant_text', 'text-amber-600': ev.kind==='tool_use', 'text-gray-500': true}"
                     class="font-medium"
                     x-text="ev.kind==='tool_use' ? ev.tool : ev.kind.replace('_text','').replace('tool_result','result')"></span>
@@ -638,7 +642,24 @@
             <pre class="text-gray-700 whitespace-pre-wrap break-words"
                  :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
           </template>
-          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text'">
+          <!-- AskUserQuestion: full question text + every option, no truncation -->
+          <template x-if="ev.kind === 'ask_question'">
+            <div class="text-xs space-y-1.5">
+              <template x-for="(q, qi) in (ev.extra?.questions || [])" :key="qi">
+                <div class="border-l-2 border-amber-200 pl-2">
+                  <div class="font-medium text-amber-800 whitespace-pre-wrap break-words" x-text="q.q"></div>
+                  <template x-for="(o, oi) in (q.options || [])" :key="oi">
+                    <div class="ml-2 text-gray-600">
+                      <span class="text-amber-600">•</span>
+                      <span class="font-medium" x-text="o.label"></span>
+                      <span x-show="o.desc" class="text-gray-400" x-text="o.desc ? ' — ' + o.desc : ''"></span>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'ask_question'">
             <pre class="text-xs text-gray-700 max-h-32 overflow-y-auto" x-text="ev.text?.slice(0,2000) || ''"></pre>
           </template>
         </div>
