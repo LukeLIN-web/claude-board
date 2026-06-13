@@ -155,5 +155,56 @@ class DiscoverProcTranscriptTests(unittest.TestCase):
         self.assertIsNone(path)
 
 
+@unittest.skipUnless(os.path.isdir("/proc"), "process-first detection is Linux-only")
+class ResumeForkTests(unittest.TestCase):
+    """`--resume <oldid>` forks a new id in recent Claude; the card must follow
+    the forked (live) transcript, not the frozen resume-arg file."""
+
+    def setUp(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        self._tmp = tempfile.TemporaryDirectory()
+        self.projects = Path(self._tmp.name)
+        self.cwd = "/work/qwen3-Omni"
+        self.slug = "-work-qwen3-Omni"
+        (self.projects / self.slug).mkdir()
+        self.addCleanup(self._tmp.cleanup)
+        p = mock.patch("core.sessions.PROJECTS_DIR", self.projects)
+        p.start()
+        self.addCleanup(p.stop)
+        self.now = time.time()
+
+    def _touch(self, sid, mtime):
+        f = self.projects / self.slug / f"{sid}.jsonl"
+        f.write_text('{"type":"summary","sessionId":"%s"}\n' % sid)
+        os.utime(f, (mtime, mtime))
+
+    def _run(self, ps):
+        with mock.patch("core.sessions.subprocess.check_output", return_value=ps.encode()), \
+             mock.patch("core.sessions._pid_alive", return_value=True), \
+             mock.patch("core.sessions._cwd_visible", return_value=True), \
+             mock.patch("core.sessions.os.readlink", return_value=self.cwd):
+            return sessions.list_claude_proc_windows(set(), set())
+
+    def test_adopts_forked_transcript_over_frozen_resume_arg(self):
+        self._touch("oldid", mtime=self.now - 3600)   # frozen at pre-resume point
+        self._touch("newforkid", mtime=self.now)      # live forked continuation
+        pid = os.getpid()
+        w = next(w for w in self._run(f"{pid} pts/3 claude --resume oldid\n")
+                 if w.pid == pid)
+        self.assertEqual(w.session_id, "newforkid")
+        self.assertTrue(w.transcript_path.endswith("newforkid.jsonl"))
+
+    def test_keeps_resume_arg_when_no_newer_sibling(self):
+        # Older-Claude behavior: the session appends to the resume-arg file, so
+        # there's no newer sibling and the card keeps the resume-arg id.
+        self._touch("oldid", mtime=self.now)
+        pid = os.getpid()
+        w = next(w for w in self._run(f"{pid} pts/3 claude --resume oldid\n")
+                 if w.pid == pid)
+        self.assertEqual(w.session_id, "oldid")
+
+
 if __name__ == "__main__":
     unittest.main()

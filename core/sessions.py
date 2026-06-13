@@ -448,6 +448,23 @@ def list_claude_proc_windows(
 
         if session_id:
             transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
+            # Recent Claude FORKS a new session id on `--resume <id>`: the
+            # resume-arg file then freezes at the pre-resume point while the live
+            # conversation lands in the new id, so the card would track a stale
+            # file forever. If a sibling transcript was written after this process
+            # started AND is newer than the resume-arg file, adopt it as the fork.
+            # (The resume-arg id is pre-claimed above, so discovery returns the
+            # fork, not the frozen original; None when the session simply appends
+            # to the resume-arg file, the older-Claude behavior.)
+            disc_sid, disc_path = _discover_proc_transcript(slug, start, claimed_sids)
+            if disc_sid:
+                try:
+                    forked = (not transcript.exists()) or (
+                        Path(disc_path).stat().st_mtime > transcript.stat().st_mtime)
+                except OSError:
+                    forked = True
+                if forked:
+                    session_id, transcript = disc_sid, Path(disc_path)
         else:
             # Fresh spawn (no --resume id, no session file): recover the
             # transcript it's writing so the card and prompt-queue reconciliation
