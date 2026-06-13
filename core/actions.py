@@ -414,6 +414,16 @@ def _is_tabbar(line: str) -> bool:
     return "Submit" in line and "✔" in line and ("←" in line or "→" in line)
 
 
+def _is_menu_hint(line: str) -> bool:
+    """Footer / instruction chrome that must not bleed into an option's detail
+    text when collecting the wrapped lines under a numbered option."""
+    return any(s in line for s in (
+        "to select", "Esc to cancel", "Enter to confirm", "Tab to amend",
+        "ctrl+e to explain", "Do you want to proceed", "Ready to submit",
+        "Enter to set", "to use this session", "↑/↓",
+    ))
+
+
 # Top-left / bottom-left corners of a box-drawn panel (square or rounded).
 _BOX_TL = ("┌", "╭")
 _BOX_BL = ("└", "╰")
@@ -538,25 +548,46 @@ def parse_pane_menu(text: str) -> Optional[dict]:
             break
     first_opt_line = run[0][0]
 
-    # multiSelect options carry a [ ]/[✔] checkbox; split it off the label so the
-    # dashboard renders the checked state instead of a literal "[✔] Foo".
-    options: list[dict] = []
-    multi = False
-    for (_, n, label) in run:
-        cb = _CHECKBOX_RE.match(label)
-        if cb:
-            multi = True
-            options.append({"num": n, "label": cb.group(2).strip(),
-                            "checked": bool(cb.group(1).strip())})
-        else:
-            options.append({"num": n, "label": label})
-
     def _meaningful(s):
         core = s.replace(" ", "")
         if not core:
             return False
         # skip pure divider / box-drawing lines
         return not all(c in "-=." or 0x2014 <= ord(c) <= 0x2027 or 0x2500 <= ord(c) <= 0x257F for c in core)
+
+    # multiSelect options carry a [ ]/[✔] checkbox; split it off the label so the
+    # dashboard renders the checked state instead of a literal "[✔] Foo". Each
+    # option's wrapped continuation lines (the multi-line description Claude
+    # prints under the numbered title) become `detail`, so the dashboard shows
+    # the whole option instead of just its first line.
+    run_idx = [t[0] for t in run]
+
+    def _detail_for(k: int) -> str:
+        d_hi = run_idx[k + 1] if k + 1 < len(run_idx) else hi
+        parts = []
+        for i in range(run_idx[k] + 1, d_hi):
+            ln = lines[i]
+            if _MENU_OPT_RE.match(ln) or _is_tabbar(ln) or _is_menu_hint(ln):
+                continue
+            t = ln.replace("\xa0", " ").strip()
+            if _meaningful(t):
+                parts.append(t)
+        return " ".join(parts).strip()
+
+    options: list[dict] = []
+    multi = False
+    for k, (_, n, label) in enumerate(run):
+        cb = _CHECKBOX_RE.match(label)
+        if cb:
+            multi = True
+            opt = {"num": n, "label": cb.group(2).strip(),
+                   "checked": bool(cb.group(1).strip())}
+        else:
+            opt = {"num": n, "label": label}
+        detail = _detail_for(k)
+        if detail:
+            opt["detail"] = detail
+        options.append(opt)
 
     if mode == "permission":
         prompt = lines[proceed_idx].replace("\xa0", " ").strip()

@@ -454,6 +454,7 @@
             <span x-show="opt.checked !== undefined" class="mr-1" x-text="opt.checked ? '☑' : '☐'"></span>
             <span class="font-medium" :class="timelineData?.menu?.kind === 'permission' ? 'text-red-800' : 'text-amber-800'"
                   x-text="opt.num + '. ' + opt.label"></span>
+            <span x-show="opt.detail" class="block text-xs text-gray-500 mt-0.5 whitespace-pre-wrap" x-text="opt.detail"></span>
           </button>
         </template>
       </div>
