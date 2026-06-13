@@ -97,7 +97,14 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     via AppleScript on macOS. Returns a structured dict and never raises. If
     neither backend is available, returns a clear actionable error rather than
     the opaque `[Errno 2] No such file or directory: 'osascript'`.
+
+    Resume/fork (the callers below) always launch with
+    `--dangerously-skip-permissions`, matching fresh spawns (create_session ->
+    tmux.new_window's default). The fleet drives these sessions unattended, so
+    a per-action approval prompt would otherwise wedge a resumed /goal loop.
     """
+    if "--dangerously-skip-permissions" not in claude_args:
+        claude_args = ["--dangerously-skip-permissions", *claude_args]
     if tmux.available():
         r = tmux.new_window(cwd, ["claude", *claude_args])
         if r["ok"]:
