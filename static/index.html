@@ -262,7 +262,7 @@
             <span class="px-1 rounded text-white text-[10px]"
                   :class="hit.platform==='codex' ? 'bg-green-500' : hit.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
                   x-text="hit.platform"></span>
-            <span x-text="hit.ts?.slice(0,19) || ''"></span>
+            <span x-text="fmtDateTimeET(hit.ts)" :title="hit.ts || ''"></span>
             <span class="bg-gray-100 rounded px-1" x-text="hit.project_slug?.slice(0,30)"></span>
           </div>
           <p class="mt-0.5 text-gray-700" x-text="hit.excerpt"></p>
@@ -530,7 +530,7 @@
                  @click="ph._expanded = !ph._expanded">
               <div class="flex items-center gap-2">
                 <span class="font-mono text-purple-700 text-xs font-bold" x-text="ph.version_label"></span>
-                <span class="text-xs text-gray-500" x-text="ph.ts?.slice(0,19) || ''"></span>
+                <span class="text-xs text-gray-500" x-text="fmtDateTimeET(ph.ts)" :title="ph.ts || ''"></span>
                 <span class="text-[10px] px-1.5 rounded"
                       :class="ph.operation==='write' ? 'bg-purple-200 text-purple-800' : 'bg-amber-100 text-amber-700'"
                       x-text="ph.operation"></span>
@@ -602,7 +602,7 @@
                'border-gray-300': ev.kind==='tool_result'||ev.kind==='system'
              }">
           <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
-            <span x-text="ev.ts?.slice(11,19) || ''"></span>
+            <span x-text="fmtTimeET(ev.ts)" :title="ev.ts || ''"></span>
             <template x-if="ev.kind==='skill_invoke'">
               <span class="text-purple-600 font-medium">skill: <span x-text="ev.tool"></span></span>
             </template>
@@ -977,6 +977,30 @@ function fleet() {
         return isNaN(d) ? '' : d.toISOString().slice(0, 10);
       }
       return String(ts).slice(0, 10);
+    },
+
+    // Convert a UTC ISO timestamp to US Eastern time (America/New_York, DST-aware).
+    // The transcript stores ts as UTC ISO-8601; raw string-slicing would show UTC.
+    // Falls back to the original string slice if the value can't be parsed.
+    _etParts(ts, opts) {
+      if (ts == null || ts === '') return null;
+      const d = new Date(ts);
+      if (isNaN(d)) return null;
+      return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', hour12: false, ...opts }).format(d);
+    },
+    // Time only, e.g. "14:30:45 ET"
+    fmtTimeET(ts) {
+      const s = this._etParts(ts, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return s ? s + ' ET' : (ts?.slice(11, 19) || '');
+    },
+    // Date + time, e.g. "2026-06-13 14:30:45 ET"
+    fmtDateTimeET(ts) {
+      const s = this._etParts(ts, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      });
+      // en-CA renders as "YYYY-MM-DD, HH:MM:SS"; drop the comma for a clean look.
+      return s ? s.replace(',', '') + ' ET' : (ts?.slice(0, 19) || '');
     },
 
     async focusWindow(pid) {
