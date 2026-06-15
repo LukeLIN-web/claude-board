@@ -46,7 +46,14 @@ def _run(*args: str) -> dict:
 
 
 def available() -> bool:
-    """True if tmux is usable. Cached briefly to avoid per-poll subprocesses."""
+    """True if tmux is usable. Cached briefly to avoid per-poll subprocesses.
+
+    Probes with `start-server` rather than `list-sessions`: the latter exits
+    non-zero when there are zero sessions, which wrongly hid the spawn UI and
+    made it impossible to create the first session from the dashboard. Starting
+    the server succeeds with zero sessions and is the actual precondition for
+    spawning, and is idempotent if a server is already running.
+    """
     if os.environ.get("TMUX"):
         return True
     now = time.monotonic()
@@ -54,7 +61,7 @@ def available() -> bool:
     ts = _available_cache.get("ts", 0.0)
     if cached is not None and (now - ts) < _AVAILABLE_TTL:
         return cached
-    value = _run("list-sessions")["ok"]
+    value = _run("start-server")["ok"]
     _available_cache["value"] = value
     _available_cache["ts"] = now
     return value
@@ -96,6 +103,17 @@ def pane_for_tty(tty: str) -> Optional[str]:
     return None
 
 
+def pane_target(pane: str) -> Optional[str]:
+    """Human-addressable target ("session:window.pane") for a pane id, or None."""
+    if not pane:
+        return None
+    r = _run("display-message", "-p", "-t", pane,
+             "#{session_name}:#{window_index}.#{pane_index}")
+    if not r["ok"]:
+        return None
+    return r["stdout"].strip() or None
+
+
 def _session_names() -> list[str]:
     r = _run("list-sessions", "-F", "#{session_name}")
     if not r["ok"]:
@@ -103,17 +121,25 @@ def _session_names() -> list[str]:
     return [ln.strip() for ln in r["stdout"].splitlines() if ln.strip()]
 
 
+_DEFAULT_SESSION = "fleet"
+
+
 def _resolve_target() -> dict:
-    """Pick the tmux session to spawn into: $FLEET_TMUX_SESSION or the first one."""
+    """Resolve the tmux session to host fleet windows.
+
+    Returns {target, exists}. `exists=False` means the chosen session name does
+    not exist yet and the caller must create it — this is the cold-start case
+    (zero sessions) or a pinned `$FLEET_TMUX_SESSION` that hasn't been made yet.
+    A `new-window` needs a host session to attach to; spawning/resuming from a
+    fleet with no live sessions must create that host rather than dead-end.
+    """
     sessions = _session_names()
     env_target = os.environ.get("FLEET_TMUX_SESSION")
     if env_target:
-        if env_target in sessions:
-            return {"ok": True, "target": env_target}
-        return {"ok": False, "error": f"FLEET_TMUX_SESSION '{env_target}' is not a current tmux session"}
+        return {"target": env_target, "exists": env_target in sessions}
     if sessions:
-        return {"ok": True, "target": sessions[0]}
-    return {"ok": False, "error": "no tmux session available to spawn into"}
+        return {"target": sessions[0], "exists": True}
+    return {"target": _DEFAULT_SESSION, "exists": False}
 
 
 def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
@@ -123,13 +149,19 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     drive new sessions non-interactively (no per-action permission prompts blocking
     the pane). Callers that need a different command — e.g. forking or resuming an
     existing session — pass `cmd` explicitly.
+
+    When no host session exists yet, `cmd` is launched as a fresh detached
+    session (running directly, with no placeholder shell) so spawn/resume/fork
+    work from a cold start instead of failing on an empty tmux server.
     """
-    target = _resolve_target()
-    if not target["ok"]:
-        return {"ok": False, "error": target["error"]}
     cmd = cmd or ["claude", "--dangerously-skip-permissions"]
-    r = _run("new-window", "-P", "-F", "#{pane_id}",
-             "-t", target["target"], "-c", cwd, *cmd)
+    target = _resolve_target()
+    if target["exists"]:
+        r = _run("new-window", "-P", "-F", "#{pane_id}",
+                 "-t", target["target"], "-c", cwd, *cmd)
+    else:
+        r = _run("new-session", "-d", "-s", target["target"],
+                 "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
     if not r["ok"]:
         return {"ok": False, "error": r["error"]}
     return {"ok": True, "pane_id": r["stdout"].strip()}
@@ -170,14 +202,32 @@ def send_keys(pane: str, *keys: str) -> dict:
 # Waiting this long before Enter lets the popup settle on the typed text.
 _SLASH_SETTLE = 0.5
 
+# Codex's TUI composer batches a fast literal-text burst with an Enter that
+# lands in the same instant and swallows the Enter — the text stays in the
+# composer unsubmitted. A short settle splits the burst from the Enter so it
+# registers as a real submit. Applies to EVERY Codex prompt (not just slash),
+# so callers pass it explicitly via send_text(settle_before_enter=...).
+_CODEX_ENTER_SETTLE = 0.4
 
-def send_text(pane: str, text: str) -> dict:
-    """Send `text` literally into `pane`, then a separate Enter to submit it."""
+
+def send_text(pane: str, text: str, settle_before_enter: float = 0.0) -> dict:
+    """Send `text` literally into `pane`, then a separate Enter to submit it.
+
+    `settle_before_enter` pauses between the pasted text and the Enter. Some TUIs
+    (Codex always; Claude when a slash-command popup is open) coalesce a rapid
+    text burst with an immediately-following Enter and drop the Enter instead of
+    submitting; the settle lets the composer catch up. The slash case is detected
+    here; platform-wide needs (e.g. Codex) are passed in by the caller. When both
+    apply, the longer wait wins.
+    """
     literal = _run("send-keys", "-t", pane, "-l", "--", text)
     if not literal["ok"]:
         return {"ok": False, "error": literal["error"]}
+    delay = settle_before_enter
     if text.lstrip().startswith("/"):
-        time.sleep(_SLASH_SETTLE)
+        delay = max(delay, _SLASH_SETTLE)
+    if delay > 0:
+        time.sleep(delay)
     enter = _run("send-keys", "-t", pane, "Enter")
     if not enter["ok"]:
         return {"ok": False, "error": enter["error"]}

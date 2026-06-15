@@ -39,6 +39,23 @@ _cache: list[HistorySession] = []
 _cache_ts: float = 0
 _CACHE_TTL = 30
 
+# Per-transcript enrichment (skills/memory/model/first-input) costs ~4-5 full
+# reads of each .jsonl. With ~1k sessions that made a cold index build take
+# 15s+, and it ran on every cache miss. We now only enrich the most-recent
+# sessions (the History panel shows recent sessions; older ones still appear as
+# cheap skeletons) and memoize each result by (sid, mtime) so the periodic
+# rebuild never re-parses an unchanged transcript.
+_ENRICH_LIMIT = 200
+_enrich_cache: dict[tuple, dict] = {}
+
+
+def _clear_caches() -> None:
+    """Reset memoized index + enrichment state (tests / explicit refresh)."""
+    global _cache, _cache_ts
+    _cache = []
+    _cache_ts = 0
+    _enrich_cache.clear()
+
 
 def _load_history_jsonl() -> dict[str, dict]:
     out: dict[str, dict] = {}
@@ -156,6 +173,9 @@ def _build_index() -> list[HistorySession]:
     all_sids = set(hist.keys()) | set(transcripts.keys())
     sessions: list[HistorySession] = []
 
+    # Phase 1 — cheap skeletons (no per-transcript parsing). first_input comes
+    # from history.jsonl here; the transcript-read fallback is deferred to the
+    # enrichment phase so we never read 1k transcripts just to list them.
     for sid in all_sids:
         h = hist.get(sid, {})
         t = transcripts.get(sid, {})
@@ -165,48 +185,24 @@ def _build_index() -> list[HistorySession]:
             t.get("project_slug", "").replace("-", "/").split("/")[-1] or "unknown"
         )
 
-        first_input = h.get("first_input", "")
-        if not first_input and t.get("path"):
-            first_input = _extract_first_user_text(Path(t["path"]))
-
-        skills = []
-        mem_ops = []
-        model = ""
-        skill_breakdown = {}
-        memory_breakdown = {}
-        tp = t.get("path")
-        if tp:
-            skills = _extract_skills_from_transcript(Path(tp))
-            from .transcripts import extract_memory_ops, count_skill_activity, count_memory_activity
-            mem_ops = extract_memory_ops(tp)
-            model = _extract_model(Path(tp))
-            sa = count_skill_activity(tp)
-            skill_breakdown = {
-                "per_skill_invokes": sa.get("per_skill_invokes", {}),
-                "per_skill_reads": sa.get("per_skill_reads", {}),
-                "per_skill_writes": sa.get("per_skill_writes", {}),
-                "per_skill_bash_refs": sa.get("per_skill_bash_refs", {}),
-            }
-            memory_breakdown = count_memory_activity(tp)
-
         sessions.append(HistorySession(
             session_id=sid,
             project=project,
             project_name=project_name,
-            first_input=first_input,
+            first_input=h.get("first_input", ""),
             input_count=h.get("count", 0),
             first_ts=h.get("first_ts", ""),
             last_ts=h.get("last_ts", ""),
-            transcript_path=tp,
+            transcript_path=t.get("path"),
             transcript_size=t.get("size", 0),
             transcript_mtime=t.get("mtime", 0),
             is_alive=sid in alive,
             platform="claude",
-            model=model,
-            skills_used=skills,
-            memory_ops=mem_ops,
-            skill_breakdown=skill_breakdown,
-            memory_breakdown=memory_breakdown,
+            model="",
+            skills_used=[],
+            memory_ops=[],
+            skill_breakdown={},
+            memory_breakdown={},
         ))
 
     # Merge Codex sessions
@@ -227,7 +223,48 @@ def _build_index() -> list[HistorySession]:
         pass
 
     sessions.sort(key=lambda s: s.transcript_mtime or 0, reverse=True)
+
+    # Phase 2 — enrich only the most-recent claude sessions (bounded + memoized).
+    for s in sessions[:_ENRICH_LIMIT]:
+        if s.platform == "claude" and s.transcript_path:
+            _apply_enrichment(s)
     return sessions
+
+
+def _compute_enrichment(sid: str, tp: str) -> dict:
+    """The expensive per-transcript reads, isolated for memoization."""
+    from .transcripts import extract_memory_ops, count_skill_activity, count_memory_activity
+    sa = count_skill_activity(tp)
+    return {
+        "first_input": _extract_first_user_text(Path(tp)),
+        "skills": _extract_skills_from_transcript(Path(tp)),
+        "mem_ops": extract_memory_ops(tp),
+        "model": _extract_model(Path(tp)),
+        "skill_breakdown": {
+            "per_skill_invokes": sa.get("per_skill_invokes", {}),
+            "per_skill_reads": sa.get("per_skill_reads", {}),
+            "per_skill_writes": sa.get("per_skill_writes", {}),
+            "per_skill_bash_refs": sa.get("per_skill_bash_refs", {}),
+        },
+        "memory_breakdown": count_memory_activity(tp),
+    }
+
+
+def _apply_enrichment(s: HistorySession) -> None:
+    """Fill skills/memory/model/first-input on `s`, memoized by (sid, mtime)."""
+    key = (s.session_id, s.transcript_mtime)
+    enr = _enrich_cache.get(key)
+    if enr is None:
+        enr = _compute_enrichment(s.session_id, s.transcript_path)
+        if len(_enrich_cache) > 2000:  # keep unbounded growth in check
+            _enrich_cache.clear()
+        _enrich_cache[key] = enr
+    s.first_input = s.first_input or enr["first_input"]
+    s.model = enr["model"]
+    s.skills_used = enr["skills"]
+    s.memory_ops = enr["mem_ops"]
+    s.skill_breakdown = enr["skill_breakdown"]
+    s.memory_breakdown = enr["memory_breakdown"]
 
 
 def _extract_first_user_text(path: Path) -> str:

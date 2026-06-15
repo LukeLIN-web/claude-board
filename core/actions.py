@@ -97,7 +97,14 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     via AppleScript on macOS. Returns a structured dict and never raises. If
     neither backend is available, returns a clear actionable error rather than
     the opaque `[Errno 2] No such file or directory: 'osascript'`.
+
+    Resume/fork (the callers below) always launch with
+    `--dangerously-skip-permissions`, matching fresh spawns (create_session ->
+    tmux.new_window's default). The fleet drives these sessions unattended, so
+    a per-action approval prompt would otherwise wedge a resumed /goal loop.
     """
+    if "--dangerously-skip-permissions" not in claude_args:
+        claude_args = ["--dangerously-skip-permissions", *claude_args]
     if tmux.available():
         r = tmux.new_window(cwd, ["claude", *claude_args])
         if r["ok"]:
@@ -131,13 +138,54 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     }
 
 
+def open_codex_window(cwd: str, codex_args: list[str]) -> dict:
+    """Open `codex <codex_args>` in a new window, cwd-anchored (tmux/iTerm2).
+
+    Mirrors open_claude_window but launches the Codex CLI; used to fork/resume a
+    Codex session into a fresh window.
+    """
+    if tmux.available():
+        r = tmux.new_window(cwd, ["codex", *codex_args])
+        if r["ok"]:
+            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
+        return {"ok": False, "error": r["error"], "backend": "tmux"}
+
+    if not shutil.which("osascript"):
+        return {
+            "ok": False,
+            "error": "no terminal backend: start a tmux server (Linux) "
+                     "or run on macOS with iTerm2 (osascript not found)",
+        }
+
+    args_str = " ".join(shlex.quote(a) for a in codex_args)
+    inner = f"cd {shlex.quote(cwd)} && codex {args_str}"
+    quoted_for_applescript = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    script = _FORK_APPLESCRIPT_ITERM.format(cmd=quoted_for_applescript)
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": proc.returncode == 0, "cwd": cwd, "backend": "iterm",
+            "stdout": proc.stdout, "stderr": proc.stderr}
+
+
 def fork_session(pid: int) -> dict:
-    """Open a new window and fork the session (new ID, inherits history)."""
+    """Open a new window and fork the session (new ID, inherits history).
+
+    Codex has no `--fork-session`; the closest is resuming the rollout into a
+    fresh window, so codex sessions branch to `codex resume <session_id>`.
+    """
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
 
-    r = open_claude_window(w.cwd, ["--resume", w.session_id, "--fork-session"])
+    if getattr(w, "platform", "claude") == "codex":
+        r = open_codex_window(w.cwd, ["resume", w.session_id])
+    else:
+        r = open_claude_window(w.cwd, ["--resume", w.session_id, "--fork-session"])
     r.setdefault("session_id", w.session_id)
     return r
 
@@ -293,13 +341,20 @@ def close_session(pid: int) -> dict:
     return {"ok": True, "pid": pid, "message": f"SIGTERM sent to {pid}"}
 
 
-def create_session(cwd: str) -> dict:
-    """Spawn a new tmux window running `claude` in `cwd` (validated server-side)."""
+def create_session(cwd: str, platform: str = "claude") -> dict:
+    """Spawn a new tmux window in `cwd` (validated server-side).
+
+    `platform` selects the CLI: "claude" (default) launches Claude Code with
+    permission prompts skipped; "codex" launches the Codex TUI in `--yolo` mode
+    so the fleet can drive it without per-action approval prompts.
+    """
     if not cwd or not cwd.strip():
         return {"ok": False, "error": "cwd is required"}
     resolved = os.path.expanduser(cwd.strip())
     if not os.path.isdir(resolved):
         return {"ok": False, "error": f"not a directory: {resolved}"}
+    if platform == "codex":
+        return tmux.new_window(resolved, ["codex", "--yolo"])
     return tmux.new_window(resolved)
 
 
@@ -357,6 +412,16 @@ def _is_tabbar(line: str) -> bool:
     'Ready to submit your answers?' has no arrow or ✔, so it is never stripped.
     """
     return "Submit" in line and "✔" in line and ("←" in line or "→" in line)
+
+
+def _is_menu_hint(line: str) -> bool:
+    """Footer / instruction chrome that must not bleed into an option's detail
+    text when collecting the wrapped lines under a numbered option."""
+    return any(s in line for s in (
+        "to select", "Esc to cancel", "Enter to confirm", "Tab to amend",
+        "ctrl+e to explain", "Do you want to proceed", "Ready to submit",
+        "Enter to set", "to use this session", "↑/↓",
+    ))
 
 
 # Top-left / bottom-left corners of a box-drawn panel (square or rounded).
@@ -424,6 +489,10 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     for i, ln in enumerate(lines):
         if "Ready to submit your answers" in ln:
             review_idx = i
+    confirm_idx = None
+    for i, ln in enumerate(lines):
+        if "Enter to confirm" in ln:  # startup "resume from summary?" picker
+            confirm_idx = i
 
     if footer_idx is not None:
         mode = "question"
@@ -431,6 +500,8 @@ def parse_pane_menu(text: str) -> Optional[dict]:
         mode = "permission"
     elif review_idx is not None:
         mode = "review"
+    elif confirm_idx is not None:
+        mode = "confirm"
     else:
         return None
 
@@ -446,6 +517,12 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     elif mode == "permission":
         header_idx = proceed_idx
         lo, hi = proceed_idx + 1, len(lines)
+    elif mode == "confirm":  # startup picker; options sit above the footer
+        # Anchor the prompt to the divider rule just above the options so the
+        # transcript text scrolled in above it isn't swept into the prompt.
+        header_idx = next((i for i in range(confirm_idx - 1, -1, -1)
+                           if _HRULE_RE.match(lines[i])), None)
+        lo, hi = (header_idx + 1 if header_idx is not None else 0), confirm_idx
     else:  # review — multiSelect confirmation ("1. Submit answers / 2. Cancel")
         header_idx = next((i for i in range(review_idx + 1)
                            if "Review your answers" in lines[i]), review_idx)
@@ -471,25 +548,46 @@ def parse_pane_menu(text: str) -> Optional[dict]:
             break
     first_opt_line = run[0][0]
 
-    # multiSelect options carry a [ ]/[✔] checkbox; split it off the label so the
-    # dashboard renders the checked state instead of a literal "[✔] Foo".
-    options: list[dict] = []
-    multi = False
-    for (_, n, label) in run:
-        cb = _CHECKBOX_RE.match(label)
-        if cb:
-            multi = True
-            options.append({"num": n, "label": cb.group(2).strip(),
-                            "checked": bool(cb.group(1).strip())})
-        else:
-            options.append({"num": n, "label": label})
-
     def _meaningful(s):
         core = s.replace(" ", "")
         if not core:
             return False
         # skip pure divider / box-drawing lines
         return not all(c in "-=." or 0x2014 <= ord(c) <= 0x2027 or 0x2500 <= ord(c) <= 0x257F for c in core)
+
+    # multiSelect options carry a [ ]/[✔] checkbox; split it off the label so the
+    # dashboard renders the checked state instead of a literal "[✔] Foo". Each
+    # option's wrapped continuation lines (the multi-line description Claude
+    # prints under the numbered title) become `detail`, so the dashboard shows
+    # the whole option instead of just its first line.
+    run_idx = [t[0] for t in run]
+
+    def _detail_for(k: int) -> str:
+        d_hi = run_idx[k + 1] if k + 1 < len(run_idx) else hi
+        parts = []
+        for i in range(run_idx[k] + 1, d_hi):
+            ln = lines[i]
+            if _MENU_OPT_RE.match(ln) or _is_tabbar(ln) or _is_menu_hint(ln):
+                continue
+            t = ln.replace("\xa0", " ").strip()
+            if _meaningful(t):
+                parts.append(t)
+        return " ".join(parts).strip()
+
+    options: list[dict] = []
+    multi = False
+    for k, (_, n, label) in enumerate(run):
+        cb = _CHECKBOX_RE.match(label)
+        if cb:
+            multi = True
+            opt = {"num": n, "label": cb.group(2).strip(),
+                   "checked": bool(cb.group(1).strip())}
+        else:
+            opt = {"num": n, "label": label}
+        detail = _detail_for(k)
+        if detail:
+            opt["detail"] = detail
+        options.append(opt)
 
     if mode == "permission":
         prompt = lines[proceed_idx].replace("\xa0", " ").strip()
@@ -514,6 +612,40 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     }
 
 
+def _menu_markers_present(text: str) -> bool:
+    """Whether a captured viewport shows a live answerable menu."""
+    return (
+        ("to select" in text and "navigate" in text)
+        or ("Do you want to proceed" in text)
+        or ("Ready to submit your answers" in text)  # multiSelect review screen (no footer)
+        # Startup "resume from summary vs full" picker — a different footer than
+        # the tool-permission menus. "Enter to confirm" marks a choice awaiting
+        # an answer (informational overlays say "Esc to dismiss", not confirm).
+        or ("Enter to confirm" in text)
+    )
+
+
+def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
+    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable.
+
+    Claude's session registry reports waitingFor="dialog open" for ANY open
+    overlay — including informational ones like the /goal panel, which has no
+    options and doesn't block the agent. This is the pane-level ground truth
+    the triage uses to tell a real picker from such an overlay. The
+    three-valued return matters: None (no tty / no pane / failed capture)
+    means "can't verify", and callers should keep trusting the registry.
+    """
+    if not tty:
+        return None
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return None
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return None
+    return _menu_markers_present(cap["text"])
+
+
 def get_pane_menu(pid: int) -> Optional[dict]:
     """Return the live interactive menu in `pid`'s pane, or None.
 
@@ -531,12 +663,7 @@ def get_pane_menu(pid: int) -> Optional[dict]:
     if not visible["ok"]:
         return None
     vis = visible["text"]
-    active = (
-        ("to select" in vis and "navigate" in vis)
-        or ("Do you want to proceed" in vis)
-        or ("Ready to submit your answers" in vis)  # multiSelect review screen (no footer)
-    )
-    if not active:
+    if not _menu_markers_present(vis):
         return None
     full = tmux.capture_pane(pane, scrollback=80)
     return parse_pane_menu(full["text"] if full["ok"] else vis)
@@ -638,4 +765,8 @@ def send_prompt(pid: int, text: str) -> dict:
         return {"ok": False, "error": "prompt is empty"}
     if len(collapsed) > _MAX_PROMPT_CHARS:
         return {"ok": False, "error": f"prompt too long (max {_MAX_PROMPT_CHARS} chars)"}
-    return tmux.send_text(pane, collapsed)
+    # Codex's TUI swallows an Enter that arrives glued to the pasted text; give it
+    # a settle delay so the prompt actually submits instead of sitting unsent in
+    # the composer. Claude needs no such delay (settle 0.0).
+    settle = tmux._CODEX_ENTER_SETTLE if getattr(w, "platform", "claude") == "codex" else 0.0
+    return tmux.send_text(pane, collapsed, settle_before_enter=settle)

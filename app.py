@@ -50,9 +50,16 @@ state = State()
 def _enriched_snapshot() -> dict:
     snap = sessions.snapshot()
     perm_by_tty = perms.pending_by_tty()
+    # Live Codex sessions arrive pre-enriched (codex transcripts have a different
+    # shape than Claude's, so they can't go through the loop below). Shell-process
+    # counts are platform-agnostic, so we fold their pids into the single ps walk.
+    codex_windows = codex.codex_window_dicts()
     shell_counts = sessions.shell_descendant_counts(
-        [w["pid"] for w in snap["windows"] if isinstance(w.get("pid"), int)]
+        [w["pid"] for w in snap["windows"] + codex_windows
+         if isinstance(w.get("pid"), int)]
     )
+    for cw in codex_windows:
+        cw["shell_proc_count"] = shell_counts.get(cw.get("pid"), 0)
     for w in snap["windows"]:
         w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
         tty = w.get("tty")
@@ -73,6 +80,16 @@ def _enriched_snapshot() -> dict:
             w["current_task"] = transcripts.current_task_hint(tp)
         else:
             w["current_task"] = None
+        # Claude reports waitingFor="dialog open" for ANY open overlay — the
+        # /goal panel included, which has nothing to answer and doesn't block
+        # the agent. Only a verifiable picker in the pane earns the waiting
+        # card (Quick Approve types "1" into the input box otherwise); when
+        # the pane shows none, treat the session as busy. An unverifiable
+        # pane (no tmux) keeps the conservative waiting card.
+        if (w.get("status") == "waiting" and w.get("waiting_for") == "dialog open"
+                and actions.pane_menu_active(w.get("tty")) is False):
+            w["status"] = "busy"
+            w["waiting_for"] = None
         tri = patrol.classify(w)
         w["triage"] = tri["triage"]
         w["triage_reason"] = tri["reason"]
@@ -114,6 +131,18 @@ def _enriched_snapshot() -> dict:
             if status == "idle" and isinstance(pid, int):
                 promptqueue.clear(pid)  # a queue can't outlive an idle session
             w["queued"] = []
+    # Merge live Codex windows in, then recompute the header counts over every
+    # visible (non-hidden) window across both platforms.
+    snap["windows"].extend(codex_windows)
+    visible = [w for w in snap["windows"] if not w.get("hidden")]
+    busy = [w for w in visible if w.get("status") == "busy"]
+    waiting = [w for w in visible if w.get("status") == "waiting"]
+    snap["counts"] = {
+        "total": len(visible),
+        "busy": len(busy),
+        "waiting": len(waiting),
+        "idle": len(visible) - len(busy) - len(waiting),
+    }
     # Sort by triage priority (most urgent first), then by idle time.
     snap["windows"].sort(key=lambda w: (
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
@@ -225,11 +254,27 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
     if not w:
         raise HTTPException(404, "window not found")
     tp = w.transcript_path or ""
+    if w.platform == "codex":
+        # Codex transcripts have their own shape and no Claude-style interactive
+        # menu to scrape from the pane.
+        activity = codex.extract_codex_session_activity(tp) if tp else {}
+        return {
+            "pid": pid,
+            "session_id": w.session_id,
+            "project_name": w.project_name,
+            "platform": "codex",
+            "events": codex.codex_timeline(tp, limit=limit, since_ms=codex.cleared_at_ms(pid)) if tp else [],
+            "skills_used": activity.get("skills_used", []),
+            "memory_ops": activity.get("memory_ops", []),
+            "plan_history": [],
+            "menu": None,
+        }
     events = transcripts.timeline(tp, limit=limit) if tp else []
     return {
         "pid": pid,
         "session_id": w.session_id,
         "project_name": w.project_name,
+        "platform": "claude",
         "events": events,
         "skills_used": transcripts.extract_skills_used(tp) if tp else [],
         "memory_ops": transcripts.extract_memory_ops(tp) if tp else [],
@@ -289,6 +334,7 @@ def api_focus(pid: int) -> dict:
 
 class CreateBody(BaseModel):
     cwd: str
+    platform: str = "claude"  # "claude" | "codex"
 
 
 class PromptBody(BaseModel):
@@ -299,7 +345,7 @@ class PromptBody(BaseModel):
 def api_window_create(body: CreateBody) -> dict:
     if not sessions._cwd_visible(body.cwd):
         raise HTTPException(403, "cwd is hidden by the dashboard filter")
-    return actions.create_session(body.cwd)
+    return actions.create_session(body.cwd, body.platform)
 
 
 @app.post("/api/windows/{pid}/prompt")
@@ -308,6 +354,22 @@ def api_window_prompt(pid: int, body: PromptBody) -> dict:
     r = actions.send_prompt(pid, body.text)
     if r.get("ok"):
         promptqueue.record_sent(pid, body.text)
+    return r
+
+
+@app.post("/api/windows/{pid}/clear")
+def api_window_clear(pid: int) -> dict:
+    """Send /clear and blank the card's pre-clear preview.
+
+    Both Claude and Codex have /clear. Claude starts a fresh transcript so its
+    card empties on its own, but Codex's /clear leaves the rollout JSONL intact —
+    so we also stamp a per-pid clear time that hides older rollout events from the
+    card and timeline (see codex.mark_cleared)."""
+    _require_window(pid)
+    r = actions.send_prompt(pid, "/clear")
+    if r.get("ok"):
+        promptqueue.record_sent(pid, "/clear")
+        codex.mark_cleared(pid)
     return r
 
 
@@ -347,6 +409,24 @@ def api_export(pid: int) -> dict:
 def api_close(pid: int) -> dict:
     _require_window(pid)
     return actions.close_session(pid)
+
+
+@app.get("/api/locate/{session_id}")
+def api_locate(session_id: str) -> dict:
+    """Reverse lookup: session id (or unique >=8-char prefix) → tmux pane.
+
+    External tools that hold a session id — overseer skills, scripts, humans
+    reading a transcript filename — use this to find where the session lives
+    instead of reverse-engineering pane contents."""
+    w = sessions.find_window_by_session(session_id)
+    if not w:
+        raise HTTPException(404, "no session matches that id")
+    pane = tmux.pane_for_tty(w.tty) if w.tty else None
+    return {
+        "window": w.to_dict(),
+        "tmux_pane": pane,
+        "tmux_target": tmux.pane_target(pane) if pane else None,
+    }
 
 
 @app.get("/api/history")

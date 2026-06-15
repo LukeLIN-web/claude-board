@@ -2,9 +2,13 @@ English | [中文](README.zh-CN.md)
 
 # Claude Fleet
 
-When you're vibe coding with 5–7 Claude Code windows open at once, you need one
-place to see what every window is doing — who's stuck, who's waiting on you, who's
-done — and to act on them without hunting for the right terminal tab.
+When you're vibe coding with 5–7 Claude Code and Codex windows open at once, you
+need one place to see what every window is doing — who's stuck, who's waiting on
+you, who's done — and to act on them without hunting for the right terminal tab.
+
+Both **Claude Code** and **Codex** sessions show up as live cards, each tagged
+with its agent (a blue `cc` or green `codex` badge) so you can tell them apart at
+a glance.
 
 ![](docs/screenshot-hero.png)
 
@@ -98,17 +102,26 @@ Claude Fleet is read-only by default, but two opt-in, tmux-backed controls let y
 drive sessions without leaving the dashboard. They appear only when tmux is
 available.
 
-- **Spawn a session** — pick a recent directory (or type one) in the header and
-  hit **Spawn**. Fleet runs `tmux new-window … claude --dangerously-skip-permissions`
-  so the new session starts fully non-interactive — no permission prompts blocking
-  the pane. The new window shows up on the next 2s poll.
+- **Spawn a session** — pick the agent (**Claude Code** or **Codex**) and a recent
+  directory (or type one) in the header, then hit **Spawn**. Fleet runs
+  `tmux new-window … claude --dangerously-skip-permissions` or
+  `tmux new-window … codex --yolo` so the new session starts fully non-interactive —
+  no permission prompts blocking the pane. The new window shows up on the next 2s poll.
 - **Send a prompt** — each card has a `Send a prompt…` box. Type a line, press
   Enter, and Fleet injects it into that session's tmux pane via
   `tmux send-keys` (literal text + a separate Enter to submit).
 
-> `--dangerously-skip-permissions` auto-approves everything in a spawned session.
-> It's the right trade-off for driving your own sessions locally — just don't spawn
-> in directories you don't trust.
+> `--dangerously-skip-permissions` (Claude) / `--yolo` (Codex) auto-approve
+> everything in a spawned session. It's the right trade-off for driving your own
+> sessions locally — just don't spawn in directories you don't trust.
+
+> **How Codex sessions are discovered.** Codex doesn't write a pid-keyed session
+> file like Claude does, so Fleet finds live Codex TUIs from running processes
+> (grouped by their controlling tty) and maps each to its `rollout-*.jsonl`
+> transcript via `/proc/<pid>/fd` once the first turn opens it. A freshly spawned
+> Codex still appears as a card immediately; its session id / transcript fill in
+> after the first turn. (Linux only; background `codex mcp-server` / `app-server`
+> processes are excluded.)
 
 ### Actions
 
@@ -122,6 +135,33 @@ available.
 | Review | send `/humanize:ask-codex review` into the session (Linux + tmux) |
 | Close | SIGTERM — available on every card |
 | Export | export a conversation doc (timeline + plan history + skill/memory summary) |
+
+On **Codex** cards the platform-agnostic controls (Close, Send a prompt, Esc,
+Commit, Clear) work the same way — Codex has its own `/clear` ("clear the
+terminal and start a new chat"), so the same command serves both. The
+Claude-specific controls (Fork, Review, and the permission quick-approve) are
+hidden, since they rely on Claude slash commands or the `claude` binary.
+
+### Locate a session by id
+
+External tools (overseer skills, scripts, you reading a transcript filename)
+usually hold a *session id*, not a pid or pane. Two equivalent reverse lookups
+resolve `session id → pid → tty → tmux pane`:
+
+- **API** — `GET /api/locate/<session-id>` (a unique prefix of ≥ 8 chars works
+  too) returns the window plus `tmux_pane` / `tmux_target`. Covers live Claude
+  *and* Codex sessions.
+- **Standalone** — [`scripts/locate-session.sh`](scripts/locate-session.sh)
+  does the same for Claude sessions with just bash+jq+tmux, no server needed:
+
+  ```console
+  $ scripts/locate-session.sh 8ce5b822
+  {"session_id":"8ce5b822-…","pid":116440,"tty":"/dev/pts/7","tmux_pane":"%3","tmux_target":"j1:2.0",…}
+  ```
+
+Both lean on the fact that Claude Code registers every live session in
+`~/.claude/sessions/<pid>.json` (`{pid, sessionId, cwd, …}`), so the mapping is
+a lookup, not a heuristic.
 
 > **Focus setup (macOS).** Focus works out of the box on Terminal.app and iTerm2 —
 > including when your sessions run inside **tmux** (the bundled
@@ -142,10 +182,10 @@ shortcuts) act on live sessions, never on the stored data.
 ```
 app.py                FastAPI + SSE (2s polling)
 core/
-  sessions.py         read sessions/*.json, map to TTY
+  sessions.py         read sessions/*.json, map to TTY (Window + platform field)
   transcripts.py      parse JSONL; extract skill/memory/plan/background tasks
   patrol.py           triage classification engine
-  codex.py            Codex session parsing
+  codex.py            Codex session parsing + live-session discovery (/proc + fd)
   search.py           cross-platform ripgrep search
   actions.py          focus / fork / close / export / spawn / send-prompt
   tmux.py             tmux backend: spawn window + inject prompt (Linux)
