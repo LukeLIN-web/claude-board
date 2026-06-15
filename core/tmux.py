@@ -22,12 +22,36 @@ def _clear_caches() -> None:
     _available_cache.clear()
 
 
+# When the board server is itself launched from inside a Claude session, its
+# environment carries CLAUDECODE / CLAUDE_CODE_* markers. tmux — and every claude
+# we spawn through it — would inherit those and start as a *child session*, which
+# does not persist a normal per-project transcript. With no transcript the card's
+# timeline reads empty. Strip these so spawned sessions are always top-level.
+_CHILD_ENV_KEYS = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+)
+
+
+def _spawn_env() -> dict:
+    """Process env with inherited Claude child-session markers removed."""
+    env = dict(os.environ)
+    for k in _CHILD_ENV_KEYS:
+        env.pop(k, None)
+    return env
+
+
 def _run(*args: str) -> dict:
     """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise."""
     try:
         cp = subprocess.run(
             ["tmux", *args],
             capture_output=True, text=True, timeout=_TIMEOUT,
+            env=_spawn_env(),
         )
     except FileNotFoundError:
         return {"ok": False, "rc": None, "stdout": "", "stderr": "", "error": "tmux not found on PATH"}
