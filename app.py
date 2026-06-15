@@ -132,11 +132,15 @@ def _enriched_snapshot() -> dict:
                 promptqueue.clear(pid)  # a queue can't outlive an idle session
             w["queued"] = []
     # Merge live Codex windows in, then recompute the header counts over every
-    # visible (non-hidden) window across both platforms.
+    # visible (non-hidden) window across both platforms. Count by `triage`, not
+    # the raw `status`: the header chips filter cards on triage, so a session
+    # stuck at status=busy but idle past the threshold (triage=completed) must
+    # land in the idle tally — otherwise it inflates "busy" yet vanishes when
+    # you click the busy filter.
     snap["windows"].extend(codex_windows)
     visible = [w for w in snap["windows"] if not w.get("hidden")]
-    busy = [w for w in visible if w.get("status") == "busy"]
-    waiting = [w for w in visible if w.get("status") == "waiting"]
+    busy = [w for w in visible if w.get("triage") == "working"]
+    waiting = [w for w in visible if w.get("triage") == "waiting_perm"]
     snap["counts"] = {
         "total": len(visible),
         "busy": len(busy),

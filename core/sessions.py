@@ -584,6 +584,8 @@ def snapshot() -> dict:
     wins.extend(list_claude_proc_windows(known_pids, known_ttys, known_sids))
     # Counts cover only real user windows; `.slock` agent sub-sessions are
     # rendered separately at the bottom of the dashboard and excluded here.
+    # These status-based tallies are a fallback: the app layer recomputes
+    # `counts` by triage (after attaching it) so the header chips match.
     visible = [w for w in wins if not w.hidden]
     waiting = [w for w in visible if w.status == "waiting"]
     busy = [w for w in visible if w.status == "busy"]
