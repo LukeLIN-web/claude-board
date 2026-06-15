@@ -493,27 +493,48 @@ def _proc_table() -> dict[int, dict]:
     return table
 
 
-def _rollout_fd(pid: int) -> Optional[str]:
-    """The codex rollout JSONL this pid holds open, or None.
+def _newest_rollout_in_fd_dir(fd_dir: str, sessions_marker: str) -> Optional[str]:
+    """The most recently written rollout JSONL among the fds open in `fd_dir`.
 
-    A running interactive codex session keeps its transcript fd open; the
-    background `mcp-server`/`app-server` codex processes do not, so this check
-    naturally selects only real user-facing sessions.
+    A codex TUI that runs a turn to completion and then continues opens a *new*
+    rollout while keeping the finished one's fd open — so a single process can
+    hold several rollout fds at once. Returning whichever listdir yields first
+    latches the card onto a stale, frozen transcript; pick the newest-by-mtime
+    fd instead (the live rollout is the one still being written). mtime is read
+    through the fd, which follows the symlink to the target file.
     """
-    fd_dir = f"/proc/{pid}/fd"
-    sessions_marker = str(CODEX_SESSIONS_DIR)
+    best: Optional[str] = None
+    best_mtime = -1.0
     try:
         names = os.listdir(fd_dir)
     except Exception:
         return None
     for n in names:
+        fd_path = os.path.join(fd_dir, n)
         try:
-            target = os.readlink(os.path.join(fd_dir, n))
+            target = os.readlink(fd_path)
         except Exception:
             continue
         if "rollout-" in target and target.endswith(".jsonl") and sessions_marker in target:
-            return target
-    return None
+            try:
+                mtime = os.stat(fd_path).st_mtime
+            except Exception:
+                mtime = 0.0
+            if mtime > best_mtime:
+                best, best_mtime = target, mtime
+    return best
+
+
+def _rollout_fd(pid: int) -> Optional[str]:
+    """The codex rollout JSONL this pid is currently writing, or None.
+
+    A running interactive codex session keeps its transcript fd open; the
+    background `mcp-server`/`app-server` codex processes do not, so this check
+    naturally selects only real user-facing sessions. When a process holds more
+    than one rollout fd (a finished turn plus its live continuation), the newest
+    one wins — see _newest_rollout_in_fd_dir.
+    """
+    return _newest_rollout_in_fd_dir(f"/proc/{pid}/fd", str(CODEX_SESSIONS_DIR))
 
 
 def _top_codex_ancestor(fd_pid: int, table: dict[int, dict]) -> int:

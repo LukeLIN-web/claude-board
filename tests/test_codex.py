@@ -7,6 +7,7 @@ carrying `input_text`. The latter shape is also reused for synthetic injections
 (`<environment_context>`, `<subagent_notification>`, …), which must be skipped.
 """
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +151,58 @@ class TestClearHidesPreClearEvents(unittest.TestCase):
         self.assertEqual(codex.cleared_at_ms(99999), 0)
         codex.mark_cleared(99999)
         self.assertGreater(codex.cleared_at_ms(99999), 0)
+
+
+class TestRolloutFdSelection(unittest.TestCase):
+    """A codex TUI that holds several rollout fds must resolve to the live one.
+
+    Repro: a turn ran to completion (frozen rollout) and the session continued
+    into a new rollout. Both fds stay open; picking the older one latches the
+    card onto a dead transcript so it never updates.
+    """
+
+    def _fake_fd_dir(self, marker: str, *, frozen_newer: bool):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        sessions = tmp / marker.lstrip("/")
+        sessions.mkdir(parents=True)
+        frozen = sessions / "rollout-2026-06-14T16-48-38-019ec889.jsonl"
+        live = sessions / "rollout-2026-06-14T17-13-32-019ec8a0.jsonl"
+        frozen.write_text("{}\n")
+        live.write_text("{}\n")
+        # Live rollout is the more recently written one (unless we invert it to
+        # prove selection is by mtime, not by name/listdir order).
+        os.utime(frozen, (2000, 2000) if frozen_newer else (1000, 1000))
+        os.utime(live, (1000, 1000) if frozen_newer else (2000, 2000))
+        fd_dir = tmp / "fd"
+        fd_dir.mkdir()
+        # listdir order is arbitrary on /proc; name the symlinks so the frozen
+        # one sorts first, the exact case that used to win.
+        os.symlink(frozen, fd_dir / "50")
+        os.symlink(live, fd_dir / "53")
+        return str(fd_dir), str(frozen), str(live), str(sessions)
+
+    def test_picks_newest_rollout_when_multiple_fds_open(self):
+        fd_dir, frozen, live, marker = self._fake_fd_dir("codex-sessions", frozen_newer=False)
+        self.assertEqual(codex._newest_rollout_in_fd_dir(fd_dir, marker), live)
+
+    def test_selection_is_by_mtime_not_listdir_order(self):
+        # Invert mtimes: the lexically-first fd is now the newest → must win.
+        fd_dir, frozen, live, marker = self._fake_fd_dir("codex-sessions", frozen_newer=True)
+        self.assertEqual(codex._newest_rollout_in_fd_dir(fd_dir, marker), frozen)
+
+    def test_no_rollout_fds_returns_none(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        fd_dir = tmp / "fd"
+        fd_dir.mkdir()
+        other = tmp / "some.log"
+        other.write_text("x")
+        os.symlink(other, fd_dir / "3")
+        self.assertIsNone(codex._newest_rollout_in_fd_dir(str(fd_dir), "codex-sessions"))
+
+    def test_missing_fd_dir_returns_none(self):
+        self.assertIsNone(codex._newest_rollout_in_fd_dir("/proc/0/fd", "codex-sessions"))
 
 
 if __name__ == "__main__":
