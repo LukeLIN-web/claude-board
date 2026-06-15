@@ -13,3 +13,4 @@ fixtures/demo-home/
 
 # humanize / codex skill cache
 .humanize/
+.env.local

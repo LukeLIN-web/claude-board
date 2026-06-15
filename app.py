@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -164,10 +165,51 @@ app = FastAPI(title="Claude Fleet", lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     html = (STATIC_DIR / "index.html").read_text()
+    html = _apply_instance_label(html)
     # The UI is a single hand-edited HTML file with no asset versioning, so tell
     # the browser to always revalidate — otherwise a stale cached copy hides new
     # features (e.g. the permission / question controls) until a hard refresh.
     return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+def _host_ip_octet() -> str:
+    """Return the last octet of this machine's primary outbound IP (e.g. "60"
+    for 10.145.87.60), so dashboards self-identify by host without manual
+    config. Empty string if the IP can't be determined."""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # No packets are sent; this just picks the interface the kernel would
+        # use to reach an external address.
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        s.close()
+    return ip.rsplit(".", 1)[-1] if ip else ""
+
+
+def _apply_instance_label(html: str) -> str:
+    """Stamp a per-host label into the tab title and header so multiple
+    dashboards are tellable apart. Defaults to the host IP's last octet
+    (e.g. "60"); CLAUDE_FLEET_LABEL overrides it. No label resolved ⇒ HTML is
+    returned unchanged."""
+    label = os.environ.get("CLAUDE_FLEET_LABEL", "").strip() or _host_ip_octet()
+    if not label:
+        return html
+    html = html.replace(
+        "<title>Claude Fleet</title>",
+        f"<title>Claude Fleet · {label}</title>",
+    )
+    html = html.replace(
+        '<h1 class="text-xl font-bold tracking-tight">Claude Fleet</h1>',
+        '<h1 class="text-xl font-bold tracking-tight">Claude Fleet'
+        ' <span class="text-xs font-normal align-middle bg-slate-200'
+        ' text-slate-700 px-2 py-0.5 rounded-full">' + label + "</span></h1>",
+    )
+    return html
 
 
 @app.get("/api/windows")
@@ -227,11 +269,19 @@ def api_plan_by_name(name: str) -> dict:
     return p
 
 
-@app.post("/api/windows/{pid}/focus")
-def api_focus(pid: int) -> dict:
+def _require_window(pid: int):
+    """Resolve a pid to a *visible* window or 404. `find_window` already honors
+    the CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE filter, so this also blocks actions
+    against hidden sessions, not just unknown pids."""
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
+    return w
+
+
+@app.post("/api/windows/{pid}/focus")
+def api_focus(pid: int) -> dict:
+    w = _require_window(pid)
     if not w.tty:
         return {"ok": False, "error": "no tty available for this pid"}
     return actions.focus_terminal(w.tty)
@@ -247,11 +297,14 @@ class PromptBody(BaseModel):
 
 @app.post("/api/windows/create")
 def api_window_create(body: CreateBody) -> dict:
+    if not sessions._cwd_visible(body.cwd):
+        raise HTTPException(403, "cwd is hidden by the dashboard filter")
     return actions.create_session(body.cwd)
 
 
 @app.post("/api/windows/{pid}/prompt")
 def api_window_prompt(pid: int, body: PromptBody) -> dict:
+    _require_window(pid)
     r = actions.send_prompt(pid, body.text)
     if r.get("ok"):
         promptqueue.record_sent(pid, body.text)
@@ -264,6 +317,7 @@ class PermissionBody(BaseModel):
 
 @app.post("/api/windows/{pid}/permission")
 def api_window_permission(pid: int, body: PermissionBody) -> dict:
+    _require_window(pid)
     return actions.respond_permission(pid, body.choice)
 
 
@@ -273,21 +327,25 @@ class MenuKeysBody(BaseModel):
 
 @app.post("/api/windows/{pid}/keys")
 def api_window_keys(pid: int, body: MenuKeysBody) -> dict:
+    _require_window(pid)
     return actions.send_menu_keys(pid, body.keys)
 
 
 @app.post("/api/windows/{pid}/fork")
 def api_fork(pid: int) -> dict:
+    _require_window(pid)
     return actions.fork_session(pid)
 
 
 @app.post("/api/windows/{pid}/export")
 def api_export(pid: int) -> dict:
+    _require_window(pid)
     return actions.export_to_feishu(pid)
 
 
 @app.post("/api/windows/{pid}/close")
 def api_close(pid: int) -> dict:
+    _require_window(pid)
     return actions.close_session(pid)
 
 
@@ -305,6 +363,8 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
             continue
         f = proj_dir / f"{session_id}.jsonl"
         if f.exists():
+            if not sessions.slug_visible(proj_dir.name):
+                raise HTTPException(404, "session not found")
             fp = str(f)
             events = transcripts.timeline(fp, limit=limit)
             return {

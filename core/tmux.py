@@ -164,11 +164,20 @@ def send_keys(pane: str, *keys: str) -> dict:
     return {"ok": True}
 
 
+# A leading "/" opens Claude Code's slash-command autocomplete popup. An Enter
+# that arrives in the same instant as the pasted text races that popup and gets
+# consumed selecting a completion instead of submitting, so the prompt is lost.
+# Waiting this long before Enter lets the popup settle on the typed text.
+_SLASH_SETTLE = 0.5
+
+
 def send_text(pane: str, text: str) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it."""
     literal = _run("send-keys", "-t", pane, "-l", "--", text)
     if not literal["ok"]:
         return {"ok": False, "error": literal["error"]}
+    if text.lstrip().startswith("/"):
+        time.sleep(_SLASH_SETTLE)
     enter = _run("send-keys", "-t", pane, "Enter")
     if not enter["ok"]:
         return {"ok": False, "error": enter["error"]}

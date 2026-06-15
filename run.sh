@@ -3,6 +3,12 @@
 set -e
 cd "$(dirname "$0")"
 
+# Per-host overrides (gitignored). Use for machine-specific settings like
+# CLAUDE_FLEET_CWD_INCLUDE without committing them. Absent on other hosts.
+if [ -f .env.local ]; then
+    set -a; source .env.local; set +a
+fi
+
 if [ ! -d .venv ]; then
     echo "[claude-fleet] creating venv..."
     python3 -m venv .venv
@@ -15,7 +21,7 @@ if ! python -c "import fastapi" 2>/dev/null; then
     pip install -q -e .
 fi
 
-PORT="${CLAUDE_FLEET_PORT:-7878}"
+PORT="${CLAUDE_FLEET_PORT:-7879}"
 echo "[claude-fleet] listening on http://127.0.0.1:${PORT}"
 
 # By default run detached so the server survives the launching shell/session.

@@ -337,7 +337,12 @@ def list_sessions(
         _cache = _build_index()
         _cache_ts = now
 
-    filtered = _cache
+    # Apply the machine-local cwd visibility filter (CLAUDE_FLEET_CWD_INCLUDE/
+    # EXCLUDE) up front so every consumer — the History panel, Skills/Memory
+    # reverse-lookups + counts, and resume/fork (which resolve sessions through
+    # here) — only ever sees and acts on visible projects.
+    from .sessions import _cwd_visible
+    filtered = [s for s in _cache if _cwd_visible(s.project)]
     if not include_alive:
         filtered = [s for s in filtered if not s.is_alive]
     if platform:

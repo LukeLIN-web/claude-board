@@ -941,15 +941,44 @@ function fleet() {
       return String(ts).slice(0, 10);
     },
 
+    // POST a JSON body to an API action with one automatic retry on a transient
+    // network failure (the fetch rejects before any response — what the user
+    // sees as "TypeError: Failed to fetch", e.g. the worker briefly restarting
+    // or a momentary connection blip). Always resolves to the parsed response
+    // body; on a hard network failure after the retry it returns a normalized
+    // { ok:false, error, netError:true } so callers show "couldn't reach the
+    // server" instead of leaking a raw TypeError or a misleading server message.
+    async apiPost(url, body) {
+      const opts = { method: 'POST' };
+      if (body !== undefined) {
+        opts.headers = { 'Content-Type': 'application/json' };
+        opts.body = JSON.stringify(body);
+      }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let r;
+        try {
+          r = await fetch(url, opts);
+        } catch (e) {
+          // Request never reached the server. Retry once after a short pause;
+          // give up only if the retry also fails to connect.
+          if (attempt === 0) { await new Promise((res) => setTimeout(res, 400)); continue; }
+          return { ok: false, error: 'could not reach the server — is it still running?', netError: true };
+        }
+        try {
+          return await r.json();
+        } catch {
+          return { ok: false, error: `server returned a non-JSON response (HTTP ${r.status})` };
+        }
+      }
+    },
+
     async focusWindow(pid) {
-      const r = await fetch(`/api/windows/${pid}/focus`, { method: 'POST' });
-      const d = await r.json();
+      const d = await this.apiPost(`/api/windows/${pid}/focus`);
       if (!d.ok) this.toast('Focus failed: ' + (d.error || ''));
     },
 
     async forkWindow(pid) {
-      const r = await fetch(`/api/windows/${pid}/fork`, { method: 'POST' });
-      const d = await r.json();
+      const d = await this.apiPost(`/api/windows/${pid}/fork`);
       this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
     },
 
@@ -959,20 +988,13 @@ function fleet() {
       if (!cwd) { this.toast('Pick or type a directory'); return; }
       this.spawning = true;
       try {
-        const r = await fetch('/api/windows/create', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cwd }),
-        });
-        const d = await r.json();
+        const d = await this.apiPost('/api/windows/create', { cwd });
         if (d.ok) {
           this.toast('Spawned claude in ' + cwd);
           this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = '';
         } else {
           this.toast('Spawn failed: ' + (d.error || ''));
         }
-      } catch (e) {
-        this.toast('Spawn failed: ' + e);
       } finally {
         this.spawning = false;
       }
@@ -984,20 +1006,13 @@ function fleet() {
       if (!text) { this.toast('Type a prompt first'); return; }
       this.promptSending[pid] = true;
       try {
-        const r = await fetch(`/api/windows/${pid}/prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
-        });
-        const d = await r.json();
+        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text });
         if (d.ok) {
           this.toast('Sent prompt');
           this.promptDrafts[pid] = '';
         } else {
           this.toast('Send failed: ' + (d.error || ''));
         }
-      } catch (e) {
-        this.toast('Send failed: ' + e);
       } finally {
         this.promptSending[pid] = false;
       }
@@ -1018,15 +1033,8 @@ function fleet() {
       if (this.promptSending[pid]) return;
       this.promptSending[pid] = true;
       try {
-        const r = await fetch(`/api/windows/${pid}/prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: '/clear' }),
-        });
-        const d = await r.json();
+        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text: '/clear' });
         this.toast(d.ok ? 'Sent /clear' : 'Clear failed: ' + (d.error || ''));
-      } catch (e) {
-        this.toast('Clear failed: ' + e);
       } finally {
         this.promptSending[pid] = false;
       }
@@ -1036,15 +1044,8 @@ function fleet() {
       if (this.promptSending[pid]) return;
       this.promptSending[pid] = true;
       try {
-        const r = await fetch(`/api/windows/${pid}/prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: 'commit and push' }),
-        });
-        const d = await r.json();
+        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text: 'commit and push' });
         this.toast(d.ok ? 'Sent commit and push' : 'Commit failed: ' + (d.error || ''));
-      } catch (e) {
-        this.toast('Commit failed: ' + e);
       } finally {
         this.promptSending[pid] = false;
       }
@@ -1054,15 +1055,8 @@ function fleet() {
       if (this.promptSending[pid]) return;
       this.promptSending[pid] = true;
       try {
-        const r = await fetch(`/api/windows/${pid}/prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: '/humanize:ask-codex review' }),
-        });
-        const d = await r.json();
+        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text: '/humanize:ask-codex review' });
         this.toast(d.ok ? 'Sent /humanize:ask-codex review' : 'Review failed: ' + (d.error || ''));
-      } catch (e) {
-        this.toast('Review failed: ' + e);
       } finally {
         this.promptSending[pid] = false;
       }
@@ -1073,34 +1067,17 @@ function fleet() {
       this.permSending[pid] = true;
       const labels = { approve: 'Approved', approve_always: 'Approved (always)', deny: 'Denied' };
       try {
-        const r = await fetch(`/api/windows/${pid}/permission`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ choice }),
-        });
-        const d = await r.json();
+        const d = await this.apiPost(`/api/windows/${pid}/permission`, { choice });
         this.toast(d.ok ? (labels[choice] || 'Sent') : 'Permission failed: ' + (d.error || ''));
-      } catch (e) {
-        this.toast('Permission failed: ' + e);
       } finally {
         this.permSending[pid] = false;
       }
     },
 
     async sendKeys(pid, keys) {
-      try {
-        const r = await fetch(`/api/windows/${pid}/keys`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ keys }),
-        });
-        const d = await r.json();
-        if (!d.ok) this.toast('Failed: ' + (d.error || ''));
-        return d.ok;
-      } catch (e) {
-        this.toast('Failed: ' + e);
-        return false;
-      }
+      const d = await this.apiPost(`/api/windows/${pid}/keys`, { keys });
+      if (!d.ok) this.toast('Failed: ' + (d.error || ''));
+      return d.ok;
     },
     // Press an option's number key in the live menu (question or permission).
     // Single-select: the digit selects + submits immediately. multiSelect: the
@@ -1125,15 +1102,13 @@ function fleet() {
     },
 
     async closeWindow(pid) {
-      const r = await fetch(`/api/windows/${pid}/close`, { method: 'POST' });
-      const d = await r.json();
+      const d = await this.apiPost(`/api/windows/${pid}/close`);
       this.toast(d.ok ? 'Closed ' + (d.name || pid) : 'Failed: ' + (d.error || ''));
     },
 
     async exportWindow(pid) {
       this.toast('Exporting...');
-      const r = await fetch(`/api/windows/${pid}/export`, { method: 'POST' });
-      const d = await r.json();
+      const d = await this.apiPost(`/api/windows/${pid}/export`);
       if (d.ok && d.doc_url) {
         this.toast('Exported: ' + d.doc_url);
         window.open(d.doc_url, '_blank');
@@ -1218,8 +1193,7 @@ function fleet() {
     },
 
     async resumeSession(s) {
-      const r = await fetch(`/api/history/${s.session_id}/resume`, { method: 'POST' });
-      const d = await r.json();
+      const d = await this.apiPost(`/api/history/${s.session_id}/resume`);
       if (d.ok) {
         this.toast(d.action === 'focused' ? 'Focused existing window' : 'Resumed session');
       } else {
@@ -1228,8 +1202,7 @@ function fleet() {
     },
 
     async forkHistorySession(s) {
-      const r = await fetch(`/api/history/${s.session_id}/fork`, { method: 'POST' });
-      const d = await r.json();
+      const d = await this.apiPost(`/api/history/${s.session_id}/fork`);
       this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
     },
 
