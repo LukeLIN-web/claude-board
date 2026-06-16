@@ -126,6 +126,63 @@ class SendPromptTests(unittest.TestCase):
         st.assert_called_once()
 
 
+_PICKER_TEXT = (
+    "This session is 7h old and 192k tokens.\n"
+    "  ❯ 1. Resume from summary (recommended)\n"
+    "    2. Resume full session as-is\n"
+    "    3. Don't ask me again\n"
+    "  Enter to confirm · Esc to cancel"
+)
+_LIVE_TEXT = "❯ \n⏵⏵ bypass permissions on"
+
+
+class ConfirmResumePickerTests(unittest.TestCase):
+    """Auto-answering Claude's 'resume from summary?' picker for fleet resumes."""
+
+    def test_digit_then_enter_confirms_and_reports(self):
+        # Picker is up at first; still up after the digit (digit only selects);
+        # gone after Enter. Expect choice "2" then Enter, and confirmed=True.
+        caps = [_PICKER_TEXT, _PICKER_TEXT, _LIVE_TEXT]
+
+        def fake_capture(pane, **kw):
+            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
+
+        sent = []
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=lambda p, *k: sent.append(k)), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.confirm_resume_picker("%0")
+        self.assertTrue(r["confirmed"])
+        self.assertEqual(sent, [("2",), ("Enter",)])
+
+    def test_no_enter_leak_when_digit_already_dismissed(self):
+        # Some builds confirm on the digit alone: the picker is gone right after
+        # "2", so Enter must NOT be sent (it would land in the live session).
+        caps = [_PICKER_TEXT, _LIVE_TEXT]
+
+        def fake_capture(pane, **kw):
+            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
+
+        sent = []
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=lambda p, *k: sent.append(k)), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.confirm_resume_picker("%0")
+        self.assertTrue(r["confirmed"])
+        self.assertEqual(sent, [("2",)])
+
+    def test_no_picker_sends_nothing(self):
+        # A small session resumes straight to a live prompt: never send keys.
+        with mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": _LIVE_TEXT}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.confirm_resume_picker("%0", attempts=2)
+        self.assertFalse(r["confirmed"])
+        self.assertEqual(r["reason"], "no picker")
+        sk.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 

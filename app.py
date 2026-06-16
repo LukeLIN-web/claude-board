@@ -495,6 +495,11 @@ def api_history_resume(session_id: str) -> dict:
     cwd = sess.get("project") or str(Path.home())
     r = actions.open_claude_window(cwd, ["--resume", session_id])
     r.update({"action": "resumed", "session_id": session_id, "cwd": cwd})
+    # A large/old session parks on Claude's "resume from summary?" picker. The
+    # fleet drives resumed sessions unattended, so auto-answer it (default:
+    # "Resume full session as-is") rather than leaving the card stuck on a menu.
+    if r.get("ok") and r.get("backend") == "tmux" and r.get("pane_id"):
+        r["picker"] = actions.confirm_resume_picker(r["pane_id"])
     return r
 
 

@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -170,6 +171,76 @@ def open_codex_window(cwd: str, codex_args: list[str]) -> dict:
         return {"ok": False, "error": str(e)}
     return {"ok": proc.returncode == 0, "cwd": cwd, "backend": "iterm",
             "stdout": proc.stdout, "stderr": proc.stderr}
+
+
+# Both lines are present only on Claude's "resume from summary?" picker, shown
+# when resuming a large/old session. Requiring both avoids matching a session
+# that merely printed the word "resume" in its output.
+_RESUME_PICKER_MARKERS = ("Resume from summary", "Resume full session")
+
+
+def _resume_picker_up(pane_id: str) -> bool:
+    """True if `pane_id` currently shows Claude's resume-summary picker."""
+    cap = tmux.capture_pane(pane_id)
+    text = cap.get("text", "") if cap.get("ok") else ""
+    return all(m in text for m in _RESUME_PICKER_MARKERS)
+
+
+def confirm_resume_picker(
+    pane_id: str,
+    choice: str = "2",
+    attempts: int = 15,
+    interval: float = 0.4,
+    settle: float = 0.6,
+) -> dict:
+    """Poll `pane_id` for Claude's resume-summary picker and auto-answer it.
+
+    A freshly launched `claude --resume <id>` on a large/old session parks on a
+    "Resume from summary / Resume full session" picker. The fleet drives resumed
+    sessions unattended (on a headless host nobody is watching that detached
+    pane), so we answer it. `choice` defaults to "2" — "Resume full session
+    as-is".
+
+    Driving a live TUI is unforgiving: a key sent the instant the menu paints is
+    dropped (the menu text renders before its input handler is armed), and any
+    key sent *after* the picker dismisses lands in the resumed session as stray
+    text — which is how a misfire injects a `/compact` or a junk prompt into a
+    real session. So this is deliberate: wait for the picker, settle, press the
+    digit, then send Enter ONLY while the picker is still up, and verify it
+    cleared. If the digit alone already confirmed (some builds do), the Enter is
+    skipped so nothing leaks.
+
+    Returns {confirmed, waited, reason}. `confirmed=False` with reason
+    "no picker" means the session resumed straight to a live prompt (small
+    session) — nothing to answer. Never raises.
+    """
+    if not pane_id:
+        return {"confirmed": False, "waited": 0.0, "reason": "no pane"}
+    waited = 0.0
+    seen = False
+    for _ in range(max(1, attempts)):
+        if _resume_picker_up(pane_id):
+            seen = True
+            break
+        time.sleep(interval)
+        waited += interval
+    if not seen:
+        return {"confirmed": False, "waited": round(waited, 2), "reason": "no picker"}
+    # Let the TUI's input handler arm before the first keypress.
+    time.sleep(settle)
+    tmux.send_keys(pane_id, choice)
+    time.sleep(settle)
+    # Confirm only if the digit selected without dismissing; skip Enter (avoid a
+    # leak) if the picker is already gone.
+    if _resume_picker_up(pane_id):
+        tmux.send_keys(pane_id, "Enter")
+        time.sleep(settle)
+    gone = not _resume_picker_up(pane_id)
+    return {
+        "confirmed": gone,
+        "waited": round(waited, 2),
+        "reason": "" if gone else "picker still present",
+    }
 
 
 def fork_session(pid: int) -> dict:
