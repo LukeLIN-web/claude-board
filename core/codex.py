@@ -651,6 +651,17 @@ def list_codex_windows() -> list[Window]:
             except Exception:
                 continue
 
+        # Anchor the card's ordering to the immutable process start time, NOT the
+        # rollout meta timestamp. The two clocks disagree (e.g. `codex resume`
+        # reuses an old rollout whose meta predates the process), and the rollout
+        # branch is only taken while a pid is observed holding the transcript fd —
+        # so a session that flips between the rollout and the just-launched
+        # fallback would see started_at jump by hours, reshuffling its card mid-
+        # turn. proc start is constant for the life of card_pid (which is itself
+        # the stable card :key), so the card stays put busy↔idle. Frontend sorts
+        # cards by started_at and never displays it, so this is ordering-only.
+        started_at = _proc_start_ms(card_pid)
+
         if rollout:
             rp = Path(rollout)
             try:
@@ -660,16 +671,14 @@ def list_codex_windows() -> list[Window]:
             meta = _parse_session_meta(rp) or {}
             cwd = cwd or meta.get("cwd", "") or ""
             status = _infer_codex_status(rp, mtime) if mtime else "idle"
-            updated_at = int(mtime * 1000) if mtime else _proc_start_ms(card_pid)
-            started_at = _parse_iso_ms(meta.get("timestamp", "")) or updated_at
+            updated_at = int(mtime * 1000) if mtime else started_at
             session_id = meta.get("id", rp.stem)
             version = str(meta.get("cli_version", ""))
             transcript = str(rp)
         else:
             # Just launched: no rollout yet. Show the card anyway, keyed by pid.
-            start = _proc_start_ms(card_pid)
             status = "idle"
-            updated_at = started_at = start
+            updated_at = started_at
             session_id = f"codex-{card_pid}"
             version = ""
             transcript = None

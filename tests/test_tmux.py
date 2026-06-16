@@ -195,6 +195,12 @@ class NewWindowTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%1")
         self.assertFalse(any("new-window" in a for a in calls))
+        # The server must be started in its own call *before* new-session, so a
+        # cold-start new-session only attaches and never forks the daemon under
+        # our captured pipe (the "Spawning…" hang). Order matters.
+        start_idx = next(i for i, a in enumerate(calls) if "start-server" in a)
+        new_sess_idx = next(i for i, a in enumerate(calls) if "new-session" in a)
+        self.assertLess(start_idx, new_sess_idx)
         new_sess_argv = [a for a in calls if "new-session" in a][0]
         self.assertEqual(
             new_sess_argv,
@@ -330,6 +336,46 @@ class SendTextTests(unittest.TestCase):
             r = tmux.send_text("%5", "hi")
         self.assertFalse(r["ok"])
         self.assertIn("enter failed", r["error"])
+
+
+class SpawnEnvTests(unittest.TestCase):
+    """_spawn_env must hand spawned sessions a clean interpreter, not the board's."""
+
+    def _env(self, overrides, *, prefix, base_prefix):
+        with mock.patch.dict(tmux.os.environ, overrides, clear=True), \
+             mock.patch.object(tmux.sys, "prefix", prefix), \
+             mock.patch.object(tmux.sys, "base_prefix", base_prefix):
+            return tmux._spawn_env()
+
+    def test_strips_board_virtualenv_from_path(self):
+        venv = "/board/.venv"
+        env = self._env(
+            {
+                "VIRTUAL_ENV": venv,
+                "PATH": f"{venv}/bin:/usr/bin:/bin",
+                "PYTHONHOME": f"{venv}",
+            },
+            prefix=venv, base_prefix="/usr",
+        )
+        self.assertNotIn("VIRTUAL_ENV", env)
+        self.assertNotIn("PYTHONHOME", env)
+        self.assertNotIn(f"{venv}/bin", env["PATH"].split(":"))
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+
+    def test_leaves_path_untouched_when_not_in_a_venv(self):
+        env = self._env(
+            {"PATH": "/usr/bin:/bin"},
+            prefix="/usr", base_prefix="/usr",
+        )
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+
+    def test_still_strips_claude_child_session_markers(self):
+        env = self._env(
+            {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "abc", "PATH": "/usr/bin"},
+            prefix="/usr", base_prefix="/usr",
+        )
+        self.assertNotIn("CLAUDECODE", env)
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", env)
 
 
 if __name__ == "__main__":

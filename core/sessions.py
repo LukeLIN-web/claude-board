@@ -113,6 +113,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _proc_start_ms(pid: int) -> int:
+    """Immutable process start time (ms) from the /proc/<pid> dir mtime; 0 if the
+    process is gone. Constant for the life of the pid, so it makes a stable card-
+    ordering anchor — see the started_at note in list_windows."""
+    try:
+        return int(os.stat(f"/proc/{pid}").st_mtime * 1000)
+    except Exception:
+        return 0
+
+
 def _pid_tty(pid: int) -> Optional[str]:
     try:
         out = subprocess.check_output(
@@ -262,6 +272,18 @@ def list_windows(include_dead: bool = False) -> list[Window]:
         slug = _cwd_to_project_slug(cwd)
         transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
 
+        # Card-ordering anchor: pin a live session to its immutable process start
+        # time, the SAME value list_claude_proc_windows seeds before the session
+        # file exists. A fresh spawn is first carded process-first (proc start),
+        # then from its file once written — if those two clocks disagree the card
+        # jumps slots on that handoff. Claude's recorded `startedAt` ≈ proc start
+        # for a clean launch but is the ORIGINAL session time on `--resume`, hours
+        # off; proc start keeps the card put either way. Dead/historical windows
+        # have no /proc, so fall back to the file's startedAt. Codex pins the same
+        # way (core/codex.py). started_at is sort-only; it is never displayed.
+        started_at = (_proc_start_ms(pid) if alive else 0) or int(
+            data.get("startedAt", 0))
+
         windows.append(
             Window(
                 pid=pid,
@@ -272,7 +294,7 @@ def list_windows(include_dead: bool = False) -> list[Window]:
                 name=data.get("name"),
                 status=data.get("status", "unknown"),
                 waiting_for=data.get("waitingFor"),
-                started_at=int(data.get("startedAt", 0)),
+                started_at=started_at,
                 # `.slock` agent sub-sessions only write `startedAt` (no
                 # `updatedAt` heartbeat); fall back so idle isn't computed
                 # from the epoch (which renders as ~494593h ago).
@@ -441,10 +463,7 @@ def list_claude_proc_windows(
 
         session_id = parsed["session_id"]
         slug = _cwd_to_project_slug(cwd)
-        try:
-            start = int(os.stat(f"/proc/{pid}").st_mtime * 1000)
-        except Exception:
-            start = int(time.time() * 1000)
+        start = _proc_start_ms(pid) or int(time.time() * 1000)
 
         if session_id:
             transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
