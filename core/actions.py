@@ -795,12 +795,21 @@ def get_pane_queue(pid: int) -> list[str]:
 
 
 def parse_btw_overlay(text: str) -> Optional[dict]:
-    """Extract {question, answer} from a captured /btw aside overlay, or None.
+    """Extract {question, answer} for the *newest* /btw aside, or None.
 
-    /btw answers are shown in an ephemeral overlay and are never written to the
-    transcript, so scraping the pane is the only way to recover them. Best-effort:
-    if a long answer scrolls the ▔ top border off-screen we return None (precision
-    over recall — better to miss than to latch a half-parsed answer).
+    /btw answers show in an ephemeral overlay and are never written to the
+    transcript, so scraping the pane is the only way to recover them. The overlay
+    is a history carousel: firing several /btw stacks every question, but only the
+    current (newest) aside's answer is shown. So we pair the LAST "/btw …" line
+    with the answer block beneath it — taking the first would swallow later
+    question lines into the answer.
+
+    Only latch a *settled* answer: while Claude is still generating, the answer
+    region is just an animated spinner ("✽ Answering…") and the footer lacks the
+    "c to copy · f to fork" hints (you can't copy an unfinished answer). Requiring
+    "to copy" in the footer gates out mid-generation frames — this also stops the
+    animating spinner from defeating the archive's de-dupe. Best-effort otherwise:
+    a long answer that scrolls the ▔ border off-screen is missed by design.
     """
     if not text:
         return None
@@ -809,11 +818,13 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
                  if "Esc to close" in lines[i]), None)
     if foot is None:
         return None
+    if "to copy" not in lines[foot]:
+        return None  # answer still generating — don't latch a partial/spinner
     top = next((i for i in range(foot - 1, -1, -1)
                 if _BTW_TOP_RE.match(lines[i])), None)
     if top is None:
         return None
-    q_idx = next((i for i in range(top + 1, foot)
+    q_idx = next((i for i in range(foot - 1, top, -1)
                   if lines[i].lstrip().startswith("/btw")), None)
     if q_idx is None:
         return None

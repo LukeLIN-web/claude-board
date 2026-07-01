@@ -33,7 +33,51 @@ CAP_BTW = f"""\
 """
 
 
+# Real capture: several /btw fired in a row stack into one history-carousel
+# overlay. The question region lists every /btw; the answer region shows only the
+# CURRENT (newest) aside's answer. Footer switches to "←/→ to switch" and gains
+# "x to clear history"; it keeps "c to copy · f to fork" once the answer settles.
+CAP_MULTI = f"""\
+{_BORDER}
+
+    /btw what is recall in one sentence?
+    /btw name three primary colors, one per line.
+
+      Red
+      Blue
+      Yellow
+
+    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close
+"""
+
+# Real capture mid-generation: the answer region is just the animated spinner,
+# and the footer LACKS "c to copy · f to fork" (you can't copy an unfinished
+# answer) — our settled signal.
+CAP_MIDGEN = f"""\
+{_BORDER}
+
+    /btw what is recall in one sentence?
+    /btw name three primary colors, one per line.
+
+      ✽ Answering…
+
+    ←/→ to switch · x to clear history · Esc to close
+"""
+
+
 class ParseBtwOverlayTests(unittest.TestCase):
+    def test_multi_aside_takes_newest_qa_only(self):
+        # Must pair the LAST /btw question with the shown answer, not swallow the
+        # whole history.
+        got = actions.parse_btw_overlay(CAP_MULTI)
+        self.assertEqual(got["question"], "name three primary colors, one per line.")
+        self.assertEqual(got["answer"], "Red\nBlue\nYellow")
+
+    def test_none_while_generating(self):
+        # No "c to copy" in the footer => answer not finished => don't latch.
+        self.assertIsNone(actions.parse_btw_overlay(CAP_MIDGEN))
+
+
     def test_parses_question_and_multiline_answer(self):
         got = actions.parse_btw_overlay(CAP_BTW)
         self.assertEqual(
@@ -54,7 +98,7 @@ class ParseBtwOverlayTests(unittest.TestCase):
         self.assertIsNone(actions.parse_btw_overlay(CAP_BTW.replace("/btw ", "")))
 
     def test_none_when_answer_empty(self):
-        cap = f"{_BORDER}\n    /btw hi?\n\n    ↑/↓ to scroll · Esc to close\n"
+        cap = f"{_BORDER}\n    /btw hi?\n\n    ↑/↓ to scroll · c to copy · f to fork · Esc to close\n"
         self.assertIsNone(actions.parse_btw_overlay(cap))
 
     def test_none_on_empty(self):
