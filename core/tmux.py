@@ -69,14 +69,35 @@ def _spawn_env() -> dict:
         env.pop(k, None)
     bin_dirs = _venv_bin_dirs()
     if bin_dirs:
-        env.pop("VIRTUAL_ENV", None)
-        env.pop("PYTHONHOME", None)
+        for v in _VENV_MARKER_VARS:
+            env.pop(v, None)
         path = env.get("PATH", "")
         if path:
             kept = [p for p in path.split(os.pathsep)
                     if p and os.path.normpath(p) not in bin_dirs]
             env["PATH"] = os.pathsep.join(kept)
     return env
+
+
+# Env vars that mark the board's own virtualenv. `_spawn_env()` drops them, but a
+# `pop` is not an `unset`: a long-lived tmux server started while `.venv` was
+# active still holds these in its own environment and re-injects them into every
+# new pane it forks — so a spawned session can inherit VIRTUAL_ENV from the stale
+# server even after `_spawn_env()` cleaned the board's PATH. Wrapping the pane
+# command in `env -u …` force-unsets them in the spawned process itself, which is
+# correct regardless of how old the tmux server's environment is.
+_VENV_MARKER_VARS = ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "PYTHONHOME")
+
+
+def _venv_unset_prefix() -> list[str]:
+    """`env -u …` argv prefix that strips the board's venv markers from a pane
+    command. Empty when the board isn't running inside a venv (nothing to strip)."""
+    if not _venv_bin_dirs():
+        return []
+    prefix = ["env"]
+    for v in _VENV_MARKER_VARS:
+        prefix += ["-u", v]
+    return prefix
 
 
 def _run(*args: str) -> dict:
@@ -214,6 +235,9 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     work from a cold start instead of failing on an empty tmux server.
     """
     cmd = cmd or ["claude", "--dangerously-skip-permissions"]
+    # Force-unset the board's venv markers on the pane command itself so a stale
+    # tmux server can't re-inject VIRTUAL_ENV into the spawned session.
+    cmd = [*_venv_unset_prefix(), *cmd]
     target = _resolve_target()
     if target["exists"]:
         r = _run("new-window", "-P", "-F", "#{pane_id}",

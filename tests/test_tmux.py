@@ -149,7 +149,8 @@ class NewWindowTests(unittest.TestCase):
                 return FakeProc(returncode=0, stdout="mysess\nother\n")
             return FakeProc(returncode=0, stdout="%12\n")
 
-        with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "mysess"}, clear=True):
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "mysess"}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/home/u/proj")
         new_win_argv = [a for a in calls if "new-window" in a][0]
@@ -189,7 +190,8 @@ class NewWindowTests(unittest.TestCase):
                 return FakeProc(returncode=1, stdout="", stderr="no server")
             return FakeProc(returncode=0, stdout="%1\n")
 
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
@@ -208,6 +210,31 @@ class NewWindowTests(unittest.TestCase):
              "-P", "-F", "#{pane_id}", "-c", "/tmp",
              "claude", "--dangerously-skip-permissions"],
         )
+
+    def test_spawned_command_force_unsets_board_venv_markers(self):
+        # A long-lived tmux server started while the board's .venv was active
+        # re-injects VIRTUAL_ENV into every new pane. When the board is in a venv,
+        # the pane command must be wrapped in `env -u …` so the spawned session
+        # can't inherit those markers regardless of the server's stale env.
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "list-sessions" in argv:
+                return FakeProc(returncode=0, stdout="alpha\n")
+            return FakeProc(returncode=0, stdout="%9\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value={"/board/.venv/bin"}):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        new_win_argv = [a for a in calls if "new-window" in a][0]
+        # `env -u VIRTUAL_ENV -u VIRTUAL_ENV_PROMPT -u PYTHONHOME` precedes `claude`.
+        claude_idx = new_win_argv.index("claude")
+        self.assertEqual(new_win_argv[claude_idx - 7:claude_idx],
+                         ["env", "-u", "VIRTUAL_ENV",
+                          "-u", "VIRTUAL_ENV_PROMPT", "-u", "PYTHONHOME"])
 
     def test_new_window_nonzero_exit_returns_error(self):
         def fake_run(argv, **kw):
