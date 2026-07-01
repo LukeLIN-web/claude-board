@@ -365,6 +365,60 @@ class SendTextTests(unittest.TestCase):
         self.assertIn("enter failed", r["error"])
 
 
+class SendTextVerifySubmitTests(unittest.TestCase):
+    """verify_submit confirms the Codex composer emptied and resends Enter."""
+
+    def setUp(self):
+        tmux._clear_caches()
+
+    @staticmethod
+    def _recorder(calls):
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+        return fake_run
+
+    def test_no_resend_when_composer_already_empty(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+            r = tmux.send_text("%5", "hello", verify_submit=True)
+        self.assertTrue(r["ok"])
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 1)  # submit Enter only, no resend
+
+    def test_resends_enter_until_composer_clears(self):
+        calls = []
+        states = iter([True, False])  # stranded once, then submitted
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=lambda *a: next(states)):
+            r = tmux.send_text("%5", "hello", verify_submit=True)
+        self.assertTrue(r["ok"])
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 2)  # initial submit + one resend
+
+    def test_reports_failure_when_prompt_never_submits(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=True):
+            r = tmux.send_text("%5", "hello", verify_submit=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("unsent", r["error"])
+
+
+class CodexEnterSettleTests(unittest.TestCase):
+    def test_scales_with_length_and_caps(self):
+        self.assertEqual(tmux.codex_enter_settle(0), tmux._CODEX_ENTER_SETTLE)
+        # monotonic in length
+        self.assertGreater(tmux.codex_enter_settle(4000), tmux.codex_enter_settle(500))
+        # never exceeds the cap, even past the max prompt size
+        self.assertEqual(tmux.codex_enter_settle(1_000_000), tmux._CODEX_ENTER_SETTLE_MAX)
+
+
 class SpawnEnvTests(unittest.TestCase):
     """_spawn_env must hand spawned sessions a clean interpreter, not the board's."""
 

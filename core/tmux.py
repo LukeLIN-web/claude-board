@@ -298,10 +298,52 @@ _SLASH_SETTLE = 0.5
 # composer unsubmitted. A short settle splits the burst from the Enter so it
 # registers as a real submit. Applies to EVERY Codex prompt (not just slash),
 # so callers pass it explicitly via send_text(settle_before_enter=...).
-_CODEX_ENTER_SETTLE = 0.4
+#
+# The catch-up time grows with paste size: a big multi-paragraph prompt is still
+# being ingested/re-wrapped when a flat 0.4s Enter arrives, so it gets dropped
+# and the prompt sits unsent. Scale the settle with length instead of trusting a
+# single magic number, and back it with a submit-verify (see send_text) so the
+# rare tail case still self-heals rather than silently stranding the prompt.
+_CODEX_ENTER_SETTLE = 0.4          # base/floor
+_CODEX_ENTER_SETTLE_PER_KCHAR = 0.5  # extra seconds per 1000 chars pasted
+_CODEX_ENTER_SETTLE_MAX = 3.0
 
 
-def send_text(pane: str, text: str, settle_before_enter: float = 0.0) -> dict:
+# After the submit Enter, re-check the composer this many times, waiting this
+# long each round, resending Enter while our text is still stranded there.
+_SUBMIT_VERIFY_RETRIES = 3
+_SUBMIT_VERIFY_WAIT = 0.4
+
+
+def codex_enter_settle(text_len: int) -> float:
+    """Length-scaled settle before Codex's submit Enter (see _CODEX_ENTER_SETTLE)."""
+    scaled = _CODEX_ENTER_SETTLE + (text_len / 1000.0) * _CODEX_ENTER_SETTLE_PER_KCHAR
+    return min(scaled, _CODEX_ENTER_SETTLE_MAX)
+
+
+def _composer_has_tail(pane: str, text: str) -> bool:
+    """True if a distinctive tail of `text` still sits in `pane`'s composer.
+
+    The composer is the region after the last `›` prompt marker; a submitted
+    prompt is echoed as a turn ABOVE that marker and leaves the composer empty
+    (a dim ghost suggestion, never our text). Whitespace is squeezed on both
+    sides so the needle survives the composer's soft-wrapping and indentation.
+    """
+    needle = "".join(text.split())[-24:]
+    if not needle:
+        return False
+    cap = capture_pane(pane).get("text", "")
+    idx = cap.rfind("›")
+    region = cap[idx:] if idx != -1 else cap
+    return needle in "".join(region.split())
+
+
+def send_text(
+    pane: str,
+    text: str,
+    settle_before_enter: float = 0.0,
+    verify_submit: bool = False,
+) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it.
 
     `settle_before_enter` pauses between the pasted text and the Enter. Some TUIs
@@ -310,6 +352,10 @@ def send_text(pane: str, text: str, settle_before_enter: float = 0.0) -> dict:
     submitting; the settle lets the composer catch up. The slash case is detected
     here; platform-wide needs (e.g. Codex) are passed in by the caller. When both
     apply, the longer wait wins.
+
+    `verify_submit` (Codex) confirms the composer actually emptied after Enter and
+    resends Enter a couple of times if the prompt is still sitting there, so an
+    under-tuned settle can't silently strand a prompt.
     """
     literal = _run("send-keys", "-t", pane, "-l", "--", text)
     if not literal["ok"]:
@@ -322,4 +368,15 @@ def send_text(pane: str, text: str, settle_before_enter: float = 0.0) -> dict:
     enter = _run("send-keys", "-t", pane, "Enter")
     if not enter["ok"]:
         return {"ok": False, "error": enter["error"]}
+    if verify_submit:
+        for _ in range(_SUBMIT_VERIFY_RETRIES):
+            time.sleep(_SUBMIT_VERIFY_WAIT)
+            if not _composer_has_tail(pane, text):
+                break
+            resent = _run("send-keys", "-t", pane, "Enter")
+            if not resent["ok"]:
+                return {"ok": False, "error": resent["error"]}
+        else:
+            if _composer_has_tail(pane, text):
+                return {"ok": False, "error": "prompt still unsent after retries"}
     return {"ok": True}

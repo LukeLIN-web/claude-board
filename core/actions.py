@@ -837,7 +837,11 @@ def send_prompt(pid: int, text: str) -> dict:
     if len(collapsed) > _MAX_PROMPT_CHARS:
         return {"ok": False, "error": f"prompt too long (max {_MAX_PROMPT_CHARS} chars)"}
     # Codex's TUI swallows an Enter that arrives glued to the pasted text; give it
-    # a settle delay so the prompt actually submits instead of sitting unsent in
-    # the composer. Claude needs no such delay (settle 0.0).
-    settle = tmux._CODEX_ENTER_SETTLE if getattr(w, "platform", "claude") == "codex" else 0.0
-    return tmux.send_text(pane, collapsed, settle_before_enter=settle)
+    # a settle delay (scaled by paste size — a big prompt needs longer to ingest)
+    # so the prompt actually submits instead of sitting unsent in the composer,
+    # and verify the composer emptied afterward. Claude needs neither (settle 0.0).
+    is_codex = getattr(w, "platform", "claude") == "codex"
+    settle = tmux.codex_enter_settle(len(collapsed)) if is_codex else 0.0
+    return tmux.send_text(
+        pane, collapsed, settle_before_enter=settle, verify_submit=is_codex
+    )

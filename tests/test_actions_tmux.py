@@ -60,8 +60,10 @@ class SendPromptTests(unittest.TestCase):
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, "hello")
         pf.assert_called_once_with("/dev/pts/3")
-        # Claude gets no settle before Enter.
-        st.assert_called_once_with("%5", "hello", settle_before_enter=0.0)
+        # Claude gets no settle before Enter and no submit-verify.
+        st.assert_called_once_with(
+            "%5", "hello", settle_before_enter=0.0, verify_submit=False,
+        )
         self.assertTrue(r["ok"])
 
     def test_codex_window_gets_settle_before_enter(self):
@@ -70,8 +72,11 @@ class SendPromptTests(unittest.TestCase):
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, "hello")
+        # Codex gets a length-scaled settle and submit-verification.
         st.assert_called_once_with(
-            "%5", "hello", settle_before_enter=actions.tmux._CODEX_ENTER_SETTLE,
+            "%5", "hello",
+            settle_before_enter=actions.tmux.codex_enter_settle(len("hello")),
+            verify_submit=True,
         )
         self.assertTrue(r["ok"])
 
