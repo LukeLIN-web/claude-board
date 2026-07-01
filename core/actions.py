@@ -745,6 +745,11 @@ _HRULE_RE = re.compile(r"^\s*[─—\-]{8,}\s*$")
 # A queued message line: indented "❯ <text>". The leading whitespace is what
 # distinguishes it from the column-0 active prompt and the in-box input line.
 _QUEUED_RE = re.compile(r"^\s+❯[ \t]+(\S.*?)\s*$")
+# A /btw aside answer renders in a modal overlay: a ▔▔▔ (U+2594) top border, the
+# echoed "/btw …" question, the answer body, then a "… Esc to close" footer. The
+# ▔ border is distinct from the input box's ─ rule (_HRULE_RE), so it anchors the
+# top; "Esc to close" anchors the bottom.
+_BTW_TOP_RE = re.compile(r"^\s*▔{6,}\s*$")
 
 
 def parse_pane_queue(text: str) -> list[str]:
@@ -787,6 +792,56 @@ def get_pane_queue(pid: int) -> list[str]:
     if not cap["ok"]:
         return []
     return parse_pane_queue(cap["text"])
+
+
+def parse_btw_overlay(text: str) -> Optional[dict]:
+    """Extract {question, answer} from a captured /btw aside overlay, or None.
+
+    /btw answers are shown in an ephemeral overlay and are never written to the
+    transcript, so scraping the pane is the only way to recover them. Best-effort:
+    if a long answer scrolls the ▔ top border off-screen we return None (precision
+    over recall — better to miss than to latch a half-parsed answer).
+    """
+    if not text:
+        return None
+    lines = text.split("\n")
+    foot = next((i for i in range(len(lines) - 1, -1, -1)
+                 if "Esc to close" in lines[i]), None)
+    if foot is None:
+        return None
+    top = next((i for i in range(foot - 1, -1, -1)
+                if _BTW_TOP_RE.match(lines[i])), None)
+    if top is None:
+        return None
+    q_idx = next((i for i in range(top + 1, foot)
+                  if lines[i].lstrip().startswith("/btw")), None)
+    if q_idx is None:
+        return None
+    question = lines[q_idx].strip()
+    if question.startswith("/btw"):
+        question = question[len("/btw"):].strip()
+    answer = "\n".join(ln.strip() for ln in lines[q_idx + 1:foot] if ln.strip())[:4000]
+    if not answer:
+        return None
+    return {"question": question, "answer": answer}
+
+
+def get_btw_answer(pid: int) -> Optional[dict]:
+    """The /btw overlay currently on `pid`'s pane as {question, answer}, or None.
+
+    The overlay covers the visible pane, so a plain capture (no scrollback, which
+    would pull in stale pre-overlay content) is what we want. None on any miss.
+    """
+    w = find_window(pid)
+    if not w or not w.tty:
+        return None
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return None
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return None
+    return parse_btw_overlay(cap["text"])
 
 
 # Keys the dashboard is allowed to send into an interactive menu (e.g. the

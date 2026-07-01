@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -131,6 +131,20 @@ def _enriched_snapshot() -> dict:
             if status == "idle" and isinstance(pid, int):
                 promptqueue.clear(pid)  # a queue can't outlive an idle session
             w["queued"] = []
+        # /btw asides never reach the transcript, so scrape the ephemeral overlay
+        # from the pane (best-effort, only while it is on-screen) and latch it to
+        # disk. The overlay can be open whether the session is busy or idle, so
+        # this isn't gated on show_queue. w["btw"] shows the latest archived aside
+        # and persists after the overlay is dismissed.
+        sid = w.get("session_id")
+        if isinstance(pid, int) and w.get("tty"):
+            try:
+                ov = actions.get_btw_answer(pid)
+                if ov and sid:
+                    btwlog.record(sid, ov["question"], ov["answer"])
+            except Exception:
+                pass  # scrape/parse failures degrade to whatever is already latched
+        w["btw"] = btwlog.latest(sid) if sid else None
     # Merge live Codex windows in, then recompute the header counts over every
     # visible (non-hidden) window across both platforms. Count by `triage`, not
     # the raw `status`: the header chips filter cards on triage, so a session
@@ -274,6 +288,14 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
             "menu": None,
         }
     events = transcripts.timeline(tp, limit=limit) if tp else []
+    # Merge in /btw asides — they live only in the fleet's archive (never the
+    # transcript). Re-sort by timestamp so they interleave with real turns;
+    # only sort when there is something to merge, to avoid perturbing the
+    # transcript's own ordering otherwise.
+    btw_evs = btwlog.timeline_events(w.session_id) if w.session_id else []
+    if btw_evs:
+        events = sorted(events + btw_evs,
+                        key=lambda e: transcripts._parse_ts(e.get("ts", "")))[-limit:]
     return {
         "pid": pid,
         "session_id": w.session_id,
