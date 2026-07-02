@@ -972,6 +972,39 @@ def send_menu_keys(pid: int, keys: list[str]) -> dict:
     return tmux.send_keys(pane, *keys)
 
 
+# A /btw answer stays up as a modal overlay ("Esc to close") until dismissed —
+# it does NOT auto-close after answering, and neither the read-only scrape nor
+# the scroll-stitch capture (capture_full_btw_answer) closes it. Text pasted into
+# a pane while that overlay is open is swallowed by the overlay, not the composer,
+# so the *next* prompt after a /btw is silently lost ("回不到普通 prompt 模式").
+# Detect the overlay by its distinctive ▔ top border together with the "Esc to
+# close" footer — distinct enough from normal transcript output that we won't
+# Escape (and so interrupt) a merely-working session.
+_OVERLAY_CLOSE_HINT = "Esc to close"
+_OVERLAY_DISMISS_TRIES = 4      # Escape + re-check, a few times
+_OVERLAY_DISMISS_SETTLE = 0.15  # let the overlay tear down before re-capturing
+
+
+def _answer_overlay_open(text: str) -> bool:
+    """True if a dismissible answer overlay (a /btw aside) is covering the pane."""
+    if not text or _OVERLAY_CLOSE_HINT not in text:
+        return False
+    return any(_BTW_TOP_RE.match(ln) for ln in text.split("\n"))
+
+
+def _dismiss_answer_overlay(pane: str) -> None:
+    """Escape a modal /btw answer overlay so a following prompt lands in the real
+    composer instead of being eaten. Best-effort and self-limiting: only presses
+    Escape while the overlay is actually detected (never on a clean/busy pane),
+    and gives up quietly if capture fails or it won't clear."""
+    for _ in range(_OVERLAY_DISMISS_TRIES):
+        cap = tmux.capture_pane(pane)
+        if not cap.get("ok") or not _answer_overlay_open(cap.get("text", "")):
+            return
+        tmux.send_keys(pane, "Escape")
+        time.sleep(_OVERLAY_DISMISS_SETTLE)
+
+
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
     w = find_window(pid)
@@ -988,6 +1021,9 @@ def send_prompt(pid: int, text: str) -> dict:
         return {"ok": False, "error": "prompt is empty"}
     if len(collapsed) > _MAX_PROMPT_CHARS:
         return {"ok": False, "error": f"prompt too long (max {_MAX_PROMPT_CHARS} chars)"}
+    # A /btw aside from a prior send may still be open over the pane; clear it
+    # first so this prompt isn't swallowed by the overlay.
+    _dismiss_answer_overlay(pane)
     # Codex's TUI swallows an Enter that arrives glued to the pasted text; give it
     # a settle delay (scaled by paste size — a big prompt needs longer to ingest)
     # so the prompt actually submits instead of sitting unsent in the composer,

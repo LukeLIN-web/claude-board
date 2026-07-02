@@ -130,6 +130,45 @@ class SendPromptTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         st.assert_called_once()
 
+    # A settled /btw answer overlay left on the pane: ▔ border + "Esc to close".
+    _BTW_OVERLAY = (
+        "▔" * 60 + "\n\n"
+        "    /btw what is 2 plus 2\n\n"
+        "      2 plus 2 is 4.\n\n"
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\n"
+    )
+    _CLEAN_PANE = "❯ \n⏵⏵ bypass permissions on"
+
+    def test_open_btw_overlay_is_dismissed_before_send(self):
+        # An open /btw overlay is modal: a prompt pasted while it's up is eaten.
+        # send_prompt must Escape it (then re-check it cleared) before the paste.
+        caps = [{"ok": True, "text": self._BTW_OVERLAY},
+                {"ok": True, "text": self._CLEAN_PANE}]
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.send_prompt(1234, "hello")
+        sk.assert_any_call("%5", "Escape")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
+    def test_no_escape_when_composer_is_clean(self):
+        # No overlay -> never touch Escape (it would interrupt a working session).
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": self._CLEAN_PANE}), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
+            r = actions.send_prompt(1234, "hello")
+        sk.assert_not_called()
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
 
 _PICKER_TEXT = (
     "This session is 7h old and 192k tokens.\n"
