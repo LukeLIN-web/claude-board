@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, btwcapture, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -137,13 +137,11 @@ def _enriched_snapshot() -> dict:
         # this isn't gated on show_queue. w["btw"] shows the latest archived aside
         # and persists after the overlay is dismissed.
         sid = w.get("session_id")
-        if isinstance(pid, int) and w.get("tty"):
-            try:
-                ov = actions.get_btw_answer(pid)
-                if ov and sid:
-                    btwlog.record(sid, ov["question"], ov["answer"])
-            except Exception:
-                pass  # scrape/parse failures degrade to whatever is already latched
+        if isinstance(pid, int) and w.get("tty") and sid:
+            # A long answer only shows a slice in the overlay window; recovering the
+            # rest means scrolling the pane, so this gates on a cheap top-slice
+            # scrape and does the slow scroll-stitch off-thread (core.btwcapture).
+            btwcapture.maybe_capture(pid, sid)
         w["btw"] = btwlog.latest(sid) if sid else None
     # Merge live Codex windows in, then recompute the header counts over every
     # visible (non-hidden) window across both platforms. Count by `triage`, not

@@ -121,6 +121,83 @@ class GetBtwAnswerTests(unittest.TestCase):
         self.assertEqual(got["answer"], "Red\nYellow\nBlue")
 
 
+def _btw_frame(answer_lines, question="print the integers", *, overlay=True, settled=True):
+    """Build a captured-pane string mimicking a /btw overlay at some scroll
+    position: pinned ▔ border, pinned "/btw …" line, the currently-visible answer
+    window, then the pinned footer. overlay=False yields a plain (dismissed) pane
+    so parse/extract return None; settled=False drops the "c to copy" hint."""
+    if not overlay:
+        return "some normal pane text\n❯ \n"
+    foot = "↑/↓ to scroll · " + ("c to copy · f to fork · " if settled else "") + "Esc to close"
+    body = "\n".join(f"      {ln}" for ln in answer_lines)
+    return f"{'▔' * 60}\n\n    /btw {question}\n\n{body}\n\n    {foot}\n"
+
+
+class StitchBtwTests(unittest.TestCase):
+    def test_merges_overlapping_windows(self):
+        self.assertEqual(actions._stitch_btw(["a", "b", "c"], ["b", "c", "d"]),
+                         ["a", "b", "c", "d"])
+
+    def test_empty_accumulator_takes_new(self):
+        self.assertEqual(actions._stitch_btw([], ["a", "b"]), ["a", "b"])
+
+    def test_full_overlap_does_not_grow(self):
+        # Bottom reached: the window stopped advancing.
+        self.assertEqual(actions._stitch_btw(["a", "b", "c"], ["a", "b", "c"]),
+                         ["a", "b", "c"])
+
+    def test_no_overlap_concatenates(self):
+        self.assertEqual(actions._stitch_btw(["a", "b"], ["c", "d"]),
+                         ["a", "b", "c", "d"])
+
+
+class CaptureFullBtwAnswerTests(unittest.TestCase):
+    def _run(self, frames):
+        sent = []
+        w = types.SimpleNamespace(tty="/dev/pts/9")
+        with mock.patch.object(actions, "find_window", return_value=w), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%3"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               side_effect=[{"ok": True, "text": f} for f in frames]), \
+             mock.patch.object(actions.tmux, "send_keys",
+                               side_effect=lambda pane, *keys: sent.extend(keys) or {"ok": True}), \
+             mock.patch.object(actions.time, "sleep"):
+            got = actions.capture_full_btw_answer(123)
+        return got, sent
+
+    def test_scrolls_and_stitches_full_answer(self):
+        # window of 3 lines, full answer L1..L6, scrolling 1 line per Down until
+        # the window clamps at the bottom (last frame == previous).
+        frames = [
+            _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["L2", "L3", "L4"]),
+            _btw_frame(["L3", "L4", "L5"]),
+            _btw_frame(["L4", "L5", "L6"]),
+            _btw_frame(["L4", "L5", "L6"]),  # bottom clamp -> stop
+        ]
+        got, sent = self._run(frames)
+        self.assertEqual(got["answer"], "L1\nL2\nL3\nL4\nL5\nL6")
+        # 4 Downs advanced the window; the view is then restored with 4 Ups.
+        self.assertEqual(sent, ["Down"] * 4 + ["Up"] * 4)
+
+    def test_none_when_no_overlay(self):
+        got, sent = self._run([_btw_frame([], overlay=False)])
+        self.assertIsNone(got)
+        self.assertEqual(sent, [])  # never touch the keyboard without an overlay
+
+    def test_aborts_without_restoring_when_overlay_vanishes(self):
+        # If the overlay disappears mid-scroll, stop immediately and send NO Ups —
+        # stray arrows would fall through to the composer (history recall).
+        frames = [
+            _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["L2", "L3", "L4"]),
+            _btw_frame([], overlay=False),  # gone
+        ]
+        got, sent = self._run(frames)
+        self.assertEqual(got["answer"], "L1\nL2\nL3\nL4")
+        self.assertEqual(sent, ["Down", "Down"])  # no Up restore
+
+
 class BtwLogTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -165,6 +242,17 @@ class BtwLogTests(unittest.TestCase):
         btwlog._cache.clear()
         self.assertEqual(btwlog.entries("sess1"), [])
         self.assertFalse((Path(self.tmp) / "sess1.jsonl").exists())
+
+    def test_has_prefix_matches_stored_answer_prefix(self):
+        btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4")
+        self.assertTrue(btwlog.has_prefix("sess1", "q1", "L1\nL2"))
+        self.assertTrue(btwlog.has_prefix("sess1", "q1", "L1\nL2\nL3\nL4"))
+
+    def test_has_prefix_false_on_mismatch(self):
+        btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4")
+        self.assertFalse(btwlog.has_prefix("sess1", "q1", "X"))
+        self.assertFalse(btwlog.has_prefix("sess1", "other", "L1"))
+        self.assertFalse(btwlog.has_prefix("sess1", "q1", "   "))
 
     def test_timeline_events_shape(self):
         btwlog.record("sess1", "q1", "a1")
@@ -218,6 +306,58 @@ class TimelineMergeTests(unittest.TestCase):
             for p in patches:
                 p.stop()
         self.assertEqual(len(out["events"]), 1)
+
+
+class BtwCaptureGateTests(unittest.TestCase):
+    """The gate that decides whether to fire the (slow, key-injecting) full-answer
+    scroll-stitch: skip when the aside is already fully archived, and never run two
+    at once for the same session."""
+
+    def setUp(self):
+        from core import btwcapture
+        self.btwcapture = btwcapture
+        self.tmp = tempfile.mkdtemp()
+        self._orig = btwlog._DIR
+        btwlog._DIR = Path(self.tmp)
+        btwlog._cache.clear()
+        btwcapture._inflight.clear()
+        # Run the "background" work synchronously so the test is deterministic.
+        self._thread_patch = mock.patch.object(
+            btwcapture.threading, "Thread",
+            side_effect=lambda target, args=(), daemon=None: types.SimpleNamespace(
+                start=lambda: target(*args)))
+        self._thread_patch.start()
+
+    def tearDown(self):
+        self._thread_patch.stop()
+        btwlog._DIR = self._orig
+        btwlog._cache.clear()
+        self.btwcapture._inflight.clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_captures_and_stores_new_aside(self):
+        slice_ov = {"question": "q1", "answer": "L1\nL2"}
+        full = {"question": "q1", "answer": "L1\nL2\nL3\nL4\nL5\nL6"}
+        with mock.patch.object(self.btwcapture.actions, "get_btw_answer", return_value=slice_ov), \
+             mock.patch.object(self.btwcapture.actions, "capture_full_btw_answer",
+                               return_value=full) as cf:
+            self.btwcapture.maybe_capture(123, "sess1")
+        cf.assert_called_once()
+        self.assertEqual(btwlog.latest("sess1")["answer"], "L1\nL2\nL3\nL4\nL5\nL6")
+
+    def test_skips_already_archived_aside(self):
+        btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4\nL5\nL6")
+        slice_ov = {"question": "q1", "answer": "L1\nL2"}  # top slice of the stored full answer
+        with mock.patch.object(self.btwcapture.actions, "get_btw_answer", return_value=slice_ov), \
+             mock.patch.object(self.btwcapture.actions, "capture_full_btw_answer") as cf:
+            self.btwcapture.maybe_capture(123, "sess1")
+        cf.assert_not_called()  # already have it — no key injection
+
+    def test_skips_when_no_overlay(self):
+        with mock.patch.object(self.btwcapture.actions, "get_btw_answer", return_value=None), \
+             mock.patch.object(self.btwcapture.actions, "capture_full_btw_answer") as cf:
+            self.btwcapture.maybe_capture(123, "sess1")
+        cf.assert_not_called()
 
 
 if __name__ == "__main__":

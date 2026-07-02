@@ -811,6 +811,25 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     animating spinner from defeating the archive's de-dupe. Best-effort otherwise:
     a long answer that scrolls the ▔ border off-screen is missed by design.
     """
+    got = _btw_regions(text)
+    if got is None:
+        return None
+    question, answer_lines = got
+    answer = "\n".join(answer_lines)[:4000]
+    if not answer:
+        return None
+    return {"question": question, "answer": answer}
+
+
+def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
+    """The (question, visible-answer-lines) of a *settled* /btw overlay, or None.
+
+    The overlay pins its ▔ border, the "/btw …" question line, and the footer in
+    place while only the answer region scrolls, so this same anchor logic works at
+    any scroll position — capture_full_btw_answer relies on that to walk a long
+    answer window-by-window. Returns None when there is no settled overlay on the
+    pane (no footer, mid-generation, or border/question scrolled off), which is
+    also the signal that the overlay has been dismissed."""
     if not text:
         return None
     lines = text.split("\n")
@@ -831,10 +850,8 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     question = lines[q_idx].strip()
     if question.startswith("/btw"):
         question = question[len("/btw"):].strip()
-    answer = "\n".join(ln.strip() for ln in lines[q_idx + 1:foot] if ln.strip())[:4000]
-    if not answer:
-        return None
-    return {"question": question, "answer": answer}
+    answer_lines = [ln.strip() for ln in lines[q_idx + 1:foot] if ln.strip()]
+    return question, answer_lines
 
 
 def get_btw_answer(pid: int) -> Optional[dict]:
@@ -853,6 +870,75 @@ def get_btw_answer(pid: int) -> Optional[dict]:
     if not cap["ok"]:
         return None
     return parse_btw_overlay(cap["text"])
+
+
+# The /btw overlay shows a long answer only a sliding window at a time, and the
+# un-scrolled remainder is never emitted to the terminal (nor the transcript), so
+# a single capture truncates it. To recover the whole answer we scroll the window
+# to the bottom and stitch each frame. Empirically (Claude Code v2.1.x, 80x24):
+# only ↑/↓ scroll — PgUp/PgDn are no-ops and Ctrl-D/Ctrl-F/Space *dismiss* the
+# overlay; ↓ advances a few lines and clamps at the bottom (frame stops changing);
+# ↑ clamps at the top. Crucially, once the overlay is gone, arrow keys fall
+# through to the composer (history recall), so we re-verify the overlay is present
+# before every keystroke and, if it has vanished, stop sending keys at once.
+_BTW_SCROLL_MAX = 120          # hard cap on ↓ presses (far beyond any real answer)
+_BTW_SCROLL_SETTLE = 0.18      # let the overlay redraw before re-capturing
+_BTW_ANSWER_MAX = 20000        # sanity cap on a fully-stitched answer
+
+
+def _stitch_btw(acc: list[str], window: list[str]) -> list[str]:
+    """Append a later, overlapping scroll `window` onto `acc`, dropping the longest
+    prefix of `window` that is already the suffix of `acc`. Equal frames (the
+    window clamped at the bottom) leave `acc` unchanged — the caller's stop signal."""
+    if not acc:
+        return list(window)
+    for o in range(min(len(acc), len(window)), 0, -1):
+        if acc[-o:] == window[:o]:
+            return acc + window[o:]
+    return acc + window
+
+
+def capture_full_btw_answer(pid: int) -> Optional[dict]:
+    """The *complete* /btw aside on `pid`'s pane, scrolling the overlay to recover
+    an answer taller than the visible window. None if no settled overlay is up.
+
+    Injects ↓ keys into the live pane, so callers must gate this (see
+    core.btwcapture): only run it for a not-yet-archived aside, off the hot path.
+    """
+    w = find_window(pid)
+    if not w or not w.tty:
+        return None
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return None
+    first = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+    if first is None:
+        return None  # no settled overlay — never touch the keyboard
+    question, acc = first
+    presses = 0
+    overlay_alive = True
+    while presses < _BTW_SCROLL_MAX:
+        tmux.send_keys(pane, "Down")
+        presses += 1
+        time.sleep(_BTW_SCROLL_SETTLE)
+        cur = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+        if cur is None:
+            # Overlay dismissed mid-scroll: stop now and DO NOT restore — further
+            # arrows would drive the composer's history instead of the overlay.
+            overlay_alive = False
+            break
+        merged = _stitch_btw(acc, cur[1])
+        if merged == acc:
+            break  # window clamped at the bottom — whole answer captured
+        acc = merged
+    if overlay_alive:
+        # Restore the user's view to the top: exactly as many ↑ as ↓ (both clamp,
+        # so this lands back at the top). ↑ never dismisses the overlay.
+        for _ in range(presses):
+            tmux.send_keys(pane, "Up")
+            time.sleep(_BTW_SCROLL_SETTLE)
+    answer = "\n".join(acc)[:_BTW_ANSWER_MAX]
+    return {"question": question, "answer": answer} if answer else None
 
 
 # Keys the dashboard is allowed to send into an interactive menu (e.g. the

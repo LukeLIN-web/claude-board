@@ -74,6 +74,22 @@ def record(session_id: str, question: str, answer: str) -> Optional[dict]:
     return entry
 
 
+def has_prefix(session_id: str, question: str, answer_prefix: str) -> bool:
+    """Is an aside with this question, whose stored answer *starts with*
+    `answer_prefix`, already archived? The scroll-stitch capture is top-anchored,
+    so the visible top slice is a prefix of the full answer — this lets the gate
+    (core.btwcapture) recognise an already-fully-captured aside from its cheap top
+    slice and skip re-scraping it (which would re-inject scroll keys)."""
+    if not session_id:
+        return False
+    q = (question or "").strip()
+    a = (answer_prefix or "").strip()
+    if not a:
+        return False
+    return any(e.get("question") == q and (e.get("answer") or "").startswith(a)
+               for e in _load(session_id))
+
+
 def latest(session_id: str) -> Optional[dict]:
     """Most recent aside for the card, or None."""
     if not session_id:
