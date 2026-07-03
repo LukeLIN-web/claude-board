@@ -421,6 +421,7 @@
   <!-- ===== Timeline panel ===== -->
   <div x-ref="timelinePanel"
        x-show="(expandedPid !== null && timelineData) || (expandedHistoryId && timelineData)"
+       @copy="copyAsPlainText($event)"
        class="mt-6 bg-white rounded-xl shadow border p-5" x-transition>
     <div class="flex items-center justify-between mb-4">
       <h2 class="font-semibold flex items-center gap-2">
@@ -852,6 +853,15 @@ function fleet() {
     setAssistantFont(delta) {
       this.assistantFontPx = Math.min(28, Math.max(10, this.assistantFontPx + delta));
       localStorage.setItem('assistantFontPx', this.assistantFontPx);
+    },
+
+    // Timeline text lives in <pre> tags; a default copy carries that HTML along,
+    // so Teams/Word render the paste as a code block. Strip to text/plain only.
+    copyAsPlainText(e) {
+      const text = window.getSelection()?.toString();
+      if (!text || !e.clipboardData) return;
+      e.preventDefault();
+      e.clipboardData.setData('text/plain', text);
     },
 
     get recentCwds() {
