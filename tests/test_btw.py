@@ -273,6 +273,53 @@ class BtwLogTests(unittest.TestCase):
         self.assertFalse(btwlog.has_prefix("sess1", "other", "L1"))
         self.assertFalse(btwlog.has_prefix("sess1", "q1", "   "))
 
+    def test_dismiss_hides_latest_from_card(self):
+        e = btwlog.record("sess1", "q1", "a1")
+        self.assertTrue(btwlog.dismiss("sess1", e["id"]))
+        self.assertIsNone(btwlog.latest("sess1"))
+
+    def test_dismiss_persists_across_cache_drop(self):
+        # The dismissal must survive a fleet restart, or the aside pops back.
+        e = btwlog.record("sess1", "q1", "a1")
+        btwlog.dismiss("sess1", e["id"])
+        btwlog._cache.clear()
+        self.assertIsNone(btwlog.latest("sess1"))
+
+    def test_dismiss_unknown_id_is_false(self):
+        btwlog.record("sess1", "q1", "a1")
+        self.assertFalse(btwlog.dismiss("sess1", 999))
+        self.assertIsNotNone(btwlog.latest("sess1"))
+
+    def test_dismissed_stays_in_timeline(self):
+        # Dismiss only affects the card's current-state view; the timeline is
+        # history and keeps the aside.
+        e = btwlog.record("sess1", "q1", "a1")
+        btwlog.dismiss("sess1", e["id"])
+        evs = btwlog.timeline_events("sess1")
+        self.assertEqual([ev["kind"] for ev in evs], ["user_text", "assistant_text"])
+
+    def test_new_aside_after_dismiss_shows_on_card(self):
+        e = btwlog.record("sess1", "q1", "a1")
+        btwlog.dismiss("sess1", e["id"])
+        btwlog.record("sess1", "q2", "a2")
+        self.assertEqual(btwlog.latest("sess1")["question"], "q2")
+
+    def test_dismissed_aside_still_dedupes_rescrape(self):
+        # The overlay may still be on-screen after a card dismiss; the 2s
+        # re-scrape must not resurrect the aside as a fresh entry.
+        e = btwlog.record("sess1", "q1", "a1")
+        btwlog.dismiss("sess1", e["id"])
+        self.assertIsNone(btwlog.record("sess1", "q1", "a1"))
+        self.assertIsNone(btwlog.latest("sess1"))
+
+    def test_ids_unique_across_restart(self):
+        # Dismiss tombstones reference entries by id, so an id minted after a
+        # restart must not collide with one already on disk.
+        e1 = btwlog.record("sess1", "q1", "a1")
+        btwlog._cache.clear()  # simulate a fresh process
+        e2 = btwlog.record("sess1", "q2", "a2")
+        self.assertNotEqual(e1["id"], e2["id"])
+
     def test_timeline_events_shape(self):
         btwlog.record("sess1", "q1", "a1")
         evs = btwlog.timeline_events("sess1")

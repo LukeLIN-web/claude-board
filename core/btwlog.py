@@ -15,18 +15,22 @@ is a warm cache.
 """
 from __future__ import annotations
 
-import itertools
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# One JSONL per session under the user's Claude dir; each line is one entry.
+# One JSONL per session under the user's Claude dir. Append-only: a line is
+# either an entry or a {"dismiss": id} tombstone (see dismiss()).
 _DIR = Path.home() / ".claude" / "fleet_btwlog"
-_ids = itertools.count(1)
-# session_id -> [{id, ts, question, answer}]  (ts = epoch seconds)
+# session_id -> [{id, ts, question, answer[, dismissed]}]  (ts = epoch seconds)
 _cache: dict[str, list[dict]] = {}
+# Guards the read-modify-append in record()/dismiss(): ids are per-session
+# max+1, so two writers racing (watcher thread vs. a btwcapture thread) could
+# otherwise mint the same id and dismiss() would then hide both entries.
+_lock = threading.Lock()
 
 
 def _path(session_id: str) -> Path:
@@ -44,8 +48,16 @@ def _load(session_id: str) -> list[dict]:
         try:
             for line in p.read_text().splitlines():
                 line = line.strip()
-                if line:
-                    items.append(json.loads(line))
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if "dismiss" in obj:
+                    # Tombstone: flag the referenced entry instead of appending.
+                    for e in items:
+                        if e.get("id") == obj["dismiss"]:
+                            e["dismissed"] = True
+                else:
+                    items.append(obj)
         except Exception:
             items = []  # a corrupt file degrades to empty, never raises
     _cache[session_id] = items
@@ -60,17 +72,22 @@ def record(session_id: str, question: str, answer: str) -> Optional[dict]:
         return None
     q = (question or "").strip()
     a = answer.strip()
-    items = _load(session_id)
-    if items and items[-1].get("question") == q and items[-1].get("answer") == a:
-        return None
-    entry = {"id": next(_ids), "ts": time.time(), "question": q, "answer": a}
-    items.append(entry)
-    try:
-        _DIR.mkdir(parents=True, exist_ok=True)
-        with _path(session_id).open("a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass  # disk failure degrades to in-memory only
+    with _lock:
+        items = _load(session_id)
+        if items and items[-1].get("question") == q and items[-1].get("answer") == a:
+            return None
+        # Per-session max+1, not a process counter: dismiss tombstones reference
+        # entries by id, so ids minted after a restart must not reuse ones
+        # already persisted for the session.
+        next_id = max((e.get("id") or 0 for e in items), default=0) + 1
+        entry = {"id": next_id, "ts": time.time(), "question": q, "answer": a}
+        items.append(entry)
+        try:
+            _DIR.mkdir(parents=True, exist_ok=True)
+            with _path(session_id).open("a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # disk failure degrades to in-memory only
     return entry
 
 
@@ -90,12 +107,42 @@ def has_prefix(session_id: str, question: str, answer_prefix: str) -> bool:
                for e in _load(session_id))
 
 
+def dismiss(session_id: str, entry_id: int) -> bool:
+    """Hide an archived aside from the card; the archive and the timeline keep
+    it — dismiss changes the card's current-state view, not history. Persisted
+    as an appended {"dismiss": id} tombstone so the file stays append-only
+    (a rewrite could race the capture thread's append and drop an entry)."""
+    if not session_id:
+        return False
+    with _lock:
+        items = _load(session_id)
+        hit = False
+        for e in items:
+            if e.get("id") == entry_id:
+                e["dismissed"] = True
+                hit = True
+        if not hit:
+            return False
+        try:
+            _DIR.mkdir(parents=True, exist_ok=True)
+            with _path(session_id).open("a") as f:
+                f.write(json.dumps({"dismiss": entry_id}) + "\n")
+        except Exception:
+            pass  # disk failure degrades to in-memory only
+    return True
+
+
 def latest(session_id: str) -> Optional[dict]:
-    """Most recent aside for the card, or None."""
+    """Most recent aside for the card, or None. A dismissed newest aside yields
+    None rather than falling back to an older entry — older asides were already
+    superseded on the card, and resurrecting one on dismiss would look like a
+    bug (one click must clear the card)."""
     if not session_id:
         return None
     items = _load(session_id)
-    return items[-1] if items else None
+    if not items or items[-1].get("dismissed"):
+        return None
+    return items[-1]
 
 
 def entries(session_id: str) -> list[dict]:

@@ -29,16 +29,22 @@ class State:
         self.subscribers: set[asyncio.Queue] = set()
 
     def diff_signature(self, snap: dict) -> tuple:
-        # Tuple of (pid, status, waiting_for, updated_at, queued) lets us tell
-        # whether anything dashboard-visible has changed. The queued list is
-        # included so consuming/adding a queued prompt re-broadcasts even when
-        # status and updated_at are otherwise unchanged (the session stays
-        # "busy" while Claude works through the queue).
+        # Tuple of (pid, status, waiting_for, updated_at, queued, btw) lets us
+        # tell whether anything dashboard-visible has changed. The queued list
+        # is included so consuming/adding a queued prompt re-broadcasts even
+        # when status and updated_at are otherwise unchanged (the session stays
+        # "busy" while Claude works through the queue). The /btw aside identity
+        # is included so archiving or dismissing one re-broadcasts on an
+        # otherwise idle session (a fuller stitched answer gets a new id, and a
+        # pending aside has no id yet — hence id+question+pending).
         return tuple(
             (
                 w["pid"], w["status"], w["waiting_for"], w["updated_at"],
                 tuple((q.get("source"), q.get("text"))
                       for q in w.get("queued", [])),
+                ((w.get("btw") or {}).get("id"),
+                 (w.get("btw") or {}).get("question"),
+                 (w.get("btw") or {}).get("pending")),
             )
             for w in snap["windows"]
         )
@@ -438,6 +444,24 @@ def api_export(pid: int) -> dict:
 def api_close(pid: int) -> dict:
     _require_window(pid)
     return actions.close_session(pid)
+
+
+class BtwDismissBody(BaseModel):
+    id: int  # btwlog entry id (w["btw"].id on the card)
+
+
+@app.post("/api/windows/{pid}/btw/dismiss")
+def api_btw_dismiss(pid: int, body: BtwDismissBody) -> dict:
+    """Hide the card's archived /btw aside. Card-state only: the aside stays in
+    the archive and the timeline (that's history), it just stops occupying the
+    card."""
+    w = _require_window(pid)
+    sid = getattr(w, "session_id", None)
+    if not sid:
+        return {"ok": False, "error": "window has no session id"}
+    if not btwlog.dismiss(sid, body.id):
+        return {"ok": False, "error": "aside not found"}
+    return {"ok": True}
 
 
 @app.get("/api/locate/{session_id}")

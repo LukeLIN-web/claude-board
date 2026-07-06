@@ -54,6 +54,32 @@ class PromptRouteTests(unittest.TestCase):
         m.assert_not_called()
 
 
+class BtwDismissRouteTests(unittest.TestCase):
+    def test_dispatches_to_btwlog_dismiss(self):
+        w = mock.Mock(session_id="sess1")
+        with mock.patch.object(appmod.sessions, "find_window", return_value=w), \
+             mock.patch.object(appmod.btwlog, "dismiss", return_value=True) as m:
+            r = appmod.api_btw_dismiss(4321, appmod.BtwDismissBody(id=7))
+        m.assert_called_once_with("sess1", 7)
+        self.assertTrue(r["ok"])
+
+    def test_error_without_session_id(self):
+        w = mock.Mock(session_id=None)
+        with mock.patch.object(appmod.sessions, "find_window", return_value=w), \
+             mock.patch.object(appmod.btwlog, "dismiss") as m:
+            r = appmod.api_btw_dismiss(4321, appmod.BtwDismissBody(id=7))
+        m.assert_not_called()
+        self.assertFalse(r["ok"])
+
+    def test_blocked_for_hidden_window(self):
+        import fastapi
+        with mock.patch.object(appmod.sessions, "find_window", return_value=None), \
+             mock.patch.object(appmod.btwlog, "dismiss") as m:
+            with self.assertRaises(fastapi.HTTPException):
+                appmod.api_btw_dismiss(4321, appmod.BtwDismissBody(id=7))
+        m.assert_not_called()
+
+
 class SnapshotFlagTests(unittest.TestCase):
     def test_tmux_available_present_with_zero_windows(self):
         empty = {"windows": [], "counts": {}, "ts": 0}
@@ -125,6 +151,19 @@ class DiffSignatureTests(unittest.TestCase):
         self.assertNotEqual(
             st.diff_signature(before), st.diff_signature(after),
             "consuming a queued prompt must change the broadcast signature")
+
+    def test_btw_change_alone_changes_signature(self):
+        # Archiving or dismissing an aside on an otherwise idle session must
+        # still broadcast, or the card keeps showing a stale (or dismissed) aside.
+        st = appmod.State()
+        w_with = self._win([])
+        w_with["btw"] = {"id": 1, "ts": 0, "question": "q", "answer": "a"}
+        w_without = self._win([])
+        w_without["btw"] = None
+        self.assertNotEqual(
+            st.diff_signature({"windows": [w_with], "counts": {}, "ts": 0}),
+            st.diff_signature({"windows": [w_without], "counts": {}, "ts": 0}),
+            "dismissing the card's aside must change the broadcast signature")
 
 
 class StaleDialogOpenTests(unittest.TestCase):

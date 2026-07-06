@@ -346,17 +346,32 @@
           </div>
           <!-- Latest /btw aside — scraped from the ephemeral overlay (never in the
                transcript), latched to disk, so it survives the overlay closing. -->
-          <div x-show="w.btw" class="space-y-0.5">
-            <div class="text-[10px] font-semibold text-teal-700 uppercase tracking-wide">💬 /btw</div>
+          <!-- !dismissed guard: a snapshot built just before a dismiss can still
+               carry the aside (flagged dismissed) for one 2s watcher tick. -->
+          <div x-show="w.btw && !w.btw.dismissed" class="space-y-0.5">
+            <div class="flex items-center justify-between">
+              <div class="text-[10px] font-semibold text-teal-700 uppercase tracking-wide">💬 /btw</div>
+              <!-- Dismiss is card-state only: the aside stays in the timeline
+                   (that's history). A pending aside has no archived entry (no
+                   id) yet, so it can't be dismissed. -->
+              <button x-show="w.btw?.id" @click.stop="dismissBtw(w)"
+                      class="text-[10px] leading-none text-teal-400 hover:text-teal-700 px-1"
+                      title="Dismiss from card (kept in timeline)">✕</button>
+            </div>
             <div class="text-[10px] text-teal-800 bg-teal-50 rounded px-1.5 py-0.5">
               <div class="font-medium truncate" x-show="w.btw?.question" x-text="w.btw?.question"></div>
               <!-- While the aside is still generating there is nothing archived
                    yet; show a live state instead of nothing so /btw never looks
                    like it did nothing. -->
               <div x-show="w.btw?.pending" class="italic text-teal-600">✽ answering…</div>
-              <div x-show="!w.btw?.pending" class="whitespace-pre-line"
-                   style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;"
-                   x-text="w.btw?.answer"></div>
+              <div x-show="!w.btw?.pending">
+                <div class="whitespace-pre-line"
+                     :style="btwExpanded[btwKey(w)] ? '' : 'display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;'"
+                     x-text="w.btw?.answer"></div>
+                <button x-show="btwIsLong(w)" @click.stop="btwExpanded[btwKey(w)] = !btwExpanded[btwKey(w)]"
+                        class="text-teal-600 hover:text-teal-800 underline"
+                        x-text="btwExpanded[btwKey(w)] ? 'less ▴' : 'more ▾'"></button>
+              </div>
             </div>
           </div>
           <div class="text-gray-400">
@@ -852,6 +867,9 @@ function fleet() {
     promptDrafts: {},
     promptSending: {},
     permSending: {},
+    // Per-aside expand state for long /btw answers, keyed by pid:entry-id so a
+    // new aside on the same card starts collapsed again.
+    btwExpanded: {},
     assistantFontPx: Number(localStorage.getItem('assistantFontPx')) || 14,
 
     setAssistantFont(delta) {
@@ -1065,6 +1083,23 @@ function fleet() {
     async focusWindow(pid) {
       const d = await this.apiPost(`/api/windows/${pid}/focus`);
       if (!d.ok) this.toast('Focus failed: ' + (d.error || ''));
+    },
+
+    btwKey(w) {
+      return w.pid + ':' + (w.btw?.id || 0);
+    },
+    // The answer is clamped to 3 rendered lines; offer expand when it plausibly
+    // overflows that — by newline count or by enough text to wrap past 3 lines.
+    btwIsLong(w) {
+      const a = w.btw?.answer || '';
+      return a.split('\n').length > 3 || a.length > 240;
+    },
+    async dismissBtw(w) {
+      const id = w.btw?.id;
+      if (!id) return;
+      const d = await this.apiPost(`/api/windows/${w.pid}/btw/dismiss`, { id });
+      if (d.ok) w.btw = null;  // optimistic; the next snapshot agrees
+      else this.toast('Dismiss failed: ' + (d.error || ''));
     },
 
     async forkWindow(pid) {
