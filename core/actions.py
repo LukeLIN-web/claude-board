@@ -821,15 +821,15 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     return {"question": question, "answer": answer}
 
 
-def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
-    """The (question, visible-answer-lines) of a *settled* /btw overlay, or None.
+def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
+    """(lines, top, q_idx, foot) anchors of any open /btw overlay, or None.
 
     The overlay pins its ▔ border, the "/btw …" question line, and the footer in
     place while only the answer region scrolls, so this same anchor logic works at
     any scroll position — capture_full_btw_answer relies on that to walk a long
-    answer window-by-window. Returns None when there is no settled overlay on the
-    pane (no footer, mid-generation, or border/question scrolled off), which is
-    also the signal that the overlay has been dismissed."""
+    answer window-by-window. Settled-or-not is the caller's judgment (the footer
+    at `foot` carries the signal): _btw_regions wants finished answers only,
+    parse_btw_pending wants the mid-generation state."""
     if not text:
         return None
     lines = text.split("\n")
@@ -837,8 +837,6 @@ def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
                  if "Esc to close" in lines[i]), None)
     if foot is None:
         return None
-    if "to copy" not in lines[foot]:
-        return None  # answer still generating — don't latch a partial/spinner
     top = next((i for i in range(foot - 1, -1, -1)
                 if _BTW_TOP_RE.match(lines[i])), None)
     if top is None:
@@ -847,15 +845,54 @@ def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
                   if lines[i].lstrip().startswith("/btw")), None)
     if q_idx is None:
         return None
-    question = lines[q_idx].strip()
+    return lines, top, q_idx, foot
+
+
+def _overlay_question(line: str) -> str:
+    question = line.strip()
     if question.startswith("/btw"):
         question = question[len("/btw"):].strip()
+    return question
+
+
+def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
+    """The (question, visible-answer-lines) of a *settled* /btw overlay, or None.
+
+    Returns None when there is no settled overlay on the pane (no footer,
+    mid-generation, or border/question scrolled off), which is also the signal
+    that the overlay has been dismissed."""
+    got = _overlay_anchors(text)
+    if got is None:
+        return None
+    lines, _top, q_idx, foot = got
+    if "to copy" not in lines[foot]:
+        return None  # answer still generating — don't latch a partial/spinner
+    question = _overlay_question(lines[q_idx])
     answer_lines = [ln.strip() for ln in lines[q_idx + 1:foot] if ln.strip()]
     return question, answer_lines
 
 
-def get_btw_answer(pid: int) -> Optional[dict]:
-    """The /btw overlay currently on `pid`'s pane as {question, answer}, or None.
+def parse_btw_pending(text: str) -> Optional[str]:
+    """Question of a /btw aside whose answer is still generating, or None.
+
+    The card would otherwise show nothing while an aside is answering (asides
+    never reach the transcript, and the archive only latches settled answers),
+    which reads as "/btw did nothing" and invites an Escape that destroys the
+    answer. The mid-generation footer lacks the "c to copy" hint — the same
+    signal _btw_regions uses, inverted."""
+    got = _overlay_anchors(text)
+    if got is None:
+        return None
+    lines, _top, q_idx, foot = got
+    if "to copy" in lines[foot]:
+        return None  # settled — parse_btw_overlay territory
+    return _overlay_question(lines[q_idx])
+
+
+def get_btw_state(pid: int) -> Optional[dict]:
+    """One-capture view of the /btw overlay on `pid`'s pane:
+    {"settled": {question, answer}} while a finished answer is up,
+    {"pending": question} while the answer is still generating, else None.
 
     The overlay covers the visible pane, so a plain capture (no scrollback, which
     would pull in stale pre-overlay content) is what we want. None on any miss.
@@ -869,7 +906,17 @@ def get_btw_answer(pid: int) -> Optional[dict]:
     cap = tmux.capture_pane(pane)
     if not cap["ok"]:
         return None
-    return parse_btw_overlay(cap["text"])
+    ov = parse_btw_overlay(cap["text"])
+    if ov:
+        return {"settled": ov}
+    q = parse_btw_pending(cap["text"])
+    return {"pending": q} if q is not None else None
+
+
+def get_btw_answer(pid: int) -> Optional[dict]:
+    """The settled /btw overlay on `pid`'s pane as {question, answer}, or None."""
+    state = get_btw_state(pid)
+    return state["settled"] if state and "settled" in state else None
 
 
 # The /btw overlay shows a long answer only a sliding window at a time, and the
@@ -969,6 +1016,19 @@ def send_menu_keys(pid: int, keys: list[str]) -> dict:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return {"ok": False, "error": "session not in a tmux pane"}
+    # The dashboard's Esc button lands here. If a settled /btw overlay is up,
+    # this Escape closes it — and the answer exists nowhere else — so archive it
+    # first. A still-answering aside is NOT waited for: the user is interrupting,
+    # and delaying their Escape would be worse than losing the aside they chose
+    # to kill.
+    if "Escape" in keys:
+        sid = getattr(w, "session_id", None)
+        if sid:
+            cap = tmux.capture_pane(pane)
+            text = cap.get("text", "") if cap.get("ok") else ""
+            if _btw_regions(text):
+                from . import btwcapture  # lazy: btwcapture imports this module
+                btwcapture.capture_sync(pid, sid)
     return tmux.send_keys(pane, *keys)
 
 
@@ -1005,6 +1065,38 @@ def _dismiss_answer_overlay(pane: str) -> None:
         time.sleep(_OVERLAY_DISMISS_SETTLE)
 
 
+# An aside's answer exists ONLY in its overlay — dismissing an un-archived one
+# destroys the answer forever. Before Escaping, give a still-generating answer a
+# bounded window to settle, then archive it synchronously.
+_ASIDE_SETTLE_WAIT = 10.0   # max seconds to wait for "Answering…" to finish
+_ASIDE_SETTLE_POLL = 0.4
+
+
+def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
+    """Latch the /btw aside on `pane` to the archive before it gets dismissed.
+
+    If the answer is still generating, wait (bounded) for it to settle — an
+    Escape now would kill the answer with no way to ever recover it. Quietly a
+    no-op when there is no overlay, no session id, or the answer never settles
+    in time (the caller proceeds to dismiss regardless; a bounded loss beats an
+    unbounded stall of the prompt the user is trying to send)."""
+    if not session_id:
+        return
+    deadline = time.time() + _ASIDE_SETTLE_WAIT
+    while True:
+        cap = tmux.capture_pane(pane)
+        text = cap.get("text", "") if cap.get("ok") else ""
+        if not _answer_overlay_open(text):
+            return  # no overlay — nothing at risk
+        if _btw_regions(text):
+            break  # settled — archivable
+        if time.time() >= deadline:
+            return
+        time.sleep(_ASIDE_SETTLE_POLL)
+    from . import btwcapture  # lazy: btwcapture imports this module
+    btwcapture.capture_sync(pid, session_id)
+
+
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
     w = find_window(pid)
@@ -1021,8 +1113,10 @@ def send_prompt(pid: int, text: str) -> dict:
         return {"ok": False, "error": "prompt is empty"}
     if len(collapsed) > _MAX_PROMPT_CHARS:
         return {"ok": False, "error": f"prompt too long (max {_MAX_PROMPT_CHARS} chars)"}
-    # A /btw aside from a prior send may still be open over the pane; clear it
-    # first so this prompt isn't swallowed by the overlay.
+    # A /btw aside from a prior send may still be open over the pane; archive it
+    # (its answer lives nowhere else), then clear it so this prompt isn't
+    # swallowed by the overlay.
+    _archive_open_aside(pane, pid, getattr(w, "session_id", None))
     _dismiss_answer_overlay(pane)
     # Codex's TUI swallows an Enter that arrives glued to the pasted text; give it
     # a settle delay (scaled by paste size — a big prompt needs longer to ingest)

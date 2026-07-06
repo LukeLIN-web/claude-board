@@ -137,12 +137,17 @@ def _enriched_snapshot() -> dict:
         # this isn't gated on show_queue. w["btw"] shows the latest archived aside
         # and persists after the overlay is dismissed.
         sid = w.get("session_id")
+        pending_q = None
         if isinstance(pid, int) and w.get("tty") and sid:
             # A long answer only shows a slice in the overlay window; recovering the
             # rest means scrolling the pane, so this gates on a cheap top-slice
             # scrape and does the slow scroll-stitch off-thread (core.btwcapture).
-            btwcapture.maybe_capture(pid, sid)
+            pending_q = btwcapture.maybe_capture(pid, sid)
         w["btw"] = btwlog.latest(sid) if sid else None
+        if pending_q is not None:
+            # An aside whose answer is still generating: show it live so /btw
+            # never looks dead while it works (nothing is archived yet).
+            w["btw"] = {"question": pending_q, "answer": "", "pending": True}
     # Merge live Codex windows in, then recompute the header counts over every
     # visible (non-hidden) window across both platforms. Count by `triage`, not
     # the raw `status`: the header chips filter cards on triage, so a session

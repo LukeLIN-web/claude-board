@@ -350,7 +350,11 @@
             <div class="text-[10px] font-semibold text-teal-700 uppercase tracking-wide">💬 /btw</div>
             <div class="text-[10px] text-teal-800 bg-teal-50 rounded px-1.5 py-0.5">
               <div class="font-medium truncate" x-show="w.btw?.question" x-text="w.btw?.question"></div>
-              <div class="whitespace-pre-line"
+              <!-- While the aside is still generating there is nothing archived
+                   yet; show a live state instead of nothing so /btw never looks
+                   like it did nothing. -->
+              <div x-show="w.btw?.pending" class="italic text-teal-600">✽ answering…</div>
+              <div x-show="!w.btw?.pending" class="whitespace-pre-line"
                    style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;"
                    x-text="w.btw?.answer"></div>
             </div>
@@ -799,10 +803,9 @@
 
 <!-- Toast -->
 <div class="fixed bottom-4 right-4 z-50 space-y-2">
-  <template x-for="(t, idx) in toasts" :key="idx">
+  <template x-for="t in toasts" :key="t.id">
     <div class="toast-enter bg-gray-900 text-white text-sm rounded-lg px-4 py-2 shadow-lg max-w-sm"
-         x-text="t" x-show="true" x-transition
-         x-init="setTimeout(() => toasts.splice(idx, 1), 4000)"></div>
+         x-text="t.msg" x-show="true" x-transition></div>
   </template>
 </div>
 
@@ -822,6 +825,7 @@ function fleet() {
     timelineData: null,
     planData: null,
     toasts: [],
+    toastSeq: 0,
     evtSource: null,
     historySessions: [],
     historyTotal: 0,
@@ -1399,9 +1403,15 @@ function fleet() {
       this.memoryData = d;
     },
 
+    // Toasts carry a unique id and each schedules its OWN removal by that id.
+    // (Removing by array index broke overlapping toasts: the first removal
+    // shifted the survivors, the later timers spliced past the end, and the
+    // last toast — e.g. "Esc sent" — stayed on screen forever.)
     toast(msg) {
-      this.toasts.push(msg);
+      const id = ++this.toastSeq;
+      this.toasts.push({ id, msg });
       if (this.toasts.length > 5) this.toasts.shift();
+      setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 4000);
     },
   };
 }

@@ -8,8 +8,8 @@ from unittest import mock
 from core import actions
 
 
-def _fake_window(tty, platform="claude"):
-    return types.SimpleNamespace(tty=tty, platform=platform)
+def _fake_window(tty, platform="claude", session_id=None):
+    return types.SimpleNamespace(tty=tty, platform=platform, session_id=session_id)
 
 
 class CreateSessionTests(unittest.TestCase):
@@ -167,6 +167,95 @@ class SendPromptTests(unittest.TestCase):
             r = actions.send_prompt(1234, "hello")
         sk.assert_not_called()
         st.assert_called_once()
+        self.assertTrue(r["ok"])
+
+    # The same aside mid-generation: footer lacks "c to copy" (not settled).
+    _BTW_ANSWERING = (
+        "▔" * 60 + "\n\n"
+        "    /btw what is 2 plus 2\n\n"
+        "      ✽ Answering…\n\n"
+        "    ↑/↓ to scroll · Esc to close\n"
+    )
+
+    def test_answering_aside_is_waited_out_and_archived_before_dismiss(self):
+        # The aside's answer exists only in the overlay. send_prompt must wait
+        # (bounded) for it to settle and archive it BEFORE the dismiss-Escape
+        # destroys it — otherwise the answer is unrecoverable.
+        from core import btwcapture
+        caps = [{"ok": True, "text": self._BTW_ANSWERING},   # archive: still generating
+                {"ok": True, "text": self._BTW_OVERLAY},     # archive: settled -> latch
+                {"ok": True, "text": self._BTW_OVERLAY},     # dismiss: overlay present -> Esc
+                {"ok": True, "text": self._CLEAN_PANE}]      # dismiss: cleared
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/3", session_id="sessX")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}), \
+             mock.patch.object(actions.time, "sleep"), \
+             mock.patch.object(btwcapture, "capture_sync") as cs:
+            r = actions.send_prompt(1234, "hello")
+        cs.assert_called_once_with(1234, "sessX")
+        sk.assert_any_call("%5", "Escape")
+        self.assertTrue(r["ok"])
+
+    def test_no_archive_without_session_id(self):
+        # Windows without a session id (e.g. codex) have no /btw archive to feed.
+        from core import btwcapture
+        caps = [{"ok": True, "text": self._BTW_OVERLAY},
+                {"ok": True, "text": self._CLEAN_PANE}]
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}), \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}), \
+             mock.patch.object(actions.time, "sleep"), \
+             mock.patch.object(btwcapture, "capture_sync") as cs:
+            r = actions.send_prompt(1234, "hello")
+        cs.assert_not_called()
+        self.assertTrue(r["ok"])
+
+
+class SendMenuKeysOverlayTests(unittest.TestCase):
+    """The dashboard Esc button closes a /btw overlay as a side effect; a settled
+    un-archived answer must be latched before that Escape is delivered."""
+
+    _BTW_OVERLAY = SendPromptTests._BTW_OVERLAY
+    _BTW_ANSWERING = SendPromptTests._BTW_ANSWERING
+    _CLEAN_PANE = SendPromptTests._CLEAN_PANE
+
+    def _run(self, keys, pane_text, session_id="sessX"):
+        from core import btwcapture
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/3", session_id=session_id)), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": pane_text}), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
+             mock.patch.object(btwcapture, "capture_sync") as cs:
+            r = actions.send_menu_keys(1234, keys)
+        return r, sk, cs
+
+    def test_escape_archives_settled_overlay_first(self):
+        r, sk, cs = self._run(["Escape"], self._BTW_OVERLAY)
+        cs.assert_called_once_with(1234, "sessX")
+        sk.assert_called_once_with("%5", "Escape")
+        self.assertTrue(r["ok"])
+
+    def test_escape_does_not_wait_for_generating_aside(self):
+        # The user is interrupting; delaying their Escape would be worse than
+        # losing the aside they chose to kill.
+        r, sk, cs = self._run(["Escape"], self._BTW_ANSWERING)
+        cs.assert_not_called()
+        sk.assert_called_once_with("%5", "Escape")
+        self.assertTrue(r["ok"])
+
+    def test_non_escape_keys_never_probe_the_pane(self):
+        r, sk, cs = self._run(["1"], self._BTW_OVERLAY)
+        cs.assert_not_called()
+        sk.assert_called_once_with("%5", "1")
         self.assertTrue(r["ok"])
 
 
