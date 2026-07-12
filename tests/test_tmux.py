@@ -514,6 +514,70 @@ class SendTextVerifySubmitTests(unittest.TestCase):
         self.assertEqual(len(enters), 1)
 
 
+class SendTextVerifyLandedTests(unittest.TestCase):
+    """verify_landed confirms the literal text reached the composer before Enter,
+    re-sending it (Ctrl-U first) when a busy-pane re-render dropped it."""
+
+    def setUp(self):
+        tmux._clear_caches()
+
+    @staticmethod
+    def _recorder(calls):
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+        return fake_run
+
+    def test_no_resend_when_text_lands_first_try(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=True):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertTrue(r["ok"])
+        literals = [c for c in calls if "-l" in c]
+        self.assertEqual(len(literals), 1)  # text sent once
+        self.assertNotIn(["tmux", "send-keys", "-t", "%5", "C-u"], calls)  # no clear
+
+    def test_resends_text_after_clearing_when_dropped_once(self):
+        calls = []
+        landed = iter([False, True])  # dropped once, then lands
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=lambda *a: next(landed)):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertTrue(r["ok"])
+        literals = [c for c in calls if "-l" in c]
+        self.assertEqual(len(literals), 2)  # initial + one resend
+        # The retry clears any partial paste before re-sending: literal, C-u,
+        # literal (no capture calls — _composer_has_tail is mocked out).
+        self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "C-u"])
+
+    def test_reports_failure_when_text_never_lands(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        # Never press Enter on a prompt that never made it into the composer.
+        self.assertNotIn(["tmux", "send-keys", "-t", "%5", "Enter"], calls)
+
+    def test_landed_then_verifies_submit_together(self):
+        # The two phases compose: text lands before Enter, composer empties after.
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=[True, False]):  # landed, then submitted
+            r = tmux.send_text("%5", "hello", verify_landed=True, verify_submit=True)
+        self.assertTrue(r["ok"])
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
+
+
 class ComposerHasTailTests(unittest.TestCase):
     """_composer_has_tail must find the composer under BOTH markers: Codex's `›`
     and Claude's `❯`."""

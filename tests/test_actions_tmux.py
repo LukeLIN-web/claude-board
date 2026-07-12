@@ -60,9 +60,10 @@ class SendPromptTests(unittest.TestCase):
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, "hello")
         pf.assert_called_once_with("/dev/pts/3")
-        # Claude gets no settle before Enter and no submit-verify.
+        # Claude's busy pane can drop the injected keystrokes, so verify the text
+        # lands before Enter and that the composer empties after.
         st.assert_called_once_with(
-            "%5", "hello", settle_before_enter=0.0, verify_submit=False,
+            "%5", "hello", verify_landed=True, verify_submit=True,
         )
         self.assertTrue(r["ok"])
 

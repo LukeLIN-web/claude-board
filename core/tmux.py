@@ -327,6 +327,14 @@ _CODEX_ENTER_SETTLE_MAX = 3.0
 _SUBMIT_VERIFY_RETRIES = 3
 _SUBMIT_VERIFY_WAIT = 0.4
 
+# Before the submit Enter, confirm the literal text actually reached the
+# composer. A busy pane mid-re-render can drop the injected keystrokes outright,
+# so a following Enter would submit an empty line and the prompt would vanish
+# with no trace. Re-send the text up to this many extra times, waiting this long
+# for the composer to catch it before each check.
+_LANDED_VERIFY_RETRIES = 3
+_LANDED_VERIFY_WAIT = 0.15
+
 
 def codex_enter_settle(text_len: int) -> float:
     """Length-scaled settle before Codex's submit Enter (see _CODEX_ENTER_SETTLE)."""
@@ -369,11 +377,35 @@ def _composer_has_tail(pane: str, text: str) -> bool:
     return needle in "".join(region.split())
 
 
+def _send_until_landed(pane: str, text: str) -> bool:
+    """Send `text` literally into `pane`, confirming it reached the composer.
+
+    A busy pane can drop the injected keystrokes during a re-render, so the text
+    never arrives and a following Enter submits nothing — the prompt vanishes
+    with no transcript trace (the dashboard then shows a phantom "Queued"). Re-
+    send until the composer holds our text, clearing any partial paste with
+    Ctrl-U first so a retry can't concatenate into a corrupted prompt. Returns
+    False if the text never lands after the retries — the caller then reports the
+    failure rather than pressing Enter on a lost prompt.
+    """
+    for attempt in range(_LANDED_VERIFY_RETRIES + 1):
+        if attempt:
+            _run("send-keys", "-t", pane, "C-u")  # drop any partial before retry
+        literal = _run("send-keys", "-t", pane, "-l", "--", text)
+        if not literal["ok"]:
+            return False
+        time.sleep(_LANDED_VERIFY_WAIT)
+        if _composer_has_tail(pane, text):
+            return True
+    return False
+
+
 def send_text(
     pane: str,
     text: str,
     settle_before_enter: float = 0.0,
     verify_submit: bool = False,
+    verify_landed: bool = False,
 ) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it.
 
@@ -384,16 +416,24 @@ def send_text(
     here; platform-wide needs (e.g. Codex) are passed in by the caller. When both
     apply, the longer wait wins.
 
-    `verify_submit` (Codex) confirms the composer actually emptied after Enter and
-    resends Enter a couple of times if the prompt is still sitting there, so an
-    under-tuned settle can't silently strand a prompt. Slash prompts verify
-    unconditionally: even after the settle, Claude's popup can consume the Enter
-    selecting the highlighted completion, leaving the command (e.g. "/clear") in
-    the composer unsubmitted — the resent Enter then submits it for real.
+    `verify_landed` (Claude) confirms the literal text actually reached the
+    composer before Enter, re-sending it if a busy-pane re-render dropped the
+    keystrokes — otherwise the Enter submits an empty line and the prompt is
+    lost. `verify_submit` (Codex) confirms the composer actually emptied after
+    Enter and resends Enter a couple of times if the prompt is still sitting
+    there, so an under-tuned settle can't silently strand a prompt. Slash prompts
+    verify submit unconditionally: even after the settle, Claude's popup can
+    consume the Enter selecting the highlighted completion, leaving the command
+    (e.g. "/clear") in the composer unsubmitted — the resent Enter then submits
+    it for real.
     """
-    literal = _run("send-keys", "-t", pane, "-l", "--", text)
-    if not literal["ok"]:
-        return {"ok": False, "error": literal["error"]}
+    if verify_landed:
+        if not _send_until_landed(pane, text):
+            return {"ok": False, "error": "prompt text never landed in composer"}
+    else:
+        literal = _run("send-keys", "-t", pane, "-l", "--", text)
+        if not literal["ok"]:
+            return {"ok": False, "error": literal["error"]}
     is_slash = text.lstrip().startswith("/")
     delay = settle_before_enter
     if is_slash:

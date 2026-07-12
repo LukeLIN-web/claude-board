@@ -133,6 +133,11 @@ def _enriched_snapshot() -> dict:
             except Exception:
                 pass  # scrape failures degrade to dashboard-only
             w["queued"] = queued
+            try:
+                from core import _queuedebug
+                _queuedebug.dump(pid, status, tp, queued)
+            except Exception:
+                pass  # TEMP diagnostic; never break the snapshot
         else:
             if status == "idle" and isinstance(pid, int):
                 promptqueue.clear(pid)  # a queue can't outlive an idle session

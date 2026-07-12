@@ -1126,12 +1126,20 @@ def send_prompt(pid: int, text: str) -> dict:
     # swallowed by the overlay.
     _archive_open_aside(pane, pid, getattr(w, "session_id", None))
     _dismiss_answer_overlay(pane)
-    # Codex's TUI swallows an Enter that arrives glued to the pasted text; give it
-    # a settle delay (scaled by paste size — a big prompt needs longer to ingest)
-    # so the prompt actually submits instead of sitting unsent in the composer,
-    # and verify the composer emptied afterward. Claude needs neither (settle 0.0).
+    # Both TUIs can silently lose an injected prompt when the pane is busy:
+    # Codex swallows an Enter glued to the pasted text (fixed with a size-scaled
+    # settle + submit-verify), and Claude drops the injected keystrokes outright
+    # mid-re-render — the text never reaches the composer, so the Enter submits
+    # nothing and the prompt vanishes with no transcript trace (the card then
+    # shows a phantom "Queued"). For Claude, verify the text actually landed
+    # before pressing Enter and that the composer emptied after, re-sending
+    # whichever half a busy re-render dropped.
     is_codex = getattr(w, "platform", "claude") == "codex"
-    settle = tmux.codex_enter_settle(len(collapsed)) if is_codex else 0.0
+    if is_codex:
+        settle = tmux.codex_enter_settle(len(collapsed))
+        return tmux.send_text(
+            pane, collapsed, settle_before_enter=settle, verify_submit=True
+        )
     return tmux.send_text(
-        pane, collapsed, settle_before_enter=settle, verify_submit=is_codex
+        pane, collapsed, verify_landed=True, verify_submit=True
     )
