@@ -133,11 +133,6 @@ def _enriched_snapshot() -> dict:
             except Exception:
                 pass  # scrape failures degrade to dashboard-only
             w["queued"] = queued
-            try:
-                from core import _queuedebug
-                _queuedebug.dump(pid, status, tp, queued)
-            except Exception:
-                pass  # TEMP diagnostic; never break the snapshot
         else:
             if status == "idle" and isinstance(pid, int):
                 promptqueue.clear(pid)  # a queue can't outlive an idle session
@@ -391,9 +386,13 @@ def api_window_create(body: CreateBody) -> dict:
 @app.post("/api/windows/{pid}/prompt")
 def api_window_prompt(pid: int, body: PromptBody) -> dict:
     _require_window(pid)
+    # Stamp the send time before the keystrokes: send_prompt types, verifies the
+    # composer and verifies the submit, which takes long enough that Claude's own
+    # transcript row for the prompt can predate a post-send stamp (see record_sent).
+    sent_at = time.time()
     r = actions.send_prompt(pid, body.text)
     if r.get("ok"):
-        promptqueue.record_sent(pid, body.text)
+        promptqueue.record_sent(pid, body.text, ts=sent_at)
     return r
 
 
@@ -406,9 +405,10 @@ def api_window_clear(pid: int) -> dict:
     so we also stamp a per-pid clear time that hides older rollout events from the
     card and timeline (see codex.mark_cleared)."""
     _require_window(pid)
+    sent_at = time.time()
     r = actions.send_prompt(pid, "/clear")
     if r.get("ok"):
-        promptqueue.record_sent(pid, "/clear")
+        promptqueue.record_sent(pid, "/clear", ts=sent_at)
         codex.mark_cleared(pid)
     return r
 
