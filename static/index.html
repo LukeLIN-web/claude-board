@@ -409,6 +409,16 @@
                   class="text-xs border border-orange-200 text-orange-600 px-2 py-1 rounded hover:bg-orange-50 transition"
                   title="Press Esc in this session to interrupt what it's doing">
             Esc</button>
+          <!-- Codex's /model ignores an argument (it opens an interactive picker), so this is Claude-only. -->
+          <select x-show="tmuxAvailable && w.platform !== 'codex'"
+                  @change="switchModel(w.pid, $event.target.value); $event.target.value = ''"
+                  :disabled="!!promptSending[w.pid]"
+                  class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded bg-white hover:bg-purple-50 transition disabled:opacity-50 disabled:cursor-wait"
+                  title="Switch this session's model (this session only — your default for new sessions is untouched)">
+            <option value="">Model ▾</option>
+            <option value="opus">Opus</option>
+            <option value="fable">Fable</option>
+          </select>
           <!-- Waiting on a prompt: open the timeline to see the actual options and respond -->
           <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
                x-show="w.triage === 'waiting_perm' && tmuxAvailable">
@@ -1173,6 +1183,21 @@ function fleet() {
       try {
         const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text: 'commit and push' });
         this.toast(d.ok ? 'Sent commit and push' : 'Commit failed: ' + (d.error || ''));
+      } finally {
+        this.promptSending[pid] = false;
+      }
+    },
+
+    // The select is an action, not a state display: the board can't see which
+    // model a session is currently on, so it snaps back to the placeholder
+    // rather than pretending the picked alias is the live setting.
+    async switchModel(pid, alias) {
+      if (!alias) return;
+      if (this.promptSending[pid]) return;
+      this.promptSending[pid] = true;
+      try {
+        const d = await this.apiPost(`/api/windows/${pid}/model`, { model: alias });
+        this.toast(d.ok ? `Model → ${alias} (this session only)` : 'Model switch failed: ' + (d.error || ''));
       } finally {
         this.promptSending[pid] = false;
       }

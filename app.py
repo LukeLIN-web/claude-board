@@ -413,6 +413,21 @@ def api_window_clear(pid: int) -> dict:
     return r
 
 
+class ModelBody(BaseModel):
+    model: str  # a /model dialog alias, e.g. "opus" | "fable"
+
+
+@app.post("/api/windows/{pid}/model")
+def api_window_model(pid: int, body: ModelBody) -> dict:
+    """Switch this session's model for the running session only.
+
+    Not a plain `/model <alias>` prompt: that form also saves the pick as the
+    user's default for new sessions. actions.switch_model drives the dialog and
+    commits with "s" instead (see its docstring)."""
+    _require_window(pid)
+    return actions.switch_model(pid, body.model)
+
+
 class PermissionBody(BaseModel):
     choice: str  # approve | approve_always | deny
 

@@ -609,3 +609,105 @@ class PaneMenuActiveTests(unittest.TestCase):
 
     def test_failed_capture_is_unknown(self):
         self.assertIsNone(self._run(self.GOAL_OVERLAY, ok=False))
+
+
+# A real capture of Claude's /model dialog (v2.1.209), cursor on the session's
+# current model — Sonnet here, which is exactly why the row to reach can't be
+# found by a fixed number of keypresses.
+MODEL_DIALOG = """\
+❯ /model
+  Select model
+  Switch between Claude models. Your pick becomes the default for new sessions.
+    1. Default (recommended)  Opus 4.8 with 1M context · Best for everyday, complex tasks
+    2. Opus                   Opus 4.8 with 1M context · Best for everyday, complex tasks
+    3. Fable                  Fable 5 · Most capable for your hardest and longest-running tasks
+  ❯ 4. Sonnet ✔               Sonnet 5 · Efficient for routine tasks
+    5. Haiku                  Haiku 4.5 · Fastest for quick answers
+  ● High effort (default) ←/→ to adjust
+  Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+
+class ModelDialogParseTests(unittest.TestCase):
+    def test_rows_and_cursor(self):
+        rows, cursor = actions._model_dialog_rows(MODEL_DIALOG)
+        self.assertEqual(
+            rows, [(1, "Default"), (2, "Opus"), (3, "Fable"), (4, "Sonnet"), (5, "Haiku")]
+        )
+        self.assertEqual(cursor, 4)
+
+    def test_no_cursor_when_dialog_absent(self):
+        rows, cursor = actions._model_dialog_rows("no dialog here\n")
+        self.assertEqual(rows, [])
+        self.assertEqual(cursor, 0)
+
+
+class SwitchModelTests(unittest.TestCase):
+    """switch_model drives the dialog by keypress, so the tests assert on the keys
+    it sends — Enter would save the pick as the user's default, "s" must not."""
+
+    def _drive(self, alias, cursor_start=4, rows=5):
+        """Fake a dialog whose cursor wraps 1..rows and moves on each Down."""
+        state = {"cursor": cursor_start, "open": True}
+
+        def capture(pane, scrollback=0):
+            if not state["open"]:
+                return {"ok": True, "text": "❯ \n"}
+            lines = ["  Select model"]
+            names = ["Default", "Opus", "Fable", "Sonnet", "Haiku"][:rows]
+            for i, name in enumerate(names, 1):
+                mark = "❯ " if i == state["cursor"] else "  "
+                lines.append(f"  {mark}{i}. {name}   blurb")
+            lines.append("  Enter to set as default · s to use this session only · Esc to cancel")
+            return {"ok": True, "text": "\n".join(lines) + "\n"}
+
+        sent = []
+
+        def send_keys(pane, *keys):
+            sent.extend(keys)
+            for k in keys:
+                if k == "Down":
+                    state["cursor"] = state["cursor"] % rows + 1
+                elif k == "s":
+                    state["open"] = False
+            return {"ok": True}
+
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/9")), \
+             mock.patch.object(actions, "send_prompt", return_value={"ok": True}), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
+             mock.patch.object(actions.tmux, "capture_pane", side_effect=capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.switch_model(1234, alias)
+        return r, sent, state
+
+    def test_commits_with_s_not_enter(self):
+        r, sent, _ = self._drive("fable")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["model"], "fable")
+        self.assertEqual(sent[-1], "s")
+        self.assertNotIn("Enter", sent)
+
+    def test_wraps_around_to_reach_target(self):
+        # Cursor starts on Sonnet (4); Fable (3) is reachable only by wrapping.
+        _, sent, state = self._drive("fable", cursor_start=4)
+        self.assertEqual(sent.count("Down"), 4)
+        self.assertEqual(state["cursor"], 3)
+
+    def test_no_move_when_already_on_target(self):
+        _, sent, _ = self._drive("sonnet", cursor_start=4)
+        self.assertEqual(sent, ["s"])
+
+    def test_unknown_alias_escapes_the_dialog(self):
+        r, sent, _ = self._drive("gpt5")
+        self.assertFalse(r["ok"])
+        self.assertIn("not in the /model dialog", r["error"])
+        self.assertEqual(sent, ["Escape"])
+        self.assertNotIn("s", sent)
+
+    def test_codex_is_rejected(self):
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/9", platform="codex")):
+            r = actions.switch_model(1234, "opus")
+        self.assertFalse(r["ok"])
+        self.assertIn("Claude-only", r["error"])

@@ -1156,3 +1156,111 @@ def send_prompt(pid: int, text: str) -> dict:
     return tmux.send_text(
         pane, collapsed, verify_landed=True, verify_submit=True
     )
+
+
+# Claude's /model dialog. Its footer is the marker that the dialog is up, and it
+# spells out the two ways to commit a pick: Enter also saves the model as the
+# default for NEW sessions, while "s" scopes it to the running session. The board
+# only ever wants the latter — switching one card's model shouldn't silently
+# re-point every session you start afterwards.
+_MODEL_DIALOG_FOOTER = "s to use this session only"
+
+# A dialog row, e.g. "    2. Opus  Opus 4.8 …" or "  ❯ 3. Fable  Fable 5 …".
+# Group "cur" is the ❯ cursor (present on exactly one row), "n" the row number,
+# "label" the model name — the first token, so "Default (recommended)" ⇒ Default
+# and "Sonnet ✔" ⇒ Sonnet.
+_MODEL_ROW_RE = re.compile(r"^(?P<cur>[\s ]*❯)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<label>\S+)")
+
+_MODEL_DIALOG_WAIT = 8.0   # seconds to wait for the dialog to open / close
+_MODEL_DIALOG_POLL = 0.2
+_MODEL_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
+
+
+def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
+    """Parse the /model dialog: [(row number, model label)], plus the number of
+    the highlighted row (0 if no row carries the cursor)."""
+    rows: list[tuple[int, str]] = []
+    cursor = 0
+    for line in text.splitlines():
+        m = _MODEL_ROW_RE.match(line)
+        if not m:
+            continue
+        n = int(m.group("n"))
+        rows.append((n, m.group("label")))
+        if m.group("cur"):
+            cursor = n
+    return rows, cursor
+
+
+def switch_model(pid: int, alias: str) -> dict:
+    """Switch `pid`'s session to model `alias` (e.g. "opus") for THIS SESSION ONLY.
+
+    Drives Claude's /model dialog rather than sending `/model <alias>`: the
+    argument form works, but it also rewrites the user's default model for new
+    sessions. The dialog's "s" key is the only way to scope the switch to the
+    running session.
+
+    The dialog opens with its cursor on the session's *current* model, so the
+    number of keypresses to reach a target row isn't fixed — and the row list
+    wraps, so there's no edge to anchor against either. We step Down one row at a
+    time, re-reading the cursor from the pane after each press, until it sits on
+    the target. That read doubles as the check that we're about to commit the
+    right row.
+    """
+    alias = (alias or "").strip().lower()
+    if not alias.isalnum():
+        return {"ok": False, "error": f"invalid model alias '{alias}'"}
+    w = find_window(pid)
+    if not w:
+        return {"ok": False, "error": f"no window pid={pid}"}
+    if getattr(w, "platform", "claude") == "codex":
+        return {"ok": False, "error": "model switching is Claude-only"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+
+    r = send_prompt(pid, "/model")
+    if not r.get("ok"):
+        return r
+
+    text = ""
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        text = tmux.capture_pane(pane).get("text", "")
+        if _MODEL_DIALOG_FOOTER in text:
+            break
+        time.sleep(_MODEL_DIALOG_POLL)
+    else:
+        return {"ok": False, "error": "the /model dialog never opened"}
+
+    rows, _ = _model_dialog_rows(text)
+    target = next((n for n, label in rows if label.lower() == alias), 0)
+    if not target:
+        # Leave the session as we found it rather than parked on an open modal.
+        tmux.send_keys(pane, "Escape")
+        offered = ", ".join(label for _, label in rows) or "none"
+        return {"ok": False, "error": f"'{alias}' is not in the /model dialog (offered: {offered})"}
+
+    # The list wraps, so Down alone reaches every row from wherever it starts.
+    on_target = False
+    for _ in range(len(rows) + 1):
+        _, cursor = _model_dialog_rows(tmux.capture_pane(pane).get("text", ""))
+        if cursor == target:
+            on_target = True
+            break
+        tmux.send_keys(pane, "Down")
+        time.sleep(_MODEL_KEY_SETTLE)
+    if not on_target:
+        tmux.send_keys(pane, "Escape")
+        return {"ok": False, "error": f"could not move the dialog cursor onto {alias}"}
+
+    tmux.send_keys(pane, "s")
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        if _MODEL_DIALOG_FOOTER not in tmux.capture_pane(pane).get("text", ""):
+            return {"ok": True, "model": alias}
+        time.sleep(_MODEL_DIALOG_POLL)
+    tmux.send_keys(pane, "Escape")
+    return {"ok": False, "error": "the /model dialog did not close after pressing s"}
