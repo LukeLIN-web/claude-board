@@ -84,8 +84,14 @@ def _enriched_snapshot() -> dict:
                 w["first_input"] = first[:100]
         if tp:
             w["current_task"] = transcripts.current_task_hint(tp)
+            # The model that last *answered* — a board-driven switch only shows up
+            # here once the session replies on the new model, which is the point:
+            # the card can't claim a switch the session never actually made.
+            w["model"] = transcripts.current_model(tp)
         else:
             w["current_task"] = None
+            w["model"] = ""
+        w["model_label"] = transcripts.pretty_model(w["model"])
         # Claude reports waitingFor="dialog open" for ANY open overlay — the
         # /goal panel included, which has nothing to answer and doesn't block
         # the agent. Only a verifiable picker in the pane earns the waiting

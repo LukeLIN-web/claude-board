@@ -414,8 +414,11 @@
                   @change="switchModel(w.pid, $event.target.value); $event.target.value = ''"
                   :disabled="!!promptSending[w.pid]"
                   class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded bg-white hover:bg-purple-50 transition disabled:opacity-50 disabled:cursor-wait"
-                  title="Switch this session's model (this session only — your default for new sessions is untouched)">
-            <option value="">Model ▾</option>
+                  :title="(w.model ? 'Running on ' + w.model + '. ' : '') + 'Switch this session\'s model (this session only — your default for new sessions is untouched). Shows the model that last answered, so it updates on the session\'s next reply.'">
+            <!-- The idle label doubles as the readout: the select snaps back to
+                 this option after every pick, so it always reads the model the
+                 session is actually on (blank until it has answered once). -->
+            <option value="" x-text="(w.model_label || 'Model') + ' ▾'"></option>
             <option value="opus">Opus</option>
             <option value="fable">Fable</option>
           </select>
@@ -640,6 +643,7 @@
                'border-purple-500': ev.kind==='skill_invoke',
                'border-sky-400 border-dashed': ev.kind==='memory_read',
                'border-pink-500': ev.kind==='memory_write',
+               'border-violet-500': ev.kind==='model',
                'border-gray-300': ev.kind==='tool_result'||ev.kind==='system'
              }">
           <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
@@ -659,7 +663,12 @@
             <template x-if="ev.kind==='ask_question'">
               <span class="text-amber-700 font-medium">❓ <span x-text="ev.tool"></span></span>
             </template>
-            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write' && ev.kind!=='ask_question'">
+            <!-- The model that answered changed between two assistant turns — a
+                 /model switch, whether driven from a card or typed in the TUI. -->
+            <template x-if="ev.kind==='model'">
+              <span class="text-violet-600 font-medium">🔀 model</span>
+            </template>
+            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write' && ev.kind!=='ask_question' && ev.kind!=='model'">
               <span :class="{'text-blue-600': ev.kind==='user_text', 'text-emerald-600': ev.kind==='assistant_text', 'text-amber-600': ev.kind==='tool_use', 'text-gray-500': true}"
                     class="font-medium"
                     x-text="ev.kind==='tool_use' ? ev.tool : ev.kind.replace('_text','').replace('tool_result','result')"></span>
@@ -703,7 +712,11 @@
               </template>
             </div>
           </template>
-          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'ask_question'">
+          <template x-if="ev.kind === 'model'">
+            <div class="text-xs font-medium text-violet-700" x-text="ev.text || ''"
+                 :title="ev.extra?.model || ''"></div>
+          </template>
+          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'ask_question' && ev.kind !== 'model'">
             <pre class="text-xs text-gray-700 max-h-32 overflow-y-auto" x-text="ev.text?.slice(0,2000) || ''"></pre>
           </template>
         </div>
@@ -1188,9 +1201,10 @@ function fleet() {
       }
     },
 
-    // The select is an action, not a state display: the board can't see which
-    // model a session is currently on, so it snaps back to the placeholder
-    // rather than pretending the picked alias is the live setting.
+    // The select snaps back to its idle option, which carries w.model_label — the
+    // model that last answered. So the readout follows the transcript, not the
+    // pick: a switch shows up once the session replies on the new model, and a
+    // switch that didn't land shows nothing rather than a label that lies.
     async switchModel(pid, alias) {
       if (!alias) return;
       if (this.promptSending[pid]) return;

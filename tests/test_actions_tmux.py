@@ -646,13 +646,31 @@ class SwitchModelTests(unittest.TestCase):
     """switch_model drives the dialog by keypress, so the tests assert on the keys
     it sends — Enter would save the pick as the user's default, "s" must not."""
 
-    def _drive(self, alias, cursor_start=4, rows=5):
-        """Fake a dialog whose cursor wraps 1..rows and moves on each Down."""
-        state = {"cursor": cursor_start, "open": True}
+    def _drive(self, alias, cursor_start=4, rows=5,
+               confirm=False, confirm_cursor=1, confirm_sticks=False):
+        """Fake a dialog whose cursor wraps 1..rows and moves on each Down.
+
+        `confirm` adds the second dialog Claude raises when the switch happens
+        mid-conversation ("Switch model?" — the cached history has to be re-read).
+        It carries none of the picker's footer, so a fix that only watches for the
+        footer to vanish will call the switch done while the session sits on it.
+        Escape backs out of it to the picker, not to the prompt.
+        """
+        state = {"cursor": cursor_start, "screen": "picker", "confirm_cursor": confirm_cursor}
 
         def capture(pane, scrollback=0):
-            if not state["open"]:
+            if state["screen"] == "closed":
                 return {"ok": True, "text": "❯ \n"}
+            if state["screen"] == "confirm":
+                lines = [
+                    "  Switch model?",
+                    "  This conversation is cached for the current model. Switching to Fable 5",
+                    "  means the full history gets re-read on your next message.",
+                ]
+                for i, name in enumerate(["Yes, switch to Fable 5", "No, go back"], 1):
+                    mark = "❯ " if i == state["confirm_cursor"] else "  "
+                    lines.append(f"  {mark}{i}. {name}")
+                return {"ok": True, "text": "\n".join(lines) + "\n"}
             lines = ["  Select model"]
             names = ["Default", "Opus", "Fable", "Sonnet", "Haiku"][:rows]
             for i, name in enumerate(names, 1):
@@ -666,10 +684,21 @@ class SwitchModelTests(unittest.TestCase):
         def send_keys(pane, *keys):
             sent.extend(keys)
             for k in keys:
-                if k == "Down":
-                    state["cursor"] = state["cursor"] % rows + 1
-                elif k == "s":
-                    state["open"] = False
+                if state["screen"] == "confirm":
+                    if k == "Down":
+                        state["confirm_cursor"] = state["confirm_cursor"] % 2 + 1
+                    elif k == "Enter":
+                        if state["confirm_cursor"] == 1 and not confirm_sticks:
+                            state["screen"] = "closed"
+                    elif k == "Escape":
+                        state["screen"] = "picker"
+                elif state["screen"] == "picker":
+                    if k == "Down":
+                        state["cursor"] = state["cursor"] % rows + 1
+                    elif k == "s":
+                        state["screen"] = "confirm" if confirm else "closed"
+                    elif k == "Escape":
+                        state["screen"] = "closed"
             return {"ok": True}
 
         with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/9")), \
@@ -704,6 +733,32 @@ class SwitchModelTests(unittest.TestCase):
         self.assertIn("not in the /model dialog", r["error"])
         self.assertEqual(sent, ["Escape"])
         self.assertNotIn("s", sent)
+
+    def test_confirms_the_cached_history_dialog(self):
+        # Mid-conversation, "s" raises a second dialog instead of closing. The
+        # switch isn't real until that one is answered Yes.
+        r, sent, state = self._drive("fable", confirm=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["screen"], "closed")
+        self.assertEqual(sent[-2:], ["s", "Enter"])
+
+    def test_confirm_enter_lands_on_yes_not_whatever_is_highlighted(self):
+        # Cursor parked on "No, go back": Enter must not be pressed until it's moved.
+        r, sent, state = self._drive("fable", confirm=True, confirm_cursor=2)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["screen"], "closed")
+        self.assertEqual(sent[-3:], ["s", "Down", "Enter"])
+
+    def test_confirm_that_never_closes_escapes_out_of_both_dialogs(self):
+        # time.sleep is mocked out, so shorten the wait or the give-up path spins
+        # for the full real-time deadline.
+        with mock.patch.object(actions, "_MODEL_DIALOG_WAIT", 0.05):
+            r, sent, state = self._drive("fable", confirm=True, confirm_sticks=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("confirm", r["error"].lower())
+        # One Escape only backs out to the picker — the session is left on an open
+        # modal unless we keep going until the pane is clean.
+        self.assertEqual(state["screen"], "closed")
 
     def test_codex_is_rejected(self):
         with mock.patch.object(actions, "find_window",
