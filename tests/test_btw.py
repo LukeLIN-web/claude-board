@@ -64,6 +64,37 @@ CAP_MIDGEN = f"""\
     ←/→ to switch · x to clear history · Esc to close
 """
 
+# Real capture from a CURRENT Claude build (v2.1.20x): the overlay draws NO ▔
+# top border at all. The composer line above still shows the just-submitted
+# /btw command (with the ❯ marker), then the stacked question lines, the
+# newest aside's answer, and the same carousel footer.
+CAP_BORDERLESS = """\
+
+● Background command "re-warm" completed (exit code 0)
+
+❯ /btw why run base too?
+
+  /btw why the 917-question short regime?
+  /btw why run base too?
+
+    Two reasons, briefly:
+    - same-denominator comparison needs it
+    - the gate replay reuses its outputs
+
+  ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close
+"""
+
+CAP_BORDERLESS_MIDGEN = """\
+
+❯ /btw why run base too?
+
+  /btw why run base too?
+
+    ✽ Answering…
+
+  Esc to close
+"""
+
 
 class ParseBtwOverlayTests(unittest.TestCase):
     def test_multi_aside_takes_newest_qa_only(self):
@@ -89,10 +120,25 @@ class ParseBtwOverlayTests(unittest.TestCase):
     def test_none_without_footer(self):
         self.assertIsNone(actions.parse_btw_overlay(CAP_BTW.replace("Esc to close", "")))
 
-    def test_none_without_top_border(self):
-        # A long answer can scroll the ▔ border off-screen; we prefer a miss to a
-        # half-parsed answer.
-        self.assertIsNone(actions.parse_btw_overlay(CAP_BTW.replace(_BORDER, "")))
+    def test_borderless_overlay_parses(self):
+        # Current Claude builds draw NO ▔ top border; the composer's ❯ marker
+        # line is the fallback top anchor. Requiring the border meant every
+        # /btw on these builds scraped as "no overlay" and was never archived.
+        got = actions.parse_btw_overlay(CAP_BORDERLESS)
+        self.assertEqual(got["question"], "why run base too?")
+        self.assertEqual(
+            got["answer"],
+            "Two reasons, briefly:\n- same-denominator comparison needs it\n"
+            "- the gate replay reuses its outputs",
+        )
+
+    def test_borderless_composer_text_is_not_the_question(self):
+        # The ❯ composer line still shows the /btw command while the overlay is
+        # open; the question must come from the overlay's own /btw lines, and a
+        # capture with ONLY the composer line (question scrolled off) must miss.
+        stack_removed = CAP_BORDERLESS.replace("  /btw why the 917-question short regime?\n", "")
+        stack_removed = stack_removed.replace("  /btw why run base too?\n", "")
+        self.assertIsNone(actions.parse_btw_overlay(stack_removed))
 
     def test_none_without_btw_line(self):
         self.assertIsNone(actions.parse_btw_overlay(CAP_BTW.replace("/btw ", "")))
@@ -109,6 +155,12 @@ class ParseBtwPendingTests(unittest.TestCase):
     """The mid-generation state: overlay open, footer without "c to copy". The
     card shows this live (there is nothing to archive yet), and the dismiss path
     uses it to wait for the answer instead of destroying it."""
+
+    def test_borderless_generating_aside_is_pending(self):
+        self.assertEqual(
+            actions.parse_btw_pending(CAP_BORDERLESS_MIDGEN),
+            "why run base too?",
+        )
 
     def test_question_of_generating_aside(self):
         self.assertEqual(

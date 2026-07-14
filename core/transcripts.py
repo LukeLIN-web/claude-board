@@ -214,23 +214,43 @@ def _parse_ts(ts: str) -> float:
         return 0.0
 
 
-def recent_user_texts(path: str | Path, n: int = 40) -> list[tuple[float, str]]:
-    """Recent real user messages as (epoch_ts, text), oldest first.
+def consumed_prompt_texts(path: str | Path, since: float) -> list[tuple[float, str]]:
+    """Prompts Claude has demonstrably taken, as (epoch_ts, text) at/after `since`.
 
-    Used to reconcile the dashboard's sent-prompt queue: once a queued prompt
-    shows up here, Claude has picked it up. tool_result rows (role user but not
-    typed prompts) are excluded.
+    Used to reconcile the dashboard's sent-prompt queue. Two independent signals
+    count as "Claude took it", and both are needed:
+
+      - a genuine user_text row — the session was idle, so Claude read the prompt
+        straight away and logged it as a normal user turn.
+      - a `queue-operation` row with operation `remove` — the session was BUSY, so
+        the prompt went into Claude's own queue (`enqueue`) and was later pulled
+        off it (`remove`). These prompts never get a user row at all, so a
+        user-row-only reconcile leaves every busy-time send stuck on the card
+        forever. An `enqueue` with no `remove` is still waiting: not consumed.
+
+    Scans the whole transcript rather than a fixed tail: a busy session buries
+    the row under hundreds of tool rows, and anything queued has to stay
+    matchable until Claude gets to it. `since` (the oldest pending send) bounds
+    the result, so an old identical prompt can't clear a freshly queued one.
     """
     p = Path(path)
     if not p.exists():
         return []
-    raw = _tail_lines(p, max(n * 2, 100))
     out: list[tuple[float, str]] = []
-    for d in raw:
+    for d in _iter_lines(p):
+        if d.get("type") == "queue-operation":
+            if d.get("operation") != "remove":
+                continue
+            ts, text = _parse_ts(d.get("timestamp", "")), d.get("content") or ""
+            if ts >= since and text.strip():
+                out.append((ts, text))
+            continue
         for ev in _normalize(d):
             if ev.kind == "user_text" and ev.text.strip():
-                out.append((_parse_ts(ev.ts), ev.text))
-    return out[-n:]
+                ts = _parse_ts(ev.ts)
+                if ts >= since:
+                    out.append((ts, ev.text))
+    return out
 
 
 def current_task_hint(path: str | Path) -> Optional[str]:

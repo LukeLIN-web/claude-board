@@ -19,6 +19,10 @@ from .transcripts import timeline, extract_plan_history, extract_skills_used, ex
 # Upper bound on an injected single-line prompt (after newline collapse).
 _MAX_PROMPT_CHARS = 8000
 
+# Foreground commands that mean the pane is sitting at a shell, not a TUI —
+# injecting a prompt there would type it at the shell and Enter would run it.
+_SHELL_COMMANDS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh"}
+
 # Focus shim resolution: a user override at ~/.claude/focus-tty.sh wins; otherwise
 # the bundled cross-setup default (Terminal.app / iTerm2 / tmux) shipped with the repo.
 _USER_FOCUS_SCRIPT = CLAUDE_HOME / "focus-tty.sh"
@@ -824,12 +828,19 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
 def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
     """(lines, top, q_idx, foot) anchors of any open /btw overlay, or None.
 
-    The overlay pins its ▔ border, the "/btw …" question line, and the footer in
-    place while only the answer region scrolls, so this same anchor logic works at
-    any scroll position — capture_full_btw_answer relies on that to walk a long
+    The overlay pins the "/btw …" question line and the footer in place while
+    only the answer region scrolls, so this same anchor logic works at any
+    scroll position — capture_full_btw_answer relies on that to walk a long
     answer window-by-window. Settled-or-not is the caller's judgment (the footer
     at `foot` carries the signal): _btw_regions wants finished answers only,
-    parse_btw_pending wants the mid-generation state."""
+    parse_btw_pending wants the mid-generation state.
+
+    Top anchor: older Claude builds draw a ▔ border above the overlay; current
+    builds (v2.1.20x) draw none, so fall back to the composer marker line (the
+    overlay always renders below the composer) and finally to the capture
+    start. The composer line is only ever the (exclusive) top bound — while the
+    aside is open it still shows the just-submitted "/btw …" command itself,
+    and must never be mistaken for the overlay's question line."""
     if not text:
         return None
     lines = text.split("\n")
@@ -840,7 +851,9 @@ def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
     top = next((i for i in range(foot - 1, -1, -1)
                 if _BTW_TOP_RE.match(lines[i])), None)
     if top is None:
-        return None
+        marker = next((i for i in range(foot - 1, -1, -1)
+                       if lines[i].lstrip().startswith(("❯", "›"))), None)
+        top = marker if marker is not None else -1
     q_idx = next((i for i in range(foot - 1, top, -1)
                   if lines[i].lstrip().startswith("/btw")), None)
     if q_idx is None:
@@ -1035,21 +1048,20 @@ def send_menu_keys(pid: int, keys: list[str]) -> dict:
 # A /btw answer stays up as a modal overlay ("Esc to close") until dismissed —
 # it does NOT auto-close after answering, and neither the read-only scrape nor
 # the scroll-stitch capture (capture_full_btw_answer) closes it. Text pasted into
-# a pane while that overlay is open is swallowed by the overlay, not the composer,
-# so the *next* prompt after a /btw is silently lost ("回不到普通 prompt 模式").
-# Detect the overlay by its distinctive ▔ top border together with the "Esc to
-# close" footer — distinct enough from normal transcript output that we won't
-# Escape (and so interrupt) a merely-working session.
-_OVERLAY_CLOSE_HINT = "Esc to close"
+# a pane while that overlay is open is swallowed by the overlay's key handling,
+# not the composer, so the *next* prompt after a /btw is silently lost — and the
+# stray keys destroy the aside itself ("回不到普通 prompt 模式"). Detection uses
+# the same anchors as the parser (_overlay_anchors: "Esc to close" footer plus a
+# "/btw" question line above it — border or borderless), distinct enough from
+# normal transcript output that we won't Escape (and so interrupt) a
+# merely-working session.
 _OVERLAY_DISMISS_TRIES = 4      # Escape + re-check, a few times
 _OVERLAY_DISMISS_SETTLE = 0.15  # let the overlay tear down before re-capturing
 
 
 def _answer_overlay_open(text: str) -> bool:
     """True if a dismissible answer overlay (a /btw aside) is covering the pane."""
-    if not text or _OVERLAY_CLOSE_HINT not in text:
-        return False
-    return any(_BTW_TOP_RE.match(ln) for ln in text.split("\n"))
+    return _overlay_anchors(text) is not None
 
 
 def _dismiss_answer_overlay(pane: str) -> None:
@@ -1107,6 +1119,15 @@ def send_prompt(pid: int, text: str) -> dict:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return {"ok": False, "error": "session not in a tmux pane"}
+    # If the TUI exited or was suspended (Ctrl-Z, crash), the pane's foreground
+    # process is its parent shell: the injected text echoes at the shell prompt
+    # — where a stale composer marker in the scrollback can fool the landed
+    # check — and the submit Enter would EXECUTE the prompt as a shell command.
+    # Best-effort lookup; anything unrecognized fails open.
+    fg = (tmux.pane_current_command(pane) or "").lstrip("-")
+    if fg in _SHELL_COMMANDS:
+        return {"ok": False,
+                "error": f"pane is at a shell prompt ({fg}) — TUI not running"}
     # v1 is single-line: fold any internal newlines into spaces.
     collapsed = " ".join((text or "").split("\n")).strip()
     if not collapsed:
@@ -1118,12 +1139,20 @@ def send_prompt(pid: int, text: str) -> dict:
     # swallowed by the overlay.
     _archive_open_aside(pane, pid, getattr(w, "session_id", None))
     _dismiss_answer_overlay(pane)
-    # Codex's TUI swallows an Enter that arrives glued to the pasted text; give it
-    # a settle delay (scaled by paste size — a big prompt needs longer to ingest)
-    # so the prompt actually submits instead of sitting unsent in the composer,
-    # and verify the composer emptied afterward. Claude needs neither (settle 0.0).
+    # Both TUIs can silently lose an injected prompt when the pane is busy:
+    # Codex swallows an Enter glued to the pasted text (fixed with a size-scaled
+    # settle + submit-verify), and Claude drops the injected keystrokes outright
+    # mid-re-render — the text never reaches the composer, so the Enter submits
+    # nothing and the prompt vanishes with no transcript trace (the card then
+    # shows a phantom "Queued"). For Claude, verify the text actually landed
+    # before pressing Enter and that the composer emptied after, re-sending
+    # whichever half a busy re-render dropped.
     is_codex = getattr(w, "platform", "claude") == "codex"
-    settle = tmux.codex_enter_settle(len(collapsed)) if is_codex else 0.0
+    if is_codex:
+        settle = tmux.codex_enter_settle(len(collapsed))
+        return tmux.send_text(
+            pane, collapsed, settle_before_enter=settle, verify_submit=True
+        )
     return tmux.send_text(
-        pane, collapsed, settle_before_enter=settle, verify_submit=is_codex
+        pane, collapsed, verify_landed=True, verify_submit=True
     )

@@ -40,8 +40,15 @@ def norm(text: str) -> str:
     return " ".join(_bare_command((text or "").strip()).split())
 
 
-def record_sent(pid: int, text: str) -> None:
-    """Record a prompt sent from the dashboard to `pid`'s session."""
+def record_sent(pid: int, text: str, ts: Optional[float] = None) -> None:
+    """Record a prompt sent from the dashboard to `pid`'s session.
+
+    `ts` must be sampled BEFORE the keystrokes go out, not after the send call
+    returns: typing + composer/submit verification take a few hundred ms, and
+    Claude timestamps its transcript row the moment it receives the prompt. Stamp
+    it afterwards and that row lands *earlier* than the send time, so the `ts >=`
+    guard in `pending` rejects the real match and the prompt sticks on the card.
+    """
     n = norm(text)
     if not n:
         return
@@ -49,7 +56,8 @@ def record_sent(pid: int, text: str) -> None:
     # typed so the card label still reads "/btw", not "btw".
     display = " ".join((text or "").split())
     _sent.setdefault(pid, []).append(
-        {"id": next(_ids), "norm": n, "text": display, "ts": time.time()}
+        {"id": next(_ids), "norm": n, "text": display,
+         "ts": time.time() if ts is None else ts}
     )
 
 
@@ -62,9 +70,12 @@ def pending(pid: int, transcript_path: Optional[str], status: str) -> list[dict]
 
     Reconciliation:
       - status == "idle": the queue can't outlive an idle session -> clear all.
-      - else: drop one tracked item per matching transcript user message whose
-        timestamp is at/after the send (so an older identical prompt can't
-        falsely consume a freshly queued one). Duplicates clear in send order.
+      - else: drop one tracked item per matching consumed-prompt row (a user turn,
+        or Claude pulling the prompt off its own queue -- see
+        transcripts.consumed_prompt_texts) whose timestamp is at/after the send,
+        so an older identical prompt can't falsely consume a freshly queued one.
+        Duplicates clear in send order.
+      - then the FIFO sweep below.
     """
     items = _sent.get(pid)
     if not items:
@@ -74,8 +85,10 @@ def pending(pid: int, transcript_path: Optional[str], status: str) -> list[dict]
         return []
 
     if transcript_path:
-        seen = transcripts.recent_user_texts(transcript_path)
+        oldest = min(it["ts"] for it in items)
+        seen = transcripts.consumed_prompt_texts(transcript_path, since=oldest)
         remaining: list[dict] = []
+        newest_consumed = 0.0
         # Greedy match in send order: each transcript hit consumes one item.
         for it in items:
             hit = next(
@@ -87,7 +100,13 @@ def pending(pid: int, transcript_path: Optional[str], status: str) -> list[dict]
                 remaining.append(it)
             else:
                 seen.pop(hit)  # don't let one message clear two queued copies
-        items = remaining
+                newest_consumed = max(newest_consumed, it["ts"])
+        # FIFO sweep: Claude drains its queue in send order, so once a prompt is
+        # consumed, every prompt sent before it is settled -- an unmatched one is
+        # gone for good (swallowed by an overlay, or its rows went to a transcript
+        # that /clear or a compact rotated away). Keeping it would strand it on the
+        # card until the session next idles, which is the bug users see.
+        items = [it for it in remaining if it["ts"] >= newest_consumed]
         _sent[pid] = items
 
     return [{"id": it["id"], "text": it["text"]} for it in items]

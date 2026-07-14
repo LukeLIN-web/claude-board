@@ -61,6 +61,56 @@ class RunHelperTests(unittest.TestCase):
         self.assertEqual(argv[:3], ["tmux", "list-panes", "-a"])
 
 
+class SocketArgsTests(unittest.TestCase):
+    """FLEET_TMUX_SOCKET routes every call to an isolated tmux server."""
+
+    def setUp(self):
+        tmux._clear_caches()
+
+    def test_run_injects_socket_before_command(self):
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True):
+            with _patch_run(returncode=0) as m:
+                tmux._run("list-panes", "-a")
+        argv = m.call_args[0][0]
+        self.assertEqual(argv, ["tmux", "-L", "juyi", "list-panes", "-a"])
+
+    def test_run_omits_socket_when_unset(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with _patch_run(returncode=0) as m:
+                tmux._run("list-panes", "-a")
+        argv = m.call_args[0][0]
+        self.assertEqual(argv, ["tmux", "list-panes", "-a"])
+
+    def test_run_omits_socket_when_blank(self):
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "  "}, clear=True):
+            with _patch_run(returncode=0) as m:
+                tmux._run("list-panes")
+        argv = m.call_args[0][0]
+        self.assertEqual(argv, ["tmux", "list-panes"])
+
+    def test_new_window_targets_socketed_server(self):
+        # Socket is dedicated (-L juyi) but the session is NOT pinned: it falls
+        # out of sessions[0] on that server, so cards land wherever that server
+        # already hosts, not a hard-coded name.
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "list-sessions" in argv:
+                return FakeProc(returncode=0, stdout="beauty\n")
+            return FakeProc(returncode=0, stdout="%3\n")
+
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        list_argv = [a for a in calls if "list-sessions" in a][0]
+        self.assertEqual(list_argv[:3], ["tmux", "-L", "juyi"])
+        new_win_argv = [a for a in calls if "new-window" in a][0]
+        self.assertEqual(new_win_argv[:4], ["tmux", "-L", "juyi", "new-window"])
+        self.assertIn("beauty", new_win_argv)  # sessions[0], not a pin
+
+
 class AvailableTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
@@ -312,7 +362,7 @@ class SendTextTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
             r = tmux.send_text("%5", "/research-pipeline")
         self.assertTrue(r["ok"])
-        self.assertEqual(sleeps, [tmux._SLASH_SETTLE])
+        self.assertEqual(sleeps[0], tmux._SLASH_SETTLE)
         self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
 
     def test_settle_before_enter_pauses_plain_text(self):
@@ -341,7 +391,7 @@ class SendTextTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
             r = tmux.send_text("%5", "/foo", settle_before_enter=0.1)
         self.assertTrue(r["ok"])
-        self.assertEqual(sleeps, [tmux._SLASH_SETTLE])
+        self.assertEqual(sleeps[0], tmux._SLASH_SETTLE)
 
     def test_plain_text_does_not_sleep(self):
         def fake_run(argv, **kw):
@@ -408,6 +458,205 @@ class SendTextVerifySubmitTests(unittest.TestCase):
             r = tmux.send_text("%5", "hello", verify_submit=True)
         self.assertFalse(r["ok"])
         self.assertIn("unsent", r["error"])
+
+    def test_slash_prompt_auto_verifies_submit(self):
+        # Claude's slash popup can eat the submit Enter (it selects the
+        # highlighted completion instead), silently stranding e.g. "/clear" in
+        # the composer. Slash prompts must verify-and-resend without the caller
+        # opting in via verify_submit.
+        calls = []
+        states = iter([True, False])  # stranded once, then submitted
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=lambda *a: next(states)):
+            r = tmux.send_text("%5", "/clear")
+        self.assertTrue(r["ok"])
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 2)  # initial submit + one resend
+
+    def test_open_btw_overlay_does_not_trigger_enter_resend(self):
+        # A submitted /btw keeps its command text on the composer line while the
+        # answer overlay is open, and an Enter would DISMISS that overlay — the
+        # aside dies mid-answer with nothing archived. The verify pass must read
+        # the overlay as "submitted", never as a stranded prompt to re-Enter.
+        overlay_screen = (
+            "❯ /btw hello, just reply ok\n"
+            "▔▔▔▔▔▔▔▔▔▔▔▔\n"
+            "  /btw hello, just reply ok\n"
+            "    ✽ Answering…\n"
+            "  Esc to close\n"
+        )
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "capture-pane" in argv:
+                return FakeProc(returncode=0, stdout=overlay_screen)
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep"):
+            r = tmux.send_text("%5", "/btw hello, just reply ok")
+        self.assertTrue(r["ok"])
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 1)  # submit Enter only — overlay untouched
+
+    def test_plain_text_still_skips_verification_by_default(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail") as tail:
+            r = tmux.send_text("%5", "hello")
+        self.assertTrue(r["ok"])
+        tail.assert_not_called()
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 1)
+
+
+class SendTextVerifyLandedTests(unittest.TestCase):
+    """verify_landed confirms the literal text reached the composer before Enter,
+    re-sending it (Ctrl-U first) when a busy-pane re-render dropped it."""
+
+    def setUp(self):
+        tmux._clear_caches()
+
+    @staticmethod
+    def _recorder(calls):
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+        return fake_run
+
+    def test_no_resend_when_text_lands_first_try(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=True):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertTrue(r["ok"])
+        literals = [c for c in calls if "-l" in c]
+        self.assertEqual(len(literals), 1)  # text sent once
+        self.assertNotIn(["tmux", "send-keys", "-t", "%5", "C-u"], calls)  # no clear
+
+    def test_resends_text_after_clearing_when_dropped_once(self):
+        calls = []
+        landed = iter([False, True])  # dropped once, then lands
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=lambda *a: next(landed)):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertTrue(r["ok"])
+        literals = [c for c in calls if "-l" in c]
+        self.assertEqual(len(literals), 2)  # initial + one resend
+        # The retry clears any partial paste before re-sending: literal, C-u,
+        # literal (no capture calls — _composer_has_tail is mocked out).
+        self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "C-u"])
+
+    def test_reports_failure_when_text_never_lands(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        # Never press Enter on a prompt that never made it into the composer.
+        self.assertNotIn(["tmux", "send-keys", "-t", "%5", "Enter"], calls)
+        # A stalled TUI buffers the keystrokes rather than dropping them — they
+        # land AFTER we give up and would strand in the composer, corrupting the
+        # next send. Giving up must end with a cleanup Ctrl-U so the buffered
+        # text is wiped whenever the pane wakes: one clear per retry plus the
+        # final cleanup, and the cleanup is the last key sent.
+        clears = [c for c in calls if c[-1] == "C-u"]
+        self.assertEqual(len(clears), len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(calls[-1], ["tmux", "send-keys", "-t", "%5", "C-u"])
+
+    def test_landed_waits_escalate_for_laggy_panes(self):
+        # A busy pane can take well over 0.15s to echo the paste; the between-
+        # check waits must escalate so ordinary render lag doesn't get
+        # misreported as a dropped prompt.
+        sleeps = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder([])), \
+                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertFalse(r["ok"])
+        self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
+        self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
+        self.assertGreaterEqual(sum(sleeps), 3.0)  # rides out multi-second lag
+
+    def test_landed_then_verifies_submit_together(self):
+        # The two phases compose: text lands before Enter, composer empties after.
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=[True, False]):  # landed, then submitted
+            r = tmux.send_text("%5", "hello", verify_landed=True, verify_submit=True)
+        self.assertTrue(r["ok"])
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
+
+
+class ComposerHasTailTests(unittest.TestCase):
+    """_composer_has_tail must find the composer under BOTH markers: Codex's `›`
+    and Claude's `❯`."""
+
+    def _tail(self, cap_text, text):
+        with mock.patch.object(tmux, "capture_pane",
+                               return_value={"ok": True, "text": cap_text}):
+            return tmux._composer_has_tail("%5", text)
+
+    def test_claude_stranded_slash_command_is_detected(self):
+        cap = (
+            "✻ Cogitated for 3m 17s\n"
+            "\n"
+            "────────────\n"
+            "❯ /clear\n"
+            "────────────\n"
+            "  ⏵⏵ bypass permissions on\n"
+        )
+        self.assertTrue(self._tail(cap, "/clear"))
+
+    def test_claude_echoed_turn_above_empty_composer_is_not_stranded(self):
+        # A submitted prompt is echoed as a turn ABOVE the composer, with the
+        # same ❯ marker; only the LAST marker is the composer, and it is empty.
+        cap = (
+            "❯ /clear\n"
+            "  ⎿ cleared\n"
+            "────────────\n"
+            "❯ \n"
+            "────────────\n"
+            "  ⏵⏵ bypass permissions on\n"
+        )
+        self.assertFalse(self._tail(cap, "/clear"))
+
+    def test_shell_echo_without_composer_marker_is_not_landed(self):
+        # If the TUI died or was suspended, its parent shell owns the pty: the
+        # injected text is echoed at a bash prompt with NO composer marker on
+        # screen. Treating that echo as "landed" would make send_text press
+        # Enter and EXECUTE the prompt as a shell command. No marker → False.
+        cap = (
+            "(base) user@host:~/repo$ \n"
+            "(base) user@host:~/repo$ this prompt must NOT submit\n"
+        )
+        self.assertFalse(self._tail(cap, "this prompt must NOT submit"))
+
+    def test_btw_overlay_with_command_still_on_composer_is_not_stranded(self):
+        # While a /btw aside is open the composer line still shows the command
+        # AND the overlay echoes it below — but the "Esc to close" footer proves
+        # the submit landed, so the text must not be treated as stranded.
+        cap = (
+            "────────────\n"
+            "❯ /btw hello, just reply ok\n"
+            "▔▔▔▔▔▔▔▔▔▔▔▔\n"
+            "  /btw hello, just reply ok\n"
+            "    Ok.\n"
+            "  ↑/↓ to scroll · c to copy · f to fork · Esc to close\n"
+        )
+        self.assertFalse(self._tail(cap, "/btw hello, just reply ok"))
 
 
 class CodexEnterSettleTests(unittest.TestCase):

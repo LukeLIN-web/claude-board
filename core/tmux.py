@@ -79,6 +79,19 @@ def _spawn_env() -> dict:
     return env
 
 
+def _socket_args() -> list[str]:
+    """`-L <name>` server selector, or empty for the default tmux server.
+
+    `FLEET_TMUX_SOCKET=juyi` makes every call `tmux -L juyi …`, pinning the board
+    to an isolated server (its own socket + server process) instead of the shared
+    default one — so spawned cards never land next to unrelated sessions. `-L` is
+    a server option and must precede the tmux command. The session within that
+    server is still chosen by `_resolve_target`; the socket only picks the server.
+    """
+    name = (os.environ.get("FLEET_TMUX_SOCKET") or "").strip()
+    return ["-L", name] if name else []
+
+
 # Env vars that mark the board's own virtualenv. `_spawn_env()` drops them, but a
 # `pop` is not an `unset`: a long-lived tmux server started while `.venv` was
 # active still holds these in its own environment and re-injects them into every
@@ -104,7 +117,7 @@ def _run(*args: str) -> dict:
     """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise."""
     try:
         cp = subprocess.run(
-            ["tmux", *args],
+            ["tmux", *_socket_args(), *args],
             capture_output=True, text=True, timeout=_TIMEOUT,
             env=_spawn_env(),
             stdin=subprocess.DEVNULL,
@@ -181,6 +194,17 @@ def pane_for_tty(tty: str) -> Optional[str]:
         if _norm_tty(pane["tty"]) == target:
             return pane["pane_id"]
     return None
+
+
+def pane_current_command(pane: str) -> Optional[str]:
+    """Name of the pane's foreground process (tmux #{pane_current_command}), or
+    None when it can't be resolved. Best-effort — callers must fail open."""
+    if not pane:
+        return None
+    r = _run("display-message", "-p", "-t", pane, "#{pane_current_command}")
+    if not r["ok"]:
+        return None
+    return r["stdout"].strip() or None
 
 
 def pane_target(pane: str) -> Optional[str]:
@@ -314,6 +338,14 @@ _CODEX_ENTER_SETTLE_MAX = 3.0
 _SUBMIT_VERIFY_RETRIES = 3
 _SUBMIT_VERIFY_WAIT = 0.4
 
+# Before the submit Enter, confirm the literal text actually reached the
+# composer. A busy pane mid-re-render can drop the injected keystrokes outright,
+# so a following Enter would submit an empty line and the prompt would vanish
+# with no trace. One wait per re-send attempt, escalating: a churning TUI often
+# takes well over 0.15s to echo a paste (a stalled one buffers it for seconds),
+# and a fixed short wait misreports that lag as a dropped prompt.
+_LANDED_VERIFY_WAITS = (0.15, 0.5, 1.2, 2.5)
+
 
 def codex_enter_settle(text_len: int) -> float:
     """Length-scaled settle before Codex's submit Enter (see _CODEX_ENTER_SETTLE)."""
@@ -321,21 +353,77 @@ def codex_enter_settle(text_len: int) -> float:
     return min(scaled, _CODEX_ENTER_SETTLE_MAX)
 
 
-def _composer_has_tail(pane: str, text: str) -> bool:
-    """True if a distinctive tail of `text` still sits in `pane`'s composer.
+# Footer line of an open /btw aside overlay (same anchor actions._overlay_anchors
+# keys on). While the aside is open, the composer line STILL shows the "/btw …"
+# command and the overlay echoes it again below — and a resent Enter would
+# dismiss the overlay, killing the aside mid-answer. So an on-screen footer
+# means "submitted", never "stranded". Any pre-existing overlay was closed by
+# actions.send_prompt before the send, so by verify time the footer can only
+# belong to the aside this very submit opened.
+_BTW_OVERLAY_FOOTER = "Esc to close"
 
-    The composer is the region after the last `›` prompt marker; a submitted
-    prompt is echoed as a turn ABOVE that marker and leaves the composer empty
+
+def _composer_has_tail(pane: str, text: str) -> bool:
+    """True if a distinctive tail of `text` still sits in `pane`'s composer,
+    stranded and awaiting a submit Enter.
+
+    The composer is the region after the last prompt marker — `›` for Codex,
+    `❯` for Claude; a submitted prompt is echoed as a turn ABOVE that marker
+    (with the same marker glyph, hence "last") and leaves the composer empty
     (a dim ghost suggestion, never our text). Whitespace is squeezed on both
     sides so the needle survives the composer's soft-wrapping and indentation.
+
+    Exception: a /btw aside keeps its command text on the composer line for as
+    long as its answer overlay is open, so the overlay footer in the region
+    means the prompt DID submit (see _BTW_OVERLAY_FOOTER).
+
+    No marker on screen means there is NO composer — the TUI exited or was
+    suspended and its parent shell owns the pty. The injected text still echoes
+    there (line-discipline echo at a bash prompt), and matching that echo would
+    make send_text press Enter and EXECUTE the prompt as a shell command.
     """
     needle = "".join(text.split())[-24:]
     if not needle:
         return False
     cap = capture_pane(pane).get("text", "")
-    idx = cap.rfind("›")
-    region = cap[idx:] if idx != -1 else cap
+    idx = max(cap.rfind("›"), cap.rfind("❯"))
+    if idx == -1:
+        return False
+    region = cap[idx:]
+    if _BTW_OVERLAY_FOOTER in region:
+        return False
     return needle in "".join(region.split())
+
+
+def _send_until_landed(pane: str, text: str) -> bool:
+    """Send `text` literally into `pane`, confirming it reached the composer.
+
+    A busy pane can drop the injected keystrokes during a re-render, so the text
+    never arrives and a following Enter submits nothing — the prompt vanishes
+    with no transcript trace (the dashboard then shows a phantom "Queued"). Re-
+    send until the composer holds our text, clearing any partial paste with
+    Ctrl-U first so a retry can't concatenate into a corrupted prompt. Returns
+    False if the text never lands after the retries — the caller then reports the
+    failure rather than pressing Enter on a lost prompt.
+
+    A fully stalled TUI (frozen spinner, event loop wedged) never drops the
+    keystrokes at all — the pty buffers them and they land whenever the pane
+    wakes, possibly minutes after we've given up. Giving up therefore ends with
+    a cleanup Ctrl-U queued behind everything we sent: when the pane wakes it
+    wipes the late-landing text, so "never landed" stays truthful and the
+    stranded prompt can't concatenate into the next send.
+    """
+    for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
+        if attempt:
+            _run("send-keys", "-t", pane, "C-u")  # drop any partial before retry
+        literal = _run("send-keys", "-t", pane, "-l", "--", text)
+        if not literal["ok"]:
+            return False
+        time.sleep(wait)
+        if _composer_has_tail(pane, text):
+            return True
+    _run("send-keys", "-t", pane, "C-u")  # wipe the buffered text on wake
+    return False
 
 
 def send_text(
@@ -343,6 +431,7 @@ def send_text(
     text: str,
     settle_before_enter: float = 0.0,
     verify_submit: bool = False,
+    verify_landed: bool = False,
 ) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it.
 
@@ -353,22 +442,34 @@ def send_text(
     here; platform-wide needs (e.g. Codex) are passed in by the caller. When both
     apply, the longer wait wins.
 
-    `verify_submit` (Codex) confirms the composer actually emptied after Enter and
-    resends Enter a couple of times if the prompt is still sitting there, so an
-    under-tuned settle can't silently strand a prompt.
+    `verify_landed` (Claude) confirms the literal text actually reached the
+    composer before Enter, re-sending it if a busy-pane re-render dropped the
+    keystrokes — otherwise the Enter submits an empty line and the prompt is
+    lost. `verify_submit` (Codex) confirms the composer actually emptied after
+    Enter and resends Enter a couple of times if the prompt is still sitting
+    there, so an under-tuned settle can't silently strand a prompt. Slash prompts
+    verify submit unconditionally: even after the settle, Claude's popup can
+    consume the Enter selecting the highlighted completion, leaving the command
+    (e.g. "/clear") in the composer unsubmitted — the resent Enter then submits
+    it for real.
     """
-    literal = _run("send-keys", "-t", pane, "-l", "--", text)
-    if not literal["ok"]:
-        return {"ok": False, "error": literal["error"]}
+    if verify_landed:
+        if not _send_until_landed(pane, text):
+            return {"ok": False, "error": "prompt text never landed in composer"}
+    else:
+        literal = _run("send-keys", "-t", pane, "-l", "--", text)
+        if not literal["ok"]:
+            return {"ok": False, "error": literal["error"]}
+    is_slash = text.lstrip().startswith("/")
     delay = settle_before_enter
-    if text.lstrip().startswith("/"):
+    if is_slash:
         delay = max(delay, _SLASH_SETTLE)
     if delay > 0:
         time.sleep(delay)
     enter = _run("send-keys", "-t", pane, "Enter")
     if not enter["ok"]:
         return {"ok": False, "error": enter["error"]}
-    if verify_submit:
+    if verify_submit or is_slash:
         for _ in range(_SUBMIT_VERIFY_RETRIES):
             time.sleep(_SUBMIT_VERIFY_WAIT)
             if not _composer_has_tail(pane, text):
