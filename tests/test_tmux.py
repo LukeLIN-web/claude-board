@@ -564,6 +564,28 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertIn("never landed", r["error"])
         # Never press Enter on a prompt that never made it into the composer.
         self.assertNotIn(["tmux", "send-keys", "-t", "%5", "Enter"], calls)
+        # A stalled TUI buffers the keystrokes rather than dropping them — they
+        # land AFTER we give up and would strand in the composer, corrupting the
+        # next send. Giving up must end with a cleanup Ctrl-U so the buffered
+        # text is wiped whenever the pane wakes: one clear per retry plus the
+        # final cleanup, and the cleanup is the last key sent.
+        clears = [c for c in calls if c[-1] == "C-u"]
+        self.assertEqual(len(clears), len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(calls[-1], ["tmux", "send-keys", "-t", "%5", "C-u"])
+
+    def test_landed_waits_escalate_for_laggy_panes(self):
+        # A busy pane can take well over 0.15s to echo the paste; the between-
+        # check waits must escalate so ordinary render lag doesn't get
+        # misreported as a dropped prompt.
+        sleeps = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder([])), \
+                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append), \
+                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+            r = tmux.send_text("%5", "hello", verify_landed=True)
+        self.assertFalse(r["ok"])
+        self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
+        self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
+        self.assertGreaterEqual(sum(sleeps), 3.0)  # rides out multi-second lag
 
     def test_landed_then_verifies_submit_together(self):
         # The two phases compose: text lands before Enter, composer empties after.
@@ -610,6 +632,17 @@ class ComposerHasTailTests(unittest.TestCase):
             "  ⏵⏵ bypass permissions on\n"
         )
         self.assertFalse(self._tail(cap, "/clear"))
+
+    def test_shell_echo_without_composer_marker_is_not_landed(self):
+        # If the TUI died or was suspended, its parent shell owns the pty: the
+        # injected text is echoed at a bash prompt with NO composer marker on
+        # screen. Treating that echo as "landed" would make send_text press
+        # Enter and EXECUTE the prompt as a shell command. No marker → False.
+        cap = (
+            "(base) user@host:~/repo$ \n"
+            "(base) user@host:~/repo$ this prompt must NOT submit\n"
+        )
+        self.assertFalse(self._tail(cap, "this prompt must NOT submit"))
 
     def test_btw_overlay_with_command_still_on_composer_is_not_stranded(self):
         # While a /btw aside is open the composer line still shows the command

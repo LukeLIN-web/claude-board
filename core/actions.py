@@ -19,6 +19,10 @@ from .transcripts import timeline, extract_plan_history, extract_skills_used, ex
 # Upper bound on an injected single-line prompt (after newline collapse).
 _MAX_PROMPT_CHARS = 8000
 
+# Foreground commands that mean the pane is sitting at a shell, not a TUI —
+# injecting a prompt there would type it at the shell and Enter would run it.
+_SHELL_COMMANDS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh"}
+
 # Focus shim resolution: a user override at ~/.claude/focus-tty.sh wins; otherwise
 # the bundled cross-setup default (Terminal.app / iTerm2 / tmux) shipped with the repo.
 _USER_FOCUS_SCRIPT = CLAUDE_HOME / "focus-tty.sh"
@@ -1115,6 +1119,15 @@ def send_prompt(pid: int, text: str) -> dict:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return {"ok": False, "error": "session not in a tmux pane"}
+    # If the TUI exited or was suspended (Ctrl-Z, crash), the pane's foreground
+    # process is its parent shell: the injected text echoes at the shell prompt
+    # — where a stale composer marker in the scrollback can fool the landed
+    # check — and the submit Enter would EXECUTE the prompt as a shell command.
+    # Best-effort lookup; anything unrecognized fails open.
+    fg = (tmux.pane_current_command(pane) or "").lstrip("-")
+    if fg in _SHELL_COMMANDS:
+        return {"ok": False,
+                "error": f"pane is at a shell prompt ({fg}) — TUI not running"}
     # v1 is single-line: fold any internal newlines into spaces.
     collapsed = " ".join((text or "").split("\n")).strip()
     if not collapsed:

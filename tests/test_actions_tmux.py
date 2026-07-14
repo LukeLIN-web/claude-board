@@ -88,6 +88,37 @@ class SendPromptTests(unittest.TestCase):
             actions.send_prompt(1234, "line1\nline2\nline3")
         self.assertEqual(st.call_args[0][1], "line1 line2 line3")
 
+    def test_shell_foreground_refuses_to_send(self):
+        # If the TUI exited or was suspended, the pane's foreground process is
+        # its parent shell — injected text would echo at the shell prompt and
+        # the submit Enter would EXECUTE the prompt as a shell command.
+        for shell in ("bash", "zsh", "-fish"):
+            with mock.patch.object(actions, "find_window",
+                                   return_value=_fake_window("/dev/pts/3")), \
+                 mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+                 mock.patch.object(actions.tmux, "pane_current_command",
+                                   return_value=shell), \
+                 mock.patch.object(actions.tmux, "send_text") as st:
+                r = actions.send_prompt(1234, "hello")
+            self.assertFalse(r["ok"], shell)
+            self.assertIn("shell", r["error"])
+            st.assert_not_called()
+
+    def test_unknown_foreground_command_still_sends(self):
+        # The lookup is best-effort: an unrecognized or unresolvable foreground
+        # command (node, claude, "") must not block the send.
+        for cmd in ("claude", "node", "", None):
+            with mock.patch.object(actions, "find_window",
+                                   return_value=_fake_window("/dev/pts/3")), \
+                 mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+                 mock.patch.object(actions.tmux, "pane_current_command",
+                                   return_value=cmd), \
+                 mock.patch.object(actions.tmux, "send_text",
+                                   return_value={"ok": True}) as st:
+                r = actions.send_prompt(1234, "hello")
+            self.assertTrue(r["ok"], repr(cmd))
+            st.assert_called_once()
+
     def test_no_pane_returns_explicit_error(self):
         with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
              mock.patch.object(actions.tmux, "pane_for_tty", return_value=None), \

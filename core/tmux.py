@@ -196,6 +196,17 @@ def pane_for_tty(tty: str) -> Optional[str]:
     return None
 
 
+def pane_current_command(pane: str) -> Optional[str]:
+    """Name of the pane's foreground process (tmux #{pane_current_command}), or
+    None when it can't be resolved. Best-effort — callers must fail open."""
+    if not pane:
+        return None
+    r = _run("display-message", "-p", "-t", pane, "#{pane_current_command}")
+    if not r["ok"]:
+        return None
+    return r["stdout"].strip() or None
+
+
 def pane_target(pane: str) -> Optional[str]:
     """Human-addressable target ("session:window.pane") for a pane id, or None."""
     if not pane:
@@ -330,10 +341,10 @@ _SUBMIT_VERIFY_WAIT = 0.4
 # Before the submit Enter, confirm the literal text actually reached the
 # composer. A busy pane mid-re-render can drop the injected keystrokes outright,
 # so a following Enter would submit an empty line and the prompt would vanish
-# with no trace. Re-send the text up to this many extra times, waiting this long
-# for the composer to catch it before each check.
-_LANDED_VERIFY_RETRIES = 3
-_LANDED_VERIFY_WAIT = 0.15
+# with no trace. One wait per re-send attempt, escalating: a churning TUI often
+# takes well over 0.15s to echo a paste (a stalled one buffers it for seconds),
+# and a fixed short wait misreports that lag as a dropped prompt.
+_LANDED_VERIFY_WAITS = (0.15, 0.5, 1.2, 2.5)
 
 
 def codex_enter_settle(text_len: int) -> float:
@@ -365,13 +376,20 @@ def _composer_has_tail(pane: str, text: str) -> bool:
     Exception: a /btw aside keeps its command text on the composer line for as
     long as its answer overlay is open, so the overlay footer in the region
     means the prompt DID submit (see _BTW_OVERLAY_FOOTER).
+
+    No marker on screen means there is NO composer — the TUI exited or was
+    suspended and its parent shell owns the pty. The injected text still echoes
+    there (line-discipline echo at a bash prompt), and matching that echo would
+    make send_text press Enter and EXECUTE the prompt as a shell command.
     """
     needle = "".join(text.split())[-24:]
     if not needle:
         return False
     cap = capture_pane(pane).get("text", "")
     idx = max(cap.rfind("›"), cap.rfind("❯"))
-    region = cap[idx:] if idx != -1 else cap
+    if idx == -1:
+        return False
+    region = cap[idx:]
     if _BTW_OVERLAY_FOOTER in region:
         return False
     return needle in "".join(region.split())
@@ -387,16 +405,24 @@ def _send_until_landed(pane: str, text: str) -> bool:
     Ctrl-U first so a retry can't concatenate into a corrupted prompt. Returns
     False if the text never lands after the retries — the caller then reports the
     failure rather than pressing Enter on a lost prompt.
+
+    A fully stalled TUI (frozen spinner, event loop wedged) never drops the
+    keystrokes at all — the pty buffers them and they land whenever the pane
+    wakes, possibly minutes after we've given up. Giving up therefore ends with
+    a cleanup Ctrl-U queued behind everything we sent: when the pane wakes it
+    wipes the late-landing text, so "never landed" stays truthful and the
+    stranded prompt can't concatenate into the next send.
     """
-    for attempt in range(_LANDED_VERIFY_RETRIES + 1):
+    for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         if attempt:
             _run("send-keys", "-t", pane, "C-u")  # drop any partial before retry
         literal = _run("send-keys", "-t", pane, "-l", "--", text)
         if not literal["ok"]:
             return False
-        time.sleep(_LANDED_VERIFY_WAIT)
+        time.sleep(wait)
         if _composer_has_tail(pane, text):
             return True
+    _run("send-keys", "-t", pane, "C-u")  # wipe the buffered text on wake
     return False
 
 
