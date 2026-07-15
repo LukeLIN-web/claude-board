@@ -363,15 +363,20 @@ def codex_enter_settle(text_len: int) -> float:
 _BTW_OVERLAY_FOOTER = "Esc to close"
 
 
-def _composer_has_tail(pane: str, text: str) -> bool:
+def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
     """True if a distinctive tail of `text` still sits in `pane`'s composer,
     stranded and awaiting a submit Enter.
 
-    The composer is the region after the last prompt marker — `›` for Codex,
-    `❯` for Claude; a submitted prompt is echoed as a turn ABOVE that marker
-    (with the same marker glyph, hence "last") and leaves the composer empty
-    (a dim ghost suggestion, never our text). Whitespace is squeezed on both
-    sides so the needle survives the composer's soft-wrapping and indentation.
+    The composer is the region after the last prompt marker — `marker` is the
+    DRIVEN platform's composer glyph (`❯` for Claude, `›` for Codex), and only
+    that one is searched. The other TUI's glyph is ordinary content here: Claude
+    renders `›` as the " › blocked by #N" task-list separator, which the todo
+    summary draws BELOW the composer — searching for both markers would anchor
+    on that trailing `›`, look past the real composer, and wrongly report a
+    landed prompt as "never landed". A submitted prompt is echoed as a turn ABOVE
+    the marker (same glyph, hence "last") and leaves the composer empty (a dim
+    ghost suggestion, never our text). Whitespace is squeezed on both sides so
+    the needle survives the composer's soft-wrapping and indentation.
 
     Exception: a /btw aside keeps its command text on the composer line for as
     long as its answer overlay is open, so the overlay footer in the region
@@ -386,7 +391,7 @@ def _composer_has_tail(pane: str, text: str) -> bool:
     if not needle:
         return False
     cap = capture_pane(pane).get("text", "")
-    idx = max(cap.rfind("›"), cap.rfind("❯"))
+    idx = cap.rfind(marker)
     if idx == -1:
         return False
     region = cap[idx:]
@@ -395,7 +400,7 @@ def _composer_has_tail(pane: str, text: str) -> bool:
     return needle in "".join(region.split())
 
 
-def _send_until_landed(pane: str, text: str) -> bool:
+def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
     A busy pane can drop the injected keystrokes during a re-render, so the text
@@ -420,7 +425,7 @@ def _send_until_landed(pane: str, text: str) -> bool:
         if not literal["ok"]:
             return False
         time.sleep(wait)
-        if _composer_has_tail(pane, text):
+        if _composer_has_tail(pane, text, marker):
             return True
     _run("send-keys", "-t", pane, "C-u")  # wipe the buffered text on wake
     return False
@@ -432,6 +437,7 @@ def send_text(
     settle_before_enter: float = 0.0,
     verify_submit: bool = False,
     verify_landed: bool = False,
+    marker: str = "❯",
 ) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it.
 
@@ -454,7 +460,7 @@ def send_text(
     it for real.
     """
     if verify_landed:
-        if not _send_until_landed(pane, text):
+        if not _send_until_landed(pane, text, marker):
             return {"ok": False, "error": "prompt text never landed in composer"}
     else:
         literal = _run("send-keys", "-t", pane, "-l", "--", text)
@@ -472,12 +478,12 @@ def send_text(
     if verify_submit or is_slash:
         for _ in range(_SUBMIT_VERIFY_RETRIES):
             time.sleep(_SUBMIT_VERIFY_WAIT)
-            if not _composer_has_tail(pane, text):
+            if not _composer_has_tail(pane, text, marker):
                 break
             resent = _run("send-keys", "-t", pane, "Enter")
             if not resent["ok"]:
                 return {"ok": False, "error": resent["error"]}
         else:
-            if _composer_has_tail(pane, text):
+            if _composer_has_tail(pane, text, marker):
                 return {"ok": False, "error": "prompt still unsent after retries"}
     return {"ok": True}

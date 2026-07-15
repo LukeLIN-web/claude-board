@@ -1151,10 +1151,11 @@ def send_prompt(pid: int, text: str) -> dict:
     if is_codex:
         settle = tmux.codex_enter_settle(len(collapsed))
         return tmux.send_text(
-            pane, collapsed, settle_before_enter=settle, verify_submit=True
+            pane, collapsed, settle_before_enter=settle, verify_submit=True,
+            marker="›",
         )
     return tmux.send_text(
-        pane, collapsed, verify_landed=True, verify_submit=True
+        pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
     )
 
 

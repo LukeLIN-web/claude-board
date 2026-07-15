@@ -601,13 +601,40 @@ class SendTextVerifyLandedTests(unittest.TestCase):
 
 
 class ComposerHasTailTests(unittest.TestCase):
-    """_composer_has_tail must find the composer under BOTH markers: Codex's `›`
-    and Claude's `❯`."""
+    """_composer_has_tail anchors on the DRIVEN platform's composer marker only —
+    Claude's `❯` by default, Codex's `›` when passed. The other TUI's glyph is
+    ordinary content on the pane (Claude renders `›` as a task-list separator
+    BELOW the composer), so searching for both would steal the anchor."""
 
-    def _tail(self, cap_text, text):
+    def _tail(self, cap_text, text, marker="❯"):
         with mock.patch.object(tmux, "capture_pane",
                                return_value={"ok": True, "text": cap_text}):
-            return tmux._composer_has_tail("%5", text)
+            return tmux._composer_has_tail("%5", text, marker)
+
+    def test_claude_text_landed_with_tasklist_below_composer(self):
+        # Claude renders the todo summary BELOW the input composer, and each
+        # blocked task carries a `›` separator. Anchoring on the LAST `›` (a task
+        # line, below our text) would look past the composer and wrongly report
+        # the prompt never landed. The ❯ composer holds our text → landed.
+        cap = (
+            "  ✻ Cogitated for 2m 10s\n"
+            "────────────\n"
+            "❯ start the training run now\n"
+            "────────────\n"
+            "  10 tasks (0 done, 1 in progress, 9 open)\n"
+            "  ◼ task1: New pool mining + eligibility + dedup\n"
+            "  ◻ task2: Render spec v5 › blocked by #1\n"
+            "  ◻ task3: Objective function › blocked by #2\n"
+        )
+        self.assertTrue(self._tail(cap, "start the training run now"))
+
+    def test_codex_stranded_prompt_is_detected_with_codex_marker(self):
+        cap = (
+            "────────────\n"
+            "› run the benchmark suite\n"
+            "────────────\n"
+        )
+        self.assertTrue(self._tail(cap, "run the benchmark suite", marker="›"))
 
     def test_claude_stranded_slash_command_is_detected(self):
         cap = (

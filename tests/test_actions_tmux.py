@@ -61,9 +61,11 @@ class SendPromptTests(unittest.TestCase):
             r = actions.send_prompt(1234, "hello")
         pf.assert_called_once_with("/dev/pts/3")
         # Claude's busy pane can drop the injected keystrokes, so verify the text
-        # lands before Enter and that the composer empties after.
+        # lands before Enter and that the composer empties after — anchored on
+        # Claude's `❯` composer marker, never Codex's `›` (a task-list separator
+        # here).
         st.assert_called_once_with(
-            "%5", "hello", verify_landed=True, verify_submit=True,
+            "%5", "hello", verify_landed=True, verify_submit=True, marker="❯",
         )
         self.assertTrue(r["ok"])
 
@@ -73,11 +75,12 @@ class SendPromptTests(unittest.TestCase):
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, "hello")
-        # Codex gets a length-scaled settle and submit-verification.
+        # Codex gets a length-scaled settle and submit-verification, anchored on
+        # Codex's `›` composer marker.
         st.assert_called_once_with(
             "%5", "hello",
             settle_before_enter=actions.tmux.codex_enter_settle(len("hello")),
-            verify_submit=True,
+            verify_submit=True, marker="›",
         )
         self.assertTrue(r["ok"])
 
