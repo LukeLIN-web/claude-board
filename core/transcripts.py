@@ -190,6 +190,71 @@ def _normalize(d: dict) -> list[TurnEvent]:
     return []
 
 
+def _row_model(d: dict) -> str:
+    """The model that ran an assistant row ("" if none did).
+
+    Claude stamps model "<synthetic>" on rows it writes on the model's behalf —
+    "No response requested.", API-error placeholders. Counting those would park a
+    card on "<synthetic>" and fake a switch away and back around every one.
+    """
+    if d.get("type") != "assistant":
+        return ""
+    model = (d.get("message") or {}).get("model") or ""
+    return "" if model.startswith("<") else model
+
+
+def current_model(path: str | Path) -> str:
+    """Model id of the session's most recent assistant turn ("" if none yet).
+
+    The last row, not the first (history._extract_model): a session that switched
+    model mid-run is *on* the new one, and that's what the board's card claims.
+    """
+    p = Path(path)
+    model = ""
+    for d in _iter_lines(p):
+        model = _row_model(d) or model
+    return model
+
+
+def pretty_model(raw: str) -> str:
+    """Model id -> the label Claude's own /model dialog uses: claude-opus-4-8 ->
+    "Opus 4.8". Anything that doesn't parse is passed through unchanged."""
+    if not (raw or "").startswith("claude-"):
+        return raw
+    parts = [t for t in raw.split("-") if t and t != "claude"]
+    # Drop the release date suffix (claude-haiku-4-5-20251001).
+    parts = [t for t in parts if not (t.isdigit() and len(t) == 8)]
+    family = next((t for t in parts if not t.isdigit()), "")
+    version = ".".join(t for t in parts if t.isdigit())
+    if not family or not version:
+        return raw
+    return f"{family.capitalize()} {version}"
+
+
+def _model_change_events(raw: list[dict]) -> dict[int, TurnEvent]:
+    """Model switches within `raw`, as {index of the row that first ran on the new
+    model: event}.
+
+    Read from the assistant rows because that's the model that actually answered:
+    a switch that failed to land leaves no trace here (correctly), and one made by
+    typing /model in the TUI shows up all the same. The first model seen isn't a
+    change — `raw` is only a tail, so its earliest row has no predecessor.
+    """
+    out: dict[int, TurnEvent] = {}
+    prev = ""
+    for i, d in enumerate(raw):
+        model = _row_model(d)
+        if not model:
+            continue
+        if prev and model != prev:
+            out[i] = TurnEvent(
+                d.get("timestamp", ""), "model", f"Model → {pretty_model(model)}",
+                None, "system", {"model": model},
+            )
+        prev = model
+    return out
+
+
 def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     """Return ≤ limit most recent flattened turn events for a transcript."""
     p = Path(path)
@@ -197,8 +262,11 @@ def timeline(path: str | Path, limit: int = 50) -> list[dict]:
         return []
     # Read more lines than needed because one jsonl row can expand into several events.
     raw = _tail_lines(p, max(limit * 2, 100))
+    switches = _model_change_events(raw)
     events: list[TurnEvent] = []
-    for d in raw:
+    for i, d in enumerate(raw):
+        if i in switches:
+            events.append(switches[i])
         events.extend(_normalize(d))
     return [e.__dict__ for e in events[-limit:]]
 

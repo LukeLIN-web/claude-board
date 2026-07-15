@@ -1151,8 +1151,184 @@ def send_prompt(pid: int, text: str) -> dict:
     if is_codex:
         settle = tmux.codex_enter_settle(len(collapsed))
         return tmux.send_text(
-            pane, collapsed, settle_before_enter=settle, verify_submit=True
+            pane, collapsed, settle_before_enter=settle, verify_submit=True,
+            marker="›",
         )
     return tmux.send_text(
-        pane, collapsed, verify_landed=True, verify_submit=True
+        pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
     )
+
+
+# Claude's /model dialog. Its footer is the marker that the dialog is up, and it
+# spells out the two ways to commit a pick: Enter also saves the model as the
+# default for NEW sessions, while "s" scopes it to the running session. The board
+# only ever wants the latter — switching one card's model shouldn't silently
+# re-point every session you start afterwards.
+_MODEL_DIALOG_FOOTER = "s to use this session only"
+
+# A dialog row, e.g. "    2. Opus  Opus 4.8 …" or "  ❯ 3. Fable  Fable 5 …".
+# Group "cur" is the ❯ cursor (present on exactly one row), "n" the row number,
+# "label" the model name — the first token, so "Default (recommended)" ⇒ Default
+# and "Sonnet ✔" ⇒ Sonnet.
+_MODEL_ROW_RE = re.compile(r"^(?P<cur>[\s ]*❯)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<label>\S+)")
+
+# Switching mid-conversation raises a SECOND dialog on top of the picker: the
+# history is cached against the old model and has to be re-read, so Claude asks
+# for confirmation ("Switch model? … 1. Yes, switch to Fable 5 / 2. No, go back").
+# It carries none of the picker's footer, so "footer gone" does NOT mean the
+# switch landed — until this one is answered the session sits on an open modal
+# and the model never changes. Escape backs out of it to the picker, not to the
+# prompt, which is why the cleanup path has to keep pressing.
+_MODEL_CONFIRM_YES_RE = re.compile(r"^[^\d\n]*(?P<n>\d+)\.[\s ]+Yes, switch to\b", re.M)
+
+_MODEL_DIALOG_WAIT = 8.0   # seconds to wait for the dialog to open / close
+_MODEL_DIALOG_POLL = 0.2
+_MODEL_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
+_MODEL_ESCAPES = 3         # enough to back out of confirm -> picker -> prompt
+
+
+def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
+    """Parse the /model dialog: [(row number, model label)], plus the number of
+    the highlighted row (0 if no row carries the cursor)."""
+    rows: list[tuple[int, str]] = []
+    cursor = 0
+    for line in text.splitlines():
+        m = _MODEL_ROW_RE.match(line)
+        if not m:
+            continue
+        n = int(m.group("n"))
+        rows.append((n, m.group("label")))
+        if m.group("cur"):
+            cursor = n
+    return rows, cursor
+
+
+def _model_confirm_yes_row(text: str) -> int:
+    """Number of the "Yes, switch to …" row if the confirm dialog is up, else 0."""
+    m = _MODEL_CONFIRM_YES_RE.search(text)
+    return int(m.group("n")) if m else 0
+
+
+def _model_dialogs_closed(text: str) -> bool:
+    """True when neither the /model picker nor its confirm dialog is on the pane."""
+    return _MODEL_DIALOG_FOOTER not in text and not _model_confirm_yes_row(text)
+
+
+def _escape_model_dialogs(pane: str) -> None:
+    """Leave the session at a prompt, not parked on a modal — from either dialog."""
+    for _ in range(_MODEL_ESCAPES):
+        if _model_dialogs_closed(tmux.capture_pane(pane).get("text", "")):
+            return
+        tmux.send_keys(pane, "Escape")
+        time.sleep(_MODEL_KEY_SETTLE)
+
+
+def _step_cursor_onto(pane: str, target: int, rows: int, read_cursor) -> bool:
+    """Press Down until the dialog's cursor sits on row `target`.
+
+    The list wraps, so Down alone reaches every row from wherever it starts; the
+    cursor is re-read from the pane after each press, which doubles as the check
+    that we're about to commit the right row.
+    """
+    for _ in range(rows + 1):
+        if read_cursor(tmux.capture_pane(pane).get("text", "")) == target:
+            return True
+        tmux.send_keys(pane, "Down")
+        time.sleep(_MODEL_KEY_SETTLE)
+    return False
+
+
+def switch_model(pid: int, alias: str) -> dict:
+    """Switch `pid`'s session to model `alias` (e.g. "opus") for THIS SESSION ONLY.
+
+    Drives Claude's /model dialog rather than sending `/model <alias>`: the
+    argument form works, but it also rewrites the user's default model for new
+    sessions. The dialog's "s" key is the only way to scope the switch to the
+    running session.
+
+    The dialog opens with its cursor on the session's *current* model, so the
+    number of keypresses to reach a target row isn't fixed — and the row list
+    wraps, so there's no edge to anchor against either. We step Down one row at a
+    time, re-reading the cursor from the pane after each press, until it sits on
+    the target. That read doubles as the check that we're about to commit the
+    right row.
+
+    Mid-conversation, "s" doesn't commit — it raises a confirm dialog (the cached
+    history has to be re-read against the new model). Same treatment: step onto
+    its "Yes" row, then Enter. Only a pane clear of BOTH dialogs counts as a
+    switch; anything else escapes out and reports failure, because a session left
+    on an open modal is a session that answers nothing.
+    """
+    alias = (alias or "").strip().lower()
+    if not alias.isalnum():
+        return {"ok": False, "error": f"invalid model alias '{alias}'"}
+    w = find_window(pid)
+    if not w:
+        return {"ok": False, "error": f"no window pid={pid}"}
+    if getattr(w, "platform", "claude") == "codex":
+        return {"ok": False, "error": "model switching is Claude-only"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+
+    r = send_prompt(pid, "/model")
+    if not r.get("ok"):
+        return r
+
+    text = ""
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        text = tmux.capture_pane(pane).get("text", "")
+        if _MODEL_DIALOG_FOOTER in text:
+            break
+        time.sleep(_MODEL_DIALOG_POLL)
+    else:
+        return {"ok": False, "error": "the /model dialog never opened"}
+
+    rows, _ = _model_dialog_rows(text)
+    target = next((n for n, label in rows if label.lower() == alias), 0)
+    if not target:
+        # Leave the session as we found it rather than parked on an open modal.
+        _escape_model_dialogs(pane)
+        offered = ", ".join(label for _, label in rows) or "none"
+        return {"ok": False, "error": f"'{alias}' is not in the /model dialog (offered: {offered})"}
+
+    if not _step_cursor_onto(pane, target, len(rows),
+                             lambda t: _model_dialog_rows(t)[1]):
+        _escape_model_dialogs(pane)
+        return {"ok": False, "error": f"could not move the dialog cursor onto {alias}"}
+
+    tmux.send_keys(pane, "s")
+
+    # "s" either commits (both dialogs gone) or raises the confirm dialog.
+    yes_row = 0
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        text = tmux.capture_pane(pane).get("text", "")
+        yes_row = _model_confirm_yes_row(text)
+        if yes_row or _model_dialogs_closed(text):
+            break
+        time.sleep(_MODEL_DIALOG_POLL)
+    else:
+        _escape_model_dialogs(pane)
+        return {"ok": False, "error": "the /model dialog did not close after pressing s"}
+
+    if not yes_row:
+        return {"ok": True, "model": alias}
+
+    # Confirm dialog: two rows, and it opens on "Yes" — but commit the row we can
+    # see the cursor on, not the row we hope it's on.
+    if not _step_cursor_onto(pane, yes_row, 2, lambda t: _model_dialog_rows(t)[1]):
+        _escape_model_dialogs(pane)
+        return {"ok": False, "error": f"could not confirm the switch to {alias}"}
+
+    tmux.send_keys(pane, "Enter")
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        if _model_dialogs_closed(tmux.capture_pane(pane).get("text", "")):
+            return {"ok": True, "model": alias}
+        time.sleep(_MODEL_DIALOG_POLL)
+    _escape_model_dialogs(pane)
+    return {"ok": False, "error": f"the confirm dialog did not close after confirming {alias}"}

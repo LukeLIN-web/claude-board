@@ -99,6 +99,41 @@ class SnapshotFlagTests(unittest.TestCase):
         self.assertFalse(snap["tmux_available"])
 
 
+class CardModelTests(unittest.TestCase):
+    """The card carries the model the session is actually running on — without it,
+    a switch driven from the board changes nothing visible."""
+
+    def _run(self, win):
+        snap = {"windows": [win], "counts": {}, "ts": 0}
+        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
+             mock.patch.object(appmod.tmux, "available", return_value=True), \
+             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
+             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
+             mock.patch.object(appmod.patrol, "classify",
+                               return_value={"triage": "", "reason": "", "suggestion": ""}), \
+             mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
+             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
+             mock.patch.object(appmod.transcripts, "current_task_hint", return_value=None), \
+             mock.patch.object(appmod.transcripts, "current_model",
+                               return_value="claude-fable-5"):
+            return appmod._enriched_snapshot()["windows"][0]
+
+    def test_card_reports_the_running_model(self):
+        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                       "name": "s", "updated_at": 0})
+        self.assertEqual(w["model"], "claude-fable-5")
+        self.assertEqual(w["model_label"], "Fable 5")
+
+    def test_no_transcript_means_no_model(self):
+        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                       "tty": "pts/1", "transcript_path": None, "cwd": "/x",
+                       "name": "s", "updated_at": 0})
+        self.assertEqual(w["model"], "")
+        self.assertEqual(w["model_label"], "")
+
+
 class HiddenAgentQueueTests(unittest.TestCase):
     """`.slock` agent sub-sessions never write a `status` field (it normalizes to
     "unknown"), yet their pid+tty still back the queue. The Queued list must
