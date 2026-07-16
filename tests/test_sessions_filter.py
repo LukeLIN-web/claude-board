@@ -108,5 +108,71 @@ class HistoryFilterTests(unittest.TestCase):
         self.assertEqual(out["total"], 1)
 
 
+class UninterruptibleWrappersTests(unittest.TestCase):
+    """uninterruptible_wrappers finds exactly the wedged Bash-tool wrappers a
+    force-kill should target: a direct SHELL child of the claude pid whose
+    subtree holds a D-state process."""
+
+    CLAUDE = 100
+
+    def _run(self, rows):
+        with mock.patch.object(sessions, "_proc_snapshot", return_value=rows):
+            return sessions.uninterruptible_wrappers(self.CLAUDE)
+
+    def test_bash_wrapper_with_d_grandchild_is_found(self):
+        # claude(100) -> bash(200,S) -> nvidia-smi(300,D)
+        rows = [
+            (self.CLAUDE, 1, "Ssl+", "claude"),
+            (200, self.CLAUDE, "Ss", "bash"),
+            (300, 200, "Dl", "nvidia-smi"),
+        ]
+        self.assertEqual(self._run(rows), [200])
+
+    def test_bash_wrapper_without_d_descendant_is_left_alone(self):
+        # A normal, interruptible command — Esc can handle it, don't force-kill.
+        rows = [
+            (self.CLAUDE, 1, "Ssl+", "claude"),
+            (200, self.CLAUDE, "Ss", "bash"),
+            (300, 200, "S", "grep"),
+        ]
+        self.assertEqual(self._run(rows), [])
+
+    def test_non_shell_child_with_d_descendant_is_not_targeted(self):
+        # e.g. the codex mcp-server (node) — never force-kill it.
+        rows = [
+            (self.CLAUDE, 1, "Ssl+", "claude"),
+            (400, self.CLAUDE, "Sl+", "node"),
+            (401, 400, "D", "something"),
+        ]
+        self.assertEqual(self._run(rows), [])
+
+    def test_d_process_nested_below_an_intermediate_shell(self):
+        # claude(100) -> bash(200) -> sh(250) -> proc(300,D): the DIRECT child
+        # 200 is the reap target Claude awaits.
+        rows = [
+            (self.CLAUDE, 1, "Ssl+", "claude"),
+            (200, self.CLAUDE, "Ss", "bash"),
+            (250, 200, "S", "sh"),
+            (300, 250, "D", "nvidia-smi"),
+        ]
+        self.assertEqual(self._run(rows), [200])
+
+    def test_multiple_wrappers_only_the_wedged_ones(self):
+        rows = [
+            (self.CLAUDE, 1, "Ssl+", "claude"),
+            (200, self.CLAUDE, "Ss", "bash"),      # wedged
+            (300, 200, "Dl", "nvidia-smi"),
+            (210, self.CLAUDE, "Ss", "bash"),      # healthy
+            (310, 210, "S", "tail"),
+        ]
+        self.assertEqual(self._run(rows), [200])
+
+    def test_empty_snapshot_returns_empty(self):
+        self.assertEqual(self._run([]), [])
+
+    def test_no_children_returns_empty(self):
+        self.assertEqual(self._run([(self.CLAUDE, 1, "Ssl+", "claude")]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
