@@ -587,20 +587,22 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         landed = iter([False, True])  # dropped once, then lands
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_composer_has_tail",
                                   side_effect=lambda *a: next(landed)):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 2)  # initial + one resend
-        # The retry clears any partial paste before re-sending: literal, C-u,
-        # literal (no capture calls — _composer_has_tail is mocked out).
-        self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "C-u"])
+        # The retry clears any partial paste before re-sending, so a retry can't
+        # concatenate into a corrupted prompt.
+        cc.assert_called_once_with("%5")
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertFalse(r["ok"])
@@ -609,12 +611,10 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertNotIn(["tmux", "send-keys", "-t", "%5", "Enter"], calls)
         # A stalled TUI buffers the keystrokes rather than dropping them — they
         # land AFTER we give up and would strand in the composer, corrupting the
-        # next send. Giving up must end with a cleanup Ctrl-U so the buffered
+        # next send. Giving up must end with a cleanup clear so the buffered
         # text is wiped whenever the pane wakes: one clear per retry plus the
-        # final cleanup, and the cleanup is the last key sent.
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertEqual(len(clears), len(tmux._LANDED_VERIFY_WAITS))
-        self.assertEqual(calls[-1], ["tmux", "send-keys", "-t", "%5", "C-u"])
+        # final cleanup.
+        self.assertEqual(cc.call_count, len(tmux._LANDED_VERIFY_WAITS))
 
     def test_landed_waits_escalate_for_laggy_panes(self):
         # A busy pane can take well over 0.15s to echo the paste; the between-
@@ -700,6 +700,139 @@ class ComposerHasTailTests(unittest.TestCase):
             "  ↑/↓ to scroll · c to copy · f to fork · Esc to close\n"
         )
         self.assertFalse(self._tail(cap, "/btw hello, just reply ok"))
+
+    def test_collapsed_paste_placeholder_counts_as_our_text(self):
+        # Claude collapses a paste past ~1000 chars into a "[Pasted text #N]"
+        # placeholder — the literal tail is never on screen, so requiring it
+        # made EVERY long prompt fail landed-verify ("prompt text never landed
+        # in composer", seen live on v2.1.211). The placeholder in the composer
+        # region IS our text: Claude holds the full content and expands it on
+        # submit.
+        cap = (
+            "────────────\n"
+            "❯ [Pasted text #13]\n"
+            "────────────\n"
+            "  paste again to expand\n"
+        )
+        self.assertTrue(self._tail(cap, "很长的提示内容" * 200))
+
+    def test_placeholder_wrapped_after_leading_text_still_counts(self):
+        # A collapsed paste appended after text already in the composer can
+        # soft-wrap mid-placeholder; the check must survive the line break.
+        cap = (
+            "────────────\n"
+            "❯ 前置文字前置文字前置文字前置文字前置文字前置文字 [Pasted text\n"
+            "  #4]\n"
+            "────────────\n"
+        )
+        self.assertTrue(self._tail(cap, "很长的提示内容" * 200))
+
+    def test_placeholder_in_echoed_turn_above_composer_is_not_stranded(self):
+        # A submitted long prompt is echoed as a turn above the composer with
+        # the same placeholder rendering; only the region after the LAST marker
+        # (the empty composer) counts.
+        cap = (
+            "❯ [Pasted text #2]\n"
+            "● done\n"
+            "────────────\n"
+            "❯ \n"
+            "────────────\n"
+        )
+        self.assertFalse(self._tail(cap, "很长的提示内容" * 200))
+
+
+class ComposerTextTests(unittest.TestCase):
+    """_composer_text reads what is sitting in the composer: the last marker
+    line plus wrapped continuation lines, stopping at the chrome below."""
+
+    def test_empty_composer_reads_empty(self):
+        cap = (
+            "✻ Churned for 8s\n"
+            "────────────\n"
+            "❯ \n"
+            "────────────\n"
+            "  ⏵⏵ bypass permissions on\n"
+        )
+        self.assertEqual(tmux._composer_text(cap), "")
+
+    def test_wrapped_content_is_joined_across_lines(self):
+        cap = (
+            "────────────\n"
+            "❯ ABC0123456789012345678901234567890123456789\n"
+            "  678901234567890123456789012345678901234567\n"
+            "────────────\n"
+            "  ⏵⏵ bypass permissions on\n"
+        )
+        text = tmux._composer_text(cap)
+        self.assertIn("ABC", text)
+        self.assertIn("6789012345678901234567890123456789", text)
+
+    def test_status_line_without_rule_is_not_content(self):
+        # Minimal layouts draw the status line directly under the marker line.
+        cap = "❯ \n⏵⏵ bypass permissions on\n"
+        self.assertEqual(tmux._composer_text(cap), "")
+
+    def test_no_marker_returns_none(self):
+        self.assertIsNone(tmux._composer_text("(base) user@host:~$ \n"))
+
+
+class ClearComposerTests(unittest.TestCase):
+    """_clear_composer must press Ctrl-U once per visual LINE (Claude's composer
+    kills only the current line per press, seen live on v2.1.211), verified
+    against the pane, falling back to blind presses when the pane won't redraw."""
+
+    @staticmethod
+    def _recorder(calls):
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+        return fake_run
+
+    def test_presses_once_per_line_until_empty(self):
+        screens = iter([
+            "❯ line-a line-a line-a\n  line-b line-b\n────────────\n",
+            "❯ line-a line-a line-a\n────────────\n",
+            "❯ \n────────────\n",
+        ])
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "capture_pane",
+                                  side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
+            tmux._clear_composer("%5")
+        clears = [c for c in calls if c[-1] == "C-u"]
+        self.assertEqual(len(clears), 2)  # one per non-empty read, none once empty
+
+    def test_already_empty_composer_sends_nothing(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "capture_pane",
+                                  return_value={"ok": True, "text": "❯ \n────────────\n"}):
+            tmux._clear_composer("%5")
+        self.assertEqual([c for c in calls if c[-1] == "C-u"], [])
+
+    def test_stalled_pane_falls_back_to_blind_presses(self):
+        # A stalled TUI never redraws: the same screen comes back after a press
+        # (no progress), so the loop must stop reading and queue enough blind
+        # Ctrl-Us to clear a worst-case wrapped paste whenever the pane wakes.
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "capture_pane",
+                                  return_value={"ok": True, "text": "❯ stuck text\n────────────\n"}):
+            tmux._clear_composer("%5")
+        clears = [c for c in calls if c[-1] == "C-u"]
+        self.assertGreaterEqual(len(clears), tmux._CLEAR_BLIND_PRESSES)
+
+    def test_capture_failure_falls_back_to_blind_presses(self):
+        calls = []
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "capture_pane", return_value={"ok": False}):
+            tmux._clear_composer("%5")
+        clears = [c for c in calls if c[-1] == "C-u"]
+        self.assertEqual(len(clears), tmux._CLEAR_BLIND_PRESSES)
 
 
 class CodexEnterSettleTests(unittest.TestCase):
