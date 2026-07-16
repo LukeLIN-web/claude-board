@@ -192,6 +192,82 @@ def shell_descendant_counts(pids: list[int]) -> dict[int, int]:
     return result
 
 
+def _proc_snapshot() -> list[tuple[int, int, str, str]]:
+    """One `ps` pass → [(pid, ppid, stat, comm), ...]; empty on any failure.
+
+    Split out from uninterruptible_wrappers so the escalation logic can be
+    unit-tested against a synthetic process tree without spawning processes.
+    `stat` is the raw ps STAT field — its first letter is the scheduler state
+    ('D' == uninterruptible sleep).
+    """
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid=,ppid=,stat=,comm="],
+            stderr=subprocess.DEVNULL, timeout=5,
+        ).decode("utf-8", "replace")
+    except Exception:
+        return []
+    rows: list[tuple[int, int, str, str]] = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        rows.append((pid, ppid, parts[2], parts[3].rsplit("/", 1)[-1]))
+    return rows
+
+
+def uninterruptible_wrappers(claude_pid: int) -> list[int]:
+    """Direct shell children of `claude_pid` whose subtree holds a D-state
+    (uninterruptible-sleep) process.
+
+    This is the exact — and only — case where the dashboard's Esc can never
+    work. Claude Code's interrupt sends SIGINT to the Bash tool it spawned, but
+    a `bash -c` blocked in wait() on a foreground child ignores SIGINT and
+    forwards it to that child, and a D-state child (e.g. an nvidia-smi stuck on
+    a wedged GPU driver) is immune to every signal, SIGKILL included. That
+    wrapper bash is the reap target Claude Code awaits, so SIGKILL-ing *it* —
+    it sits in killable, interruptible do_wait — resolves the turn while the D
+    child harmlessly reparents to init.
+
+    Restricting to shells with a D descendant is the safety gate: a normal
+    long-running command (which Esc *can* interrupt) is left alone, and a
+    non-shell child such as the codex mcp-server is never targeted.
+    """
+    rows = _proc_snapshot()
+    if not rows:
+        return []
+    children: dict[int, list[int]] = {}
+    stat: dict[int, str] = {}
+    comm: dict[int, str] = {}
+    for pid, ppid, st, cm in rows:
+        children.setdefault(ppid, []).append(pid)
+        stat[pid] = st
+        comm[pid] = cm
+
+    def _has_d_in_subtree(root: int) -> bool:
+        stack = [root]
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if stat.get(cur, "").startswith("D"):
+                return True
+            stack.extend(children.get(cur, []))
+        return False
+
+    wrappers = []
+    for child in children.get(claude_pid, []):
+        if comm.get(child, "") in _SHELL_COMMS and _has_d_in_subtree(child):
+            wrappers.append(child)
+    return wrappers
+
+
 def get_tty(pid: int) -> Optional[str]:
     if pid not in _TTY_CACHE:
         _TTY_CACHE[pid] = _pid_tty(pid)

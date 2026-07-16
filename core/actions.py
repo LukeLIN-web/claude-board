@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import tmux
-from .sessions import CLAUDE_HOME, find_window
+from .sessions import CLAUDE_HOME, find_window, uninterruptible_wrappers
 from .transcripts import timeline, extract_plan_history, extract_skills_used, extract_memory_ops
 
 # Upper bound on an injected single-line prompt (after newline collapse).
@@ -1007,6 +1007,46 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
 # send_prompt instead.
 _MENU_KEYS = {"Enter", "Escape", "Up", "Down", "Space", "Tab"} | {str(n) for n in range(0, 10)}
 
+# Give Claude Code's own (graceful) Esc interrupt a beat to land before we decide
+# it's wedged and force-kill the wrapper. Long enough that a merely-slow interrupt
+# isn't pre-empted, short enough not to stall the Esc button in the common case.
+_INTERRUPT_ESCALATE_WAIT = 1.5
+
+
+def _escalate_stuck_interrupt(pid: int) -> Optional[dict]:
+    """Step 2–3 of the Esc ladder: after the graceful Escape keystroke, force-
+    reap any Bash-tool wrapper wedged on an uninterruptible (D-state) child so
+    the interrupt actually takes.
+
+    A plain Esc delegates to Claude Code's interrupt, which SIGINTs the running
+    tool — useless when the tool's `bash -c` is blocked awaiting a D-state child
+    (e.g. nvidia-smi on a wedged GPU driver), because neither the wrapper (it
+    ignores SIGINT while waiting on a foreground child) nor the D child (immune
+    to all signals) dies. SIGKILL on the wrapper itself is the un-ignorable
+    escape hatch: Claude Code was awaiting *its* exit, so reaping it unwinds the
+    turn; the D child reparents to init and clears when the driver recovers.
+
+    Returns a report dict only if it force-killed something, else None. Costs
+    just one `ps` in the common case (no D-wrapper present → the ordinary Esc /
+    picker-cancel stays fast); only the genuinely-wedged case pays the settle.
+    """
+    if not uninterruptible_wrappers(pid):
+        return None  # nothing signal-proof here — the graceful Escape suffices
+    time.sleep(_INTERRUPT_ESCALATE_WAIT)  # let Claude Code's own interrupt try first
+    wrappers = uninterruptible_wrappers(pid)
+    if not wrappers:
+        return None  # graceful path cleared it after all — don't kill anything
+    killed = []
+    for wp in wrappers:
+        try:
+            os.kill(wp, signal.SIGKILL)
+            killed.append(wp)
+        except OSError:
+            pass  # already gone, or another user's process — skip it
+    if not killed:
+        return None
+    return {"escalated": True, "killed_wrappers": killed}
+
 
 def send_menu_keys(pid: int, keys: list[str]) -> dict:
     """Send a short sequence of whitelisted menu keys into `pid`'s tmux pane.
@@ -1042,7 +1082,15 @@ def send_menu_keys(pid: int, keys: list[str]) -> dict:
             if _btw_regions(text):
                 from . import btwcapture  # lazy: btwcapture imports this module
                 btwcapture.capture_sync(pid, sid)
-    return tmux.send_keys(pane, *keys)
+    result = tmux.send_keys(pane, *keys)
+    # A bare Esc is an interrupt. If the send landed but the turn is wedged on an
+    # uninterruptible (D-state) child, the keystroke can't reach it — escalate by
+    # force-reaping the Bash-tool wrapper Claude Code is blocked awaiting.
+    if result.get("ok") and keys == ["Escape"]:
+        escalated = _escalate_stuck_interrupt(pid)
+        if escalated:
+            result = {**result, **escalated}
+    return result
 
 
 # A /btw answer stays up as a modal overlay ("Esc to close") until dismissed —

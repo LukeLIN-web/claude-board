@@ -349,6 +349,72 @@ class SendMenuKeysOverlayTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
 
+class SendMenuKeysInterruptEscalationTests(unittest.TestCase):
+    """A bare Esc that Claude Code's own interrupt can't honour (turn wedged on a
+    D-state child) escalates to a SIGKILL of the Bash-tool wrapper."""
+
+    _CLEAN_PANE = SendPromptTests._CLEAN_PANE
+
+    def _run(self, keys, wrappers, send_ok=True):
+        """`wrappers` is a list of returns for successive uninterruptible_wrappers
+        calls (the pre-check, then the post-settle re-check)."""
+        import signal
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/3", session_id="s")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": self._CLEAN_PANE}), \
+             mock.patch.object(actions.tmux, "send_keys",
+                               return_value={"ok": send_ok}) as sk, \
+             mock.patch.object(actions, "uninterruptible_wrappers",
+                               side_effect=wrappers) as uw, \
+             mock.patch.object(actions.time, "sleep") as sleep, \
+             mock.patch.object(actions.os, "kill") as kill:
+            r = actions.send_menu_keys(1234, keys)
+        return r, sk, uw, sleep, kill, signal
+
+    def test_wedged_wrapper_is_force_killed(self):
+        r, sk, uw, sleep, kill, signal = self._run(["Escape"], [[200], [200]])
+        sk.assert_called_once_with("%5", "Escape")   # graceful Esc still sent first
+        sleep.assert_called_once()                   # gave the graceful path a beat
+        kill.assert_called_once_with(200, signal.SIGKILL)
+        self.assertTrue(r["escalated"])
+        self.assertEqual(r["killed_wrappers"], [200])
+
+    def test_no_dwrapper_never_escalates_and_stays_fast(self):
+        r, sk, uw, sleep, kill, _ = self._run(["Escape"], [[]])
+        sk.assert_called_once_with("%5", "Escape")
+        sleep.assert_not_called()                    # no settle in the common case
+        kill.assert_not_called()
+        self.assertNotIn("escalated", r)
+        self.assertTrue(r["ok"])
+
+    def test_graceful_interrupt_clearing_after_settle_kills_nothing(self):
+        # Pre-check sees the wedge; after the settle it's gone (graceful Esc won).
+        r, sk, uw, sleep, kill, _ = self._run(["Escape"], [[200], []])
+        sleep.assert_called_once()
+        kill.assert_not_called()
+        self.assertNotIn("escalated", r)
+
+    def test_non_escape_key_never_escalates(self):
+        r, sk, uw, sleep, kill, _ = self._run(["1"], [[200], [200]])
+        uw.assert_not_called()
+        kill.assert_not_called()
+        self.assertNotIn("escalated", r)
+
+    def test_escape_combined_with_other_keys_is_not_an_interrupt(self):
+        # Only a bare ["Escape"] is the interrupt button; combos are picker nav.
+        r, sk, uw, sleep, kill, _ = self._run(["1", "Escape"], [[200], [200]])
+        uw.assert_not_called()
+        kill.assert_not_called()
+
+    def test_failed_send_skips_escalation(self):
+        r, sk, uw, sleep, kill, _ = self._run(["Escape"], [[200], [200]], send_ok=False)
+        uw.assert_not_called()
+        kill.assert_not_called()
+        self.assertFalse(r["ok"])
+
+
 _PICKER_TEXT = (
     "This session is 7h old and 192k tokens.\n"
     "  ❯ 1. Resume from summary (recommended)\n"
