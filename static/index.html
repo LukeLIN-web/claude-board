@@ -1156,7 +1156,7 @@ function fleet() {
       try {
         const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text });
         if (d.ok) {
-          this.toast('Sent prompt');
+          this.toast(d.note || 'Sent prompt');
           this.promptDrafts[pid] = '';
         } else {
           this.toast('Send failed: ' + (d.error || ''));

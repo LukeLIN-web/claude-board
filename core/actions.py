@@ -1208,6 +1208,59 @@ def _wait_composer_ready(pane: str) -> bool:
         time.sleep(_COMPOSER_READY_POLL)
 
 
+# Diagnosing what is covering the composer when a send can't land. Each
+# classified blocker maps to a human label and whether Esc'ing it is
+# destructive: a live permission/choice menu answers "deny/cancel" to Esc,
+# unlike the /model dialog or Rewind panel, which Esc simply cancels.
+_BLOCKER_ESC_SETTLE = 0.3   # seconds for an overlay to disappear after an Esc
+_BLOCKER_ESC_TRIES = 3
+
+
+def _diagnose_blocker(text: str) -> Optional[dict]:
+    """Classify an overlay covering `text`'s composer, or None if it's clear.
+
+    Ordered most-specific first so the broad menu marker never shadows the
+    /model dialog. Returns {kind, label, warn}; `warn` flags a blocker whose
+    Esc is destructive (a live menu — Esc denies the pending tool call)."""
+    if not text:
+        return None
+    if _rewind_panel_open(text):
+        return {"kind": "rewind", "label": "a Rewind panel", "warn": False}
+    if _MODEL_DIALOG_FOOTER in text:
+        return {"kind": "model", "label": "a /model dialog", "warn": False}
+    if _overlay_anchors(text) is not None:
+        return {"kind": "btw", "label": "a /btw aside", "warn": False}
+    if _menu_markers_present(text):
+        return {"kind": "menu", "label": "a permission/choice menu", "warn": True}
+    return None
+
+
+def _clear_blocker(pane: str) -> Optional[dict]:
+    """Esc away a cancellable overlay covering `pane`'s composer.
+
+    Returns the diagnosed blocker (with an added `cleared` flag) when one was on
+    screen, or None when the composer was already clear. Presses Esc up to
+    _BLOCKER_ESC_TRIES times, re-capturing between presses, until no blocker
+    remains — `cleared` records whether the pane actually came clean, so the
+    caller can either resend (cleared) or report it still open (not cleared).
+    Some blockers (the /model dialog) draw their own ❯ cursor, so this must run
+    before _wait_composer_ready, which would otherwise mistake that cursor for a
+    ready composer."""
+    cap = tmux.capture_pane(pane)
+    if not cap.get("ok"):
+        return None
+    b = _diagnose_blocker(cap["text"])
+    if b is None:
+        return None
+    for _ in range(_BLOCKER_ESC_TRIES):
+        tmux.send_keys(pane, "Escape")
+        time.sleep(_BLOCKER_ESC_SETTLE)
+        cap = tmux.capture_pane(pane)
+        if not cap.get("ok") or _diagnose_blocker(cap["text"]) is None:
+            return {**b, "cleared": True}
+    return {**b, "cleared": False}
+
+
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
     w = find_window(pid)
@@ -1241,6 +1294,16 @@ def send_prompt(pid: int, text: str) -> dict:
     # swallowed by the overlay.
     _archive_open_aside(pane, pid, getattr(w, "session_id", None))
     _dismiss_answer_overlay(pane)
+    # A cancellable overlay (/model dialog, permission/choice menu, Rewind panel)
+    # can sit over the composer and eat the injected prompt — and some draw their
+    # own ❯ cursor, fooling _wait_composer_ready below. Esc it away first,
+    # remembering what we cleared so the outcome can name it (and warn when
+    # closing a live menu meant denying a pending permission prompt).
+    blocker = _clear_blocker(pane)
+    if blocker and not blocker["cleared"]:
+        return {"ok": False,
+                "error": f"send blocked: {blocker['label']} is still open on "
+                         "this pane — press Esc on the card, then resend."}
     # Refuse to type until the composer is actually on screen: a booting TUI
     # eats or doubles the prompt, and a Rewind panel (which the wait dismisses
     # itself) eats it outright.
@@ -1259,13 +1322,32 @@ def send_prompt(pid: int, text: str) -> dict:
     is_codex = getattr(w, "platform", "claude") == "codex"
     if is_codex:
         settle = tmux.codex_enter_settle(len(collapsed))
-        return tmux.send_text(
+        res = tmux.send_text(
             pane, collapsed, settle_before_enter=settle, verify_submit=True,
             marker="›",
         )
-    return tmux.send_text(
-        pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
-    )
+    else:
+        res = tmux.send_text(
+            pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
+        )
+    # Reactive diagnosis: if the prompt still didn't land, a blocker may have
+    # (re)surfaced between the clear above and the send — name it instead of the
+    # generic "never landed in composer".
+    if not res.get("ok"):
+        cap = tmux.capture_pane(pane)
+        b = _diagnose_blocker(cap["text"]) if cap.get("ok") else None
+        if b:
+            return {"ok": False,
+                    "error": f"send blocked: {b['label']} is open on this pane "
+                             "— press Esc on the card, then resend."}
+        return res
+    # Delivered. If we had to auto-close a blocker to get here, say so.
+    if blocker:
+        note = f"sent — {blocker['label']} was open, auto-closed it and resent."
+        if blocker["warn"]:
+            note += " ⚠ this may have denied a pending tool-permission prompt."
+        return {**res, "note": note}
+    return res
 
 
 # Claude's /model dialog. Its footer is the marker that the dialog is up, and it
