@@ -207,6 +207,19 @@ def pane_current_command(pane: str) -> Optional[str]:
     return r["stdout"].strip() or None
 
 
+def exit_copy_mode(pane: str) -> None:
+    """Kick `pane` out of copy-mode before injecting keystrokes.
+
+    A pane slips into copy-mode from a mouse scroll or view-mode, and while
+    there tmux interprets every injected key as a copy-mode command — send-keys
+    text is silently eaten and never reaches the TUI's composer. Best-effort:
+    a failed probe is treated as "not in mode" and nothing is sent.
+    """
+    r = _run("display-message", "-p", "-t", pane, "#{pane_in_mode}")
+    if r["ok"] and r["stdout"].strip() == "1":
+        _run("send-keys", "-t", pane, "-X", "cancel")
+
+
 def pane_target(pane: str) -> Optional[str]:
     """Human-addressable target ("session:window.pane") for a pane id, or None."""
     if not pane:

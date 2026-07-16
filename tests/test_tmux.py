@@ -415,6 +415,49 @@ class SendTextTests(unittest.TestCase):
         self.assertIn("enter failed", r["error"])
 
 
+class ExitCopyModeTests(unittest.TestCase):
+    """A pane in copy-mode (mouse scroll / view-mode) eats injected keystrokes;
+    exit_copy_mode must kick it back to the TUI before any send."""
+
+    def setUp(self):
+        tmux._clear_caches()
+
+    def test_cancels_when_pane_in_copy_mode(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if argv[-1] == "#{pane_in_mode}":
+                return FakeProc(returncode=0, stdout="1\n")
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            tmux.exit_copy_mode("%5")
+        self.assertIn(["tmux", "send-keys", "-t", "%5", "-X", "cancel"], calls)
+
+    def test_noop_when_not_in_mode(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0, stdout="0\n")
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            tmux.exit_copy_mode("%5")
+        self.assertEqual(len(calls), 1)  # probe only, no cancel
+
+    def test_noop_when_probe_fails(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=1, stderr="no such pane")
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            tmux.exit_copy_mode("%5")
+        self.assertEqual(len(calls), 1)
+
+
 class SendTextVerifySubmitTests(unittest.TestCase):
     """verify_submit confirms the Codex composer emptied and resends Enter."""
 

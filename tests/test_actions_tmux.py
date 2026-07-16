@@ -305,6 +305,93 @@ class SendPromptTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
 
+class SendPromptReadinessTests(unittest.TestCase):
+    """send_prompt must not type until a composer marker is on screen.
+
+    Typing into a still-booting TUI is lost or replayed doubled (the retry's
+    C-u sits unread in the same pty buffer as the text it should clear), and a
+    pane wedged on the Rewind panel (double-Escape — e.g. the board's own Esc
+    button pressed twice on an idle card) eats every send until dismissed.
+    """
+
+    # A freshly spawned Claude still booting: banner painted, no composer yet.
+    _BOOTING = (
+        " ▐▛███▜▌   Claude Code v2.1.211\n"
+        "▝▜█████▛▘  Fable 5 · Claude Max\n"
+        "  ▘▘ ▝▝    /shared/user60/workspace/juyi/qwen3omni\n"
+    )
+    _READY = _BOOTING + "❯ \n⏵⏵ bypass permissions on"
+    # The Rewind panel replacing the composer (lifted from a live wedged pane).
+    _REWIND = _BOOTING + "  Rewind\n\n  Nothing to rewind to yet.\n\n  Esc to cancel\n"
+    # Same panel in a session WITH checkpoints (lifted live): it draws its own
+    # `❯ (current)` cursor row, so the last on-screen ❯ is inside the panel.
+    _REWIND_HISTORY = (
+        "❯ earlier prompt\n\n● OK\n\n"
+        "  Rewind\n\n"
+        "  Restore the code and/or conversation to the point before…\n"
+        "    earlier prompt\n"
+        "    No code changes\n"
+        "  ❯ (current)\n\n"
+        "  Enter to continue · Esc to cancel\n"
+    )
+
+    def _send(self, caps, text="hello"):
+        seq = list(caps)
+        last = seq[-1]
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "exit_copy_mode") as ecm, \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               side_effect=lambda *a, **k: {"ok": True, "text": seq.pop(0) if seq else last}), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
+             mock.patch.object(actions.time, "sleep"), \
+             mock.patch.object(actions, "_COMPOSER_READY_TIMEOUT", 0.2), \
+             mock.patch.object(actions, "_COMPOSER_READY_POLL", 0.0):
+            r = actions.send_prompt(1234, text)
+        return r, sk, st, ecm
+
+    def test_booting_pane_waits_for_composer_then_sends(self):
+        # dismiss-overlay probe sees the booting pane, then the readiness loop
+        # sees it once more before the composer paints.
+        r, sk, st, _ = self._send([self._BOOTING, self._BOOTING, self._READY])
+        st.assert_called_once()
+        sk.assert_not_called()
+        self.assertTrue(r["ok"])
+
+    def test_composer_never_ready_fails_without_typing(self):
+        r, _, st, _ = self._send([self._BOOTING])
+        st.assert_not_called()
+        self.assertFalse(r["ok"])
+        self.assertIn("composer", r["error"])
+
+    def test_rewind_panel_is_escaped_then_send_proceeds(self):
+        r, sk, st, _ = self._send([self._REWIND, self._REWIND, self._READY])
+        sk.assert_any_call("%5", "Escape")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
+    def test_rewind_panel_with_checkpoints_is_escaped_despite_its_own_cursor(self):
+        # The ❯ cursor row inside the panel must not read as a ready composer.
+        r, sk, st, _ = self._send(
+            [self._REWIND_HISTORY, self._REWIND_HISTORY, self._READY])
+        sk.assert_any_call("%5", "Escape")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
+    def test_copy_mode_is_cancelled_before_typing(self):
+        r, _, st, ecm = self._send([self._READY])
+        ecm.assert_called_once_with("%5")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
+    def test_ready_pane_sends_without_waiting_or_keys(self):
+        r, sk, st, _ = self._send([self._READY])
+        sk.assert_not_called()
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
+
 class SendMenuKeysOverlayTests(unittest.TestCase):
     """The dashboard Esc button closes a /btw overlay as a side effect; a settled
     un-archived answer must be latched before that Escape is delivered."""

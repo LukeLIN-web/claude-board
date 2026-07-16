@@ -1109,6 +1109,57 @@ def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
     btwcapture.capture_sync(pid, session_id)
 
 
+# A prompt injected before the TUI paints its composer is lost or, worse,
+# replayed doubled: the pty buffers the keystrokes unread, so the landed-verify
+# retry's C-u sits inert in the same buffer as the text it was meant to clear,
+# and both copies pour into the composer when the TUI wakes (seen live on a
+# fresh spawn — boot takes seconds on this class of shared-filesystem host,
+# past the whole landed-verify window). So never type until a composer marker
+# (❯ Claude / › Codex) is actually on screen.
+_COMPOSER_READY_TIMEOUT = 15.0
+_COMPOSER_READY_POLL = 0.5
+
+# Claude's Rewind panel replaces the composer wholesale and eats every injected
+# key until dismissed. It opens on double-Escape — two presses of the board's
+# own Esc button on an idle card are enough — and then wedges the session for
+# every subsequent send (seen live). Detection is line-anchored, not marker-
+# region-anchored: with checkpoints the panel draws its own `❯ (current)`
+# cursor row, so the last on-screen ❯ sits INSIDE the panel below the header.
+# Both observed layouts share a bare "Rewind" header line and a footer that is
+# the last non-empty line ("Esc to cancel" / "Enter to continue · Esc to
+# cancel"); the normal composer's status line never matches either.
+_REWIND_HEADER = "Rewind"
+_REWIND_FOOTER = "Esc to cancel"
+
+
+def _rewind_panel_open(text: str) -> bool:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or _REWIND_FOOTER not in lines[-1]:
+        return False
+    return any(ln == _REWIND_HEADER for ln in lines)
+
+
+def _wait_composer_ready(pane: str) -> bool:
+    """Block until `pane` shows a composer marker, dismissing a Rewind panel if
+    that's what is covering it. False when the composer never appears — the
+    caller must then refuse to type rather than feed keystrokes to a pane that
+    will eat or double them. Fails open when the pane can't be captured (the
+    landed-verify downstream still guards the actual send)."""
+    deadline = time.time() + _COMPOSER_READY_TIMEOUT
+    while True:
+        cap = tmux.capture_pane(pane)
+        if not cap.get("ok"):
+            return True
+        text = cap.get("text", "")
+        if _rewind_panel_open(text):
+            tmux.send_keys(pane, "Escape")
+        elif "❯" in text or "›" in text:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(_COMPOSER_READY_POLL)
+
+
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
     w = find_window(pid)
@@ -1134,11 +1185,21 @@ def send_prompt(pid: int, text: str) -> dict:
         return {"ok": False, "error": "prompt is empty"}
     if len(collapsed) > _MAX_PROMPT_CHARS:
         return {"ok": False, "error": f"prompt too long (max {_MAX_PROMPT_CHARS} chars)"}
+    # Copy-mode intercepts every key we're about to send (including the aside
+    # Escapes below), so leave it before touching the pane at all.
+    tmux.exit_copy_mode(pane)
     # A /btw aside from a prior send may still be open over the pane; archive it
     # (its answer lives nowhere else), then clear it so this prompt isn't
     # swallowed by the overlay.
     _archive_open_aside(pane, pid, getattr(w, "session_id", None))
     _dismiss_answer_overlay(pane)
+    # Refuse to type until the composer is actually on screen: a booting TUI
+    # eats or doubles the prompt, and a Rewind panel (which the wait dismisses
+    # itself) eats it outright.
+    if not _wait_composer_ready(pane):
+        return {"ok": False,
+                "error": "composer not on screen — TUI still starting or a "
+                         "full-screen dialog is covering it; prompt not sent"}
     # Both TUIs can silently lose an injected prompt when the pane is busy:
     # Codex swallows an Enter glued to the pasted text (fixed with a size-scaled
     # settle + submit-verify), and Claude drops the injected keystrokes outright
