@@ -6,6 +6,7 @@ raises out to its caller. Higher layers (actions, routes) rely on that contract.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -207,6 +208,19 @@ def pane_current_command(pane: str) -> Optional[str]:
     return r["stdout"].strip() or None
 
 
+def exit_copy_mode(pane: str) -> None:
+    """Kick `pane` out of copy-mode before injecting keystrokes.
+
+    A pane slips into copy-mode from a mouse scroll or view-mode, and while
+    there tmux interprets every injected key as a copy-mode command — send-keys
+    text is silently eaten and never reaches the TUI's composer. Best-effort:
+    a failed probe is treated as "not in mode" and nothing is sent.
+    """
+    r = _run("display-message", "-p", "-t", pane, "#{pane_in_mode}")
+    if r["ok"] and r["stdout"].strip() == "1":
+        _run("send-keys", "-t", pane, "-X", "cancel")
+
+
 def pane_target(pane: str) -> Optional[str]:
     """Human-addressable target ("session:window.pane") for a pane id, or None."""
     if not pane:
@@ -362,6 +376,13 @@ def codex_enter_settle(text_len: int) -> float:
 # belong to the aside this very submit opened.
 _BTW_OVERLAY_FOOTER = "Esc to close"
 
+# Claude collapses a paste past ~1000 chars into a "[Pasted text #N]"
+# placeholder (multi-line pastes render "[Pasted text #N +M lines]") and keeps
+# the full content internally, expanding it on submit. The literal tail is
+# never on screen, so requiring it made every long prompt fail landed-verify.
+# Matched against the whitespace-squeezed composer region, hence no spaces.
+_PASTED_PLACEHOLDER_RE = re.compile(r"\[Pastedtext#\d+[^\]]*\]")
+
 
 def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
     """True if a distinctive tail of `text` still sits in `pane`'s composer,
@@ -397,7 +418,74 @@ def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
     region = cap[idx:]
     if _BTW_OVERLAY_FOOTER in region:
         return False
-    return needle in "".join(region.split())
+    squeezed = "".join(region.split())
+    if _PASTED_PLACEHOLDER_RE.search(squeezed):
+        return True
+    return needle in squeezed
+
+
+# One verified-clear pass reads the pane at most this many times; the blind
+# fallback queues this many Ctrl-Us. Sized to out-clear the worst wrapped
+# paste a composer can hold: anything past ~1000 chars collapses to a one-line
+# placeholder, and 1000 double-width CJK chars on a narrow (~60 col) pane wrap
+# to ~35 lines.
+_CLEAR_VERIFY_TRIES = 40
+_CLEAR_BLIND_PRESSES = 40
+_CLEAR_POLL = 0.1
+
+# Chrome the composer is boxed in: horizontal rules in the current borderless
+# layout, box borders in older bordered builds.
+_CHROME_CHARS = set("─│╭╮╰╯▔ ")
+
+
+def _composer_text(cap_text: str) -> Optional[str]:
+    """What is sitting in the composer: the last ❯/› marker line (after the
+    marker) plus wrapped continuation lines, stopping at the chrome below it
+    (rule / box border / blank / the ⏵⏵ status line). None when no marker is
+    on screen — there is no composer to read."""
+    lines = cap_text.splitlines()
+    last = None
+    for i, ln in enumerate(lines):
+        if "❯" in ln or "›" in ln:
+            last = i
+    if last is None:
+        return None
+    head = lines[last]
+    parts = [head[max(head.rfind("❯"), head.rfind("›")) + 1:].strip("│")]
+    for ln in lines[last + 1:]:
+        s = ln.strip()
+        if not s or set(s) <= _CHROME_CHARS or s.startswith("⏵⏵"):
+            break
+        parts.append(ln.strip("│"))
+    return "\n".join(p.strip() for p in parts).strip()
+
+
+def _clear_composer(pane: str) -> None:
+    """Empty `pane`'s composer before a retry / after giving up on a send.
+
+    Claude's composer kills one visual LINE per Ctrl-U (seen live on v2.1.211:
+    a wrapped paste keeps every line but the last), so the single press this
+    path used to send left most of a partial paste in place — the retry then
+    concatenated into a corrupted prompt. Press per line, re-reading the pane
+    until the composer is empty. When reading stops making progress (a stalled
+    pane never redraws; ghost hint text never deletes) or the pane can't be
+    captured, fall back to queueing blind Ctrl-Us: a stalled pty delivers them
+    after the buffered text whenever it wakes, clearing it line by line, and
+    every extra press is a no-op on an empty composer.
+    """
+    prev = None
+    for _ in range(_CLEAR_VERIFY_TRIES):
+        cap = capture_pane(pane)
+        content = _composer_text(cap.get("text", "")) if cap.get("ok") else None
+        if content == "":
+            return
+        if content is None or content == prev:
+            break  # unreadable or no progress — go blind
+        prev = content
+        _run("send-keys", "-t", pane, "C-u")
+        time.sleep(_CLEAR_POLL)
+    for _ in range(_CLEAR_BLIND_PRESSES):
+        _run("send-keys", "-t", pane, "C-u")
 
 
 def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
@@ -406,28 +494,28 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     A busy pane can drop the injected keystrokes during a re-render, so the text
     never arrives and a following Enter submits nothing — the prompt vanishes
     with no transcript trace (the dashboard then shows a phantom "Queued"). Re-
-    send until the composer holds our text, clearing any partial paste with
-    Ctrl-U first so a retry can't concatenate into a corrupted prompt. Returns
-    False if the text never lands after the retries — the caller then reports the
-    failure rather than pressing Enter on a lost prompt.
+    send until the composer holds our text, clearing any partial paste first
+    (see _clear_composer) so a retry can't concatenate into a corrupted prompt.
+    Returns False if the text never lands after the retries — the caller then
+    reports the failure rather than pressing Enter on a lost prompt.
 
     A fully stalled TUI (frozen spinner, event loop wedged) never drops the
     keystrokes at all — the pty buffers them and they land whenever the pane
     wakes, possibly minutes after we've given up. Giving up therefore ends with
-    a cleanup Ctrl-U queued behind everything we sent: when the pane wakes it
+    a cleanup clear queued behind everything we sent: when the pane wakes it
     wipes the late-landing text, so "never landed" stays truthful and the
     stranded prompt can't concatenate into the next send.
     """
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         if attempt:
-            _run("send-keys", "-t", pane, "C-u")  # drop any partial before retry
+            _clear_composer(pane)  # drop any partial before retry
         literal = _run("send-keys", "-t", pane, "-l", "--", text)
         if not literal["ok"]:
             return False
         time.sleep(wait)
         if _composer_has_tail(pane, text, marker):
             return True
-    _run("send-keys", "-t", pane, "C-u")  # wipe the buffered text on wake
+    _clear_composer(pane)  # wipe the buffered text on wake
     return False
 
 
