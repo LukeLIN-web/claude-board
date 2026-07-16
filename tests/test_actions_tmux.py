@@ -395,6 +395,105 @@ class SendPromptReadinessTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
 
+class SendPromptBlockerTests(unittest.TestCase):
+    """A cancellable overlay covering the composer is auto-Escaped and the send
+    retried; the outcome names what was closed. The /model dialog is the case
+    that motivated this — it draws its own ❯ cursor, so the readiness check alone
+    would type straight into it and the prompt would silently vanish."""
+
+    # A /model dialog (footer + its own ❯ cursor row), lifted from a live pane.
+    _MODEL_DIALOG = (
+        "  Select model\n"
+        "  ❯ 2. Opus ✔  Opus 4.8 with 1M context\n"
+        "  Enter to set as default · s to use this session only · Esc to cancel\n"
+    )
+    # A live permission menu — Esc here means deny, so the note must warn.
+    _PERM_MENU = (
+        "  Do you want to proceed?\n"
+        "  ❯ 1. Yes\n"
+        "    2. No\n"
+    )
+    _CLEAN = SendPromptTests._CLEAN_PANE
+
+    def _send_with_blocker(self, blocker_text, clears=True, text="hello"):
+        """Drive send_prompt with `blocker_text` on the pane. When `clears`, the
+        pane goes clean once an Escape is delivered (a dialog that dismisses); when
+        not, it stays blocked no matter how many Escapes land."""
+        state = {"escaped": False}
+
+        def cap(*a, **k):
+            clean = clears and state["escaped"]
+            return {"ok": True, "text": self._CLEAN if clean else blocker_text}
+
+        def keys(pane, *ks):
+            if ks and ks[0] == "Escape":
+                state["escaped"] = True
+            return {"ok": True}
+
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "exit_copy_mode"), \
+             mock.patch.object(actions.tmux, "capture_pane", side_effect=cap), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=keys) as sk, \
+             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
+             mock.patch.object(actions.time, "sleep"), \
+             mock.patch.object(actions, "_COMPOSER_READY_TIMEOUT", 0.2), \
+             mock.patch.object(actions, "_COMPOSER_READY_POLL", 0.0):
+            r = actions.send_prompt(1234, text)
+        return r, sk, st
+
+    def test_model_dialog_is_escaped_then_send_delivers_with_note(self):
+        r, sk, st = self._send_with_blocker(self._MODEL_DIALOG)
+        sk.assert_any_call("%5", "Escape")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+        self.assertIn("/model dialog", r["note"])
+        self.assertIn("auto-closed", r["note"])
+        self.assertNotIn("⚠", r["note"])  # cancelling /model is not destructive
+
+    def test_permission_menu_autoclose_note_warns_about_denial(self):
+        r, sk, st = self._send_with_blocker(self._PERM_MENU)
+        sk.assert_any_call("%5", "Escape")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+        self.assertIn("permission/choice menu", r["note"])
+        self.assertIn("⚠", r["note"])  # Esc denied a pending tool call
+
+    def test_blocker_that_wont_clear_reports_specific_error_without_typing(self):
+        r, sk, st = self._send_with_blocker(self._MODEL_DIALOG, clears=False)
+        self.assertFalse(r["ok"])
+        self.assertIn("/model dialog", r["error"])
+        self.assertIn("still open", r["error"])
+        st.assert_not_called()  # never type into a pane still covered by a dialog
+
+    def test_reactive_diagnosis_names_blocker_when_send_fails(self):
+        # Composer looks clear, so the send is attempted, but it doesn't land and
+        # a dialog is on screen by the time we re-capture — name it, don't report
+        # the generic "never landed".
+        state = {"sent": False}
+
+        def cap(*a, **k):
+            return {"ok": True,
+                    "text": self._MODEL_DIALOG if state["sent"] else self._CLEAN}
+
+        def stext(*a, **k):
+            state["sent"] = True
+            return {"ok": False, "error": "prompt text never landed in composer"}
+
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "exit_copy_mode"), \
+             mock.patch.object(actions.tmux, "capture_pane", side_effect=cap), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}), \
+             mock.patch.object(actions.tmux, "send_text", side_effect=stext) as st, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.send_prompt(1234, "hello")
+        st.assert_called_once()
+        self.assertFalse(r["ok"])
+        self.assertIn("/model dialog", r["error"])
+        self.assertNotIn("never landed", r["error"])
+
+
 class SendMenuKeysOverlayTests(unittest.TestCase):
     """The dashboard Esc button closes a /btw overlay as a side effect; a settled
     un-archived answer must be latched before that Escape is delivered."""
