@@ -37,6 +37,9 @@ if [ -n "$CLAUDE_FLEET_FOREGROUND" ]; then
     exec uvicorn app:app --host 127.0.0.1 --port "$PORT" "${RELOAD_ARGS[@]}"
 fi
 
+# This repo is shared across hosts, so each host gets its own log file —
+# a single uvicorn.log would be truncated/interleaved by the other host.
+LOG_FILE="uvicorn.$(hostname).log"
 setsid uvicorn app:app --host 127.0.0.1 --port "$PORT" "${RELOAD_ARGS[@]}" \
-    > uvicorn.log 2>&1 < /dev/null &
-echo "[claude-fleet] started detached (pid $!), logs -> uvicorn.log"
+    > "$LOG_FILE" 2>&1 < /dev/null &
+echo "[claude-fleet] started detached (pid $!), logs -> $LOG_FILE"
