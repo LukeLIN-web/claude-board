@@ -382,6 +382,28 @@ class SendPromptReadinessTests(unittest.TestCase):
         st.assert_called_once()
         self.assertTrue(r["ok"])
 
+    # Newer builds (seen live on v2.1.216, fixtures/rewind_panel_no_footer.txt)
+    # draw NO footer while the panel cursor sits on "(current)": nothing to
+    # restore means no "Enter to continue · Esc to cancel" line, so the cursor
+    # row itself is the last thing on screen.
+    _REWIND_NO_FOOTER = (
+        "  建议的第一步:不必先吞 1.82 TB。\n\n"
+        "✻ Cooked for 5m 2s\n\n"
+        "────────────────────────────────────────\n"
+        "  Rewind\n\n"
+        "  Restore the code and/or conversation to the point before…\n\n"
+        "    reference 精读一下, https://arxiv.org/abs/2607.17423 , 看看可以作为我…\n"
+        "    TimeLens2.md +60\n\n"
+        "  ❯ (current)\n\n\n"
+    )
+
+    def test_footerless_rewind_panel_is_escaped_then_send_proceeds(self):
+        r, sk, st, _ = self._send(
+            [self._REWIND_NO_FOOTER, self._REWIND_NO_FOOTER, self._READY])
+        sk.assert_any_call("%5", "Escape")
+        st.assert_called_once()
+        self.assertTrue(r["ok"])
+
     def test_copy_mode_is_cancelled_before_typing(self):
         r, _, st, ecm = self._send([self._READY])
         ecm.assert_called_once_with("%5")
@@ -492,6 +514,63 @@ class SendPromptBlockerTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("/model dialog", r["error"])
         self.assertNotIn("never landed", r["error"])
+
+
+class SendFailureDiagnosisTests(unittest.TestCase):
+    """A landed-verify failure with no classifiable blocker must still say what
+    the pane looked like — a booting TUI, a busy pane dropping keystrokes, and
+    an unrecognized overlay used to collapse into the same generic
+    "prompt text never landed in composer"."""
+
+    _CLEAN = SendPromptTests._CLEAN_PANE
+    _BOOTING = SendPromptReadinessTests._BOOTING
+    _REWIND_NO_FOOTER = SendPromptReadinessTests._REWIND_NO_FOOTER
+
+    def _fail_send(self, after_text):
+        """Composer looks clean pre-send; the send doesn't land; `after_text` is
+        on the pane by the time the failure is diagnosed."""
+        state = {"sent": False}
+
+        def cap(*a, **k):
+            return {"ok": True,
+                    "text": after_text if state["sent"] else self._CLEAN}
+
+        def stext(*a, **k):
+            state["sent"] = True
+            return {"ok": False, "error": "prompt text never landed in composer"}
+
+        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
+             mock.patch.object(actions.tmux, "exit_copy_mode"), \
+             mock.patch.object(actions.tmux, "capture_pane", side_effect=cap), \
+             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}), \
+             mock.patch.object(actions.tmux, "send_text", side_effect=stext), \
+             mock.patch.object(actions.time, "sleep"):
+            return actions.send_prompt(1234, "hello")
+
+    def test_footerless_rewind_panel_is_named_not_generic(self):
+        r = self._fail_send(self._REWIND_NO_FOOTER)
+        self.assertFalse(r["ok"])
+        self.assertIn("Rewind panel", r["error"])
+        self.assertNotIn("never landed", r["error"])
+
+    def test_no_composer_marker_is_reported_as_such(self):
+        r = self._fail_send(self._BOOTING)
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        self.assertIn("no composer marker", r["error"])
+
+    def test_empty_composer_reports_dropped_keystrokes(self):
+        r = self._fail_send(self._CLEAN)
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        self.assertIn("empty", r["error"])
+
+    def test_composer_holding_other_text_is_quoted(self):
+        r = self._fail_send("❯ some other draft\n⏵⏵ bypass permissions on")
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        self.assertIn("some other draft", r["error"])
 
 
 class SendMenuKeysOverlayTests(unittest.TestCase):

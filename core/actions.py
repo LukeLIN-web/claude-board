@@ -1175,16 +1175,20 @@ _COMPOSER_READY_POLL = 0.5
 # cursor row, so the last on-screen ❯ sits INSIDE the panel below the header.
 # Both observed layouts share a bare "Rewind" header line and a footer that is
 # the last non-empty line ("Esc to cancel" / "Enter to continue · Esc to
-# cancel"); the normal composer's status line never matches either.
+# cancel"); the normal composer's status line never matches either. Newer
+# builds (v2.1.216, fixtures/rewind_panel_no_footer.txt) draw NO footer while
+# the panel cursor sits on "(current)" — nothing to restore, so no "Enter to
+# continue" line — leaving the cursor row itself as the last thing on screen.
 _REWIND_HEADER = "Rewind"
 _REWIND_FOOTER = "Esc to cancel"
+_REWIND_CURRENT_ROW = "❯ (current)"
 
 
 def _rewind_panel_open(text: str) -> bool:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines or _REWIND_FOOTER not in lines[-1]:
+    if not lines or not any(ln == _REWIND_HEADER for ln in lines):
         return False
-    return any(ln == _REWIND_HEADER for ln in lines)
+    return _REWIND_FOOTER in lines[-1] or lines[-1] == _REWIND_CURRENT_ROW
 
 
 def _wait_composer_ready(pane: str) -> bool:
@@ -1233,6 +1237,28 @@ def _diagnose_blocker(text: str) -> Optional[dict]:
     if _menu_markers_present(text):
         return {"kind": "menu", "label": "a permission/choice menu", "warn": True}
     return None
+
+
+def _unlanded_error(text: str) -> str:
+    """Specific error for a landed-verify failure with no classifiable blocker.
+
+    Three distinct failure shapes used to collapse into the same generic
+    "prompt text never landed in composer"; telling them apart from the message
+    alone is what makes the card actionable without shelling into tmux."""
+    if "❯" not in text and "›" not in text:
+        return ("prompt text never landed: no composer marker on screen — the "
+                "TUI is still starting, mid-redraw, or a full-screen view "
+                "replaced the prompt")
+    content = tmux._composer_text(text) or ""
+    if content:
+        snippet = content if len(content) <= 60 else content[:57] + "…"
+        return ("prompt text never landed: the composer holds other text "
+                f"({snippet!r}) — an unrecognized overlay drawing its own ❯ "
+                "cursor, or someone is typing in this pane")
+    tail = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+    return ("prompt text never landed: the composer stayed empty — the pane "
+            "dropped the keystrokes (busy re-render) or an unrecognized "
+            f"overlay ate them (screen tail: {tail!r})")
 
 
 def _clear_blocker(pane: str) -> Optional[dict]:
@@ -1332,14 +1358,19 @@ def send_prompt(pid: int, text: str) -> dict:
         )
     # Reactive diagnosis: if the prompt still didn't land, a blocker may have
     # (re)surfaced between the clear above and the send — name it instead of the
-    # generic "never landed in composer".
+    # generic "never landed in composer". With no classifiable blocker, still
+    # describe the pane shape (no marker / foreign text / empty composer): the
+    # bare generic covered every one of these and made them indistinguishable.
     if not res.get("ok"):
         cap = tmux.capture_pane(pane)
-        b = _diagnose_blocker(cap["text"]) if cap.get("ok") else None
-        if b:
-            return {"ok": False,
-                    "error": f"send blocked: {b['label']} is open on this pane "
-                             "— press Esc on the card, then resend."}
+        if cap.get("ok"):
+            b = _diagnose_blocker(cap["text"])
+            if b:
+                return {"ok": False,
+                        "error": f"send blocked: {b['label']} is open on this "
+                                 "pane — press Esc on the card, then resend."}
+            if res.get("error") == "prompt text never landed in composer":
+                return {"ok": False, "error": _unlanded_error(cap["text"])}
         return res
     # Delivered. If we had to auto-close a blocker to get here, say so.
     if blocker:
