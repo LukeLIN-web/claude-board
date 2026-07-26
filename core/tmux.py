@@ -511,6 +511,19 @@ def _send_debug(msg: str) -> None:
         pass
 
 
+def _literal_key_arg(text: str) -> str:
+    """Escape a trailing semicolon for `send-keys -l`.
+
+    tmux's command parser splits a command sequence on an argument that ENDS
+    with an unescaped ";" — even when the argument arrives as its own argv
+    element — so a prompt ending in ";" is typed minus its final character.
+    The landed-verify's needle then keeps that ";" and can never match: every
+    retry misses, the give-up path clears the composer, and the send reports
+    "stayed empty" for a prompt that in fact landed. Mid-text semicolons are
+    not separators; only the final one needs the escape."""
+    return text[:-1] + "\\;" if text.endswith(";") else text
+
+
 def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
@@ -533,7 +546,7 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         if attempt:
             _clear_composer(pane)  # drop any partial before retry
-        literal = _run("send-keys", "-t", pane, "-l", "--", text)
+        literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
                         f"send-keys FAILED: {literal.get('error')!r}")
@@ -585,7 +598,7 @@ def send_text(
         if not _send_until_landed(pane, text, marker):
             return {"ok": False, "error": "prompt text never landed in composer"}
     else:
-        literal = _run("send-keys", "-t", pane, "-l", "--", text)
+        literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
         if not literal["ok"]:
             return {"ok": False, "error": literal["error"]}
     is_slash = text.lstrip().startswith("/")

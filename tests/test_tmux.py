@@ -911,5 +911,54 @@ class SpawnEnvTests(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_SESSION_ID", env)
 
 
+class TrailingSemicolonEscapeTests(unittest.TestCase):
+    """tmux's command parser splits a command sequence on an argument ending in
+    an unescaped ";", even when that argument is a single argv element — so a
+    prompt ending in ";" was typed minus its final character, the landed-verify
+    needle (which keeps the ";") could never match, and the send failed as
+    "stayed empty" after the give-up clear wiped the composer."""
+
+    def test_literal_key_arg_escapes_only_a_trailing_semicolon(self):
+        self.assertEqual(tmux._literal_key_arg("abc"), "abc")
+        self.assertEqual(tmux._literal_key_arg("a;b"), "a;b")  # mid-text is safe
+        self.assertEqual(tmux._literal_key_arg("abc;"), "abc\\;")
+        self.assertEqual(tmux._literal_key_arg("a;;"), "a;\\;")  # last one only
+
+    def _literal_calls(self, calls):
+        return [c for c in calls if "-l" in c]
+
+    def test_send_text_escapes_trailing_semicolon(self):
+        calls = []
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep"):
+            r = tmux.send_text("%5", "do the thing;")
+        self.assertTrue(r["ok"])
+        (literal,) = self._literal_calls(calls)
+        self.assertEqual(literal[-1], "do the thing\\;")
+
+    def test_landed_verify_sends_escaped_but_matches_raw_text(self):
+        # The escape is a transport detail: the composer shows the raw ";", so
+        # the landed-verify needle must keep matching against the RAW text.
+        calls = []
+        seen_tails = []
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0)
+        def fake_tail(pane, text, marker="❯"):
+            seen_tails.append(text)
+            return True
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_composer_has_tail", side_effect=fake_tail):
+            r = tmux.send_text("%5", "goal 2. 重跑(钉死);", verify_landed=True)
+        self.assertTrue(r["ok"])
+        (literal,) = self._literal_calls(calls)
+        self.assertEqual(literal[-1], "goal 2. 重跑(钉死)\\;")
+        self.assertEqual(seen_tails, ["goal 2. 重跑(钉死);"])
+
+
 if __name__ == "__main__":
     unittest.main()
