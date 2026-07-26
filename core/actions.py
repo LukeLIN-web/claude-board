@@ -1289,6 +1289,14 @@ def _clear_blocker(pane: str) -> Optional[dict]:
 
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
+    r = _send_prompt_inner(pid, text)
+    if not r.get("ok"):
+        tmux._send_debug(f"send pid={pid} len={len(text or '')} "
+                         f"tail={(text or '')[-60:]!r} FAILED: {r.get('error')!r}")
+    return r
+
+
+def _send_prompt_inner(pid: int, text: str) -> dict:
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}

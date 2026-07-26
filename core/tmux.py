@@ -488,6 +488,25 @@ def _clear_composer(pane: str) -> None:
         _run("send-keys", "-t", pane, "C-u")
 
 
+# Post-mortem trace for the send path: landed-verify attempts append what the
+# pane actually showed, so a "never landed" toast can be diagnosed from the
+# recorded frames instead of re-probing a pane whose state is long gone.
+# Host-suffixed for the same reason as uvicorn's log — the repo dir is on a
+# shared mount and instances on other hosts would interleave a single file.
+_SEND_DEBUG_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    f"send_debug.{os.uname().nodename}.log")
+
+
+def _send_debug(msg: str) -> None:
+    """Best-effort append; a send must never fail because its trace can't."""
+    try:
+        with open(_SEND_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
 def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
@@ -506,16 +525,27 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     wipes the late-landing text, so "never landed" stays truthful and the
     stranded prompt can't concatenate into the next send.
     """
+    needle = "".join(text.split())[-24:]
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         if attempt:
             _clear_composer(pane)  # drop any partial before retry
         literal = _run("send-keys", "-t", pane, "-l", "--", text)
         if not literal["ok"]:
+            _send_debug(f"landed pane={pane} attempt={attempt} "
+                        f"send-keys FAILED: {literal.get('error')!r}")
             return False
         time.sleep(wait)
         if _composer_has_tail(pane, text, marker):
             return True
+        cap = capture_pane(pane).get("text", "")
+        idx = cap.rfind(marker)
+        frame = ("".join(cap[idx:].split())[:200] if idx != -1
+                 else f"NO-MARKER tail={cap[-120:]!r}")
+        _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
+                    f"needle={needle!r} frame={frame!r}")
     _clear_composer(pane)  # wipe the buffered text on wake
+    _send_debug(f"landed pane={pane} gave up after "
+                f"{len(_LANDED_VERIFY_WAITS)} attempts")
     return False
 
 
