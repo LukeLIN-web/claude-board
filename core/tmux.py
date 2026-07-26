@@ -500,6 +500,10 @@ _SEND_DEBUG_LOG = os.path.join(
 
 def _send_debug(msg: str) -> None:
     """Best-effort append; a send must never fail because its trace can't."""
+    # The test suite drives these same paths with fake panes; keep its noise
+    # out of the log an operator reads to debug a real failed send.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
     try:
         with open(_SEND_DEBUG_LOG, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n")
