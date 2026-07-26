@@ -205,5 +205,54 @@ class TestRolloutFdSelection(unittest.TestCase):
         self.assertIsNone(codex._newest_rollout_in_fd_dir("/proc/0/fd", "codex-sessions"))
 
 
+# Codex wraps API failures in task_complete.error.message as a JSON blob; the
+# human-readable text sits at error.message inside it. Repro: session 019f9feb,
+# where every turn 400'd on an unsupported model and the card showed nothing.
+_MODEL_ERR = ("{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\","
+              "\"message\":\"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.\"}}")
+
+def _task_complete(ts, error_msg=None):
+    err = {"message": error_msg, "codex_error_info": "other"} if error_msg else None
+    return {"timestamp": ts, "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t", "error": err}}
+
+
+class TestLastTurnError(unittest.TestCase):
+    """The card must surface the latest turn's error — and only while it IS the
+    latest turn outcome; a later successful turn clears it."""
+
+    def _err_of(self, lines, since_ms=0):
+        p = _write_rollout(lines)
+        try:
+            return codex._last_turn_error(p, since_ms)
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_surfaces_latest_turn_error_message(self):
+        out = self._err_of([_task_complete("2026-07-26T19:36:10Z", _MODEL_ERR)])
+        self.assertEqual(
+            out, "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.")
+
+    def test_later_successful_turn_clears_error(self):
+        out = self._err_of([
+            _task_complete("2026-07-26T19:36:10Z", _MODEL_ERR),
+            _task_complete("2026-07-26T19:40:00Z"),
+        ])
+        self.assertIsNone(out)
+
+    def test_no_task_complete_means_no_error(self):
+        self.assertIsNone(self._err_of(ROLLOUT_LINES))
+
+    def test_pre_clear_error_is_hidden(self):
+        cutoff = codex._parse_iso_ms("2026-07-26T19:38:00Z")
+        out = self._err_of([_task_complete("2026-07-26T19:36:10Z", _MODEL_ERR)],
+                           since_ms=cutoff)
+        self.assertIsNone(out)
+
+    def test_unparseable_error_message_shown_raw(self):
+        out = self._err_of([_task_complete("2026-07-26T19:36:10Z", "stream disconnected")])
+        self.assertEqual(out, "stream disconnected")
+
+
 if __name__ == "__main__":
     unittest.main()

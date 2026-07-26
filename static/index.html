@@ -302,6 +302,10 @@
         </div>
         <div class="px-4 pb-2 text-xs space-y-1">
           <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
+          <!-- Latest turn error (codex): the turn died with no reply, so without
+               this line the card looks like the session simply never answered -->
+          <div class="text-red-600 bg-red-50 rounded px-1.5 py-0.5" x-show="w.last_error"
+               :title="w.last_error" x-text="'⚠ ' + w.last_error"></div>
           <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
           <!-- Background shells / tasks -->
           <div x-show="w.shell_proc_count > 0 || w.background_tasks?.length" class="space-y-0.5">
@@ -830,6 +834,8 @@
           </div>
           <div class="px-3 pb-3 text-[11px] text-gray-400 space-y-0.5">
             <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
+            <div class="text-red-600 truncate" x-show="w.last_error" :title="w.last_error"
+                 x-text="'⚠ ' + w.last_error"></div>
             <div class="text-gray-500 italic truncate" x-show="w.triage_reason" x-text="w.triage_reason"></div>
             <div><span x-text="formatIdle(w.idle_seconds)"></span> · pid <span x-text="w.pid"></span></div>
           </div>
