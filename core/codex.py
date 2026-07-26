@@ -423,6 +423,38 @@ def _last_assistant_text(path: Path, since_ms: int = 0) -> str:
     return ""
 
 
+def _last_turn_error(path: Path, since_ms: int = 0) -> Optional[str]:
+    """Human-readable error of the LATEST completed turn, or None.
+
+    Codex records each turn's outcome as an event_msg/task_complete; a failed
+    turn carries `error.message`, usually a JSON blob whose text lives at
+    error.message inside it (e.g. a 400 for an unsupported model). Only the most
+    recent task_complete counts — a later successful turn clears the card. Repro:
+    session 019f9feb, where every turn 400'd and the card showed nothing at all.
+    """
+    for d in reversed(_read_tail_events(path, max_lines=120)):
+        if d.get("type") != "event_msg":
+            continue
+        payload = d.get("payload") or {}
+        if payload.get("type") != "task_complete":
+            continue
+        if _before_clear(d.get("timestamp", ""), since_ms):
+            return None
+        err = payload.get("error")
+        if not isinstance(err, dict):
+            return None
+        msg = str(err.get("message") or "").strip()
+        if not msg:
+            return None
+        try:
+            inner = json.loads(msg)
+            msg = str(inner["error"]["message"]) or msg
+        except Exception:
+            pass
+        return msg[:300]
+    return None
+
+
 def _infer_codex_status(path: Path, mtime: float) -> str:
     """busy | idle, inferred from the last substantive rollout event + mtime.
 
@@ -720,6 +752,7 @@ def codex_window_dicts() -> list[dict]:
             "skills_used": [], "memory_ops": [], "model": "",
         }
         current_task = _last_assistant_text(tp, since) if tp else ""
+        last_error = _last_turn_error(tp, since) if tp else None
         tri = _classify_codex(w.status, d.get("idle_seconds", 0), current_task)
         d.update({
             "shell_proc_count": 0,            # caller overwrites via one ps walk
@@ -727,6 +760,7 @@ def codex_window_dicts() -> list[dict]:
             "permission_ts": None,
             "first_input": (_extract_first_user_input(tp, since) if tp else "")[:100],
             "current_task": current_task or None,
+            "last_error": last_error,
             "triage": tri["triage"],
             "triage_reason": tri["reason"],
             "triage_suggestion": tri["suggestion"],
