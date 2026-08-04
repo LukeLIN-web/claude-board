@@ -636,8 +636,16 @@
            x-text="memoryDetail?.content || '(loading...)'"></pre>
     </div>
     <div class="space-y-2 max-h-[32rem] overflow-y-auto" x-ref="eventsList">
-      <template x-for="(ev, idx) in (timelineData?.events || [])" :key="idx">
-        <div :id="'tl-ev-'+idx" class="text-sm border-l-2 pl-3 py-1"
+      <!-- Only the newest `timelineWindow` events are rendered; older ones load
+           on demand so a 1000-event session doesn't re-render in full on every poll. -->
+      <div class="text-center pb-1" x-show="hiddenEventCount > 0">
+        <button @click="loadEarlierEvents()"
+                class="text-xs text-blue-600 hover:underline px-2 py-1">
+          ↑ 加载更早的 <span x-text="Math.min(hiddenEventCount, 200)"></span> 条（还有 <span x-text="hiddenEventCount"></span> 条未显示）
+        </button>
+      </div>
+      <template x-for="ev in visibleEvents" :key="ev._idx">
+        <div :id="'tl-ev-'+ev._idx" class="text-sm border-l-2 pl-3 py-1"
              x-show="ev.kind !== 'system'"
              :class="{
                'border-blue-400': ev.kind==='user_text',
@@ -867,6 +875,12 @@ function fleet() {
     // new activity (e.g. the assistant replied) and auto-refresh the timeline.
     expandedUpdatedAt: null,
     timelineData: null,
+    // How many trailing timeline events to actually render. A long session has
+    // 1000+ events and the poller replaces timelineData every few seconds, so
+    // rendering the whole list means rebuilding every row on each refresh —
+    // that, not the fetch, is what makes the page janky. "Load earlier" grows
+    // this window on demand.
+    timelineWindow: 200,
     planData: null,
     toasts: [],
     toastSeq: 0,
@@ -946,6 +960,18 @@ function fleet() {
       return this.windows.filter(w => w.hidden).slice().sort(
         (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid
       );
+    },
+
+    // The trailing slice of the open timeline that actually gets rendered.
+    // `_idx` carries the index into the full events array so #tl-ev-<idx>
+    // anchors stay valid no matter where the window starts.
+    get visibleEvents() {
+      const events = this.timelineData?.events || [];
+      const start = Math.max(0, events.length - this.timelineWindow);
+      return events.slice(start).map((ev, i) => ({ ...ev, _idx: start + i }));
+    },
+    get hiddenEventCount() {
+      return Math.max(0, (this.timelineData?.events || []).length - this.timelineWindow);
     },
 
     init() {
@@ -1036,6 +1062,19 @@ function fleet() {
           });
         }
       } catch (e) { /* transient fetch error; next poll retries */ }
+    },
+
+    // Widen the rendered window backwards, keeping the reader's position: rows
+    // are prepended above, so restore scrollTop by distance-from-bottom rather
+    // than by absolute offset.
+    loadEarlierEvents(step = 200) {
+      const el = this.$refs.eventsList;
+      const fromBottom = el ? el.scrollHeight - el.scrollTop : null;
+      this.timelineWindow += step;
+      this.$nextTick(() => {
+        const e = this.$refs.eventsList;
+        if (e && fromBottom !== null) e.scrollTop = e.scrollHeight - fromBottom;
+      });
     },
 
     formatIdle(seconds) {
@@ -1301,6 +1340,7 @@ function fleet() {
       this.expandedHistoryId = null;
       this.planData = null;
       this.showPlanHistory = false;
+      this.timelineWindow = 200; // fresh session: back to the trailing window
       // Baseline the activity marker so the next bump (assistant reply, tool
       // call) triggers an auto-refresh via applySnapshot.
       this.expandedUpdatedAt = this.windows.find((w) => w.pid === pid)?.updated_at ?? null;
@@ -1351,6 +1391,7 @@ function fleet() {
       this.expandedPid = null;
       this.expandedHistoryId = sessionId;
       this.planData = null;
+      this.timelineWindow = 200;
       const r = await fetch(`/api/history/${sessionId}/timeline`);
       if (r.ok) {
         this.timelineData = await r.json();
@@ -1381,16 +1422,21 @@ function fleet() {
     scrollToSkill(skillName) {
       const events = this.timelineData?.events || [];
       const idx = events.findIndex(e => e.kind === 'skill_invoke' && e.tool === skillName);
-      if (idx >= 0) {
-        const el = document.getElementById('tl-ev-' + idx);
-        if (el) {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          el.classList.add('bg-purple-50');
-          setTimeout(() => el.classList.remove('bg-purple-50'), 2000);
-        }
-      } else {
+      if (idx < 0) {
         this.toast('Skill event not in visible timeline');
+        return;
       }
+      // The list renders only a trailing window — widen it far enough back that
+      // the target row exists before trying to scroll to it.
+      const needed = events.length - idx;
+      if (needed > this.timelineWindow) this.timelineWindow = needed;
+      this.$nextTick(() => {
+        const el = document.getElementById('tl-ev-' + idx);
+        if (!el) return;
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('bg-purple-50');
+        setTimeout(() => el.classList.remove('bg-purple-50'), 2000);
+      });
     },
 
     async showMemoryDetail(name, operation) {
