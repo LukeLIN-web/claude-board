@@ -254,5 +254,71 @@ class TestLastTurnError(unittest.TestCase):
         self.assertEqual(out, "stream disconnected")
 
 
+class TestSubagentRolloutIsNotTheCard(unittest.TestCase):
+    """`spawn_agent` opens a child thread's rollout from the SAME process.
+
+    Repro: while the subagent runs its rollout is the newest fd, so newest-by-
+    mtime swapped the card onto that near-empty thread — the user's whole
+    history vanished mid-turn and came back only when the subagent finished.
+    The user thread must win regardless of mtime.
+    """
+
+    def _meta(self, sid, parent=None):
+        payload = {"session_id": parent or sid, "id": sid, "cwd": "/tmp/proj",
+                   "timestamp": "2026-07-31T18:10:18Z"}
+        if parent:
+            payload["parent_thread_id"] = parent
+            payload["source"] = {"subagent": {"thread_spawn": {"agent": "worker"}}}
+        else:
+            payload["source"] = "cli"
+            payload["thread_source"] = "user"
+        return {"timestamp": "2026-07-31T18:10:18Z", "type": "session_meta",
+                "payload": payload}
+
+    def _fd_dir(self, *, subagent_newer=True, include_user=True):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        sessions = tmp / "codex-sessions"
+        sessions.mkdir(parents=True)
+        user = sessions / "rollout-2026-07-30T20-56-35-019fb651.jsonl"
+        sub = sessions / "rollout-2026-07-31T11-30-40-019fb971.jsonl"
+        user.write_text(json.dumps(self._meta("019fb651")) + "\n")
+        sub.write_text(json.dumps(self._meta("019fb971", parent="019fb651")) + "\n")
+        os.utime(user, (1000, 1000) if subagent_newer else (2000, 2000))
+        os.utime(sub, (2000, 2000) if subagent_newer else (1000, 1000))
+        fd_dir = tmp / "fd"
+        fd_dir.mkdir()
+        if include_user:
+            os.symlink(user, fd_dir / "50")
+        os.symlink(sub, fd_dir / "53")
+        return str(fd_dir), str(user), str(sub), str(sessions)
+
+    def test_user_thread_wins_while_subagent_is_the_newest_fd(self):
+        fd_dir, user, sub, marker = self._fd_dir(subagent_newer=True)
+        self.assertEqual(codex._newest_rollout_in_fd_dir(fd_dir, marker), user)
+
+    def test_user_thread_still_wins_when_it_is_also_newest(self):
+        fd_dir, user, sub, marker = self._fd_dir(subagent_newer=False)
+        self.assertEqual(codex._newest_rollout_in_fd_dir(fd_dir, marker), user)
+
+    def test_subagent_only_process_still_resolves(self):
+        # A standalone subagent process holds no user thread — better to card it
+        # than to card nothing.
+        fd_dir, user, sub, marker = self._fd_dir(include_user=False)
+        self.assertEqual(codex._newest_rollout_in_fd_dir(fd_dir, marker), sub)
+
+    def test_classifier(self):
+        _, user, sub, _ = self._fd_dir()
+        self.assertFalse(codex._is_subagent_rollout(user))
+        self.assertTrue(codex._is_subagent_rollout(sub))
+
+    def test_unreadable_meta_is_treated_as_user_thread(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        p = tmp / "rollout-2026-07-31T00-00-00-deadbeef.jsonl"
+        p.write_text("not json\n")
+        self.assertFalse(codex._is_subagent_rollout(str(p)))
+
+
 if __name__ == "__main__":
     unittest.main()

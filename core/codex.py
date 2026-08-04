@@ -525,6 +525,25 @@ def _proc_table() -> dict[int, dict]:
     return table
 
 
+def _is_subagent_rollout(path: str) -> bool:
+    """Whether this rollout belongs to a subagent thread rather than the user's.
+
+    `spawn_agent` starts a child thread that writes its OWN rollout *from the
+    same process*, so the parent's fd table holds both. Its session_meta names
+    the parent (`parent_thread_id`) and records how it was started
+    (`source: {"subagent": {"thread_spawn": …}}`); a top-level user thread has
+    neither. Unreadable meta ⇒ False: a rollout we can't classify is treated as
+    the user's, which at worst restores the old newest-fd behaviour.
+    """
+    meta = _parse_session_meta(Path(path))
+    if not meta:
+        return False
+    if meta.get("parent_thread_id"):
+        return True
+    src = meta.get("source")
+    return isinstance(src, dict) and "subagent" in src
+
+
 def _newest_rollout_in_fd_dir(fd_dir: str, sessions_marker: str) -> Optional[str]:
     """The most recently written rollout JSONL among the fds open in `fd_dir`.
 
@@ -534,9 +553,17 @@ def _newest_rollout_in_fd_dir(fd_dir: str, sessions_marker: str) -> Optional[str
     latches the card onto a stale, frozen transcript; pick the newest-by-mtime
     fd instead (the live rollout is the one still being written). mtime is read
     through the fd, which follows the symlink to the target file.
+
+    Newest-by-mtime alone isn't enough, though: a `spawn_agent` subagent writes
+    its own rollout from this same process, and while it runs *it* is the newest
+    fd — so the card would swap to the subagent's freshly-opened (near-empty)
+    thread mid-turn, blanking all of the user's history, then swap back when the
+    subagent finished. So subagent rollouts only win when there is no user
+    thread among the fds at all.
     """
     best: Optional[str] = None
     best_mtime = -1.0
+    best_is_sub = True          # any user thread outranks any subagent thread
     try:
         names = os.listdir(fd_dir)
     except Exception:
@@ -552,8 +579,9 @@ def _newest_rollout_in_fd_dir(fd_dir: str, sessions_marker: str) -> Optional[str
                 mtime = os.stat(fd_path).st_mtime
             except Exception:
                 mtime = 0.0
-            if mtime > best_mtime:
-                best, best_mtime = target, mtime
+            is_sub = _is_subagent_rollout(target)
+            if (not is_sub, mtime) > (not best_is_sub, best_mtime):
+                best, best_mtime, best_is_sub = target, mtime, is_sub
     return best
 
 
@@ -563,8 +591,8 @@ def _rollout_fd(pid: int) -> Optional[str]:
     A running interactive codex session keeps its transcript fd open; the
     background `mcp-server`/`app-server` codex processes do not, so this check
     naturally selects only real user-facing sessions. When a process holds more
-    than one rollout fd (a finished turn plus its live continuation), the newest
-    one wins — see _newest_rollout_in_fd_dir.
+    than one rollout fd (a finished turn, its live continuation, a subagent's
+    thread), the newest *user* thread wins — see _newest_rollout_in_fd_dir.
     """
     return _newest_rollout_in_fd_dir(f"/proc/{pid}/fd", str(CODEX_SESSIONS_DIR))
 
