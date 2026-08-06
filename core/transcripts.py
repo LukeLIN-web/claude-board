@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
+
 _CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
 _CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
 
@@ -65,14 +67,14 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
     content = msg.get("content") or []
     ts = msg.get("timestamp") or ""
     if isinstance(content, str):
-        out.append(TurnEvent(ts, "assistant_text", content[:4000], None, "assistant", {}))
+        out.append(TurnEvent(ts, "assistant_text", cap_text(content, MESSAGE_CHARS), None, "assistant", {}))
         return out
     if not isinstance(content, list):
         return out
     for c in content:
         ct = c.get("type")
         if ct == "text":
-            out.append(TurnEvent(ts, "assistant_text", (c.get("text") or "")[:4000], None, "assistant", {}))
+            out.append(TurnEvent(ts, "assistant_text", cap_text(c.get("text"), MESSAGE_CHARS), None, "assistant", {}))
         elif ct == "tool_use":
             inp = c.get("input") or {}
             tool_name = c.get("name", "")
@@ -82,7 +84,7 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
                 skill_name = inp.get("skill", "")
                 out.append(TurnEvent(
                     ts, "skill_invoke", "", skill_name, "assistant",
-                    {"args": (inp.get("args") or "")[:200]},
+                    {"args": cap_text(inp.get("args"), TOOL_ARG_CHARS)},
                 ))
             elif tool_name in ("Read", "Write", "Edit") and "/memory/" in file_path:
                 mem_name = file_path.rsplit("/", 1)[-1].replace(".md", "")
@@ -109,7 +111,7 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
                                 "label": str(o.get("label", ""))[:200],
                                 "desc": str(o.get("description", ""))[:400],
                             })
-                    qtext = str(q.get("question", ""))[:1000]
+                    qtext = cap_text(str(q.get("question", "")), MESSAGE_CHARS)
                     q_payload.append({
                         "q": qtext,
                         "header": str(q.get("header", ""))[:60],
@@ -122,14 +124,14 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
                             f"  • {o['label']}" + (f" — {o['desc']}" if o["desc"] else "")
                         )
                 out.append(TurnEvent(
-                    ts, "ask_question", "\n".join(text_lines)[:4000], tool_name,
+                    ts, "ask_question", cap_text("\n".join(text_lines), MESSAGE_CHARS), tool_name,
                     "assistant", {"questions": q_payload},
                 ))
             else:
                 preview: dict = {}
                 for k, v in (inp.items() if isinstance(inp, dict) else []):
                     if isinstance(v, str):
-                        preview[k] = v[:200]
+                        preview[k] = cap_text(v, TOOL_ARG_CHARS)
                     elif isinstance(v, (int, float, bool)) or v is None:
                         preview[k] = v
                     else:
@@ -148,14 +150,14 @@ def _flatten_user(msg: dict) -> list[TurnEvent]:
     content = msg.get("content") or []
     ts = msg.get("timestamp") or ""
     if isinstance(content, str):
-        out.append(TurnEvent(ts, "user_text", _clean_command_text(content)[:4000], None, "user", {}))
+        out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(content), MESSAGE_CHARS), None, "user", {}))
         return out
     if not isinstance(content, list):
         return out
     for c in content:
         ct = c.get("type")
         if ct == "text":
-            out.append(TurnEvent(ts, "user_text", _clean_command_text(c.get("text") or "")[:4000], None, "user", {}))
+            out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(c.get("text") or ""), MESSAGE_CHARS), None, "user", {}))
         elif ct == "tool_result":
             content_val = c.get("content")
             if isinstance(content_val, list):
@@ -163,11 +165,13 @@ def _flatten_user(msg: dict) -> list[TurnEvent]:
                 full = " ".join(text_parts)
             else:
                 full = str(content_val)
-            # Sensitive: don't dump full stdout. Cap at 200 chars — except the
-            # AskUserQuestion answer echo, which is just the user's own selection
-            # (question + chosen option), not tool output, and is worth seeing whole.
-            limit = 4000 if full.startswith("Your questions have been answered") else 200
-            out.append(TurnEvent(ts, "tool_result", full[:limit], None, "user", {}))
+            # Sensitive: don't dump full stdout — keep tool output at the short
+            # TOOL_RESULT_CHARS cap. The exception is the AskUserQuestion answer
+            # echo, which is just the user's own selection (question + chosen
+            # option), not tool output, and is worth seeing whole.
+            limit = (MESSAGE_CHARS if full.startswith("Your questions have been answered")
+                     else TOOL_RESULT_CHARS)
+            out.append(TurnEvent(ts, "tool_result", cap_text(full, limit), None, "user", {}))
     return out
 
 

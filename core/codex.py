@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
 from .sessions import (
     HOME_BASE,
     Window,
@@ -342,7 +343,7 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list
                         if text:
                             events.append({
                                 "ts": ts, "kind": "user_text",
-                                "text": text[:4000], "tool": None,
+                                "text": cap_text(text, MESSAGE_CHARS), "tool": None,
                                 "role": "user", "extra": {},
                             })
 
@@ -353,12 +354,12 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list
                             "ts": ts, "kind": "tool_use",
                             "text": "", "tool": payload.get("name", "function"),
                             "role": "assistant",
-                            "extra": {"arguments": (payload.get("arguments") or "")[:200]},
+                            "extra": {"arguments": cap_text(payload.get("arguments"), TOOL_ARG_CHARS)},
                         })
                     elif item_type == "function_call_output":
                         events.append({
                             "ts": ts, "kind": "tool_result",
-                            "text": (payload.get("output") or "")[:200],
+                            "text": cap_text(payload.get("output"), TOOL_RESULT_CHARS),
                             "tool": None, "role": "user", "extra": {},
                         })
                     elif item_type == "message":
@@ -368,7 +369,7 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list
                                 if isinstance(c, dict) and c.get("type") == "output_text":
                                     events.append({
                                         "ts": ts, "kind": "assistant_text",
-                                        "text": (c.get("text") or "")[:4000],
+                                        "text": cap_text(c.get("text"), MESSAGE_CHARS),
                                         "tool": None, "role": "assistant", "extra": {},
                                     })
     except Exception:

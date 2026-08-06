@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .sessions import HOME_BASE
+from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
 
 OPENCODE_DB = HOME_BASE / ".local/share/opencode/opencode.db"
 
@@ -108,7 +109,7 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
             if not text.strip():
                 continue
             kind = "user_text" if role == "user" else "assistant_text"
-            events.append({"ts": ts, "kind": kind, "text": text[:4000], "tool": None, "role": role or "assistant", "extra": {}})
+            events.append({"ts": ts, "kind": kind, "text": cap_text(text, MESSAGE_CHARS), "tool": None, "role": role or "assistant", "extra": {}})
 
         elif ptype == "tool":
             tool_name = pd.get("tool", "")
@@ -118,7 +119,7 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
             if status == "completed" and state.get("output"):
                 events.append({"ts": ts, "kind": "tool_use", "text": "", "tool": tool_name, "role": "assistant",
                                "extra": _tool_preview(tool_name, inp)})
-                output = (state.get("output") or "")[:200]
+                output = cap_text(state.get("output"), TOOL_RESULT_CHARS)
                 events.append({"ts": ts, "kind": "tool_result", "text": output, "tool": None, "role": "user", "extra": {}})
             elif status == "running" or not state.get("output"):
                 events.append({"ts": ts, "kind": "tool_use", "text": "", "tool": tool_name, "role": "assistant",
@@ -288,7 +289,7 @@ def _tool_preview(tool_name: str, inp: dict) -> dict:
     preview: dict = {}
     for k, v in list(inp.items())[:4]:
         if isinstance(v, str):
-            preview[k] = v[:200]
+            preview[k] = cap_text(v, TOOL_ARG_CHARS)
         elif isinstance(v, (int, float, bool)) or v is None:
             preview[k] = v
     return preview
