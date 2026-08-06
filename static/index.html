@@ -685,6 +685,11 @@
                     class="font-medium"
                     x-text="ev.kind==='tool_use' ? ev.tool : ev.kind.replace('_text','').replace('tool_result','result')"></span>
             </template>
+            <!-- Harness-injected, not typed: a skill body, a command caveat.
+                 Say so, or a row cut at 200 chars reads as a truncated prompt. -->
+            <template x-if="ev.extra?.meta">
+              <span class="text-gray-400">（注入）</span>
+            </template>
           </div>
           <!-- Skill args -->
           <template x-if="ev.kind === 'skill_invoke'">
@@ -1239,7 +1244,10 @@ function fleet() {
     lastUserPrompt() {
       const events = this.timelineData?.events || [];
       for (let i = events.length - 1; i >= 0; i--) {
-        if (events[i].kind === 'user_text' && (events[i].text || '').trim()) {
+        // Skip harness-injected rows (skill bodies, command caveats) — nobody
+        // typed those, and one would otherwise stand in for the real prompt.
+        if (events[i].kind === 'user_text' && !events[i].extra?.meta
+            && (events[i].text || '').trim()) {
           return events[i].text.trim();
         }
       }

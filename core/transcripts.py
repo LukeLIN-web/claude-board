@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
+from .textcap import META_CHARS, MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
 
 _CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
 _CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
@@ -145,19 +145,24 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
     return out
 
 
-def _flatten_user(msg: dict) -> list[TurnEvent]:
+def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
     out: list[TurnEvent] = []
     content = msg.get("content") or []
     ts = msg.get("timestamp") or ""
+    # A prompt someone typed is the point of the timeline, so it gets the
+    # generous cap. An `isMeta` row is the harness talking to the model — a
+    # skill body, a command caveat — and is worth a trace, not a wall.
+    limit = META_CHARS if is_meta else MESSAGE_CHARS
+    extra = {"meta": True} if is_meta else {}
     if isinstance(content, str):
-        out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(content), MESSAGE_CHARS), None, "user", {}))
+        out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(content), limit), None, "user", dict(extra)))
         return out
     if not isinstance(content, list):
         return out
     for c in content:
         ct = c.get("type")
         if ct == "text":
-            out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(c.get("text") or ""), MESSAGE_CHARS), None, "user", {}))
+            out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(c.get("text") or ""), limit), None, "user", dict(extra)))
         elif ct == "tool_result":
             content_val = c.get("content")
             if isinstance(content_val, list):
@@ -184,7 +189,8 @@ def _normalize(d: dict) -> list[TurnEvent]:
     if t == "assistant":
         return _flatten_assistant(msg)
     if t == "user":
-        return _flatten_user(msg)
+        # `isMeta` sits on the envelope, not on `message`.
+        return _flatten_user(msg, bool(d.get("isMeta")))
     if t in {"system", "permission-mode"}:
         return [TurnEvent(
             d.get("timestamp", ""), "system",

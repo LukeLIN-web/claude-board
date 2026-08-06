@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from core import transcripts
-from core.textcap import MESSAGE_CHARS, TOOL_RESULT_CHARS, cap_text
+from core.textcap import META_CHARS, MESSAGE_CHARS, TOOL_RESULT_CHARS, cap_text
 
 
 def _write(rows) -> Path:
@@ -62,6 +62,27 @@ class TimelineCapTests(unittest.TestCase):
         ev = transcripts.timeline(p)[0]
         self.assertLessEqual(len(out), MESSAGE_CHARS)
         self.assertEqual(ev["text"], out)
+
+    def test_injected_skill_body_is_a_trace_not_a_wall(self):
+        # Claude logs a skill's whole SKILL.md as an `isMeta` user row — 150k
+        # chars for one /update-config. Nobody typed it, so it gets the short cap.
+        body = "# Update Config Skill\n" + "说明" * 60000
+        p = _write([{"type": "user", "isMeta": True, "timestamp": "2026-08-05T10:00:00Z",
+                     "message": {"content": [{"type": "text", "text": body}]}}])
+        ev = transcripts.timeline(p)[0]
+        self.assertEqual(ev["kind"], "user_text")
+        self.assertTrue(ev["text"].startswith("# Update Config Skill"))
+        self.assertLess(len(ev["text"]), META_CHARS + 60)
+        self.assertIn(str(len(body) - META_CHARS), ev["text"])  # names the rest
+        self.assertTrue(ev["extra"]["meta"])  # the client labels it as injected
+
+    def test_a_typed_prompt_keeps_the_generous_cap(self):
+        text = "字" * 8000
+        p = _write([{"type": "user", "timestamp": "2026-08-05T10:00:00Z",
+                     "message": {"content": [{"type": "text", "text": text}]}}])
+        ev = transcripts.timeline(p)[0]
+        self.assertEqual(ev["text"], text)
+        self.assertNotIn("meta", ev["extra"])
 
 
 if __name__ == "__main__":

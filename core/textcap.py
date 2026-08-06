@@ -27,6 +27,11 @@ MESSAGE_CHARS = _env_int("CLAUDE_FLEET_MESSAGE_CHARS", 20000)
 TOOL_RESULT_CHARS = _env_int("CLAUDE_FLEET_TOOL_RESULT_CHARS", 200)
 # One tool_use argument value (a call shows up to 6 of them).
 TOOL_ARG_CHARS = _env_int("CLAUDE_FLEET_TOOL_ARG_CHARS", 200)
+# Harness-injected user rows (`isMeta`): a skill's whole SKILL.md body, the
+# local-command caveat, an image placeholder. Nobody typed these, and a skill
+# body runs to 150k chars — as a `user_text` row it buries the turn that invoked
+# it. Keep a one-line trace (the marker names the rest) instead of the wall.
+META_CHARS = _env_int("CLAUDE_FLEET_META_CHARS", 200)
 
 
 def cap_text(text: str | None, limit: int) -> str:
