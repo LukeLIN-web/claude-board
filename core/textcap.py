@@ -20,13 +20,13 @@ def _env_int(name: str, default: int) -> int:
 # User/assistant messages — generous, since reading them is the point of the
 # timeline. Only a pasted file or a giant log should ever reach this.
 MESSAGE_CHARS = _env_int("CLAUDE_FLEET_MESSAGE_CHARS", 20000)
-# Tool output still stays shorter than a message — a board left open on a screen
-# shouldn't dump whole stdout, and one grep hit can run to 60k chars. Enough to
-# read the result, not enough to drown the poll; the timeline collapses it to a
-# few lines until clicked. CLAUDE_FLEET_TOOL_RESULT_CHARS=200 restores the old cap.
-TOOL_RESULT_CHARS = _env_int("CLAUDE_FLEET_TOOL_RESULT_CHARS", 2000)
+# Tool output stays short on purpose: a board left open on a screen shouldn't
+# dump whole stdout, and one grep hit can run to 60k chars on a timeline that
+# re-polls every couple of seconds. Raise CLAUDE_FLEET_TOOL_RESULT_CHARS to read
+# results in full — the marker below already says how much is being held back.
+TOOL_RESULT_CHARS = _env_int("CLAUDE_FLEET_TOOL_RESULT_CHARS", 200)
 # One tool_use argument value (a call shows up to 6 of them).
-TOOL_ARG_CHARS = _env_int("CLAUDE_FLEET_TOOL_ARG_CHARS", 600)
+TOOL_ARG_CHARS = _env_int("CLAUDE_FLEET_TOOL_ARG_CHARS", 200)
 
 
 def cap_text(text: str | None, limit: int) -> str:
