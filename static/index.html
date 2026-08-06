@@ -467,7 +467,7 @@
       </h2>
       <div class="flex items-center gap-2">
         <!-- Assistant font-size adjuster -->
-        <div class="flex items-center border border-gray-200 rounded overflow-hidden" title="Assistant 字体大小">
+        <div class="flex items-center border border-gray-200 rounded overflow-hidden" title="正文字体大小（user / assistant）">
           <button @click="setAssistantFont(-1)"
                   class="px-2 py-1 text-xs text-gray-600 hover:bg-gray-100 transition">A−</button>
           <span class="px-1.5 text-[10px] text-gray-400 tabular-nums" x-text="assistantFontPx + 'px'"></span>
@@ -688,7 +688,7 @@
           </div>
           <!-- Skill args -->
           <template x-if="ev.kind === 'skill_invoke'">
-            <div class="text-xs text-purple-600 truncate" x-text="ev.extra?.args || ''"></div>
+            <div class="text-xs text-purple-600 whitespace-pre-wrap break-words" x-text="ev.extra?.args || ''"></div>
           </template>
           <!-- Memory operation detail -->
           <template x-if="ev.kind === 'memory_read' || ev.kind === 'memory_write'">
@@ -696,15 +696,21 @@
           </template>
           <!-- Generic tool_use -->
           <template x-if="ev.kind === 'tool_use'">
-            <div class="text-xs text-gray-600 font-mono">
+            <div class="text-xs text-gray-600 font-mono whitespace-pre-wrap break-words">
               <template x-for="(v, k) in (ev.extra || {})" :key="k">
-                <span class="mr-2"><span class="text-gray-400" x-text="k+'='"></span><span x-text="typeof v==='string' ? v.slice(0,120) : JSON.stringify(v)"></span></span>
+                <span class="mr-2"><span class="text-gray-400" x-text="k+'='"></span><span x-text="typeof v==='string' ? v : JSON.stringify(v)"></span></span>
               </template>
             </div>
           </template>
           <!-- Assistant output: show in full, no scroll, no truncation, adjustable font -->
           <template x-if="ev.kind === 'assistant_text'">
             <pre class="text-gray-700 whitespace-pre-wrap break-words"
+                 :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
+          </template>
+          <!-- User prompt: same deal — a prompt cut off mid-sentence is worse
+               than a tall row, so it wraps in full at the same adjustable size. -->
+          <template x-if="ev.kind === 'user_text'">
+            <pre class="text-gray-800 whitespace-pre-wrap break-words"
                  :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
           </template>
           <!-- AskUserQuestion: full question text + every option, no truncation -->
@@ -728,8 +734,17 @@
             <div class="text-xs font-medium text-violet-700" x-text="ev.text || ''"
                  :title="ev.extra?.model || ''"></div>
           </template>
-          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'ask_question' && ev.kind !== 'model'">
-            <pre class="text-xs text-gray-700 max-h-32 overflow-y-auto" x-text="ev.text?.slice(0,2000) || ''"></pre>
+          <!-- Everything else (tool results): wrapped, and clamped only until
+               the reader asks for the rest — nothing is cut in the markup. -->
+          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'user_text' && ev.kind !== 'ask_question' && ev.kind !== 'model'">
+            <div>
+              <pre class="text-xs text-gray-700 whitespace-pre-wrap break-words"
+                   :class="eventExpanded[ev._idx] ? '' : 'max-h-32 overflow-y-auto'"
+                   x-text="ev.text || ''"></pre>
+              <button x-show="eventIsLong(ev)" @click="eventExpanded[ev._idx] = !eventExpanded[ev._idx]"
+                      class="text-[11px] text-blue-600 hover:underline mt-0.5"
+                      x-text="eventExpanded[ev._idx] ? '收起 ▴' : '展开全部 ▾'"></button>
+            </div>
           </template>
         </div>
       </template>
@@ -881,6 +896,9 @@ function fleet() {
     // that, not the fetch, is what makes the page janky. "Load earlier" grows
     // this window on demand.
     timelineWindow: 200,
+    // Per-event "show the whole thing" state for clamped tool-result rows,
+    // keyed by the event's absolute index (stable: events only get appended).
+    eventExpanded: {},
     planData: null,
     toasts: [],
     toastSeq: 0,
@@ -972,6 +990,12 @@ function fleet() {
     },
     get hiddenEventCount() {
       return Math.max(0, (this.timelineData?.events || []).length - this.timelineWindow);
+    },
+    // A collapsed row is clamped to max-h-32 (~8 lines); offer the toggle only
+    // when the text plausibly overflows that.
+    eventIsLong(ev) {
+      const t = ev.text || '';
+      return t.split('\n').length > 8 || t.length > 400;
     },
 
     init() {
@@ -1341,6 +1365,7 @@ function fleet() {
       this.planData = null;
       this.showPlanHistory = false;
       this.timelineWindow = 200; // fresh session: back to the trailing window
+      this.eventExpanded = {};   // indices belong to the old session's events
       // Baseline the activity marker so the next bump (assistant reply, tool
       // call) triggers an auto-refresh via applySnapshot.
       this.expandedUpdatedAt = this.windows.find((w) => w.pid === pid)?.updated_at ?? null;
@@ -1392,6 +1417,7 @@ function fleet() {
       this.expandedHistoryId = sessionId;
       this.planData = null;
       this.timelineWindow = 200;
+      this.eventExpanded = {};
       const r = await fetch(`/api/history/${sessionId}/timeline`);
       if (r.ok) {
         this.timelineData = await r.json();
