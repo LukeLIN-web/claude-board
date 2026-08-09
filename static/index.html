@@ -699,8 +699,24 @@
           <template x-if="ev.kind === 'memory_read' || ev.kind === 'memory_write'">
             <div class="text-xs text-gray-500" x-text="ev.extra?.operation + ': ' + (ev.extra?.path || '').split('/').pop()"></div>
           </template>
+          <!-- Edit: the backend sends a diff, not the two strings — deleted
+               lines under `-`, added under `+`, unchanged runs named. Colour it
+               per line; one blob would leave the reader diffing by eye. -->
+          <template x-if="isEditDiff(ev)">
+            <div class="text-xs font-mono">
+              <div class="text-gray-400 break-all" x-text="ev.extra?.file_path || ''"></div>
+              <template x-for="(ln, li) in (ev.extra.diff || '').split('\n')" :key="li">
+                <div class="whitespace-pre-wrap break-words px-1"
+                     :class="ln.startsWith('-') ? 'bg-red-50 text-red-700'
+                           : ln.startsWith('+') ? 'bg-green-50 text-green-700'
+                           : 'text-gray-400'"
+                     x-text="ln"></div>
+              </template>
+              <span x-show="ev.extra?.replace_all" class="text-gray-400">replace_all</span>
+            </div>
+          </template>
           <!-- Generic tool_use -->
-          <template x-if="ev.kind === 'tool_use'">
+          <template x-if="ev.kind === 'tool_use' && !isEditDiff(ev)">
             <div class="text-xs text-gray-600 font-mono whitespace-pre-wrap break-words">
               <template x-for="(v, k) in (ev.extra || {})" :key="k">
                 <span class="mr-2"><span class="text-gray-400" x-text="k+'='"></span><span x-text="typeof v==='string' ? v : JSON.stringify(v)"></span></span>
@@ -998,6 +1014,12 @@ function fleet() {
     },
     // A collapsed row is clamped to max-h-32 (~8 lines); offer the toggle only
     // when the text plausibly overflows that.
+    // An Edit row the backend shaped into a diff. An Edit call with neither
+    // string still falls through to the generic k=v row.
+    isEditDiff(ev) {
+      return ev.kind === 'tool_use' && ev.tool === 'Edit' && !!ev.extra?.diff;
+    },
+
     eventIsLong(ev) {
       const t = ev.text || '';
       return t.split('\n').length > 8 || t.length > 400;
