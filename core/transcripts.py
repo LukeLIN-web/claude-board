@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
+from .textcap import (
+    META_CHARS,
+    MESSAGE_CHARS,
+    TOOL_ARG_CHARS,
+    TOOL_RESULT_CHARS,
+    cap_text,
+    edit_diff,
+)
 
 _CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
 _CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
@@ -93,6 +100,18 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
                     ts, kind, "", mem_name, "assistant",
                     {"operation": tool_name.lower(), "path": file_path},
                 ))
+            elif tool_name == "Edit" and isinstance(inp, dict):
+                # The generic branch below caps each arg on its own, and an
+                # Edit's two strings start out identical — all 200 chars go to
+                # the shared prefix and the row shows everything except the
+                # edit. Send the diff of the two instead of the two.
+                extra = {
+                    "file_path": file_path,
+                    "diff": edit_diff(inp.get("old_string"), inp.get("new_string")),
+                }
+                if inp.get("replace_all"):
+                    extra["replace_all"] = True
+                out.append(TurnEvent(ts, "tool_use", "", tool_name, "assistant", extra))
             elif tool_name == "AskUserQuestion":
                 # `questions` is a list, so the generic branch below would collapse
                 # it to `<list>` and drop every option. Expand it into a structured
@@ -145,19 +164,24 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
     return out
 
 
-def _flatten_user(msg: dict) -> list[TurnEvent]:
+def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
     out: list[TurnEvent] = []
     content = msg.get("content") or []
     ts = msg.get("timestamp") or ""
+    # A prompt someone typed is the point of the timeline, so it gets the
+    # generous cap. An `isMeta` row is the harness talking to the model — a
+    # skill body, a command caveat — and is worth a trace, not a wall.
+    limit = META_CHARS if is_meta else MESSAGE_CHARS
+    extra = {"meta": True} if is_meta else {}
     if isinstance(content, str):
-        out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(content), MESSAGE_CHARS), None, "user", {}))
+        out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(content), limit), None, "user", dict(extra)))
         return out
     if not isinstance(content, list):
         return out
     for c in content:
         ct = c.get("type")
         if ct == "text":
-            out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(c.get("text") or ""), MESSAGE_CHARS), None, "user", {}))
+            out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(c.get("text") or ""), limit), None, "user", dict(extra)))
         elif ct == "tool_result":
             content_val = c.get("content")
             if isinstance(content_val, list):
@@ -184,7 +208,8 @@ def _normalize(d: dict) -> list[TurnEvent]:
     if t == "assistant":
         return _flatten_assistant(msg)
     if t == "user":
-        return _flatten_user(msg)
+        # `isMeta` sits on the envelope, not on `message`.
+        return _flatten_user(msg, bool(d.get("isMeta")))
     if t in {"system", "permission-mode"}:
         return [TurnEvent(
             d.get("timestamp", ""), "system",
@@ -505,9 +530,11 @@ def extract_memory_ops(path: str | Path) -> list[dict]:
                 if tool_name == "Write":
                     entry["content_preview"] = (inp.get("content") or "")[:300]
                 elif tool_name == "Edit":
-                    old = (inp.get("old_string") or "")[:100]
-                    new = (inp.get("new_string") or "")[:100]
-                    entry["content_preview"] = f"-{old}\n+{new}" if old else new[:200]
+                    # Same reason as the timeline card: a raw before/after pair
+                    # spends the preview on the prefix both sides share.
+                    entry["content_preview"] = edit_diff(
+                        inp.get("old_string"), inp.get("new_string"), 300,
+                    )
                 ops.append(entry)
     return ops
 
