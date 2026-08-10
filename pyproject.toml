@@ -16,3 +16,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# hydra ships a pytest plugin, and something in this venv installed hydra without
+# pyyaml — so autoloading it crashes `pytest` before a single test is collected.
+# Nothing here uses hydra; skip it rather than carry an unrelated dependency.
+addopts = "-p no:hydra_pytest"

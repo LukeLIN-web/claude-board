@@ -1,9 +1,28 @@
 """Pure-logic tests for core/tmux.py — subprocess.run is always faked."""
+import os
 import subprocess
 import unittest
 from unittest import mock
 
 from core import tmux
+
+# Every argv assertion below is about the command being built, so the module runs
+# with FLEET_TMUX_SOCKET unset. Leaving it to the ambient environment made these
+# tests pass or fail on whether the machine running them had `.env.local`'s
+# socket exported — `tmux …` there, `tmux -L juyi …` here. SocketArgsTests sets
+# the variable itself, and covers what it does.
+_ambient_socket = None
+
+
+def setUpModule():
+    global _ambient_socket
+    env = {k: v for k, v in os.environ.items() if k != "FLEET_TMUX_SOCKET"}
+    _ambient_socket = mock.patch.dict("os.environ", env, clear=True)
+    _ambient_socket.start()
+
+
+def tearDownModule():
+    _ambient_socket.stop()
 
 
 class FakeProc:
