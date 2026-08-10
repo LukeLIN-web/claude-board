@@ -300,6 +300,8 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
             "skills_used": activity.get("skills_used", []),
             "memory_ops": activity.get("memory_ops", []),
             "plan_history": [],
+            # Codex writes no recap, so there is no goal to pin.
+            "goal": None,
             "menu": None,
         }
     events = transcripts.timeline(tp, limit=limit) if tp else []
@@ -320,6 +322,9 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
         "skills_used": transcripts.extract_skills_used(tp) if tp else [],
         "memory_ops": transcripts.extract_memory_ops(tp) if tp else [],
         "plan_history": transcripts.extract_plan_history(tp) if tp else [],
+        # The session's standing goal, pinned above the timeline so it stays put
+        # while the events that stated it scroll away.
+        "goal": transcripts.session_goal(tp) if tp else None,
         # Live interactive menu (AskUserQuestion / permission prompt) parsed from
         # the tmux pane — the transcript doesn't record it until it's resolved.
         "menu": actions.get_pane_menu(pid),
@@ -532,6 +537,8 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
                 "skills_used": transcripts.extract_skills_used(fp),
                 "memory_ops": transcripts.extract_memory_ops(fp),
                 "plan_history": transcripts.extract_plan_history(fp),
+                # What the session was for, still worth reading in the archive.
+                "goal": transcripts.session_goal(fp),
             }
     # Codex transcripts
     from core.codex import CODEX_SESSIONS_DIR

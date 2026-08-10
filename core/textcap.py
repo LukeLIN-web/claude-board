@@ -39,6 +39,12 @@ TOOL_ARG_CHARS = _env_int("CLAUDE_FLEET_TOOL_ARG_CHARS", 200)
 META_CHARS = _env_int("CLAUDE_FLEET_META_CHARS", 200)
 
 
+# The goal sentence pinned above the timeline. One sentence out of a recap, and
+# recaps top out around 300 chars — this only guards against a model that writes
+# a paragraph without a full stop, since the banner never scrolls away.
+GOAL_CHARS = _env_int("CLAUDE_FLEET_GOAL_CHARS", 300)
+
+
 # One Edit rendered as a - / + diff. Bigger than a plain tool arg, since this is
 # the whole point of the row and the shared text has already been dropped.
 EDIT_DIFF_CHARS = _env_int("CLAUDE_FLEET_EDIT_DIFF_CHARS", 400)
