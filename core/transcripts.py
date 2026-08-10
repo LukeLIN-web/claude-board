@@ -25,6 +25,58 @@ _CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL
 # recap.
 _RECAP_HINT_RE = re.compile(r"\s*\(\s*disable recaps in /config\s*\)\s*$")
 
+# Envelopes the CLI writes into a `user` turn that nobody typed, and that carry
+# no `isMeta` — so the text is the only marker there is. `<task-notification>` is
+# a background task reporting back; `<local-command-stdout>` is a slash command's
+# own output echoed into the turn.
+_INJECTED_ENVELOPES = ("<task-notification>", "<local-command-stdout>")
+_TN_STATUS_RE = re.compile(r"<status>\s*(.*?)\s*</status>", re.DOTALL)
+_TN_SUMMARY_RE = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
+
+
+def is_injected_user_row(d: dict) -> bool:
+    """True when a `user` row is the harness talking, not a person typing.
+
+    Three row-level markers, because the CLI added them at different times and a
+    fleet runs several versions at once:
+
+      - `isMeta` — a skill's SKILL.md body, a local-command caveat.
+      - `promptSource: "system"` — the harness speaking in the user's turn.
+      - `origin.kind == "task-notification"` — a background task reporting back.
+
+    A prompt typed on an older CLI carries none of the three, so the test has to
+    stay negative: unmarked means typed. `is_injected_text` catches the rows
+    that arrive with no marker at all.
+    """
+    if d.get("isMeta") or d.get("promptSource") == "system":
+        return True
+    origin = d.get("origin")
+    return isinstance(origin, dict) and origin.get("kind") == "task-notification"
+
+
+def is_injected_text(text: str) -> bool:
+    """True when a user row opens with an envelope no person types."""
+    return text.lstrip().startswith(_INJECTED_ENVELOPES)
+
+
+def _clean_task_notification(text: str) -> str:
+    """A background-task notification as the one line of it worth reading.
+
+    The harness wraps five XML fields, and the two that say anything — status and
+    summary — are the last two: the task id, the tool-use id and the output path
+    ahead of them are addressed to the model. Injected rows are capped short, so
+    left whole the row spends its whole budget on those ids and cuts off right
+    before the summary.
+    """
+    if not is_injected_text(text) or "<task-notification>" not in text:
+        return text
+    status = _TN_STATUS_RE.search(text)
+    summary = _TN_SUMMARY_RE.search(text)
+    if not status and not summary:
+        return text
+    head = f"后台任务 {status.group(1)}" if status else "后台任务"
+    return f"{head}：{summary.group(1)}" if summary else head
+
 
 def _clean_command_text(text: str) -> str:
     """Render a slash-command envelope as a bare command label.
@@ -40,6 +92,11 @@ def _clean_command_text(text: str) -> str:
     args_m = _CMD_ARGS_RE.search(text)
     args = args_m.group(1).strip() if args_m else ""
     return f"{name} {args}".strip()
+
+
+def clean_user_text(text: str) -> str:
+    """A user row's envelope reduced to what it actually says."""
+    return _clean_task_notification(_clean_command_text(text))
 
 
 @dataclass
@@ -173,20 +230,28 @@ def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
     out: list[TurnEvent] = []
     content = msg.get("content") or []
     ts = msg.get("timestamp") or ""
-    # A prompt someone typed is the point of the timeline, so it gets the
-    # generous cap. An `isMeta` row is the harness talking to the model — a
-    # skill body, a command caveat — and is worth a trace, not a wall.
-    limit = META_CHARS if is_meta else MESSAGE_CHARS
-    extra = {"meta": True} if is_meta else {}
+
+    def user_row(raw: str) -> TurnEvent:
+        # A prompt someone typed is the point of the timeline, so it gets the
+        # generous cap. Anything the harness wrote in the user's turn — a skill
+        # body, a command caveat, a background task reporting back — is worth a
+        # trace, not a wall, and is flagged so the board can tell the two apart.
+        injected = is_meta or is_injected_text(raw)
+        return TurnEvent(
+            ts, "user_text",
+            cap_text(clean_user_text(raw), META_CHARS if injected else MESSAGE_CHARS),
+            None, "user", {"meta": True} if injected else {},
+        )
+
     if isinstance(content, str):
-        out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(content), limit), None, "user", dict(extra)))
+        out.append(user_row(content))
         return out
     if not isinstance(content, list):
         return out
     for c in content:
         ct = c.get("type")
         if ct == "text":
-            out.append(TurnEvent(ts, "user_text", cap_text(_clean_command_text(c.get("text") or ""), limit), None, "user", dict(extra)))
+            out.append(user_row(c.get("text") or ""))
         elif ct == "tool_result":
             content_val = c.get("content")
             if isinstance(content_val, list):
@@ -218,6 +283,10 @@ def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     a prompt that waited out a long tool call shows a time earlier than the row
     above it. `extra.queued` lets the client say why instead of looking like a
     clock that ran backwards.
+
+    Claude queues its own background-task notifications the same way, and they
+    outnumber typed prompts here about four to one. Nothing on the attachment
+    says which is which, so the envelope in the text is what marks them.
     """
     a = d.get("attachment") or {}
     if a.get("type") != "queued_command":
@@ -225,10 +294,13 @@ def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     text = a.get("prompt") or ""
     if not text.strip():
         return []
+    extra = {"queued": True}
+    if is_injected_text(text):
+        extra["meta"] = True
     return [TurnEvent(
         d.get("timestamp") or a.get("timestamp") or "", "user_text",
-        cap_text(_clean_command_text(text), MESSAGE_CHARS), None, "user",
-        {"queued": True},
+        cap_text(clean_user_text(text), META_CHARS if extra.get("meta") else MESSAGE_CHARS),
+        None, "user", extra,
     )]
 
 
@@ -339,8 +411,8 @@ def _normalize(d: dict) -> list[TurnEvent]:
     if t == "assistant":
         return _flatten_assistant(msg)
     if t == "user":
-        # `isMeta` sits on the envelope, not on `message`.
-        return _flatten_user(msg, bool(d.get("isMeta")))
+        # The markers sit on the envelope, not on `message`.
+        return _flatten_user(msg, is_injected_user_row(d))
     if t == "attachment":
         return _flatten_queued_prompt(d)
     if t == "system" and d.get("subtype") == "away_summary":
@@ -504,7 +576,9 @@ def current_task_hint(path: str | Path) -> Optional[str]:
             if ev.kind == "assistant_text" and ev.text.strip():
                 first = ev.text.strip().splitlines()[0]
                 return first[:160]
-            if ev.kind == "user_text" and ev.text.strip():
+            # Only what a person typed: a task notification or a skill body is
+            # the harness talking, and reads as a session doing nothing at all.
+            if ev.kind == "user_text" and ev.text.strip() and not ev.extra.get("meta"):
                 first = ev.text.strip().splitlines()[0]
                 return f"↳ {first[:160]}"
     return None
