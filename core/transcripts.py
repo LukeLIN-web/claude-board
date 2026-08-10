@@ -199,6 +199,34 @@ def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
     return out
 
 
+def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
+    """A prompt typed while the session was busy, as the user row it never got.
+
+    A queued prompt reaches Claude one of two ways. If the queue drains at the
+    end of a turn, Claude logs an ordinary `user` row and the timeline already
+    has it. If Claude pulls it off *mid*-turn instead, the only trace is this
+    `queued_command` attachment (plus `queue-operation` bookkeeping): no user row
+    is ever written, so the prompt was missing from the board while the answer to
+    it stayed — which reads as "I said something and the timeline lost it".
+
+    The row lands where Claude read the prompt, but `ts` is when it was typed, so
+    a prompt that waited out a long tool call shows a time earlier than the row
+    above it. `extra.queued` lets the client say why instead of looking like a
+    clock that ran backwards.
+    """
+    a = d.get("attachment") or {}
+    if a.get("type") != "queued_command":
+        return []
+    text = a.get("prompt") or ""
+    if not text.strip():
+        return []
+    return [TurnEvent(
+        d.get("timestamp") or a.get("timestamp") or "", "user_text",
+        cap_text(_clean_command_text(text), MESSAGE_CHARS), None, "user",
+        {"queued": True},
+    )]
+
+
 def _normalize(d: dict) -> list[TurnEvent]:
     t = d.get("type")
     msg = d.get("message") or {}
@@ -210,6 +238,8 @@ def _normalize(d: dict) -> list[TurnEvent]:
     if t == "user":
         # `isMeta` sits on the envelope, not on `message`.
         return _flatten_user(msg, bool(d.get("isMeta")))
+    if t == "attachment":
+        return _flatten_queued_prompt(d)
     if t in {"system", "permission-mode"}:
         return [TurnEvent(
             d.get("timestamp", ""), "system",
@@ -343,7 +373,11 @@ def consumed_prompt_texts(path: str | Path, since: float) -> list[tuple[float, s
                 out.append((ts, text))
             continue
         for ev in _normalize(d):
-            if ev.kind == "user_text" and ev.text.strip():
+            # A queued prompt's `queued_command` attachment is the same delivery
+            # the `remove` row above already counted. Counting it twice would let
+            # one prompt clear two identical copies off the card, one of which is
+            # still waiting in Claude's queue.
+            if ev.kind == "user_text" and ev.text.strip() and not ev.extra.get("queued"):
                 ts = _parse_ts(ev.ts)
                 if ts >= since:
                     out.append((ts, ev.text))
