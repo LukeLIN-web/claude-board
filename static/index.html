@@ -526,6 +526,22 @@
         <span x-show="!timelineData?.menu?.multi" class="text-xs text-gray-400">多个问题：答完一题会自动跳到下一题（点 Refresh 刷新）。"Other"/自由文本用上方输入框。</span>
       </div>
     </div>
+    <!-- The session's standing goal, lifted out of its recaps. Pinned rather than
+         left in the timeline: a goal is stated once and then buried under a few
+         hundred tool rows, which is exactly when someone opens the board to ask
+         what this session is for. -->
+    <div class="mb-3 bg-cyan-50 border border-cyan-200 rounded-lg px-3 py-2" x-show="timelineData?.goal?.text">
+      <div class="flex items-baseline gap-2 mb-1">
+        <span class="text-[10px] font-semibold text-cyan-800 uppercase tracking-wide">🎯 goal</span>
+        <span class="text-[10px] text-cyan-600/70"
+              :title="timelineData?.goal?.source === 'recap'
+                      ? 'Claude 在 recap 里写的目标' : '你发的以 goal 开头的 prompt'"
+              x-text="(timelineData?.goal?.source === 'recap' ? '来自 recap · ' : '来自你发的 goal · ')
+                      + fmtDateTimeET(timelineData?.goal?.ts)"></span>
+      </div>
+      <pre class="text-cyan-900 whitespace-pre-wrap break-words m-0 font-sans"
+           :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="timelineData?.goal?.text || ''"></pre>
+    </div>
     <!-- Most recent prompt the user sent — always visible while a session is open -->
     <div class="mb-3 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2" x-show="timelineData && lastUserPrompt()">
       <div class="text-[10px] font-semibold text-blue-700 uppercase tracking-wide mb-1">最近发送的 prompt</div>
@@ -656,6 +672,7 @@
                'border-sky-400 border-dashed': ev.kind==='memory_read',
                'border-pink-500': ev.kind==='memory_write',
                'border-violet-500': ev.kind==='model',
+               'border-cyan-500': ev.kind==='recap',
                'border-gray-300': ev.kind==='tool_result'||ev.kind==='system'
              }">
           <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
@@ -680,7 +697,13 @@
             <template x-if="ev.kind==='model'">
               <span class="text-violet-600 font-medium">🔀 model</span>
             </template>
-            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write' && ev.kind!=='ask_question' && ev.kind!=='model'">
+            <!-- The recap Claude writes when you've been away: where the session
+                 got to, and what it wants next. -->
+            <template x-if="ev.kind==='recap'">
+              <span class="text-cyan-700 font-medium"
+                    title="Claude 在你离开后写的进度小结（transcript 里的 away_summary）">📋 recap</span>
+            </template>
+            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write' && ev.kind!=='ask_question' && ev.kind!=='model' && ev.kind!=='recap'">
               <span :class="{'text-blue-600': ev.kind==='user_text', 'text-emerald-600': ev.kind==='assistant_text', 'text-amber-600': ev.kind==='tool_use', 'text-gray-500': true}"
                     class="font-medium"
                     x-text="ev.kind==='tool_use' ? ev.tool : ev.kind.replace('_text','').replace('tool_result','result')"></span>
@@ -762,9 +785,16 @@
             <div class="text-xs font-medium text-violet-700" x-text="ev.text || ''"
                  :title="ev.extra?.model || ''"></div>
           </template>
+          <!-- Recap: a couple of sentences, and the row someone scanning a card
+               after being away should land on. Tinted so it reads as the
+               session's standing summary, not as one more reply in the run. -->
+          <template x-if="ev.kind === 'recap'">
+            <pre class="text-cyan-900 bg-cyan-50 rounded px-2 py-1.5 whitespace-pre-wrap break-words"
+                 :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
+          </template>
           <!-- Everything else (tool results): wrapped, and clamped only until
                the reader asks for the rest — nothing is cut in the markup. -->
-          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'user_text' && ev.kind !== 'ask_question' && ev.kind !== 'model'">
+          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'user_text' && ev.kind !== 'ask_question' && ev.kind !== 'model' && ev.kind !== 'recap'">
             <div>
               <pre class="text-xs text-gray-700 whitespace-pre-wrap break-words"
                    :class="eventExpanded[ev._idx] ? '' : 'max-h-32 overflow-y-auto'"

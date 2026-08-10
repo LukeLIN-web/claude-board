@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .textcap import (
+    GOAL_CHARS,
     META_CHARS,
     MESSAGE_CHARS,
     TOOL_ARG_CHARS,
@@ -19,6 +20,10 @@ from .textcap import (
 
 _CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
 _CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
+# Claude appends this to a recap for the first while, as a TUI affordance. The
+# board has no /config, so on a card it's just a line of noise repeated on every
+# recap.
+_RECAP_HINT_RE = re.compile(r"\s*\(\s*disable recaps in /config\s*\)\s*$")
 
 
 def _clean_command_text(text: str) -> str:
@@ -227,6 +232,104 @@ def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     )]
 
 
+def _flatten_recap(d: dict) -> list[TurnEvent]:
+    """The recap Claude writes when you've been away, as a timeline row.
+
+    Claude logs it as `system`/`away_summary`: two or three sentences of where
+    the session got to and what it needs next. The board is read by someone who
+    was away by definition, and that summary is the single most useful row in the
+    transcript for them — but every `system` row currently flattens to the same
+    placeholder the client hides, so it was the one thing the timeline dropped.
+
+    Its own `kind`, not `assistant_text`: nobody asked for it, it isn't part of
+    the turn it sits in, and the client styles it as the standing "where we are"
+    rather than as another reply.
+    """
+    text = _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
+    if not text:
+        return []
+    return [TurnEvent(
+        d.get("timestamp", ""), "recap", cap_text(text, MESSAGE_CHARS),
+        None, "system", {},
+    )]
+
+
+# "Goal: ship X", "Goal is shipping X", "目标：交付 X". Claude labels the goal
+# this way in about half the recaps it writes; the other half state the same
+# thing without the label, and guessing which opening sentence counts as a goal
+# would put a wrong one on permanent display. Only the labelled ones are taken.
+_GOAL_RE = re.compile(r"^\s*(?:goal|目标|本次目标)\s*(?:is\s+|[:：是]\s*)(.+)$",
+                      re.IGNORECASE | re.DOTALL)
+# End of the first sentence. A semicolon always ends it — Claude uses one to
+# hang the current status off the goal ("…on G1 data; the plan is written"), and
+# nothing else puts one mid-sentence. A period only ends it when a new sentence
+# follows (whitespace, then a capital) or the text does: that lookahead is what
+# keeps "pi0.5" and "53.8%" from cutting a goal off one word in.
+_SENT_END_RE = re.compile(r"[。！？；;]|[.!?](?=\s+[A-Z(\[\"'])|[.!?]\s*$")
+
+
+def _first_sentence(text: str) -> str:
+    m = _SENT_END_RE.search(text)
+    return (text[:m.start()] if m else text).strip()
+
+
+# A prompt opened with "goal …" — the way this fleet actually sets one, and the
+# only goal a session running CLI ≥ 2.1.221 has, since that build stopped writing
+# recaps. `_clean_command_text` has already unwrapped a real `/goal` by the time
+# this sees it, so both spellings land here.
+_PROMPT_GOAL_RE = re.compile(r"^\s*goal\b[:：]?\s+(.+)$", re.IGNORECASE | re.DOTALL)
+
+
+def session_goal(path: str | Path) -> Optional[dict]:
+    """What this session is for, as {text, ts, source} — None if it never said.
+
+    Two sources, newest wins, because either can be the only one present:
+
+      - `recap`: Claude opens a recap with "Goal: …" when the session has a
+        standing objective, and repeats it as the work moves. Taken from the
+        newest *labelled* recap rather than simply the newest one, since a later
+        recap can drop the label while the goal still stands.
+      - `prompt`: a prompt the user opened with "goal …". Recaps are the better
+        source when they exist — Claude keeps them current — but they stopped
+        being written after CLI 2.1.220, so on a session running today this is
+        all there is.
+
+    Either way the point is to outlive the timeline. A goal is stated once and
+    then buried under a few hundred tool rows, which is exactly when someone
+    opens the board to ask what a session is even doing.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    goal: Optional[dict] = None
+
+    def offer(text: str, ts: str, source: str) -> None:
+        nonlocal goal
+        text = _first_sentence(text)
+        if not text:
+            return
+        # Ties go to whatever came later in the file: a recap is written after
+        # the turn it summarizes, so on an equal stamp it is the fresher word.
+        if goal is None or _parse_ts(ts) >= _parse_ts(goal["ts"]):
+            goal = {"text": cap_text(text, GOAL_CHARS), "ts": ts, "source": source}
+
+    for d in _iter_lines(p):
+        if d.get("type") == "system" and d.get("subtype") == "away_summary":
+            content = _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
+            m = _GOAL_RE.match(content)
+            if m:
+                offer(m.group(1), d.get("timestamp", ""), "recap")
+            continue
+        # Anything the user typed, including a prompt Claude took off its queue.
+        for ev in _normalize(d):
+            if ev.kind != "user_text" or ev.extra.get("meta"):
+                continue
+            m = _PROMPT_GOAL_RE.match(ev.text)
+            if m:
+                offer(m.group(1), ev.ts, "prompt")
+    return goal
+
+
 def _normalize(d: dict) -> list[TurnEvent]:
     t = d.get("type")
     msg = d.get("message") or {}
@@ -240,6 +343,8 @@ def _normalize(d: dict) -> list[TurnEvent]:
         return _flatten_user(msg, bool(d.get("isMeta")))
     if t == "attachment":
         return _flatten_queued_prompt(d)
+    if t == "system" and d.get("subtype") == "away_summary":
+        return _flatten_recap(d)
     if t in {"system", "permission-mode"}:
         return [TurnEvent(
             d.get("timestamp", ""), "system",
