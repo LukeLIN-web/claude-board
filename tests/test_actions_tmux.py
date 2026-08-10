@@ -1,4 +1,5 @@
 """Tests for the tmux-backed wrappers in core/actions.py (create_session, send_prompt)."""
+import contextlib
 import os
 import tempfile
 import types
@@ -10,6 +11,33 @@ from core import actions
 
 def _fake_window(tty, platform="claude", session_id=None):
     return types.SimpleNamespace(tty=tty, platform=platform, session_id=session_id)
+
+
+def _preflight_ok(foreground="node"):
+    """A pane that's ready to be typed into.
+
+    Before it types, `send_prompt` inspects the pane: what's in the foreground,
+    whether it's in copy mode, whether a /btw aside or a cancellable dialog is
+    covering the composer, and whether the composer has drawn yet. None of that
+    is stubbed by a `send_text` mock, so tests that only mocked the send were
+    running the whole inspection against this machine's real tmux server —
+    failing on an unrelated pane, or blocking for 15s in the composer wait.
+
+    Pass foreground=None to leave `pane_current_command` alone for tests that
+    drive it themselves.
+    """
+    stack = contextlib.ExitStack()
+    if foreground is not None:
+        stack.enter_context(mock.patch.object(
+            actions.tmux, "pane_current_command", return_value=foreground))
+    stack.enter_context(mock.patch.object(
+        actions.tmux, "exit_copy_mode", return_value={"ok": True}))
+    stack.enter_context(mock.patch.object(actions, "_archive_open_aside"))
+    stack.enter_context(mock.patch.object(actions, "_dismiss_answer_overlay"))
+    stack.enter_context(mock.patch.object(actions, "_clear_blocker", return_value=None))
+    stack.enter_context(mock.patch.object(
+        actions, "_wait_composer_ready", return_value=True))
+    return stack
 
 
 class CreateSessionTests(unittest.TestCase):
@@ -55,7 +83,8 @@ class CreateSessionTests(unittest.TestCase):
 
 class SendPromptTests(unittest.TestCase):
     def test_happy_path_resolves_pane_and_sends(self):
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+        with _preflight_ok(), \
+             mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5") as pf, \
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, "hello")
@@ -70,7 +99,8 @@ class SendPromptTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
     def test_codex_window_gets_settle_before_enter(self):
-        with mock.patch.object(actions, "find_window",
+        with _preflight_ok(), \
+             mock.patch.object(actions, "find_window",
                                return_value=_fake_window("/dev/pts/3", platform="codex")), \
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
@@ -85,7 +115,8 @@ class SendPromptTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
     def test_newlines_collapsed_to_spaces(self):
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+        with _preflight_ok(), \
+             mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             actions.send_prompt(1234, "line1\nline2\nline3")
@@ -111,7 +142,8 @@ class SendPromptTests(unittest.TestCase):
         # The lookup is best-effort: an unrecognized or unresolvable foreground
         # command (node, claude, "") must not block the send.
         for cmd in ("claude", "node", "", None):
-            with mock.patch.object(actions, "find_window",
+            with _preflight_ok(foreground=None), \
+                 mock.patch.object(actions, "find_window",
                                    return_value=_fake_window("/dev/pts/3")), \
                  mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
                  mock.patch.object(actions.tmux, "pane_current_command",
@@ -158,7 +190,8 @@ class SendPromptTests(unittest.TestCase):
 
     def test_max_length_accepted(self):
         ok_text = "a" * 8000
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
+        with _preflight_ok(), \
+             mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
              mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
             r = actions.send_prompt(1234, ok_text)

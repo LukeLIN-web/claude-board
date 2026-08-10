@@ -23,6 +23,17 @@ class RequestModelTests(unittest.TestCase):
 
 
 class CreateRouteTests(unittest.TestCase):
+    """Dispatch only. The route guards on the machine-local cwd filter first, so
+    these say the cwd is visible rather than inheriting whether this machine's
+    `CLAUDE_FLEET_CWD_INCLUDE` happens to cover /tmp — it doesn't, which is what
+    used to fail them here and pass them on a box with no filter set. The guard
+    itself is `test_hidden_cwd_is_refused` below."""
+
+    def setUp(self):
+        p = mock.patch.object(appmod.sessions, "_cwd_visible", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_dispatches_to_create_session(self):
         with mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
             r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp"))
@@ -34,6 +45,19 @@ class CreateRouteTests(unittest.TestCase):
             r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp", platform="codex"))
         m.assert_called_once_with("/tmp", "codex")
         self.assertTrue(r["ok"])
+
+
+class CreateRouteVisibilityTests(unittest.TestCase):
+    def test_hidden_cwd_is_refused(self):
+        # Spawning into a dir the board filters out would create a card that the
+        # dashboard then refuses to show.
+        import fastapi
+        with mock.patch.object(appmod.sessions, "_cwd_visible", return_value=False), \
+             mock.patch.object(appmod.actions, "create_session") as m:
+            with self.assertRaises(fastapi.HTTPException) as cm:
+                appmod.api_window_create(appmod.CreateBody(cwd="/tmp"))
+        self.assertEqual(cm.exception.status_code, 403)
+        m.assert_not_called()
 
 
 class PromptRouteTests(unittest.TestCase):
