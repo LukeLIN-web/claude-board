@@ -228,6 +228,85 @@ class ConsumedPromptTextsTests(unittest.TestCase):
         self.assertEqual(transcripts.consumed_prompt_texts("/nope.jsonl", since=0.0), [])
 
 
+class QueuedPromptTimelineTests(unittest.TestCase):
+    """A prompt sent into a busy session still belongs in the timeline.
+
+    Rows captured from a live session: the user typed "说错了, 60-65" while Claude
+    was mid-turn, Claude pulled it off its queue at the next tool boundary and
+    answered it — and the transcript holds no `user` row for it anywhere. The
+    board used to show the answer with nothing it was answering.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "t.jsonl"
+
+    def _write(self, rows: list[dict]) -> None:
+        self.path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def _mid_turn_pickup(self, text: str) -> list[dict]:
+        return [
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-08-10T10:52:36.610Z", "content": text},
+            {"type": "assistant", "timestamp": "2026-08-10T10:52:50.350Z",
+             "message": {"model": "claude-opus-5", "content": [
+                 {"type": "text", "text": "马上腾出 nnmc72。"}]}},
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": "2026-08-10T10:53:06.014Z", "content": text},
+            {"type": "attachment", "timestamp": "2026-08-10T10:52:36.609Z",
+             "attachment": {"type": "queued_command", "prompt": text,
+                            "commandMode": "prompt", "origin": {"kind": "human"},
+                            "timestamp": "2026-08-10T10:52:36.609Z"}},
+            {"type": "assistant", "timestamp": "2026-08-10T10:53:27.447Z",
+             "message": {"model": "claude-opus-5", "content": [
+                 {"type": "text", "text": "收到,改 60-65。"}]}},
+        ]
+
+    def test_a_prompt_taken_mid_turn_shows_up_once(self):
+        self._write(self._mid_turn_pickup("说错了, 60-65"))
+        evs = transcripts.timeline(self.path)
+        prompts = [e for e in evs if e["kind"] == "user_text"]
+        self.assertEqual([e["text"] for e in prompts], ["说错了, 60-65"])
+        # Sent at 10:52:36, read at 10:53:06: the row sits just above the answer
+        # it explains, and carries the time it was sent.
+        self.assertTrue(prompts[0]["extra"]["queued"])
+        self.assertEqual(prompts[0]["ts"], "2026-08-10T10:52:36.609Z")
+        self.assertEqual([e["kind"] for e in evs][-2:], ["user_text", "assistant_text"])
+
+    def test_a_prompt_the_queue_drained_normally_is_not_doubled(self):
+        # The other delivery path: the queue drains at the end of a turn and
+        # Claude logs a real user row. Only `dequeue` is written (no content, no
+        # attachment), so there's nothing here to render twice.
+        self._write([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-08-10T10:52:36.610Z", "content": "继续"},
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-08-10T10:53:06.014Z"},
+            {"type": "user", "timestamp": "2026-08-10T10:53:06.020Z",
+             "message": {"role": "user", "content": "继续"}},
+        ])
+        evs = transcripts.timeline(self.path)
+        self.assertEqual([e["text"] for e in evs if e["kind"] == "user_text"], ["继续"])
+
+    def test_the_card_still_counts_one_pickup_as_one(self):
+        # The timeline reads the attachment and the queue reconcile reads the
+        # `remove` row — the same pickup. If both fed the reconcile, one prompt
+        # would clear two identical sends, one of which is still queued.
+        promptqueue._sent.clear()
+        t0 = time.time()
+        promptqueue.record_sent(1, "ping", ts=t0)
+        promptqueue.record_sent(1, "ping", ts=t0)
+        rows = self._mid_turn_pickup("ping")
+        for r in rows:  # same rows, restamped to land after the two sends
+            r["timestamp"] = _iso(t0 + 5)
+            if r.get("type") == "attachment":
+                r["attachment"]["timestamp"] = _iso(t0 + 5)
+        self.path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        out = promptqueue.pending(1, str(self.path), "busy")
+        self.assertEqual([o["text"] for o in out], ["ping"])  # one still waiting
+
+
 class QueueReconcileIntegrationTests(unittest.TestCase):
     """End-to-end: record a send, then reconcile against a real transcript file."""
 

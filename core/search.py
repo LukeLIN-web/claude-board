@@ -49,6 +49,14 @@ def _extract_text(d: dict) -> str:
                 if isinstance(c, dict) and c.get("type") == "tool_use":
                     return f"<tool:{c.get('name')}>"
         return ""
+    # A prompt sent while the session was busy: Claude writes no user row for it
+    # (see transcripts._flatten_queued_prompt), so without these two the only
+    # hits for it are raw jsonl lines rendered as JSON.
+    if t == "attachment":
+        a = d.get("attachment") or {}
+        return (a.get("prompt") or "") if a.get("type") == "queued_command" else ""
+    if t == "queue-operation":
+        return d.get("content") or ""
     # Codex format
     if t == "event_msg":
         payload = d.get("payload") or {}
@@ -78,6 +86,10 @@ def _extract_type_label(d: dict) -> str:
         return "user"
     if t == "assistant":
         return "assistant"
+    if t == "attachment" and (d.get("attachment") or {}).get("type") == "queued_command":
+        return "user:queued"
+    if t == "queue-operation":
+        return f"queue:{d.get('operation', '')}"
     if t == "event_msg":
         role = (d.get("payload") or {}).get("role", "")
         return f"codex:{role}" if role else "codex:event"

@@ -690,6 +690,13 @@
             <template x-if="ev.extra?.meta">
               <span class="text-gray-400">（注入）</span>
             </template>
+            <!-- Typed while the session was busy, so Claude took it off its own
+                 queue here instead of at the top of a turn. The time is when it
+                 was sent, which can predate the row above it. -->
+            <template x-if="ev.extra?.queued">
+              <span class="text-indigo-500"
+                    title="排队发出的 prompt：时间是发送时刻，位置是 Claude 从队列取走它的时刻">⏳（排队）</span>
+            </template>
           </div>
           <!-- Skill args -->
           <template x-if="ev.kind === 'skill_invoke'">
