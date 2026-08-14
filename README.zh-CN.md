@@ -136,6 +136,29 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 > tab → 切过去）。想换别的终端 / 窗口管理器，放一个可执行的 `~/.claude/focus-tty.sh`（接收一个
 > `<tty>` 参数）即可，它优先于自带默认。
 
+### 远程访问
+
+server 只监听 loopback。想从手机或别的机器打开面板，用
+[`scripts/tunnel.sh`](scripts/tunnel.sh) 把它发布到一个固定的
+[ngrok](https://ngrok.com) 域名上，前面挡一层 Google 登录：
+
+```console
+$ scripts/tunnel.sh start          # 还有：stop | status
+[tunnel] up -> https://<your-domain>.ngrok-free.dev (Google sign-in required)
+```
+
+域名和放行的邮箱写在 `.env.local` 的 `FLEET_TUNNEL_DOMAIN` /
+`FLEET_TUNNEL_ALLOWED_EMAILS`，ngrok authtoken 用 `ngrok config add-authtoken`
+存到 ngrok 自己的配置里——这些都不该进仓库。
+
+> **那层登录是承重的。** 这个应用自身没有任何认证，而
+> `POST /api/windows/<pid>/keys` 会往 tmux pane 里敲键——不设防的隧道就等于在一个
+> 会被扫描的固定域名上开了个公网 shell。脚本自己生成 ngrok traffic policy，没有
+> policy 就拒绝启动。两条规则缺一不可：先要 Google 登录，再查白名单，否则全世界任何
+> 一个 Google 账号都算数。用不在名单上的邮箱登录会拿到 403。
+
+注意 OAuth 之后 HTTP API 只能在浏览器里用了——`curl` 打 `/api/*` 会被重定向到登录页。
+
 ## 架构
 
 单文件前端（Alpine.js + Tailwind CDN，不需要 npm）。Python 后端从不写入 `~/.claude/` 和 `~/.codex/` 中存储的 harness 数据——这些数据保持只读。它**默认只读**：少数显式的、用户触发的操作（fork、close，以及 Linux 上基于 tmux 的新建会话 / 单条 prompt 注入，包括 Clear/Commit/Review 这几个 prompt 快捷按钮）作用于运行中的会话，而非存储的数据。

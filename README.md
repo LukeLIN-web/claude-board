@@ -170,6 +170,31 @@ a lookup, not a heuristic.
 > drop an executable `~/.claude/focus-tty.sh` taking a `<tty>` arg; it takes
 > precedence over the bundled default.
 
+### Remote access
+
+The server binds loopback only. To reach the board from a phone or another
+machine, [`scripts/tunnel.sh`](scripts/tunnel.sh) publishes it on a reserved
+[ngrok](https://ngrok.com) domain behind a Google sign-in:
+
+```console
+$ scripts/tunnel.sh start          # also: stop | status
+[tunnel] up -> https://<your-domain>.ngrok-free.dev (Google sign-in required)
+```
+
+Set your domain and the addresses allowed in via `FLEET_TUNNEL_DOMAIN` /
+`FLEET_TUNNEL_ALLOWED_EMAILS` in `.env.local`, and store the ngrok authtoken
+with `ngrok config add-authtoken` — none of it belongs in the repo.
+
+> **The login is load-bearing.** This app has no authentication of its own, and
+> `POST /api/windows/<pid>/keys` types into a tmux pane — an unprotected tunnel
+> is a public shell on a fixed hostname that gets scanned. The script generates
+> the ngrok traffic policy itself and refuses to start without one. It takes two
+> rules: a Google sign-in *and* an allow-list check, or every Google account on
+> earth would qualify. Signing in with an address that is not listed gets a 403.
+
+Note that OAuth makes the HTTP API browser-only — `curl` against `/api/*`
+answers with a redirect to the login.
+
 ## Architecture
 
 Single-file frontend (Alpine.js + Tailwind via CDN — no npm). The Python backend
