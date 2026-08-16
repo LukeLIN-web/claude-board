@@ -172,28 +172,62 @@ a lookup, not a heuristic.
 
 ### Remote access
 
-The server binds loopback only. To reach the board from a phone or another
-machine, [`scripts/tunnel.sh`](scripts/tunnel.sh) publishes it on a reserved
-[ngrok](https://ngrok.com) domain behind a Google sign-in:
+The server binds loopback only. Two ways to reach it from a phone, differing in
+*where the login lives*.
+
+> **The login is load-bearing, whichever you pick.**
+> `POST /api/windows/<pid>/keys` types into a tmux pane, so an unprotected
+> tunnel is a public shell on a hostname that gets scanned. Both scripts below
+> refuse to publish a board they cannot prove is protected.
+
+**A fixed domain, login at the edge** — [`scripts/tunnel.sh`](scripts/tunnel.sh)
+publishes on a reserved [ngrok](https://ngrok.com) domain behind a Google
+sign-in:
 
 ```console
 $ scripts/tunnel.sh start          # also: stop | status
 [tunnel] up -> https://<your-domain>.ngrok-free.dev (Google sign-in required)
 ```
 
-Set your domain and the addresses allowed in via `FLEET_TUNNEL_DOMAIN` /
-`FLEET_TUNNEL_ALLOWED_EMAILS` in `.env.local`, and store the ngrok authtoken
-with `ngrok config add-authtoken` — none of it belongs in the repo.
+Set `FLEET_TUNNEL_DOMAIN` / `FLEET_TUNNEL_ALLOWED_EMAILS` in `.env.local`, and
+store the authtoken with `ngrok config add-authtoken` — none of it belongs in
+the repo. The script generates the ngrok traffic policy itself and refuses to
+start without one. It takes two rules: a Google sign-in *and* an allow-list
+check, or every Google account on earth would qualify.
 
-> **The login is load-bearing.** This app has no authentication of its own, and
-> `POST /api/windows/<pid>/keys` types into a tmux pane — an unprotected tunnel
-> is a public shell on a fixed hostname that gets scanned. The script generates
-> the ngrok traffic policy itself and refuses to start without one. It takes two
-> rules: a Google sign-in *and* an allow-list check, or every Google account on
-> earth would qualify. Signing in with an address that is not listed gets a 403.
+**A free random URL, login in the app** — [`scripts/cf-tunnel.sh`](scripts/cf-tunnel.sh)
+uses a [Cloudflare](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
+quick tunnel, which needs no account and no domain:
 
-Note that OAuth makes the HTTP API browser-only — `curl` against `/api/*`
-answers with a redirect to the login.
+```console
+$ scripts/cf-tunnel.sh start       # also: stop | status | url
+[cf-tunnel] up -> https://<random-words>.trycloudflare.com (password required)
+```
+
+A quick tunnel has no edge policy at all, so here the gate is the app's own
+password ([`core/auth.py`](core/auth.py)): set `FLEET_AUTH_PASSWORD` in
+`.env.local` and restart the board. The script *probes* the running server and
+refuses to publish unless an anonymous request is actually rejected — it does
+not just read the variable, because `run.sh` runs uvicorn detached and a
+password added after startup is set in your shell and absent in the process.
+The URL is random and changes on every start; `cf-tunnel.sh url` reprints it.
+
+The two are independent. The password gate works behind either tunnel, or
+behind none — it is on whenever `FLEET_AUTH_PASSWORD` is set, and off (loopback
+use only) when it is not.
+
+> **There is no exemption for loopback**, deliberately: tunnel daemons connect
+> to `127.0.0.1`, so every remote request looks local, and "trust local
+> requests" would be a public bypass. Whoever is sitting at the machine logs in
+> too.
+
+Scripted access differs between the two. Under ngrok's OAuth the API is
+browser-only — `curl` against `/api/*` gets a redirect to Google. The password
+gate instead accepts `Authorization: Bearer $FLEET_API_TOKEN` if you set one:
+
+```console
+$ curl -H "Authorization: Bearer $FLEET_API_TOKEN" http://127.0.0.1:7879/api/windows
+```
 
 ## Architecture
 

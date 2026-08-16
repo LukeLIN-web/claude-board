@@ -138,9 +138,14 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 
 ### 远程访问
 
-server 只监听 loopback。想从手机或别的机器打开面板，用
-[`scripts/tunnel.sh`](scripts/tunnel.sh) 把它发布到一个固定的
-[ngrok](https://ngrok.com) 域名上，前面挡一层 Google 登录：
+server 只监听 loopback。从手机打开面板有两条路，区别在于**那层登录挡在哪里**。
+
+> **无论选哪条，那层登录都是承重的。**
+> `POST /api/windows/<pid>/keys` 会往 tmux pane 里敲键，所以不设防的隧道就是在一个
+> 会被扫描的域名上开了个公网 shell。下面两个脚本都拒绝发布一个它无法证明是设防的面板。
+
+**固定域名，登录挡在边缘** —— [`scripts/tunnel.sh`](scripts/tunnel.sh) 发布到一个
+固定的 [ngrok](https://ngrok.com) 域名上，前面是 Google 登录：
 
 ```console
 $ scripts/tunnel.sh start          # 还有：stop | status
@@ -148,16 +153,41 @@ $ scripts/tunnel.sh start          # 还有：stop | status
 ```
 
 域名和放行的邮箱写在 `.env.local` 的 `FLEET_TUNNEL_DOMAIN` /
-`FLEET_TUNNEL_ALLOWED_EMAILS`，ngrok authtoken 用 `ngrok config add-authtoken`
-存到 ngrok 自己的配置里——这些都不该进仓库。
+`FLEET_TUNNEL_ALLOWED_EMAILS`，authtoken 用 `ngrok config add-authtoken` 存到
+ngrok 自己的配置里——这些都不该进仓库。脚本自己生成 traffic policy，没有 policy 就
+拒绝启动。两条规则缺一不可：先要 Google 登录，再查白名单，否则全世界任何一个 Google
+账号都算数。
 
-> **那层登录是承重的。** 这个应用自身没有任何认证，而
-> `POST /api/windows/<pid>/keys` 会往 tmux pane 里敲键——不设防的隧道就等于在一个
-> 会被扫描的固定域名上开了个公网 shell。脚本自己生成 ngrok traffic policy，没有
-> policy 就拒绝启动。两条规则缺一不可：先要 Google 登录，再查白名单，否则全世界任何
-> 一个 Google 账号都算数。用不在名单上的邮箱登录会拿到 403。
+**免费随机域名，登录挡在应用里** —— [`scripts/cf-tunnel.sh`](scripts/cf-tunnel.sh)
+用 [Cloudflare](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
+quick tunnel，不需要账号，也不需要域名：
 
-注意 OAuth 之后 HTTP API 只能在浏览器里用了——`curl` 打 `/api/*` 会被重定向到登录页。
+```console
+$ scripts/cf-tunnel.sh start       # 还有：stop | status | url
+[cf-tunnel] up -> https://<random-words>.trycloudflare.com (password required)
+```
+
+quick tunnel 在边缘没有任何策略可言，所以这里的门是应用自己的密码
+（[`core/auth.py`](core/auth.py)）：在 `.env.local` 里设 `FLEET_AUTH_PASSWORD`，然后
+重启面板。脚本会**实际探测**跑着的 server，匿名请求确实被挡下来了才肯发布——它不是去读
+那个环境变量，因为 `run.sh` 是 detached 起 uvicorn 的，启动之后才加的密码只存在于你的
+shell 里，那个正在服务的进程根本不知道。URL 是随机的、每次启动都变，`cf-tunnel.sh url`
+可以再打印一遍。
+
+两条路互不依赖。密码门在哪种隧道后面都能用，不开隧道也能用——设了
+`FLEET_AUTH_PASSWORD` 就是开，没设就是关（只适合 loopback 自用）。
+
+> **代码里没有任何对 loopback 的放行**，这是故意的：隧道进程是连 `127.0.0.1` 的，所以
+> 每个远端请求看起来都像本地请求，"信任本地请求"就是一把公开的万能钥匙。坐在这台机器前
+> 面的人也一样要登录。
+
+脚本访问 API 这一点上两者不同。ngrok 的 OAuth 之后 API 只能在浏览器里用——`curl` 打
+`/api/*` 会被重定向到 Google。密码门则接受 `Authorization: Bearer $FLEET_API_TOKEN`
+（如果你设了这个变量）：
+
+```console
+$ curl -H "Authorization: Bearer $FLEET_API_TOKEN" http://127.0.0.1:7879/api/windows
+```
 
 ## 架构
 

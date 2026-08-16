@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, btwcapture, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, auth, btwcapture, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -220,6 +220,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Fleet", lifespan=lifespan)
+
+# The password gate, if .env.local sets FLEET_AUTH_PASSWORD. This registers the
+# login routes and wraps the whole ASGI app, so every route below — and every
+# route added later — is behind it by construction. See core/auth.py for why
+# there is no loopback exemption. With no password set it is a pass-through and
+# the board behaves exactly as it always has on 127.0.0.1; scripts/cf-tunnel.sh
+# is the piece that refuses to publish an ungated board.
+auth.install(app)
 
 
 # ---------- routes ----------

@@ -935,6 +935,26 @@
 </div>
 
 <script>
+// When the board is published behind the password gate (core/auth.py), an
+// expired cookie turns every /api/* call into a 401. The call sites below all
+// go straight to r.json(), so without this they'd fail on parsing HTML-less
+// error bodies and the board would just sit there looking broken. Wrapping
+// fetch once puts the redirect in one place instead of at fourteen call sites
+// and any added later.
+(function () {
+  const inner = window.fetch;
+  window.fetch = async function (...args) {
+    const r = await inner.apply(this, args);
+    if (r.status === 401) {
+      location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search + location.hash);
+      // Never settles, so callers don't run their .json() against a redirect
+      // that is already navigating the page away.
+      return new Promise(() => {});
+    }
+    return r;
+  };
+})();
+
 function fleet() {
   return {
     windows: [],
@@ -961,6 +981,9 @@ function fleet() {
     toasts: [],
     toastSeq: 0,
     evtSource: null,
+    // Pending SSE reconnect, so a burst of onerror firings schedules one retry
+    // rather than one per firing.
+    _reconnectTimer: null,
     historySessions: [],
     historyTotal: 0,
     historyPage: 1,
@@ -1073,7 +1096,18 @@ function fleet() {
           this.applySnapshot(JSON.parse(e.data));
         });
         this.evtSource.onerror = () => {
-          setTimeout(() => {
+          // onerror fires once per failed connection attempt, so without this
+          // guard a flapping phone connection stacks a new timer — and now a
+          // new server round trip — on every firing, while the streams they
+          // opened are never closed.
+          if (this._reconnectTimer) return;
+          this._reconnectTimer = setTimeout(() => {
+            this._reconnectTimer = null;
+            // EventSource hides the status code, so a stream dropped by an
+            // expired auth cookie is indistinguishable from a network blip.
+            // This probe goes through the wrapped fetch above, which turns a
+            // 401 into a redirect to the login page.
+            fetch('/api/windows').catch(() => {});
             if (this.evtSource) this.evtSource.close();
             this.evtSource = new EventSource('/api/events');
             this.evtSource.addEventListener('snapshot', (e) => {
@@ -1188,6 +1222,10 @@ function fleet() {
     // body; on a hard network failure after the retry it returns a normalized
     // { ok:false, error, netError:true } so callers show "couldn't reach the
     // server" instead of leaking a raw TypeError or a misleading server message.
+    // One case never resolves at all: a 401 from the password gate, which the
+    // fetch wrapper at the top of this script turns into a navigation to
+    // /login. Callers with a `finally` that clears a spinner won't run it —
+    // harmless, because the page is already leaving.
     async apiPost(url, body) {
       const opts = { method: 'POST' };
       if (body !== undefined) {
