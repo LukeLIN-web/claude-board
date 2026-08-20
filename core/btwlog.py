@@ -16,6 +16,7 @@ is a warm cache.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -91,19 +92,43 @@ def record(session_id: str, question: str, answer: str) -> Optional[dict]:
     return entry
 
 
+# Terminal crumbs a pane capture splices into the overlay's text while the pane
+# repaints: the footer's "↑/↓ to scroll" hint and the ─/▔ rules of the composer and
+# the overlay border get painted over the answer region, and a redraw re-wraps
+# lines so whitespace lands differently. None of it is part of the answer, but a
+# literal comparison treats it as content — which is how a slice of an
+# already-archived aside stops looking like a prefix of it and reopens the capture
+# gate on every poll (see core.btwcapture). Compare on a crumb-free, whitespace-free
+# fingerprint instead. Applied to BOTH sides, so a genuine ↑ or ─ inside an answer
+# is stripped from stored and probe alike and still matches.
+_BTW_CRUMBS_RE = re.compile(r"[↑↓]/?|[─━▔│]+")
+
+
+def _fingerprint(text: str) -> str:
+    """Crumb- and whitespace-free form of an aside's text, for gate comparisons
+    only — the archive always stores what was actually scraped."""
+    return "".join(_BTW_CRUMBS_RE.sub("", text or "").split())
+
+
 def has_prefix(session_id: str, question: str, answer_prefix: str) -> bool:
     """Is an aside with this question, whose stored answer *starts with*
     `answer_prefix`, already archived? The scroll-stitch capture is top-anchored,
     so the visible top slice is a prefix of the full answer — this lets the gate
     (core.btwcapture) recognise an already-fully-captured aside from its cheap top
-    slice and skip re-scraping it (which would re-inject scroll keys)."""
+    slice and skip re-scraping it (which would re-inject scroll keys).
+
+    Compared on `_fingerprint`, not raw text: redraw crumbs in the top slice must
+    not be able to pry the gate open. A probe that is *only* crumbs fingerprints to
+    "" and is rejected rather than matching everything — a false True here would
+    swallow a genuinely new aside."""
     if not session_id:
         return False
-    q = (question or "").strip()
-    a = (answer_prefix or "").strip()
+    q = _fingerprint(question)
+    a = _fingerprint(answer_prefix)
     if not a:
         return False
-    return any(e.get("question") == q and (e.get("answer") or "").startswith(a)
+    return any(_fingerprint(e.get("question")) == q
+               and _fingerprint(e.get("answer")).startswith(a)
                for e in _load(session_id))
 
 

@@ -945,6 +945,47 @@ _BTW_SCROLL_MAX = 120          # hard cap on ↓ presses (far beyond any real an
 _BTW_SCROLL_SETTLE = 0.18      # let the overlay redraw before re-capturing
 _BTW_ANSWER_MAX = 20000        # sanity cap on a fully-stitched answer
 
+# A pane captured mid-repaint yields a half-applied frame: the overlay footer's
+# "↑/" hint and the composer's ─ rules land spliced into the answer region. Such a
+# frame is worse than no frame — its lines match neither the accumulator's suffix
+# nor the next window's prefix, so _stitch_btw falls through to a bare concat and
+# the "complete" answer gains a duplicated block. That answer is then not a prefix
+# of the next poll's top slice either, so btwcapture's gate reopens and the whole
+# scroll runs again, garbling a little differently each round — the observed
+# eight-archived-copies-of-one-aside failure. So every scroll position is read
+# until two consecutive reads agree, and a position that never settles aborts the
+# round rather than being stitched.
+_BTW_FRAME_TRIES = 3            # reads per scroll position before calling it unstable
+_BTW_FRAME_RECHECK = 0.12       # settle between those reads
+_BTW_FRAME_UNSTABLE = object()  # sentinel: pane repainting, no frame worth stitching
+
+
+def _stable_btw_regions(pane: str) -> tuple[str, list[str]] | None | object:
+    """`_btw_regions` for the overlay at the pane's current scroll position, read
+    repeatedly until two consecutive reads agree.
+
+    Returns (question, answer_lines) for a settled, stable overlay; None when
+    there is no settled overlay (including one that vanished between reads, so the
+    caller stops sending keys at once); the _BTW_FRAME_UNSTABLE sentinel when the
+    regions kept changing — the pane is repainting and any frame taken from it may
+    be a spliced half-redraw.
+
+    Only the overlay's OWN regions are compared, so a busy session's spinner and
+    elapsed-time counter ticking elsewhere on the pane never count as instability.
+    """
+    prev = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+    if prev is None:
+        return None
+    for _ in range(_BTW_FRAME_TRIES - 1):
+        time.sleep(_BTW_FRAME_RECHECK)
+        cur = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+        if cur is None:
+            return None
+        if cur == prev:
+            return cur
+        prev = cur
+    return _BTW_FRAME_UNSTABLE
+
 
 def _stitch_btw(acc: list[str], window: list[str]) -> list[str]:
     """Append a later, overlapping scroll `window` onto `acc`, dropping the longest
@@ -964,6 +1005,8 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
 
     Injects ↓ keys into the live pane, so callers must gate this (see
     core.btwcapture): only run it for a not-yet-archived aside, off the hot path.
+    Returns None rather than a guess when the pane is repainting too hard to read
+    a trustworthy frame (see _stable_btw_regions).
     """
     w = find_window(pid)
     if not w or not w.tty:
@@ -971,22 +1014,26 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return None
-    first = _btw_regions(tmux.capture_pane(pane).get("text", ""))
-    if first is None:
-        return None  # no settled overlay — never touch the keyboard
+    first = _stable_btw_regions(pane)
+    if first is None or first is _BTW_FRAME_UNSTABLE:
+        return None  # no settled overlay, or an unreadable pane — no keystrokes
     question, acc = first
     presses = 0
     overlay_alive = True
+    unstable = False
     while presses < _BTW_SCROLL_MAX:
         tmux.send_keys(pane, "Down")
         presses += 1
         time.sleep(_BTW_SCROLL_SETTLE)
-        cur = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+        cur = _stable_btw_regions(pane)
         if cur is None:
             # Overlay dismissed mid-scroll: stop now and DO NOT restore — further
             # arrows would drive the composer's history instead of the overlay.
             overlay_alive = False
             break
+        if cur is _BTW_FRAME_UNSTABLE:
+            unstable = True
+            break  # restore the view below, then abandon the round
         merged = _stitch_btw(acc, cur[1])
         if merged == acc:
             break  # window clamped at the bottom — whole answer captured
@@ -997,6 +1044,11 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
         for _ in range(presses):
             tmux.send_keys(pane, "Up")
             time.sleep(_BTW_SCROLL_SETTLE)
+    if unstable:
+        # Archive nothing: the aside stays un-gated, so a later poll retries and a
+        # quieter pane yields a clean stitch. Storing the half-merged `acc` would
+        # poison the archive AND the gate that is supposed to end the retry loop.
+        return None
     answer = "\n".join(acc)[:_BTW_ANSWER_MAX]
     return {"question": question, "answer": answer} if answer else None
 

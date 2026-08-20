@@ -223,18 +223,25 @@ class StitchBtwTests(unittest.TestCase):
 
 
 class CaptureFullBtwAnswerTests(unittest.TestCase):
-    def _run(self, frames):
+    def _run_reads(self, reads):
+        """Drive one capture over an explicit list of pane captures, so a test can
+        say what each individual read of a scroll position returns."""
         sent = []
         w = types.SimpleNamespace(tty="/dev/pts/9")
         with mock.patch.object(actions, "find_window", return_value=w), \
              mock.patch.object(actions.tmux, "pane_for_tty", return_value="%3"), \
              mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=[{"ok": True, "text": f} for f in frames]), \
+                               side_effect=[{"ok": True, "text": f} for f in reads]), \
              mock.patch.object(actions.tmux, "send_keys",
                                side_effect=lambda pane, *keys: sent.extend(keys) or {"ok": True}), \
              mock.patch.object(actions.time, "sleep"):
             got = actions.capture_full_btw_answer(123)
         return got, sent
+
+    def _run(self, frames):
+        """One logical scroll position per frame, each reading identically twice —
+        what a quiet pane looks like to _stable_btw_regions."""
+        return self._run_reads([f for f in frames for _ in (0, 1)])
 
     def test_scrolls_and_stitches_full_answer(self):
         # window of 3 lines, full answer L1..L6, scrolling 1 line per Down until
@@ -267,6 +274,45 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
         got, sent = self._run(frames)
         self.assertEqual(got["answer"], "L1\nL2\nL3\nL4")
         self.assertEqual(sent, ["Down", "Down"])  # no Up restore
+
+    def test_tolerates_a_single_jittery_read(self):
+        # One disagreeing read is a redraw caught mid-flight, not an unreadable
+        # pane: the third read agrees with the second, so the position is used.
+        reads = [
+            _btw_frame(["L1", "L2", "L3"]), _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["L2", "↑/ L3", "L4"]), _btw_frame(["L2", "L3", "L4"]),
+            _btw_frame(["L2", "L3", "L4"]),
+            _btw_frame(["L2", "L3", "L4"]), _btw_frame(["L2", "L3", "L4"]),  # clamp
+        ]
+        got, sent = self._run_reads(reads)
+        self.assertEqual(got["answer"], "L1\nL2\nL3\nL4")
+        self.assertEqual(sent, ["Down", "Down", "Up", "Up"])
+
+    def test_abandons_round_when_frame_never_settles(self):
+        # A pane repainting under us reads differently every time. Stitching such a
+        # frame is what duplicated blocks into the archive (and then reopened the
+        # capture gate), so the round is abandoned: nothing is returned, and the
+        # view is still restored since the overlay is alive.
+        reads = [
+            _btw_frame(["L1", "L2", "L3"]), _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["L2", "L3", "L4"]),
+            _btw_frame(["L2", "↑/ L3", "L4"]),
+            _btw_frame(["L2", "L3", "──── L4"]),
+        ]
+        got, sent = self._run_reads(reads)
+        self.assertIsNone(got)
+        self.assertEqual(sent, ["Down", "Up"])
+
+    def test_no_keystrokes_when_first_frame_never_settles(self):
+        # Unstable before the first Down: never touch the keyboard at all.
+        reads = [
+            _btw_frame(["L1", "L2"]),
+            _btw_frame(["L1", "↑/ L2"]),
+            _btw_frame(["──── L1", "L2"]),
+        ]
+        got, sent = self._run_reads(reads)
+        self.assertIsNone(got)
+        self.assertEqual(sent, [])
 
 
 class BtwLogTests(unittest.TestCase):
@@ -324,6 +370,22 @@ class BtwLogTests(unittest.TestCase):
         self.assertFalse(btwlog.has_prefix("sess1", "q1", "X"))
         self.assertFalse(btwlog.has_prefix("sess1", "other", "L1"))
         self.assertFalse(btwlog.has_prefix("sess1", "q1", "   "))
+
+    def test_has_prefix_ignores_redraw_crumbs(self):
+        # The top slice scraped off a repainting pane carries the footer's "↑/"
+        # hint and ─ rules, and a redraw re-wraps lines. It must still read as
+        # already-archived, or the gate reopens and the overlay is re-scrolled on
+        # every 2s poll — the eight-copies-of-one-aside bug.
+        btwlog.record("sess1", "q1", "统一到 e11 协议\n不是反过来\n第三行")
+        self.assertTrue(btwlog.has_prefix("sess1", "q1", "统一到 e11 协议\n↑/不是反过来"))
+        self.assertTrue(btwlog.has_prefix("sess1", "q1", "────统一到 e11 协议\n不是反\n过来"))
+        self.assertTrue(btwlog.has_prefix("sess1", "  q1 ", "统一到 e11 协议"))
+
+    def test_has_prefix_false_when_probe_is_only_crumbs(self):
+        # A slice of nothing but crumbs fingerprints to "" — treating that as a
+        # prefix of every entry would gate out a genuinely new aside.
+        btwlog.record("sess1", "q1", "L1\nL2")
+        self.assertFalse(btwlog.has_prefix("sess1", "q1", "↑/ ────"))
 
     def test_dismiss_hides_latest_from_card(self):
         e = btwlog.record("sess1", "q1", "a1")
