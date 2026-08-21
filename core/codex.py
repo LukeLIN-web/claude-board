@@ -44,13 +44,62 @@ _MEMORY_PATH_RE = re.compile(r'/memory/([A-Za-z0-9_-]+)\.md')
 
 # Codex reuses the role=user message shape for synthetic, non-prompt turns it
 # injects itself — each wrapped in a lowercase XML-ish tag (<environment_context>,
-# <turn_aborted>, <subagent_notification>, <skill>, …). These are not the user's
-# prompt and must be skipped when surfacing "what the user said".
-_SYNTHETIC_USER_RE = re.compile(r'^<[a-z_]+>')
+# <turn_aborted>, <subagent_notification>, <skill>, <codex_internal_context
+# source="goal">, …). These are not the user's prompt and must be skipped when
+# surfacing "what the user said"; the tag can carry attributes.
+_SYNTHETIC_USER_RE = re.compile(r'^<[a-z_]+[\s>]')
 
 
 def _is_synthetic_user_text(text: str) -> bool:
     return bool(_SYNTHETIC_USER_RE.match(text.lstrip()))
+
+
+def _typed_user_parts(payload: dict) -> list[str]:
+    """The typed parts of a role=user message — [] when the message is injected.
+
+    Codex opens a session with one role=user message whose parts are the
+    project's AGENTS.md and `<environment_context>`. Only the second part is
+    tag-wrapped, so checking parts independently lets the AGENTS.md half through
+    as if a person had typed it. A message with any injected part is injected.
+    """
+    parts: list[str] = []
+    for c in (payload.get("content") or []):
+        if not isinstance(c, dict) or c.get("type") != "input_text":
+            continue
+        txt = (c.get("text") or "").strip()
+        if not txt:
+            continue
+        if _is_synthetic_user_text(txt):
+            return []
+        parts.append(txt)
+    return parts
+
+
+def _typed_item_text(payload: dict) -> str:
+    """An `item_completed` event's text if it is the user's prompt, else "".
+
+    Newer Codex builds write each turn as thread items — `item_completed` events
+    carrying an `item` of type UserMessage / AgentMessage / CommandExecution / …
+    — and stop emitting the flat `user_message` event entirely (seen from CLI
+    0.147). The UserMessage item is what the person typed, already free of the
+    injections mixed into the role=user records.
+    """
+    item = payload.get("item") or {}
+    if item.get("type") != "UserMessage":
+        return ""
+    parts = [(c.get("text") or "").strip()
+             for c in (item.get("content") or []) if isinstance(c, dict)]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _tool_output_text(output) -> str:
+    """A tool result's text, whether Codex wrote it as a string or as parts."""
+    if isinstance(output, list):
+        return "\n".join((c.get("text") or "")
+                         for c in output if isinstance(c, dict)).strip()
+    if isinstance(output, dict):
+        return str(output.get("output") or output.get("text") or "")
+    return str(output or "")
 
 
 # Codex's `/clear` wipes the TUI screen and conversation context, but it does
@@ -138,11 +187,12 @@ def _parse_session_meta(path: Path) -> Optional[dict]:
 def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
     """Return the user's first real prompt; fall back to the first assistant reply.
 
-    Codex logs a submitted prompt two ways: a clean `event_msg`/`user_message`
-    (the text typed into the TUI) and a `response_item` message with role=user
-    carrying `input_text`. The role=user shape is *also* used for synthetic
-    injections (`<environment_context>`, …), so those are skipped. If no user
-    text is found at all, the first assistant `output_text` is returned.
+    Codex logs a submitted prompt three ways: a clean `event_msg`/`user_message`
+    (the text typed into the TUI), the newer `event_msg`/`item_completed` with a
+    UserMessage item, and a `response_item` message with role=user carrying
+    `input_text`. The role=user shape is *also* used for synthetic injections
+    (`<environment_context>`, the AGENTS.md preamble, …), so those are skipped.
+    If no user text is found at all, the first assistant `output_text` is used.
     """
     fallback = ""
     try:
@@ -157,21 +207,27 @@ def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
                 t = d.get("type")
                 payload = d.get("payload") or {}
 
-                if t == "event_msg" and payload.get("type") == "user_message":
-                    msg = (payload.get("message") or "").strip()
-                    if msg:
-                        return msg[:300]
+                if t == "event_msg":
+                    ptype = payload.get("type")
+                    if ptype == "user_message":
+                        msg = (payload.get("message") or "").strip()
+                        if msg:
+                            return msg[:300]
+                    if ptype == "item_completed":
+                        msg = _typed_item_text(payload)
+                        if msg:
+                            return msg[:300]
 
                 if t == "response_item" and payload.get("type") == "message":
-                    role = payload.get("role")
+                    if payload.get("role") == "user":
+                        typed = _typed_user_parts(payload)
+                        if typed:
+                            return "\n".join(typed)[:300]
+                        continue
                     for c in (payload.get("content") or []):
                         if not isinstance(c, dict):
                             continue
-                        if role == "user" and c.get("type") == "input_text":
-                            txt = (c.get("text") or "").strip()
-                            if txt and not _is_synthetic_user_text(txt):
-                                return txt[:300]
-                        elif c.get("type") == "output_text" and not fallback:
+                        if c.get("type") == "output_text" and not fallback:
                             txt = (c.get("text") or "").strip()
                             if txt:
                                 fallback = txt[:300]
@@ -336,30 +392,50 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list
 
                 if t == "event_msg":
                     # The user's typed prompt is logged as a `user_message`
-                    # event with the text in `message` (role=user response_item
-                    # turns are reserved for synthetic injections, handled below).
+                    # event with the text in `message` — or, on newer Codex, as
+                    # an `item_completed` event carrying a UserMessage item.
+                    # (role=user response_item turns mix in synthetic injections,
+                    # so they are never the source of a user row.)
+                    text = ""
                     if payload.get("type") == "user_message":
                         text = (payload.get("message") or "").strip()
-                        if text:
+                    elif payload.get("type") == "item_completed":
+                        text = _typed_item_text(payload)
+                    if text:
+                        text = cap_text(text, MESSAGE_CHARS)
+                        # A rollout speaks one of the two shapes, never both. If
+                        # a future build emits both, the copies land back to back
+                        # (only the ignored role=user record sits between them) —
+                        # so drop a prompt that repeats the row just written.
+                        prev = events[-1] if events else None
+                        if not (prev and prev["kind"] == "user_text"
+                                and prev["text"] == text):
                             events.append({
                                 "ts": ts, "kind": "user_text",
-                                "text": cap_text(text, MESSAGE_CHARS), "tool": None,
+                                "text": text, "tool": None,
                                 "role": "user", "extra": {},
                             })
 
                 elif t == "response_item":
                     item_type = payload.get("type", "")
-                    if item_type == "function_call":
+                    if item_type in ("function_call", "custom_tool_call"):
+                        # A custom tool call is a freeform one — newer Codex runs
+                        # every shell command through `exec`, whose call body is
+                        # a JS snippet in `input` rather than JSON `arguments`.
+                        args = payload.get("arguments")
+                        if item_type == "custom_tool_call":
+                            args = payload.get("input")
                         events.append({
                             "ts": ts, "kind": "tool_use",
                             "text": "", "tool": payload.get("name", "function"),
                             "role": "assistant",
-                            "extra": {"arguments": cap_text(payload.get("arguments"), TOOL_ARG_CHARS)},
+                            "extra": {"arguments": cap_text(args, TOOL_ARG_CHARS)},
                         })
-                    elif item_type == "function_call_output":
+                    elif item_type in ("function_call_output", "custom_tool_call_output"):
                         events.append({
                             "ts": ts, "kind": "tool_result",
-                            "text": cap_text(payload.get("output"), TOOL_RESULT_CHARS),
+                            "text": cap_text(_tool_output_text(payload.get("output")),
+                                             TOOL_RESULT_CHARS),
                             "tool": None, "role": "user", "extra": {},
                         })
                     elif item_type == "message":
@@ -461,9 +537,12 @@ def _infer_codex_status(path: Path, mtime: float) -> str:
 
     Codex rollouts carry no explicit status field, so we read the tail and look
     at the last meaningful event, skipping `token_count` telemetry noise:
-      - a trailing `function_call` (a tool was issued, output pending) → busy
+      - a trailing tool call (a tool was issued, output pending) → busy
       - a rollout touched within the last few seconds → busy (actively writing)
       - otherwise → idle
+
+    Newer Codex issues shell commands as `custom_tool_call`, so a session parked
+    on a long `exec` reads as busy there too — not idle with a pending command.
     """
     if (time.time() - mtime) < _BUSY_MTIME_WINDOW:
         return "busy"
@@ -475,11 +554,12 @@ def _infer_codex_status(path: Path, mtime: float) -> str:
             continue  # telemetry; not a real activity signal
         if t == "response_item":
             it = payload.get("type", "")
-            if it in ("function_call", "function_call_output", "message"):
+            if it in ("function_call", "function_call_output", "message",
+                      "custom_tool_call", "custom_tool_call_output"):
                 last_kind = it
         elif t == "event_msg":
             last_kind = "event_" + str(payload.get("role") or payload.get("type") or "")
-    return "busy" if last_kind == "function_call" else "idle"
+    return "busy" if last_kind in ("function_call", "custom_tool_call") else "idle"
 
 
 def _format_idle(seconds: int) -> str:

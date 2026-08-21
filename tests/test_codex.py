@@ -9,6 +9,7 @@ carrying `input_text`. The latter shape is also reused for synthetic injections
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -90,6 +91,105 @@ class TestCodexTimeline(unittest.TestCase):
         evs = codex.codex_timeline(self.path)
         user_texts = [e["text"] for e in evs if e["kind"] == "user_text"]
         self.assertEqual(user_texts.count(REAL_PROMPT), 1)
+
+
+# The same session as Codex writes it since ~CLI 0.147: no `user_message` event
+# at all — every turn is an `item_completed` thread item — and shell work runs
+# through the freeform `exec` tool (`custom_tool_call`), whose result comes back
+# as a list of parts rather than a string. The opening role=user record bundles
+# the project's AGENTS.md with `<environment_context>`; nobody typed either half.
+ITEM_ROLLOUT_LINES = [
+    {"type": "session_meta", "payload": {"id": "abc", "cwd": "/tmp/proj",
+                                         "timestamp": "2026-08-20T12:53:26Z"}},
+    {"type": "response_item", "payload": {"type": "message", "role": "developer",
+        "content": [{"type": "input_text", "text": "You are Codex."}]}},
+    {"type": "response_item", "payload": {"type": "message", "role": "user",
+        "content": [
+            {"type": "input_text", "text": "# AGENTS.md instructions for /tmp/proj\n\n<INSTRUCTIONS>\n…"},
+            {"type": "input_text", "text": "<environment_context>\n  <cwd>/tmp/proj</cwd>\n</environment_context>"},
+        ]}},
+    {"type": "response_item", "payload": {"type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": REAL_PROMPT}]}},
+    {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "UserMessage", "id": "u1",
+        "content": [{"type": "text", "text": REAL_PROMPT}]}}},
+    {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "CommandExecution", "id": "exec-1", "command": ["/bin/bash", "-lc", "ls"]}}},
+    {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec",
+        "call_id": "call_1",
+        "input": 'const r = await tools.exec_command({"cmd":"ls train/"});'}},
+    {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+        "call_id": "call_1", "output": [
+            {"type": "input_text", "text": "Script completed"},
+            {"type": "input_text", "text": "train.py"},
+        ]}},
+    {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": ASSISTANT_REPLY}]}},
+]
+
+
+class TestThreadItemRollout(unittest.TestCase):
+    """Newer rollouts drop `user_message`; the prompt lives in a UserMessage item."""
+
+    def setUp(self):
+        self.path = _write_rollout(ITEM_ROLLOUT_LINES)
+
+    def tearDown(self):
+        self.path.unlink(missing_ok=True)
+
+    def test_first_input_is_the_typed_prompt_not_the_agents_md_preamble(self):
+        self.assertEqual(codex._extract_first_user_input(self.path), REAL_PROMPT)
+
+    def test_timeline_shows_the_typed_prompt_once(self):
+        user_texts = [e["text"] for e in codex.codex_timeline(self.path)
+                      if e["kind"] == "user_text"]
+        self.assertEqual(user_texts, [REAL_PROMPT])
+
+    def test_timeline_shows_the_custom_exec_tool_call(self):
+        calls = [e for e in codex.codex_timeline(self.path) if e["kind"] == "tool_use"]
+        self.assertEqual([e["tool"] for e in calls], ["exec"])
+        self.assertIn("ls train/", calls[0]["extra"]["arguments"])
+
+    def test_tool_result_parts_are_joined_into_text(self):
+        results = [e for e in codex.codex_timeline(self.path) if e["kind"] == "tool_result"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["text"], "Script completed\ntrain.py")
+
+    def test_prompt_not_doubled_when_a_rollout_carries_both_shapes(self):
+        both = list(ITEM_ROLLOUT_LINES)
+        both.insert(5, {"type": "event_msg", "payload": {
+            "type": "user_message", "message": REAL_PROMPT, "images": []}})
+        p = _write_rollout(both)
+        try:
+            user_texts = [e["text"] for e in codex.codex_timeline(p)
+                          if e["kind"] == "user_text"]
+            self.assertEqual(user_texts, [REAL_PROMPT])
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_pending_custom_tool_call_reads_as_busy(self):
+        # Rollout ends on an issued `exec` with no output yet, and was last
+        # written long enough ago that the mtime shortcut can't answer.
+        pending = ITEM_ROLLOUT_LINES[:-2]
+        p = _write_rollout(pending)
+        try:
+            self.assertEqual(
+                codex._infer_codex_status(p, mtime=time.time() - 600), "busy")
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_goal_injection_with_attributes_is_not_a_prompt(self):
+        injected = [l for l in ITEM_ROLLOUT_LINES
+                    if not (l["type"] == "event_msg"
+                            and l["payload"].get("type") == "item_completed")]
+        injected[3] = {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text",
+                "text": '<codex_internal_context source="goal">\nContinue.\n</codex_internal_context>'}]}}
+        p = _write_rollout(injected)
+        try:
+            self.assertEqual(codex._extract_first_user_input(p), ASSISTANT_REPLY)
+        finally:
+            p.unlink(missing_ok=True)
 
 
 # A rollout straddling a /clear: an old prompt+reply, then a new prompt+reply.
