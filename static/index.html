@@ -324,6 +324,14 @@
               </div>
             </template>
           </div>
+          <!-- The session's looping prompt. Unlike a shell or a Monitor it has
+               no process to count, so the card would otherwise show nothing at
+               all for a session re-running a prompt every half hour. -->
+          <div x-show="w.loop?.text" class="text-[10px] text-violet-800 bg-violet-50 rounded px-1.5 py-0.5 truncate"
+               :title="loopSourceHint(w.loop)">
+            <span class="font-medium" x-text="'🔁 ' + (w.loop?.cadence || '尚未排期')"></span>:
+            <span x-text="w.loop?.text"></span>
+          </div>
           <!-- Skill tags -->
           <div class="flex gap-1 flex-wrap" x-show="w.skills_used?.length || w.memory_ops?.length">
             <template x-for="sk in (w.skills_used||[])" :key="sk">
@@ -541,6 +549,21 @@
       </div>
       <pre class="text-cyan-900 whitespace-pre-wrap break-words m-0 font-sans"
            :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="timelineData?.goal?.text || ''"></pre>
+    </div>
+    <!-- The prompt this session is looping on. Pinned for the same reason as the
+         goal, plus one of its own: a loop keeps producing turns nobody just
+         sent, and without the banner the timeline reads as a session that talks
+         to itself. It disappears the moment the loop is stopped. -->
+    <div class="mb-3 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2" x-show="timelineData?.loop?.text">
+      <div class="flex items-baseline gap-2 mb-1">
+        <span class="text-[10px] font-semibold text-violet-800 uppercase tracking-wide">🔁 loop</span>
+        <span class="text-[10px] text-violet-600/70"
+              :title="loopSourceHint(timelineData?.loop)"
+              x-text="(timelineData?.loop?.cadence || '尚未排期')
+                      + ' · ' + fmtDateTimeET(timelineData?.loop?.ts)"></span>
+      </div>
+      <pre class="text-violet-900 whitespace-pre-wrap break-words m-0 font-sans"
+           :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="timelineData?.loop?.text || ''"></pre>
     </div>
     <!-- Most recent prompt the user sent — always visible while a session is open -->
     <div class="mb-3 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2" x-show="timelineData && lastUserPrompt()">
@@ -1272,6 +1295,16 @@ function fleet() {
       });
       // en-CA renders as "YYYY-MM-DD, HH:MM:SS"; drop the comma for a clean look.
       return s ? s.replace(',', '') + ' ET' : (ts?.slice(0, 19) || '');
+    },
+
+    // Where a loop banner's cadence comes from. Worth spelling out on hover:
+    // "尚未排期" is the honest reading of a /loop nobody has scheduled yet, and
+    // it looks identical to a loop that quietly failed to start.
+    loopSourceHint(loop) {
+      if (!loop) return '';
+      if (loop.source === 'cron') return 'CronCreate 注册的定时循环';
+      if (loop.source === 'wakeup') return 'ScheduleWakeup 自定节奏循环';
+      return '发起过 /loop · 还没看到它排期';
     },
 
     async focusWindow(pid) {

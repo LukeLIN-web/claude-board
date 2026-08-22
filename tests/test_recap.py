@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from core import transcripts
-from core.textcap import GOAL_CHARS
+from core.textcap import GOAL_CHARS, LOOP_CHARS
 
 
 def _write(rows) -> Path:
@@ -230,3 +230,184 @@ class RecapPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _tool_use(ts, name, inp):
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"model": "claude-opus-5",
+                        "content": [{"type": "tool_use", "id": "t1",
+                                     "name": name, "input": inp}]}}
+
+
+def _typed(ts, text):
+    return {"type": "user", "timestamp": ts,
+            "message": {"content": [{"type": "text", "text": text}]}}
+
+
+class CronCadenceTests(unittest.TestCase):
+    """A cadence on a pinned banner is read as fact, so an expression this can't
+    read has to come back as itself rather than as a guess."""
+
+    def test_step_and_evenly_spaced_list_are_the_same_cadence(self):
+        # `7,37` is what the model actually registered for `/loop 30 mins …`:
+        # a phase offset so a fleet's loops don't all fire on the same minute.
+        self.assertEqual(transcripts._cron_cadence("*/30 * * * *"), "每 30 分钟")
+        self.assertEqual(transcripts._cron_cadence("7,37 * * * *"), "每 30 分钟")
+        self.assertEqual(transcripts._cron_cadence("0,15,30,45 * * * *"), "每 15 分钟")
+
+    def test_hours_and_days(self):
+        self.assertEqual(transcripts._cron_cadence("0 */2 * * *"), "每 2 小时")
+        self.assertEqual(transcripts._cron_cadence("0 0 */3 * *"), "每 3 天")
+        self.assertEqual(transcripts._cron_cadence("30 4 * * *"), "每天 04:30")
+
+    def test_an_unevenly_spaced_list_is_not_a_cadence(self):
+        # Fires at :00 and :10 — twice an hour, but never "every 10 minutes".
+        self.assertEqual(transcripts._cron_cadence("0,10 * * * *"), "0,10 * * * *")
+
+    def test_shapes_loop_never_emits_come_back_verbatim(self):
+        for expr in ("15 9 * * 1", "* * * * *", "weird", "0 0 1 1 *"):
+            self.assertEqual(transcripts._cron_cadence(expr), expr)
+
+
+class SessionLoopTests(unittest.TestCase):
+    """The loop banner claims a session is re-running a prompt. It has to name
+    the schedule that was registered, not the one that was asked for, and it has
+    to vanish the moment the loop is stopped."""
+
+    def test_no_loop_and_no_file(self):
+        self.assertIsNone(transcripts.session_loop("/nope/nothing.jsonl"))
+        self.assertIsNone(transcripts.session_loop(_write([_typed("2026-08-22T08:00:00Z", "hi")])))
+
+    def test_a_registered_cron_beats_what_the_user_typed(self):
+        # `/loop 30 mins, 检查文档` reaches the transcript as "loop 30 mins, …",
+        # but CronCreate registers the interval separately and drops it from the
+        # prompt. The registered pair is the one that describes what will run.
+        lp = transcripts.session_loop(_write([
+            _typed("2026-08-22T08:59:34Z",
+                   "<command-name>/loop</command-name>"
+                   "<command-args>30 mins, 检查一下文档, 保证事实正确.</command-args>"),
+            _tool_use("2026-08-22T09:00:06Z", "CronCreate",
+                      {"cron": "7,37 * * * *", "prompt": "检查一下文档, 保证事实正确.",
+                       "recurring": True}),
+        ]))
+        self.assertEqual(lp["text"], "检查一下文档, 保证事实正确.")
+        self.assertEqual(lp["cadence"], "每 30 分钟")
+        self.assertEqual(lp["source"], "cron")
+        self.assertEqual(lp["ts"], "2026-08-22T09:00:06Z")
+
+    def test_an_invocation_shows_before_anything_is_scheduled(self):
+        # The minute between asking and scheduling, and the case where the model
+        # never scheduled at all — hence no cadence to claim.
+        lp = transcripts.session_loop(_write([
+            _typed("2026-08-22T08:59:34Z",
+                   "<command-name>/loop</command-name>"
+                   "<command-args>check the deploy</command-args>"),
+        ]))
+        self.assertEqual(lp["text"], "check the deploy")
+        self.assertEqual(lp["source"], "prompt")
+        self.assertIsNone(lp["cadence"])
+
+    def test_prose_about_loops_is_not_a_loop(self):
+        # The whole reason the envelope is matched instead of the rendered text:
+        # `_clean_command_text` turns a real /loop into "loop 30 mins, …", which
+        # these are indistinguishable from once unwrapped.
+        for text in ("loop through the files and fix each one",
+                     "loop 能不能也弄个横幅, 和 goal 一样",
+                     "the loop is finally green"):
+            self.assertIsNone(
+                transcripts.session_loop(_write([_typed("2026-08-22T08:00:00Z", text)])),
+                text)
+
+    def test_a_model_invoking_the_skill_counts_too(self):
+        # A model reaches /loop through the Skill tool, not by typing a slash.
+        lp = transcripts.session_loop(_write([
+            _tool_use("2026-08-22T08:59:34Z", "Skill",
+                      {"skill": "loop", "args": "5m check the deploy"}),
+        ]))
+        self.assertEqual(lp["text"], "5m check the deploy")
+        self.assertEqual(lp["source"], "prompt")
+
+    def test_a_slash_command_envelope_is_unwrapped(self):
+        lp = transcripts.session_loop(_write([
+            _typed("2026-08-22T08:59:34Z",
+                   "<command-name>/loop</command-name>"
+                   "<command-args>5m run the tests</command-args>"),
+        ]))
+        self.assertEqual(lp["text"], "5m run the tests")
+
+    def test_an_injected_skill_body_is_not_a_loop(self):
+        # /loop's own SKILL.md opens with "# /loop — schedule a recurring …" and
+        # lands as a user row nobody typed. It is not a task to pin.
+        self.assertIsNone(transcripts.session_loop(_write([
+            {"type": "user", "timestamp": "2026-08-22T08:59:34Z", "isMeta": True,
+             "message": {"content": [{"type": "text",
+                                      "text": "loop — schedule a recurring prompt"}]}},
+        ])))
+
+    def test_cron_delete_takes_the_banner_down(self):
+        self.assertIsNone(transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "CronCreate",
+                      {"cron": "*/30 * * * *", "prompt": "check docs", "recurring": True}),
+            _tool_use("2026-08-22T10:00:00Z", "CronDelete", {"id": "job-1"}),
+        ])))
+
+    def test_a_one_shot_cron_is_a_reminder_not_a_loop(self):
+        self.assertIsNone(transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "CronCreate",
+                      {"cron": "0 15 * * *", "prompt": "ping me", "recurring": False}),
+        ])))
+
+    def test_self_paced_mode_reads_the_wakeup(self):
+        # ScheduleWakeup stores the /loop invocation it re-enters through; the
+        # task is what's left after the wrapper.
+        lp = transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
+                      {"prompt": "/loop check the deploy", "delaySeconds": 1200,
+                       "reason": "watching CI", "noop": True}),
+        ]))
+        self.assertEqual(lp["text"], "check the deploy")
+        self.assertEqual(lp["cadence"], "自定节奏 · 约 20 分钟")
+        self.assertEqual(lp["source"], "wakeup")
+
+    def test_the_autonomous_sentinel_is_not_shown_raw(self):
+        lp = transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
+                      {"prompt": "<<autonomous-loop-dynamic>>", "delaySeconds": 1800}),
+        ]))
+        self.assertEqual(lp["text"], "自主循环")
+
+    def test_stopping_a_self_paced_loop_takes_the_banner_down(self):
+        self.assertIsNone(transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
+                      {"prompt": "/loop check the deploy", "delaySeconds": 1200}),
+            _tool_use("2026-08-22T09:20:00Z", "ScheduleWakeup", {"stop": True}),
+        ])))
+
+    def test_a_re_armed_wakeup_tracks_the_latest_tick(self):
+        lp = transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
+                      {"prompt": "/loop watch it", "delaySeconds": 1200}),
+            _tool_use("2026-08-22T09:20:00Z", "ScheduleWakeup",
+                      {"prompt": "/loop watch it", "delaySeconds": 600}),
+        ]))
+        self.assertEqual(lp["ts"], "2026-08-22T09:20:00Z")
+        self.assertEqual(lp["cadence"], "自定节奏 · 约 10 分钟")
+
+    def test_a_second_loop_replaces_the_first(self):
+        lp = transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "CronCreate",
+                      {"cron": "*/30 * * * *", "prompt": "check docs", "recurring": True}),
+            _tool_use("2026-08-22T10:00:00Z", "CronCreate",
+                      {"cron": "0 */2 * * *", "prompt": "check the deploy", "recurring": True}),
+        ]))
+        self.assertEqual(lp["text"], "check the deploy")
+        self.assertEqual(lp["cadence"], "每 2 小时")
+
+    def test_a_long_task_is_capped_visibly(self):
+        lp = transcripts.session_loop(_write([
+            _tool_use("2026-08-22T09:00:06Z", "CronCreate",
+                      {"cron": "*/30 * * * *", "prompt": "x" * (LOOP_CHARS + 500),
+                       "recurring": True}),
+        ]))
+        self.assertLess(len(lp["text"]), LOOP_CHARS + 200)
+        self.assertNotEqual(lp["text"], "x" * (LOOP_CHARS + 500))

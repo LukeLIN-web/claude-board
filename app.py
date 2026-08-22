@@ -110,10 +110,15 @@ def _enriched_snapshot() -> dict:
             w["skills_used"] = transcripts.extract_skills_used(tp)
             w["memory_ops"] = transcripts.extract_memory_ops(tp)
             w["background_tasks"] = transcripts.extract_background_tasks(tp)
+            # A looping prompt is the one background thing a card can't show any
+            # other way: it leaves no shell and no task row, so an unmarked card
+            # just looks like a session talking to itself every half hour.
+            w["loop"] = transcripts.session_loop(tp)
         else:
             w["skills_used"] = []
             w["memory_ops"] = []
             w["background_tasks"] = []
+            w["loop"] = None
         # Queued prompts: reliable dashboard-sent items (reconciled against the
         # transcript) plus best-effort TUI-typed items scraped from the pane.
         # A queue only exists while busy, which also bounds the extra capture.
@@ -308,8 +313,10 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
             "skills_used": activity.get("skills_used", []),
             "memory_ops": activity.get("memory_ops", []),
             "plan_history": [],
-            # Codex writes no recap, so there is no goal to pin.
+            # Codex writes no recap, so there is no goal to pin — and no
+            # /loop skill, so nothing schedules a looping prompt either.
             "goal": None,
+            "loop": None,
             "menu": None,
         }
     events = transcripts.timeline(tp, limit=limit) if tp else []
@@ -333,6 +340,9 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
         # The session's standing goal, pinned above the timeline so it stays put
         # while the events that stated it scroll away.
         "goal": transcripts.session_goal(tp) if tp else None,
+        # The /loop prompt this session keeps re-running, pinned for the same
+        # reason — and because it explains turns arriving that nobody just sent.
+        "loop": transcripts.session_loop(tp) if tp else None,
         # Live interactive menu (AskUserQuestion / permission prompt) parsed from
         # the tmux pane — the transcript doesn't record it until it's resolved.
         "menu": actions.get_pane_menu(pid),
@@ -547,6 +557,7 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
                 "plan_history": transcripts.extract_plan_history(fp),
                 # What the session was for, still worth reading in the archive.
                 "goal": transcripts.session_goal(fp),
+                "loop": transcripts.session_loop(fp),
             }
     # Codex transcripts
     from core.codex import CODEX_SESSIONS_DIR

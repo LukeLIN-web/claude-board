@@ -44,6 +44,11 @@ META_CHARS = _env_int("CLAUDE_FLEET_META_CHARS", 200)
 # a paragraph without a full stop, since the banner never scrolls away.
 GOAL_CHARS = _env_int("CLAUDE_FLEET_GOAL_CHARS", 300)
 
+# The looping prompt pinned next to the goal. A /loop task is something someone
+# typed on one line, so this is generous for it — the cap only exists because a
+# scheduled prompt can be pasted rather than typed, and the banner never scrolls.
+LOOP_CHARS = _env_int("CLAUDE_FLEET_LOOP_CHARS", 300)
+
 
 # One Edit rendered as a - / + diff. Bigger than a plain tool arg, since this is
 # the whole point of the row and the shared text has already been dropped.

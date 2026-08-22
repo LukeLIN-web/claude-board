@@ -10,6 +10,7 @@ from typing import Iterable, Optional
 
 from .textcap import (
     GOAL_CHARS,
+    LOOP_CHARS,
     META_CHARS,
     MESSAGE_CHARS,
     TOOL_ARG_CHARS,
@@ -400,6 +401,164 @@ def session_goal(path: str | Path) -> Optional[dict]:
             if m:
                 offer(m.group(1), ev.ts, "prompt")
     return goal
+
+
+_CRON_STEP_RE = re.compile(r"^\*/(\d+)$")
+_CRON_LIST_RE = re.compile(r"^\d+(?:,\d+)*$")
+
+
+def _cron_every(field: str, period: int) -> Optional[int]:
+    """The gap between one cron field's firings, or None if they aren't even.
+
+    Two spellings mean the same cadence. `*/30` is the obvious one; `7,37` is
+    what a model writes to spread a fleet's loops across the hour instead of
+    firing them all on the same minute, and it is still every 30 minutes. A list
+    only counts when it wraps evenly too: `0,10` fires twice an hour, fifty
+    minutes apart, and has no single cadence worth printing.
+    """
+    m = _CRON_STEP_RE.match(field)
+    if m:
+        step = int(m.group(1))
+        return step if 0 < step < period else None
+    if not _CRON_LIST_RE.match(field):
+        return None
+    vals = sorted({int(v) for v in field.split(",")})
+    if len(vals) < 2 or vals[-1] >= period:
+        return None
+    gaps = {b - a for a, b in zip(vals, vals[1:])}
+    gaps.add(period - vals[-1] + vals[0])
+    return gaps.pop() if len(gaps) == 1 else None
+
+
+def _cron_cadence(expr: str) -> str:
+    """A cron expression as the cadence it was set for, e.g. "每 30 分钟".
+
+    Only the shapes `/loop` emits are read. Anything else is handed back as the
+    expression itself: an unparsed cadence reads as unparsed, while a guessed one
+    reads as fact and would sit pinned above the timeline being wrong.
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return expr
+    minute, hour, dom, mon, dow = parts
+    if (mon, dow) != ("*", "*"):
+        return expr
+    if dom == "*" and hour == "*":
+        n = _cron_every(minute, 60)
+        return f"每 {n} 分钟" if n else expr
+    if dom == "*" and minute.isdigit():
+        n = _cron_every(hour, 24)
+        if n:
+            return f"每 {n} 小时"
+        if hour.isdigit():
+            return f"每天 {int(hour):02d}:{int(minute):02d}"
+        return expr
+    m = _CRON_STEP_RE.match(dom)
+    if m and minute.isdigit() and hour.isdigit():
+        return f"每 {m.group(1)} 天"
+    return expr
+
+
+def _delay_cadence(seconds) -> Optional[str]:
+    """A ScheduleWakeup delay as a cadence. The tool clamps to one hour, so
+    minutes is the only unit this ever has to reach for."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    return f"自定节奏 · 约 {max(1, round(s / 60))} 分钟" if s > 0 else None
+
+
+# `/loop` hands the next firing its own invocation back, so a self-paced loop's
+# stored prompt still carries the slash command it re-enters through.
+_LOOP_SELF_PREFIX_RE = re.compile(r"^\s*/loop\s+", re.IGNORECASE)
+# What `/loop` stores when nobody typed a task: the runtime swaps the real
+# instructions in at fire time, so the sentinel itself says nothing to a reader.
+_LOOP_SENTINELS = ("<<autonomous-loop-dynamic>>", "<<autonomous-loop>>")
+# A `/loop` invocation, matched on the envelope rather than on the unwrapped
+# text. `_clean_command_text` renders it as "loop 30 mins, …", which is
+# indistinguishable from prose opening the same way — and "loop through the
+# files and fix each" is a sentence, not a schedule. Only the slash command (or
+# the Skill call a model makes instead) starts a loop, so only those count.
+_LOOP_CMD_RE = re.compile(r"<command-name>\s*/?loop\s*</command-name>", re.IGNORECASE)
+
+
+def _loop_task_text(prompt: str) -> str:
+    """A stored wakeup prompt as the task, minus the `/loop` wrapper."""
+    text = _LOOP_SELF_PREFIX_RE.sub("", prompt).strip()
+    return "自主循环" if text in _LOOP_SENTINELS else text
+
+
+def session_loop(path: str | Path) -> Optional[dict]:
+    """The prompt this session keeps re-running, as {text, ts, source, cadence}.
+
+    Like a goal, a loop is set once and then buried — except it goes on acting on
+    the session long after the row that started it scrolled away, which is what
+    makes an unpinned one confusing: turns keep arriving that nobody just asked
+    for. Three sources, last one in the file wins, since the file is in the order
+    the loop was actually set up:
+
+      - `cron`: a recurring `CronCreate`, the fixed-interval mode. The best
+        source there is — the schedule and the prompt are the ones registered,
+        not the ones asked for, and those differ (`/loop 30 mins …` registers
+        `7,37 * * * *` and drops the interval from the prompt).
+      - `wakeup`: a `ScheduleWakeup`, the self-paced mode. Re-armed every tick,
+        so the stamp tracks the most recent arming rather than the first.
+      - `prompt`: a `/loop` invocation, typed or made through the Skill tool.
+        Covers the gap between asking for a loop and the model scheduling one —
+        and the case where it never did, which is why this source carries no
+        cadence to claim.
+
+    A stopped loop returns None rather than a stale banner: `CronDelete` ends a
+    cron, `ScheduleWakeup(stop=True)` ends a self-paced one, and either way
+    there is nothing left to pin.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    loop: Optional[dict] = None
+
+    def offer(text: str, ts: str, source: str, cadence: Optional[str]) -> None:
+        nonlocal loop
+        text = text.strip()
+        if not text:
+            return
+        loop = {"text": cap_text(text, LOOP_CHARS), "ts": ts,
+                "source": source, "cadence": cadence}
+
+    for d in _iter_lines(p):
+        if d.get("type") == "assistant":
+            ts = d.get("timestamp", "")
+            for c in ((d.get("message") or {}).get("content") or []):
+                if not isinstance(c, dict) or c.get("type") != "tool_use":
+                    continue
+                name, inp = c.get("name", ""), (c.get("input") or {})
+                if name == "Skill" and str(inp.get("skill", "")).lstrip("/") == "loop":
+                    offer(str(inp.get("args") or ""), ts, "prompt", None)
+                elif name == "CronDelete":
+                    loop = None
+                elif name == "CronCreate" and inp.get("recurring"):
+                    offer(str(inp.get("prompt") or ""), ts, "cron",
+                          _cron_cadence(str(inp.get("cron") or "")))
+                elif name == "ScheduleWakeup":
+                    if inp.get("stop"):
+                        loop = None
+                    else:
+                        offer(_loop_task_text(str(inp.get("prompt") or "")), ts,
+                              "wakeup", _delay_cadence(inp.get("delaySeconds")))
+            continue
+        # A `/loop` someone typed. Read off the raw row: the envelope is the
+        # only thing that distinguishes the command from a sentence about loops.
+        if d.get("type") != "user" or is_injected_user_row(d):
+            continue
+        raw = (d.get("message") or {}).get("content")
+        if isinstance(raw, list):
+            raw = "".join(b.get("text", "") for b in raw
+                          if isinstance(b, dict) and b.get("type") == "text")
+        if isinstance(raw, str) and _LOOP_CMD_RE.search(raw):
+            args = _CMD_ARGS_RE.search(raw)
+            offer(args.group(1) if args else "", d.get("timestamp", ""), "prompt", None)
+    return loop
 
 
 def _normalize(d: dict) -> list[TurnEvent]:
