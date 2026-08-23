@@ -1007,6 +1007,10 @@ function fleet() {
     // Pending SSE reconnect, so a burst of onerror firings schedules one retry
     // rather than one per firing.
     _reconnectTimer: null,
+    // Watchdog for a stream that is connected but delivering nothing, and the
+    // polling fallback it turns on. See _openEvents.
+    _streamWatchdog: null,
+    _snapshotPoll: null,
     historySessions: [],
     historyTotal: 0,
     historyPage: 1,
@@ -1114,30 +1118,7 @@ function fleet() {
       // ?snapshot renders a one-shot static view (no live SSE) — handy for
       // embeds and for headless screenshots.
       if (!new URLSearchParams(location.search).has('snapshot')) {
-        this.evtSource = new EventSource('/api/events');
-        this.evtSource.addEventListener('snapshot', (e) => {
-          this.applySnapshot(JSON.parse(e.data));
-        });
-        this.evtSource.onerror = () => {
-          // onerror fires once per failed connection attempt, so without this
-          // guard a flapping phone connection stacks a new timer — and now a
-          // new server round trip — on every firing, while the streams they
-          // opened are never closed.
-          if (this._reconnectTimer) return;
-          this._reconnectTimer = setTimeout(() => {
-            this._reconnectTimer = null;
-            // EventSource hides the status code, so a stream dropped by an
-            // expired auth cookie is indistinguishable from a network blip.
-            // This probe goes through the wrapped fetch above, which turns a
-            // 401 into a redirect to the login page.
-            fetch('/api/windows').catch(() => {});
-            if (this.evtSource) this.evtSource.close();
-            this.evtSource = new EventSource('/api/events');
-            this.evtSource.addEventListener('snapshot', (e) => {
-              this.applySnapshot(JSON.parse(e.data));
-            });
-          }, 5000);
-        };
+        this._openEvents();
       }
       this._applyHashRoute();
       window.addEventListener('hashchange', () => this._applyHashRoute());
@@ -1154,6 +1135,73 @@ function fleet() {
       // but a session can sit silently at a question/permission picker — polling
       // guarantees the menu (captured from the pane) shows up and stays current.
       setInterval(() => { if (this.expandedPid !== null) this.refreshTimeline(); }, 2500);
+    },
+
+    // Open the snapshot stream that feeds the card list.
+    //
+    // A stream can also fail without ever erroring: some proxies buffer a
+    // streaming response instead of passing it through, and a Cloudflare quick
+    // tunnel does exactly that — the headers arrive, then not one body byte
+    // until the stream closes. To the browser that connection looks open and
+    // healthy, onerror never fires, and the cards silently sit at whatever the
+    // page loaded with while everything fetched normally (the open timeline,
+    // which polls) keeps updating. So don't take "connected" for delivering:
+    // arm a watchdog, and if no event shows up, poll the same snapshot over
+    // plain requests, which proxies do pass through. The stream stays open —
+    // if it ever starts delivering, the polling stops again.
+    _openEvents() {
+      if (this.evtSource) this.evtSource.close();
+      this.evtSource = new EventSource('/api/events');
+      this.evtSource.addEventListener('snapshot', (e) => {
+        this._noteStreamAlive();
+        this.applySnapshot(JSON.parse(e.data));
+      });
+      // Carries no payload; its only job is to prove the stream still flows
+      // through a stretch where nothing on the board changed.
+      this.evtSource.addEventListener('heartbeat', () => this._noteStreamAlive());
+      this.evtSource.onerror = () => {
+        // onerror fires once per failed connection attempt, so without this
+        // guard a flapping phone connection stacks a new timer — and now a
+        // new server round trip — on every firing, while the streams they
+        // opened are never closed.
+        if (this._reconnectTimer) return;
+        this._reconnectTimer = setTimeout(() => {
+          this._reconnectTimer = null;
+          // EventSource hides the status code, so a stream dropped by an
+          // expired auth cookie is indistinguishable from a network blip.
+          // This probe goes through the wrapped fetch above, which turns a
+          // 401 into a redirect to the login page.
+          fetch('/api/windows').catch(() => {});
+          this._openEvents();
+        }, 5000);
+      };
+      // The server sends a snapshot the moment the stream opens, so silence
+      // this long means the body is not getting through.
+      this._armStreamWatchdog(8000);
+    },
+
+    // An event arrived, so the stream is delivering: stop any fallback polling
+    // and re-arm the watchdog. The server sends a heartbeat every 20s when the
+    // board is quiet, so 45s of silence means the stream has gone dark.
+    _noteStreamAlive() {
+      if (this._snapshotPoll) { clearInterval(this._snapshotPoll); this._snapshotPoll = null; }
+      this._armStreamWatchdog(45000);
+    },
+
+    _armStreamWatchdog(ms) {
+      clearTimeout(this._streamWatchdog);
+      this._streamWatchdog = setTimeout(() => {
+        if (this._snapshotPoll) return;
+        this._snapshotPoll = setInterval(() => {
+          // A backgrounded tab isn't being read; skip the round trip and let
+          // the next tick after the user returns bring the cards current.
+          if (document.hidden) return;
+          fetch('/api/windows')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => { if (d) this.applySnapshot(d); })
+            .catch(() => { /* transient; next tick retries */ });
+        }, 3000);
+      }, ms);
     },
 
     // Deep-link panels via URL hash: #skills, #memory, #search=<q>, #timeline=<sid>
