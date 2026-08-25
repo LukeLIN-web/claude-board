@@ -846,20 +846,18 @@
   <!-- ===== History section ===== -->
   <div class="mt-8 bg-white rounded-xl shadow-sm border">
     <div class="px-5 py-3 border-b flex items-center justify-between">
-      <h2 class="font-semibold text-sm">History (<span x-text="historyTotal"></span>)</h2>
+      <h2 class="font-semibold text-sm">History (<span x-text="historyTotal"></span>)
+        <!-- The list stops at HISTORY_LIMIT. Say so, or a 1300-session archive
+             showing twenty rows reads as an archive that lost the rest. -->
+        <span class="font-normal text-gray-400 text-xs" x-show="historyTotal > historySessions.length"
+              x-text="'· 显示' + (historyQuery ? '前 ' : '最近 ') + historySessions.length + ' 条'"></span>
+      </h2>
       <div class="flex items-center gap-2">
         <input type="text" placeholder="Search history..." x-model="historyQuery"
-               @keydown.enter="loadHistory(1)"
+               @keydown.enter="loadHistory()"
                class="border rounded px-2 py-1 text-xs w-48 focus:outline-none focus:ring-1 focus:ring-blue-400">
-        <button @click="loadHistory(1)" class="text-xs text-blue-600 hover:underline">Go</button>
-        <button @click="historyQuery=''; loadHistory(1)" class="text-xs text-gray-400 hover:text-gray-600" x-show="historyQuery">Clear</button>
-        <select x-model.number="historyLimit" @change="loadHistory(1)" class="border rounded px-1 py-1 text-xs bg-white">
-          <option value="10">10</option>
-          <option value="20">20</option>
-          <option value="50">50</option>
-          <option value="100">100</option>
-          <option value="500">All</option>
-        </select>
+        <button @click="loadHistory()" class="text-xs text-blue-600 hover:underline">Go</button>
+        <button @click="historyQuery=''; loadHistory()" class="text-xs text-gray-400 hover:text-gray-600" x-show="historyQuery">Clear</button>
       </div>
     </div>
     <div class="divide-y max-h-[28rem] overflow-y-auto" x-show="historySessions.length > 0">
@@ -911,16 +909,6 @@
           </div>
         </div>
       </template>
-    </div>
-    <div class="px-5 py-2 border-t flex items-center justify-between text-xs text-gray-500"
-         x-show="historyTotal > historyLimit">
-      <span>Page <span x-text="historyPage"></span> / <span x-text="Math.ceil(historyTotal / historyLimit)"></span></span>
-      <div class="flex gap-2">
-        <button @click="loadHistory(historyPage - 1)" :disabled="historyPage <= 1"
-                class="px-2 py-1 border rounded disabled:opacity-30 hover:bg-gray-100">Prev</button>
-        <button @click="loadHistory(historyPage + 1)" :disabled="historyPage * historyLimit >= historyTotal"
-                class="px-2 py-1 border rounded disabled:opacity-30 hover:bg-gray-100">Next</button>
-      </div>
     </div>
   </div>
 
@@ -989,6 +977,10 @@
   };
 })();
 
+// Rows the History panel lists: the newest this many, or the first this many
+// matches when searching.
+const HISTORY_LIMIT = 20;
+
 function fleet() {
   return {
     windows: [],
@@ -1024,8 +1016,6 @@ function fleet() {
     _snapshotPoll: null,
     historySessions: [],
     historyTotal: 0,
-    historyPage: 1,
-    historyLimit: 20,
     historyQuery: '',
     showSkills: false,
     skillsList: null,
@@ -1125,7 +1115,7 @@ function fleet() {
 
     init() {
       fetch('/api/windows').then(r => r.json()).then(d => this.applySnapshot(d));
-      this.loadHistory(1);
+      this.loadHistory();
       // ?snapshot renders a one-shot static view (no live SSE) — handy for
       // embeds and for headless screenshots.
       if (!new URLSearchParams(location.search).has('snapshot')) {
@@ -1599,14 +1589,16 @@ function fleet() {
       this.searchResults = d.hits || [];
     },
 
-    async loadHistory(page) {
-      if (page < 1) return;
+    // The archive runs to four figures and nobody pages through it — the rows
+    // worth a click are the ones near the top, and search covers the rest. One
+    // page of HISTORY_LIMIT, no pager. `total` still comes back, so the header
+    // can say how much is being held back.
+    async loadHistory() {
       const q = this.historyQuery ? `&q=${encodeURIComponent(this.historyQuery)}` : '';
-      const r = await fetch(`/api/history?page=${page}&limit=${this.historyLimit}${q}`);
+      const r = await fetch(`/api/history?page=1&limit=${HISTORY_LIMIT}${q}`);
       const d = await r.json();
       this.historySessions = d.sessions || [];
       this.historyTotal = d.total || 0;
-      this.historyPage = d.page || 1;
     },
 
     async openHistoryTimeline(sessionId) {
