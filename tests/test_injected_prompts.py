@@ -169,3 +169,116 @@ class CardTitleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PendingNotificationTests(unittest.TestCase):
+    """A notification that fired but hasn't been delivered.
+
+    An idle session doesn't wake for a background task: the CLI writes the
+    enqueue row the moment a Monitor fires and leaves it there until a turn
+    starts, which in practice means until someone types. Session 1d61c8f4 banked
+    thirteen 15-minute Monitor events between 05:21 and 08:21 and delivered all
+    thirteen at 08:23:43, a quarter second after a typed "好了吗" — three hours of
+    a card showing nothing, then thirteen rows at once. The enqueue row carries
+    the whole notification and the real firing time, so the news is on disk the
+    whole way; only the delivery is late.
+    """
+
+    def _enqueue(self, text, ts):
+        return {"type": "queue-operation", "operation": "enqueue",
+                "timestamp": ts, "content": text}
+
+    def _monitor(self, event):
+        return ("<task-notification>\n<task-id>bur1u5hib</task-id>\n"
+                "<summary>Monitor event: \"TraceAV run\"</summary>\n"
+                f"<event>{event}</event>\n</task-notification>")
+
+    def test_a_queued_notification_shows_when_it_fired(self):
+        evs = transcripts.timeline(_write([
+            _user("goal 2 开始", ts="2026-08-25T05:00:00Z"),
+            self._enqueue(self._monitor("progress 127/2200"), "2026-08-25T05:21:17Z"),
+            self._enqueue(self._monitor("progress 257/2200"), "2026-08-25T05:36:17Z"),
+        ]))
+        pending = [e for e in evs if e["extra"].get("pending")]
+        self.assertEqual([e["ts"] for e in pending],
+                         ["2026-08-25T05:21:17Z", "2026-08-25T05:36:17Z"])
+        # Injected, so it can't be mistaken for the prompt while it waits.
+        self.assertEqual(_last_prompt(evs), "goal 2 开始")
+        self.assertTrue(all(e["extra"]["meta"] for e in pending))
+
+    def test_the_event_payload_is_what_changed(self):
+        # Every firing of one Monitor repeats the same <summary> — the progress
+        # is in <event>, and without it the rows are indistinguishable.
+        evs = transcripts.timeline(_write([
+            self._enqueue(self._monitor("progress 1986/2200"), "2026-08-25T08:21:17Z"),
+        ]))
+        self.assertEqual(evs[0]["text"],
+                         '后台任务：Monitor event: "TraceAV run" — progress 1986/2200')
+
+    def test_delivery_retires_the_pending_row(self):
+        # The dequeue spelling carries no content at all, so the queue is matched
+        # by position. Left in, the same event would show up twice.
+        notif = self._monitor("progress 127/2200")
+        evs = transcripts.timeline(_write([
+            self._enqueue(notif, "2026-08-25T05:21:17Z"),
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-08-25T08:23:43Z"},
+            _user(notif, ts="2026-08-25T08:23:43Z", promptSource="system"),
+        ]))
+        self.assertEqual([e for e in evs if e["extra"].get("pending")], [])
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["ts"], "2026-08-25T08:23:43Z")
+
+    def test_a_named_removal_retires_the_right_one(self):
+        # The older spelling names what it took, and it needn't be the oldest.
+        first, second = self._monitor("progress 127/2200"), self._monitor("progress 257/2200")
+        evs = transcripts.timeline(_write([
+            self._enqueue(first, "2026-08-25T05:21:17Z"),
+            self._enqueue(second, "2026-08-25T05:36:17Z"),
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": "2026-08-25T05:40:00Z", "content": second},
+        ]))
+        pending = [e for e in evs if e["extra"].get("pending")]
+        self.assertEqual([e["ts"] for e in pending], ["2026-08-25T05:21:17Z"])
+
+    def test_a_typed_prompt_holds_its_place_but_gets_no_row(self):
+        # The dashboard's own "Queued" panel owns typed prompts. Skipping them
+        # here is fine; skipping them in the FIFO is not — the dequeue below
+        # would then retire the notification instead of the prompt.
+        notif = self._monitor("progress 127/2200")
+        evs = transcripts.timeline(_write([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-08-25T05:20:00Z", "content": "先等等"},
+            self._enqueue(notif, "2026-08-25T05:21:17Z"),
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-08-25T05:22:00Z"},
+        ]))
+        pending = [e for e in evs if e["extra"].get("pending")]
+        self.assertEqual([e["text"] for e in pending],
+                         ['后台任务：Monitor event: "TraceAV run" — progress 127/2200'])
+
+    def test_a_removal_with_no_enqueue_in_the_tail_invents_nothing(self):
+        # timeline() only reads a tail. A dequeue whose enqueue fell off the head
+        # has nothing to retire, and must not retire the row after it.
+        evs = transcripts.timeline(_write([
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-08-25T05:00:00Z"},
+            self._enqueue(self._monitor("progress 127/2200"), "2026-08-25T05:21:17Z"),
+        ]))
+        self.assertEqual(len(([e for e in evs if e["extra"].get("pending")])), 1)
+
+
+class QueuedPromptShapeTests(unittest.TestCase):
+    def test_a_queued_prompt_with_images_is_logged_as_blocks(self):
+        # A prompt with pasted images is logged as content blocks, not a string.
+        # `.strip()` on that raised, and the AttributeError took timeline() down
+        # for the whole session — a card ever sent a screenshot showed nothing.
+        evs = transcripts.timeline(_write([{
+            "type": "attachment", "timestamp": "2026-08-10T21:26:21Z",
+            "attachment": {"type": "queued_command", "prompt": [
+                {"type": "text", "text": "你可以看下[Image #6]"},
+                {"type": "image", "source": {"type": "base64", "data": "iVBORw0K"}},
+            ]},
+        }]))
+        self.assertEqual(_last_prompt(evs), "你可以看下[Image #6]")
+        self.assertNotIn("iVBORw0K", evs[0]["text"])

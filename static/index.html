@@ -687,7 +687,8 @@
         <div :id="'tl-ev-'+ev._idx" class="text-sm border-l-2 pl-3 py-1"
              x-show="ev.kind !== 'system'"
              :class="{
-               'border-blue-400': ev.kind==='user_text',
+               'border-blue-400': ev.kind==='user_text' && !ev.extra?.pending,
+               'border-orange-300 border-dashed': ev.extra?.pending,
                'border-emerald-400': ev.kind==='assistant_text',
                'border-amber-400': ev.kind==='tool_use',
                'border-amber-500': ev.kind==='ask_question',
@@ -733,8 +734,17 @@
             </template>
             <!-- Harness-injected, not typed: a skill body, a command caveat.
                  Say so, or a row cut at 200 chars reads as a truncated prompt. -->
-            <template x-if="ev.extra?.meta">
+            <template x-if="ev.extra?.meta && !ev.extra?.pending">
               <span class="text-gray-400">（注入）</span>
+            </template>
+            <!-- Fired, but Claude hasn't been handed it. An idle session doesn't
+                 wake for a background task: the notification sits in the CLI's
+                 own queue until a turn starts, which in practice means until
+                 someone types. Shown at the time it fired, so a Monitor's
+                 progress reads live instead of arriving as one burst hours late. -->
+            <template x-if="ev.extra?.pending">
+              <span class="text-orange-500 font-medium"
+                    title="后台任务通知已入队但尚未送达 Claude：session 空闲时不会被唤醒，要等下一轮 turn（通常是你发下一句）才会一次性投递。这里的时间是事件真实触发的时刻。">⏳（待送达）</span>
             </template>
             <!-- Typed while the session was busy, so Claude took it off its own
                  queue here instead of at the top of a turn. The time is when it
@@ -784,7 +794,8 @@
           <!-- User prompt: same deal — a prompt cut off mid-sentence is worse
                than a tall row, so it wraps in full at the same adjustable size. -->
           <template x-if="ev.kind === 'user_text'">
-            <pre class="text-gray-800 whitespace-pre-wrap break-words"
+            <pre class="whitespace-pre-wrap break-words"
+                 :class="ev.extra?.pending ? 'text-orange-700' : 'text-gray-800'"
                  :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
           </template>
           <!-- AskUserQuestion: full question text + every option, no truncation -->

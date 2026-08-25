@@ -33,6 +33,7 @@ _RECAP_HINT_RE = re.compile(r"\s*\(\s*disable recaps in /config\s*\)\s*$")
 _INJECTED_ENVELOPES = ("<task-notification>", "<local-command-stdout>")
 _TN_STATUS_RE = re.compile(r"<status>\s*(.*?)\s*</status>", re.DOTALL)
 _TN_SUMMARY_RE = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
+_TN_EVENT_RE = re.compile(r"<event>\s*(.*?)\s*</event>", re.DOTALL)
 
 
 def is_injected_user_row(d: dict) -> bool:
@@ -73,10 +74,17 @@ def _clean_task_notification(text: str) -> str:
         return text
     status = _TN_STATUS_RE.search(text)
     summary = _TN_SUMMARY_RE.search(text)
-    if not status and not summary:
+    event = _TN_EVENT_RE.search(text)
+    if not status and not summary and not event:
         return text
     head = f"后台任务 {status.group(1)}" if status else "后台任务"
-    return f"{head}：{summary.group(1)}" if summary else head
+    body = summary.group(1) if summary else ""
+    if event:
+        # A Monitor's summary is the standing description of what it watches —
+        # byte-identical on every firing. What actually changed is in `<event>`,
+        # so dropping it left a column of rows that all read the same.
+        body = f"{body} — {event.group(1)}" if body else event.group(1)
+    return f"{head}：{body}" if body else head
 
 
 def _clean_command_text(text: str) -> str:
@@ -270,6 +278,23 @@ def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
     return out
 
 
+def _queued_prompt_text(value) -> str:
+    """A queued prompt as text, whatever shape the CLI logged it in.
+
+    Usually a plain string. A prompt with pasted images is logged as content
+    blocks instead, and this used to go straight to `.strip()` — one
+    AttributeError that took `timeline()` down for the whole session, so any card
+    ever sent a screenshot showed an empty transcript. Keep the text blocks; the
+    image bytes have no place on a row capped at a couple hundred chars.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(b.get("text") or "" for b in value
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
 def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     """A prompt typed while the session was busy, as the user row it never got.
 
@@ -292,7 +317,7 @@ def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     a = d.get("attachment") or {}
     if a.get("type") != "queued_command":
         return []
-    text = a.get("prompt") or ""
+    text = _queued_prompt_text(a.get("prompt"))
     if not text.strip():
         return []
     extra = {"queued": True}
@@ -650,6 +675,77 @@ def _model_change_events(raw: list[dict]) -> dict[int, TurnEvent]:
     return out
 
 
+def _pending_notice_events(raw: list[dict]) -> dict[int, TurnEvent]:
+    """Notifications sitting in Claude's queue undelivered, as timeline rows.
+
+    An idle session does not wake for a background task. The CLI writes a
+    `queue-operation`/`enqueue` row the moment a Monitor fires and then leaves it
+    there — nothing drains the queue until a turn starts, which in practice means
+    until someone types. A session left alone banks every event and delivers the
+    lot in one burst stamped with the *delivery* time: seen here, thirteen 15-min
+    Monitor events fired between 05:21 and 08:21, and all thirteen landed at
+    08:23:43, a quarter second after a typed "好了吗". Three hours of a card
+    showing nothing, then thirteen rows at once.
+
+    The enqueue row carries the whole notification and the real firing time, so
+    the news was on disk all along and only the delivery was late. These are the
+    ones still waiting, placed where they fired; each drops out again the moment
+    it lands, so the timeline never shows one twice.
+
+    Matching is by queue position, not by text. A `remove` row names what it
+    took, but the `dequeue` spelling a newer CLI writes carries no content at all
+    — and all thirteen were identical anyway. The queue is FIFO, so every enqueue
+    is tracked, typed prompts included: skip those and the positions drift.
+
+    Only what `raw` holds can be reconciled. An enqueue that fell off the head of
+    the tail is invisible either way, and a removal whose enqueue fell off finds
+    nothing to retire — both leave the row out rather than inventing one.
+    """
+    queued: list[tuple[int, str]] = []  # (row index, raw content), oldest first
+
+    def retire_exact(text: str) -> bool:
+        for n, (_, content) in enumerate(queued):
+            if content == text:
+                queued.pop(n)
+                return True
+        return False
+
+    for i, d in enumerate(raw):
+        t = d.get("type")
+        if t == "queue-operation":
+            content = d.get("content")
+            content = content if isinstance(content, str) else ""
+            if d.get("operation") == "enqueue":
+                queued.append((i, content))
+            elif not (content and retire_exact(content)) and queued:
+                queued.pop(0)
+        elif t == "attachment":
+            # Claude pulled it off the queue mid-turn. On CLI versions that log
+            # no removal row this attachment is the only trace, so it counts —
+            # but by text only: the FIFO pop above already covers the rest, and
+            # doing it twice would retire a notification still waiting.
+            a = d.get("attachment") or {}
+            if a.get("type") == "queued_command":
+                retire_exact(_queued_prompt_text(a.get("prompt")))
+        elif t == "user" and is_injected_user_row(d):
+            content = (d.get("message") or {}).get("content")
+            if isinstance(content, str):
+                retire_exact(content)
+
+    out: dict[int, TurnEvent] = {}
+    for i, content in queued:
+        # A typed prompt waiting in the same queue is the dashboard's own
+        # "Queued" panel's business, and it already has one.
+        if not content.lstrip().startswith("<task-notification>"):
+            continue
+        out[i] = TurnEvent(
+            raw[i].get("timestamp", ""), "user_text",
+            cap_text(clean_user_text(content), META_CHARS),
+            None, "user", {"meta": True, "pending": True},
+        )
+    return out
+
+
 def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     """Return ≤ limit most recent flattened turn events for a transcript."""
     p = Path(path)
@@ -658,10 +754,13 @@ def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     # Read more lines than needed because one jsonl row can expand into several events.
     raw = _tail_lines(p, max(limit * 2, 100))
     switches = _model_change_events(raw)
+    pending = _pending_notice_events(raw)
     events: list[TurnEvent] = []
     for i, d in enumerate(raw):
         if i in switches:
             events.append(switches[i])
+        if i in pending:
+            events.append(pending[i])
         events.extend(_normalize(d))
     return [e.__dict__ for e in events[-limit:]]
 
