@@ -199,7 +199,9 @@ class DiffSignatureTests(unittest.TestCase):
     still change the signature, or the card keeps showing a stale queue."""
 
     def _win(self, queued):
-        return {"pid": 100, "status": "busy", "waiting_for": None,
+        # `key` is the card's address (host-qualified pid); the signature is
+        # built on it, since pids only identify a card within one host.
+        return {"pid": 100, "key": "100", "status": "busy", "waiting_for": None,
                 "updated_at": 5, "queued": queued}
 
     def test_queue_change_alone_changes_signature(self):

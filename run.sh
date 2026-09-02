@@ -9,6 +9,13 @@ if [ -f .env.local ]; then
     set -a; source .env.local; set +a
 fi
 
+# Per-host additions layered on top of the shared file above. This repo is
+# served to every host off one mount, so .env.local reaches all of them —
+# anything true of exactly one machine (its peer list, say) belongs here.
+if [ -f ".env.local.$(hostname)" ]; then
+    set -a; source ".env.local.$(hostname)"; set +a
+fi
+
 if [ ! -d .venv ]; then
     echo "[claude-fleet] creating venv..."
     python3 -m venv .venv

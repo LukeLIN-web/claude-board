@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, auth, btwcapture, btwlog, codex, history, memory, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -25,6 +25,11 @@ STATIC_DIR = HERE / "static"
 class State:
     def __init__(self) -> None:
         self.last_snapshot: dict = {"windows": [], "counts": {}, "ts": 0}
+        # The local half of the snapshot above, served verbatim to a peer board
+        # asking what *this* host is running (see api_windows). Kept rather than
+        # recomputed: an aggregating peer polls every 2s, and enrichment walks
+        # transcripts and scrapes panes.
+        self.last_local_snapshot: dict = {"windows": [], "counts": {}, "ts": 0}
         self.last_signature: tuple = ()
         self.subscribers: set[asyncio.Queue] = set()
 
@@ -39,12 +44,16 @@ class State:
         # pending aside has no id yet — hence id+question+pending).
         return tuple(
             (
-                w["pid"], w["status"], w["waiting_for"], w["updated_at"],
+                w["key"], w["status"], w["waiting_for"], w["updated_at"],
                 tuple((q.get("source"), q.get("text"))
                       for q in w.get("queued", [])),
                 ((w.get("btw") or {}).get("id"),
                  (w.get("btw") or {}).get("question"),
                  (w.get("btw") or {}).get("pending")),
+                # A peer going quiet changes nothing about its cards' own
+                # fields, so without this the board would keep broadcasting
+                # them as live and never redraw them dimmed.
+                w.get("peer_stale"),
             )
             for w in snap["windows"]
         )
@@ -53,7 +62,8 @@ class State:
 state = State()
 
 
-def _enriched_snapshot() -> dict:
+def _local_snapshot() -> dict:
+    """This host's own cards, fully enriched. No peer traffic happens here."""
     snap = sessions.snapshot()
     perm_by_tty = perms.pending_by_tty()
     # Live Codex sessions arrive pre-enriched (codex transcripts have a different
@@ -165,13 +175,31 @@ def _enriched_snapshot() -> dict:
             # An aside whose answer is still generating: show it live so /btw
             # never looks dead while it works (nothing is archived yet).
             w["btw"] = {"question": pending_q, "answer": "", "pending": True}
-    # Merge live Codex windows in, then recompute the header counts over every
-    # visible (non-hidden) window across both platforms. Count by `triage`, not
-    # the raw `status`: the header chips filter cards on triage, so a session
-    # stuck at status=busy but idle past the threshold (triage=completed) must
-    # land in the idle tally — otherwise it inflates "busy" yet vanishes when
-    # you click the busy filter.
+    # Merge live Codex windows in, then address every card. `key` — not pid — is
+    # what the UI and the action routes carry: once a peer host's cards sit in
+    # the same list, pids alone collide (see core/peers.py).
     snap["windows"].extend(codex_windows)
+    label = peers.local_label()
+    for w in snap["windows"]:
+        w["host"] = label
+        w["key"] = str(w.get("pid"))
+    snap["host"] = label
+    # Capability flag for the UI to gate the tmux-backed controls. `available()`
+    # is cached, so this does not spawn a tmux subprocess on every 2s poll.
+    snap["tmux_available"] = tmux.available()
+    _finalize_snapshot(snap)
+    return snap
+
+
+def _finalize_snapshot(snap: dict) -> None:
+    """Recompute the header counts over every visible (non-hidden) window and
+    put the cards in display order. Counts go by `triage`, not the raw `status`:
+    the header chips filter cards on triage, so a session stuck at status=busy
+    but idle past the threshold (triage=completed) must land in the idle tally —
+    otherwise it inflates "busy" yet vanishes when you click the busy filter.
+
+    Run over the merged list too, so a peer's cards are counted and ordered
+    beside the local ones instead of being appended after them."""
     visible = [w for w in snap["windows"] if not w.get("hidden")]
     busy = [w for w in visible if w.get("triage") == "working"]
     waiting = [w for w in visible if w.get("triage") == "waiting_perm"]
@@ -186,10 +214,32 @@ def _enriched_snapshot() -> dict:
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
         -w.get("updated_at", 0),
     ))
-    # Capability flag for the UI to gate the tmux-backed controls. `available()`
-    # is cached, so this does not spawn a tmux subprocess on every 2s poll.
-    snap["tmux_available"] = tmux.available()
-    return snap
+
+
+def _enriched_snapshot() -> dict:
+    """The board's view: this host's cards plus every peer's, in one list.
+
+    Peer cards come from core.peers' cache, which a background thread refills —
+    nothing here waits on the network, so a wedged peer costs its own cards
+    going stale and nothing else."""
+    local = _local_snapshot()
+    state.last_local_snapshot = local
+    if not peers.enabled():
+        return local
+    # Shallow copy with a fresh window list: the local snapshot is handed to
+    # peers verbatim and must not grow their cards back into it.
+    merged = dict(local)
+    remote = peers.remote_windows()
+    merged["windows"] = list(local["windows"]) + remote
+    merged["peers"] = peers.status()
+    # The UI gates the tmux controls on one flag. A card whose own host has no
+    # tmux still gets buttons; pressing one returns that host's error, which is
+    # a clearer answer than a control that silently isn't there.
+    merged["tmux_available"] = bool(local.get("tmux_available")) or any(
+        p.get("online") for p in merged["peers"]
+    )
+    _finalize_snapshot(merged)
+    return merged
 
 
 async def _watcher() -> None:
@@ -217,6 +267,7 @@ async def _watcher() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    peers.start()
     task = asyncio.create_task(_watcher())
     try:
         yield
@@ -247,31 +298,13 @@ def index() -> HTMLResponse:
     return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
-def _host_ip_octet() -> str:
-    """Return the last octet of this machine's primary outbound IP (e.g. "60"
-    for 10.145.87.60), so dashboards self-identify by host without manual
-    config. Empty string if the IP can't be determined."""
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # No packets are sent; this just picks the interface the kernel would
-        # use to reach an external address.
-        s.connect(("1.1.1.1", 80))
-        ip = s.getsockname()[0]
-    except OSError:
-        return ""
-    finally:
-        s.close()
-    return ip.rsplit(".", 1)[-1] if ip else ""
-
-
 def _apply_instance_label(html: str) -> str:
     """Stamp a per-host label into the tab title and header so multiple
     dashboards are tellable apart. Defaults to the host IP's last octet
     (e.g. "60"); CLAUDE_FLEET_LABEL overrides it. No label resolved ⇒ HTML is
-    returned unchanged."""
-    label = os.environ.get("CLAUDE_FLEET_LABEL", "").strip() or _host_ip_octet()
+    returned unchanged. Same label the cards carry as `host` (core/peers.py), so
+    the header badge and a local card's badge always agree."""
+    label = peers.local_label()
     if not label:
         return html
     html = html.replace(
@@ -288,14 +321,33 @@ def _apply_instance_label(html: str) -> str:
 
 
 @app.get("/api/windows")
-def api_windows() -> dict:
+def api_windows(request: Request) -> dict:
+    # A peer board asking what *this* host is running gets the local half only.
+    # Without this, two boards configured as each other's peer would each serve
+    # the other its own cards back and the page would show every session twice.
+    if request.headers.get(peers.PEER_HEADER):
+        if not state.last_local_snapshot["windows"]:
+            state.last_local_snapshot = _local_snapshot()
+        return state.last_local_snapshot
     if not state.last_snapshot["windows"]:
         state.last_snapshot = _enriched_snapshot()
     return state.last_snapshot
 
 
-@app.get("/api/windows/{pid}/timeline")
-def api_timeline(pid: int, limit: int = 2000) -> dict:
+def _split(key: str) -> tuple[str | None, int]:
+    """Card key → (peer host or None, pid on that host). A malformed key is a
+    404, the same answer an unknown pid gets."""
+    try:
+        return peers.split_key(key)
+    except ValueError:
+        raise HTTPException(404, "window not found")
+
+
+@app.get("/api/windows/{key}/timeline")
+def api_timeline(key: str, limit: int = 2000) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "GET", f"/api/windows/{pid}/timeline?limit={limit}")
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
@@ -349,8 +401,11 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
     }
 
 
-@app.get("/api/windows/{pid}/plan")
-def api_plan(pid: int) -> dict:
+@app.get("/api/windows/{key}/plan")
+def api_plan(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "GET", f"/api/windows/{pid}/plan")
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
@@ -388,8 +443,11 @@ def _require_window(pid: int):
     return w
 
 
-@app.post("/api/windows/{pid}/focus")
-def api_focus(pid: int) -> dict:
+@app.post("/api/windows/{key}/focus")
+def api_focus(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/focus")
     w = _require_window(pid)
     if not w.tty:
         return {"ok": False, "error": "no tty available for this pid"}
@@ -399,6 +457,9 @@ def api_focus(pid: int) -> dict:
 class CreateBody(BaseModel):
     cwd: str
     platform: str = "claude"  # "claude" | "codex"
+    # Which board runs the spawn. Empty (or this host's own label) means here;
+    # a configured peer label spawns on that machine, in that machine's paths.
+    host: str = ""
 
 
 class PromptBody(BaseModel):
@@ -407,13 +468,21 @@ class PromptBody(BaseModel):
 
 @app.post("/api/windows/create")
 def api_window_create(body: CreateBody) -> dict:
+    if body.host and body.host in peers.configured():
+        # Forward with the host stripped: the peer spawns locally, and a peer
+        # list that ever names this board back can't bounce the request around.
+        return peers.forward(body.host, "POST", "/api/windows/create",
+                             {"cwd": body.cwd, "platform": body.platform})
     if not sessions._cwd_visible(body.cwd):
         raise HTTPException(403, "cwd is hidden by the dashboard filter")
     return actions.create_session(body.cwd, body.platform)
 
 
-@app.post("/api/windows/{pid}/prompt")
-def api_window_prompt(pid: int, body: PromptBody) -> dict:
+@app.post("/api/windows/{key}/prompt")
+def api_window_prompt(key: str, body: PromptBody) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/prompt", body.model_dump())
     _require_window(pid)
     # Stamp the send time before the keystrokes: send_prompt types, verifies the
     # composer and verifies the submit, which takes long enough that Claude's own
@@ -425,14 +494,17 @@ def api_window_prompt(pid: int, body: PromptBody) -> dict:
     return r
 
 
-@app.post("/api/windows/{pid}/clear")
-def api_window_clear(pid: int) -> dict:
+@app.post("/api/windows/{key}/clear")
+def api_window_clear(key: str) -> dict:
     """Send /clear and blank the card's pre-clear preview.
 
     Both Claude and Codex have /clear. Claude starts a fresh transcript so its
     card empties on its own, but Codex's /clear leaves the rollout JSONL intact —
     so we also stamp a per-pid clear time that hides older rollout events from the
     card and timeline (see codex.mark_cleared)."""
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/clear")
     _require_window(pid)
     sent_at = time.time()
     r = actions.send_prompt(pid, "/clear")
@@ -446,13 +518,16 @@ class ModelBody(BaseModel):
     model: str  # a /model dialog alias, e.g. "opus" | "fable"
 
 
-@app.post("/api/windows/{pid}/model")
-def api_window_model(pid: int, body: ModelBody) -> dict:
+@app.post("/api/windows/{key}/model")
+def api_window_model(key: str, body: ModelBody) -> dict:
     """Switch this session's model for the running session only.
 
     Not a plain `/model <alias>` prompt: that form also saves the pick as the
     user's default for new sessions. actions.switch_model drives the dialog and
     commits with "s" instead (see its docstring)."""
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/model", body.model_dump())
     _require_window(pid)
     return actions.switch_model(pid, body.model)
 
@@ -461,8 +536,11 @@ class PermissionBody(BaseModel):
     choice: str  # approve | approve_always | deny
 
 
-@app.post("/api/windows/{pid}/permission")
-def api_window_permission(pid: int, body: PermissionBody) -> dict:
+@app.post("/api/windows/{key}/permission")
+def api_window_permission(key: str, body: PermissionBody) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/permission", body.model_dump())
     _require_window(pid)
     return actions.respond_permission(pid, body.choice)
 
@@ -471,26 +549,38 @@ class MenuKeysBody(BaseModel):
     keys: list[str]  # e.g. ["2"], ["Enter"], ["Escape"]
 
 
-@app.post("/api/windows/{pid}/keys")
-def api_window_keys(pid: int, body: MenuKeysBody) -> dict:
+@app.post("/api/windows/{key}/keys")
+def api_window_keys(key: str, body: MenuKeysBody) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/keys", body.model_dump())
     _require_window(pid)
     return actions.send_menu_keys(pid, body.keys)
 
 
-@app.post("/api/windows/{pid}/fork")
-def api_fork(pid: int) -> dict:
+@app.post("/api/windows/{key}/fork")
+def api_fork(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/fork")
     _require_window(pid)
     return actions.fork_session(pid)
 
 
-@app.post("/api/windows/{pid}/export")
-def api_export(pid: int) -> dict:
+@app.post("/api/windows/{key}/export")
+def api_export(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/export")
     _require_window(pid)
     return actions.export_to_feishu(pid)
 
 
-@app.post("/api/windows/{pid}/close")
-def api_close(pid: int) -> dict:
+@app.post("/api/windows/{key}/close")
+def api_close(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/close")
     _require_window(pid)
     return actions.close_session(pid)
 
@@ -499,11 +589,14 @@ class BtwDismissBody(BaseModel):
     id: int  # btwlog entry id (w["btw"].id on the card)
 
 
-@app.post("/api/windows/{pid}/btw/dismiss")
-def api_btw_dismiss(pid: int, body: BtwDismissBody) -> dict:
+@app.post("/api/windows/{key}/btw/dismiss")
+def api_btw_dismiss(key: str, body: BtwDismissBody) -> dict:
     """Hide the card's archived /btw aside. Card-state only: the aside stays in
     the archive and the timeline (that's history), it just stops occupying the
     card."""
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/btw/dismiss", body.model_dump())
     w = _require_window(pid)
     sid = getattr(w, "session_id", None)
     if not sid:

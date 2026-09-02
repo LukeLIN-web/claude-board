@@ -35,6 +35,11 @@ cd "$(dirname "$0")/.."
 if [ -f .env.local ]; then
     set -a; source .env.local; set +a
 fi
+# Same two-file layering run.sh uses, so this reads the port the board on THIS
+# host was actually started with.
+if [ -f ".env.local.$(hostname)" ]; then
+    set -a; source ".env.local.$(hostname)"; set +a
+fi
 
 PORT="${CLAUDE_FLEET_PORT:-7879}"
 RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-fleet"
