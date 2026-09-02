@@ -251,7 +251,7 @@ class QueuedPromptTimelineTests(unittest.TestCase):
              "timestamp": "2026-08-10T10:52:36.610Z", "content": text},
             {"type": "assistant", "timestamp": "2026-08-10T10:52:50.350Z",
              "message": {"model": "claude-opus-5", "content": [
-                 {"type": "text", "text": "马上腾出 nnmc72。"}]}},
+                 {"type": "text", "text": "马上腾出那台机器。"}]}},
             {"type": "queue-operation", "operation": "remove",
              "timestamp": "2026-08-10T10:53:06.014Z", "content": text},
             {"type": "attachment", "timestamp": "2026-08-10T10:52:36.609Z",

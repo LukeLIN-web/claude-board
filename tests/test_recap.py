@@ -30,7 +30,7 @@ def _recap(ts, content):
 class RecapTests(unittest.TestCase):
     def test_recap_becomes_its_own_timeline_row(self):
         text = ("Goal: evaluate the pi0.5 checkpoint on 14 RoboTwin tasks. "
-                "Next: relaunch on nnmc64's four stable GPUs.")
+                "Next: relaunch on the four stable GPUs.")
         evs = transcripts.timeline(_write([_recap("2026-08-10T05:45:32Z", text)]))
         self.assertEqual([e["kind"] for e in evs], ["recap"])
         self.assertEqual(evs[0]["text"], text)
