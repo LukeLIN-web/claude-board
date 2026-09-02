@@ -354,7 +354,7 @@ class SendPromptReadinessTests(unittest.TestCase):
     _BOOTING = (
         " ▐▛███▜▌   Claude Code v2.1.211\n"
         "▝▜█████▛▘  Fable 5 · Claude Max\n"
-        "  ▘▘ ▝▝    /shared/user60/workspace/juyi/qwen3omni\n"
+        "  ▘▘ ▝▝    /shared/ws/proj\n"
     )
     _READY = _BOOTING + "❯ \n⏵⏵ bypass permissions on"
     # The Rewind panel replacing the composer (lifted from a live wedged pane).

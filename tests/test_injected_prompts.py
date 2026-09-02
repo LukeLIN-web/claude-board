@@ -25,7 +25,7 @@ NOTIFICATION = (
     "<task-notification>\n"
     "<task-id>b8zgt9a06</task-id>\n"
     "<tool-use-id>toolu_01D1YmHM6Cxzh1AgzbMX9jyb</tool-use-id>\n"
-    "<output-file>/tmp/claude-1000/-shared-user60-workspace-juyi-qwen3omni/"
+    "<output-file>/tmp/claude-1000/-shared-ws-proj/"
     "74432bb2-4c41-48fc-bcbd-5626c173e4a3/tasks/b8zgt9a06.output</output-file>\n"
     "<status>completed</status>\n"
     "<summary>Background command \"Re-arm watcher after reboot\" completed "

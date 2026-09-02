@@ -21,28 +21,28 @@ class CwdFilterTests(unittest.TestCase):
         self.assertTrue(sessions._cwd_visible("/anything"))
 
     def test_include_allowlist(self):
-        self._set(CLAUDE_FLEET_CWD_INCLUDE="/shared/user60/workspace/juyi/")
-        self.assertTrue(sessions._cwd_visible("/shared/user60/workspace/juyi/board"))
-        self.assertTrue(sessions._cwd_visible("/shared/user60/workspace/juyi"))
+        self._set(CLAUDE_FLEET_CWD_INCLUDE="/shared/ws/proj/")
+        self.assertTrue(sessions._cwd_visible("/shared/ws/proj/board"))
+        self.assertTrue(sessions._cwd_visible("/shared/ws/proj"))
         self.assertFalse(sessions._cwd_visible("/home/user1/workspace/x"))
 
     def test_include_respects_path_boundary(self):
-        self._set(CLAUDE_FLEET_CWD_INCLUDE="/shared/user60/workspace/juyi")
+        self._set(CLAUDE_FLEET_CWD_INCLUDE="/shared/ws/proj")
         # A sibling dir that merely shares the prefix string must not match.
-        self.assertFalse(sessions._cwd_visible("/shared/user60/workspace/juyi-evil"))
+        self.assertFalse(sessions._cwd_visible("/shared/ws/proj-evil"))
 
     def test_exclude_denylist(self):
         self._set(CLAUDE_FLEET_CWD_EXCLUDE="/home/user1/workspace")
         self.assertFalse(sessions._cwd_visible("/home/user1/workspace/x"))
-        self.assertTrue(sessions._cwd_visible("/shared/user60/workspace/juyi/board"))
+        self.assertTrue(sessions._cwd_visible("/shared/ws/proj/board"))
 
     def test_exclude_wins_over_include(self):
         self._set(
             CLAUDE_FLEET_CWD_INCLUDE="/shared",
-            CLAUDE_FLEET_CWD_EXCLUDE="/shared/user60/secret",
+            CLAUDE_FLEET_CWD_EXCLUDE="/shared/ws/secret",
         )
-        self.assertTrue(sessions._cwd_visible("/shared/user60/workspace/juyi"))
-        self.assertFalse(sessions._cwd_visible("/shared/user60/secret/x"))
+        self.assertTrue(sessions._cwd_visible("/shared/ws/proj"))
+        self.assertFalse(sessions._cwd_visible("/shared/ws/secret/x"))
 
     def test_multiple_prefixes(self):
         self._set(CLAUDE_FLEET_CWD_INCLUDE="/a/b:/c/d,/e/f")
@@ -59,14 +59,14 @@ class SlugFilterTests(unittest.TestCase):
     def test_slug_matches_cwd_filter(self):
         with mock.patch.dict(
             "os.environ",
-            {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/user60/workspace/juyi"},
+            {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj"},
             clear=False,
         ):
             sessions._reload_cwd_filters()
         # slug form of an allowed cwd is visible...
-        self.assertTrue(sessions.slug_visible("-shared-user60-workspace-juyi-board"))
+        self.assertTrue(sessions.slug_visible("-shared-ws-proj-board"))
         # ...a sibling sharing the string prefix is not (boundary on "-")...
-        self.assertFalse(sessions.slug_visible("-shared-user60-workspace-juyi2-x"))
+        self.assertFalse(sessions.slug_visible("-shared-ws-proj2-x"))
         # ...and an unrelated project is hidden.
         self.assertFalse(sessions.slug_visible("-home-user1-arman-lingbot-va"))
 
@@ -90,12 +90,12 @@ class HistoryFilterTests(unittest.TestCase):
             )
 
         fake = [
-            mk("a", "/shared/user60/workspace/juyi/board"),
+            mk("a", "/shared/ws/proj/board"),
             mk("b", "/home/user1/arman/lingbot-va"),
         ]
         with mock.patch.dict(
             "os.environ",
-            {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/user60/workspace/juyi"},
+            {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj"},
             clear=False,
         ):
             sessions._reload_cwd_filters()
