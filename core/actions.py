@@ -1450,9 +1450,18 @@ _MODEL_DIALOG_FOOTER = "s to use this session only"
 
 # A dialog row, e.g. "    2. Opus  Opus 4.8 …" or "  ❯ 3. Fable  Fable 5 …".
 # Group "cur" is the ❯ cursor (present on exactly one row), "n" the row number,
-# "label" the model name — the first token, so "Default (recommended)" ⇒ Default
-# and "Sonnet ✔" ⇒ Sonnet.
-_MODEL_ROW_RE = re.compile(r"^(?P<cur>[\s ]*❯)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<label>\S+)")
+# "rest" everything after it. The gutter carries more than the cursor: when the
+# list is scrolled Claude marks the first and last rows it drew with ↑/↓, and
+# those rows are as real as any other, so a marker has to be allowed to sit where
+# the cursor would.
+_MODEL_ROW_RE = re.compile(
+    r"^[\s ]*(?:(?P<cur>❯)|[↑↓])?[\s ]*(?P<n>\d+)\.[\s ]+(?P<rest>\S.*)"
+)
+
+# A run of spaces separates a row's name from its blurb: "Opus (1M context)
+# Opus 5 with 1M context · …". Keeping the whole name rather than its first word
+# is what tells that row apart from the plain "Opus" one below it.
+_MODEL_NAME_GAP_RE = re.compile(r"[\s ]{2,}")
 
 # Switching mid-conversation raises a SECOND dialog on top of the picker: the
 # history is cached against the old model and has to be re-read, so Claude asks
@@ -1467,11 +1476,16 @@ _MODEL_DIALOG_WAIT = 8.0   # seconds to wait for the dialog to open / close
 _MODEL_DIALOG_POLL = 0.2
 _MODEL_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
 _MODEL_ESCAPES = 3         # enough to back out of confirm -> picker -> prompt
+_MODEL_WALK_MAX = 24       # hard stop for the survey lap; the list is far shorter
 
 
 def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
-    """Parse the /model dialog: [(row number, model label)], plus the number of
-    the highlighted row (0 if no row carries the cursor)."""
+    """Parse the /model dialog: [(row number, model name)], plus the number of the
+    highlighted row (0 if no row carries the cursor).
+
+    Only the rows Claude currently has on screen — see _survey_model_rows for why
+    that is rarely the whole list. The ✔ on the session's current model is
+    stripped: it marks the row, not the model."""
     rows: list[tuple[int, str]] = []
     cursor = 0
     for line in text.splitlines():
@@ -1479,7 +1493,8 @@ def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
         if not m:
             continue
         n = int(m.group("n"))
-        rows.append((n, m.group("label")))
+        name = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
+        rows.append((n, name.removesuffix("✔").strip()))
         if m.group("cur"):
             cursor = n
     return rows, cursor
@@ -1520,6 +1535,52 @@ def _step_cursor_onto(pane: str, target: int, rows: int, read_cursor) -> bool:
     return False
 
 
+def _survey_model_rows(pane: str) -> dict[int, str]:
+    """Walk the picker's cursor once around the list and return {row number: name}.
+
+    One capture shows only the rows Claude chose to draw. The list is a scrolling
+    window, and the board's sessions live in 80x24 panes with a transcript above
+    the dialog: at that height Claude renders two or three rows and folds the rest
+    behind "… +N models". Reading the target's row number off that slice is how
+    "fable" came back as "not in the /model dialog (offered: Default, Opus)" while
+    Fable sat one row below the fold.
+
+    Down scrolls the window, so a full lap is what makes the whole list readable.
+    The lap ends where it started — row numbers are stable, so coming back around
+    to the row we set out from means every row has passed under the cursor.
+    """
+    seen: dict[int, str] = {}
+    start = 0
+    for _ in range(_MODEL_WALK_MAX):
+        rows, cursor = _model_dialog_rows(tmux.capture_pane(pane).get("text", ""))
+        for n, name in rows:
+            seen.setdefault(n, name)
+        if not cursor or cursor == start:
+            break
+        if not start:
+            start = cursor
+        tmux.send_keys(pane, "Down")
+        time.sleep(_MODEL_KEY_SETTLE)
+    return seen
+
+
+def _pick_model_row(rows: dict[int, str], alias: str) -> int:
+    """Row number for `alias` in a surveyed list, 0 if it isn't offered.
+
+    Whole name first, first word only as a fallback. A session sitting on a model
+    the base list doesn't carry gets a second row for its own family — "Opus (1M
+    context)" up top and a plain "Opus ✔" at the bottom — and first-word matching
+    alone hands "opus" whichever comes first, which is the 1M row rather than the
+    one the board's Opus means. The fallback is still needed for the rows that
+    never appear bare, like "Default (recommended)".
+    """
+    exact = [n for n in sorted(rows) if rows[n].lower() == alias]
+    if exact:
+        return exact[0]
+    loose = [n for n in sorted(rows) if rows[n].lower().split()[:1] == [alias]]
+    return loose[0] if loose else 0
+
+
 def switch_model(pid: int, alias: str) -> dict:
     """Switch `pid`'s session to model `alias` (e.g. "opus") for THIS SESSION ONLY.
 
@@ -1528,12 +1589,14 @@ def switch_model(pid: int, alias: str) -> dict:
     sessions. The dialog's "s" key is the only way to scope the switch to the
     running session.
 
-    The dialog opens with its cursor on the session's *current* model, so the
-    number of keypresses to reach a target row isn't fixed — and the row list
-    wraps, so there's no edge to anchor against either. We step Down one row at a
-    time, re-reading the cursor from the pane after each press, until it sits on
-    the target. That read doubles as the check that we're about to commit the
-    right row.
+    Reaching the right row takes two laps. The first (_survey_model_rows) is what
+    reads the list at all: on a short pane most of it is folded behind "… +N
+    models", and only walking the cursor scrolls those rows into view. The second
+    (_step_cursor_onto) steps Down onto the row that survey picked, re-reading the
+    cursor from the pane after each press — the dialog opens on the session's
+    *current* model and the list wraps, so there is neither a fixed keypress count
+    nor an edge to anchor against, and the read doubles as the check that we're
+    about to commit the right row.
 
     Mid-conversation, "s" doesn't commit — it raises a confirm dialog (the cached
     history has to be re-read against the new model). Same treatment: step onto
@@ -1569,12 +1632,12 @@ def switch_model(pid: int, alias: str) -> dict:
     else:
         return {"ok": False, "error": "the /model dialog never opened"}
 
-    rows, _ = _model_dialog_rows(text)
-    target = next((n for n, label in rows if label.lower() == alias), 0)
+    rows = _survey_model_rows(pane)
+    target = _pick_model_row(rows, alias)
     if not target:
         # Leave the session as we found it rather than parked on an open modal.
         _escape_model_dialogs(pane)
-        offered = ", ".join(label for _, label in rows) or "none"
+        offered = ", ".join(rows[n] for n in sorted(rows)) or "none"
         return {"ok": False, "error": f"'{alias}' is not in the /model dialog (offered: {offered})"}
 
     if not _step_cursor_onto(pane, target, len(rows),

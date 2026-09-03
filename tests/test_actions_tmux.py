@@ -995,11 +995,37 @@ MODEL_DIALOG = """\
 """
 
 
+# The same dialog in an 80x24 pane (v2.1.259) — the size the board's sessions
+# actually run at. The list becomes a scrolling window: Default is off the top,
+# the boundary rows carry ↑/↓ where the cursor would go, and what didn't fit is
+# folded into "… +N model".
+MODEL_DIALOG_SCROLLED = """\
+  Select model
+  Switch between Claude models. Your pick becomes the default for new
+  sessions. For other/previous model names, specify with --model.
+
+  ↑ 2. Opus (1M context)      Opus 5 with 1M context · Best for everyday,
+                              complex tasks
+    3. Fable                  Fable 5.1 · Most capable for your hardest and
+                              longest-running tasks
+    4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+    5. Haiku                  Haiku 4.5 · Fastest for quick answers
+  ❯ 6. Opus ✔                 Opus 5 · Best for everyday, complex tasks
+     … +1 model
+
+  ◉ xHigh effort ←/→ to adjust
+
+  Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+
 class ModelDialogParseTests(unittest.TestCase):
     def test_rows_and_cursor(self):
         rows, cursor = actions._model_dialog_rows(MODEL_DIALOG)
         self.assertEqual(
-            rows, [(1, "Default"), (2, "Opus"), (3, "Fable"), (4, "Sonnet"), (5, "Haiku")]
+            rows,
+            [(1, "Default (recommended)"), (2, "Opus"), (3, "Fable"),
+             (4, "Sonnet"), (5, "Haiku")],
         )
         self.assertEqual(cursor, 4)
 
@@ -1008,14 +1034,56 @@ class ModelDialogParseTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(cursor, 0)
 
+    def test_scroll_marker_rows_are_rows(self):
+        # ↑/↓ sit in the cursor's column. Reading them as anything but a row is
+        # how the row under the fold went missing from the offered list.
+        rows, cursor = actions._model_dialog_rows(MODEL_DIALOG_SCROLLED)
+        self.assertEqual(
+            rows,
+            [(2, "Opus (1M context)"), (3, "Fable"), (4, "Sonnet"),
+             (5, "Haiku"), (6, "Opus")],
+        )
+        self.assertEqual(cursor, 6)
+
+    def test_fold_counter_is_not_a_row(self):
+        rows, _ = actions._model_dialog_rows("     … +4 models\n")
+        self.assertEqual(rows, [])
+
+
+class PickModelRowTests(unittest.TestCase):
+    """A session on a model the base list doesn't carry gets a second row for its
+    own family, so "Opus" is two different rows and the alias has to land on the
+    one the board's dropdown means."""
+
+    _ROWS = {1: "Default (recommended)", 2: "Opus (1M context)", 3: "Fable",
+             4: "Sonnet", 5: "Haiku", 6: "Opus"}
+
+    def test_whole_name_wins_over_first_word(self):
+        self.assertEqual(actions._pick_model_row(self._ROWS, "opus"), 6)
+
+    def test_first_word_is_the_fallback(self):
+        # Nothing is named bare "Default" — the fallback is the only way in.
+        self.assertEqual(actions._pick_model_row(self._ROWS, "default"), 1)
+
+    def test_first_word_still_reaches_a_lone_variant_row(self):
+        rows = {n: name for n, name in self._ROWS.items() if n != 6}
+        self.assertEqual(actions._pick_model_row(rows, "opus"), 2)
+
+    def test_absent_model_is_zero(self):
+        self.assertEqual(actions._pick_model_row(self._ROWS, "gpt5"), 0)
+
 
 class SwitchModelTests(unittest.TestCase):
     """switch_model drives the dialog by keypress, so the tests assert on the keys
     it sends — Enter would save the pick as the user's default, "s" must not."""
 
-    def _drive(self, alias, cursor_start=4, rows=5,
+    def _drive(self, alias, cursor_start=4, rows=5, names=None, window=None,
                confirm=False, confirm_cursor=1, confirm_sticks=False):
         """Fake a dialog whose cursor wraps 1..rows and moves on each Down.
+
+        `window` caps how many rows the dialog draws at once, the way Claude does
+        in a short pane: the rest is folded behind "… +N models" and the boundary
+        rows carry ↑/↓ in the cursor's column. Left None the whole list is drawn.
 
         `confirm` adds the second dialog Claude raises when the switch happens
         mid-conversation ("Switch model?" — the cached history has to be re-read).
@@ -1023,6 +1091,7 @@ class SwitchModelTests(unittest.TestCase):
         footer to vanish will call the switch done while the session sits on it.
         Escape backs out of it to the picker, not to the prompt.
         """
+        names = (names or ["Default", "Opus", "Fable", "Sonnet", "Haiku"])[:rows]
         state = {"cursor": cursor_start, "screen": "picker", "confirm_cursor": confirm_cursor}
 
         def capture(pane, scrollback=0):
@@ -1038,11 +1107,22 @@ class SwitchModelTests(unittest.TestCase):
                     mark = "❯ " if i == state["confirm_cursor"] else "  "
                     lines.append(f"  {mark}{i}. {name}")
                 return {"ok": True, "text": "\n".join(lines) + "\n"}
+            span = min(window or rows, rows)
+            lo = min(max(1, state["cursor"] - span // 2), rows - span + 1)
+            hi = lo + span - 1
             lines = ["  Select model"]
-            names = ["Default", "Opus", "Fable", "Sonnet", "Haiku"][:rows]
-            for i, name in enumerate(names, 1):
-                mark = "❯ " if i == state["cursor"] else "  "
-                lines.append(f"  {mark}{i}. {name}   blurb")
+            for i in range(lo, hi + 1):
+                if i == state["cursor"]:
+                    mark = "❯ "
+                elif i == lo and lo > 1:
+                    mark = "↑ "
+                elif i == hi and hi < rows:
+                    mark = "↓ "
+                else:
+                    mark = "  "
+                lines.append(f"  {mark}{i}. {names[i - 1]}   blurb")
+            if span < rows:
+                lines.append(f"     … +{rows - span} models")
             lines.append("  Enter to set as default · s to use this session only · Esc to cancel")
             return {"ok": True, "text": "\n".join(lines) + "\n"}
 
@@ -1086,20 +1166,51 @@ class SwitchModelTests(unittest.TestCase):
 
     def test_wraps_around_to_reach_target(self):
         # Cursor starts on Sonnet (4); Fable (3) is reachable only by wrapping.
+        # Two laps: 5 Downs to survey the list back to where it started, then 4
+        # more to step onto Fable.
         _, sent, state = self._drive("fable", cursor_start=4)
-        self.assertEqual(sent.count("Down"), 4)
+        self.assertEqual(sent.count("Down"), 5 + 4)
         self.assertEqual(state["cursor"], 3)
 
-    def test_no_move_when_already_on_target(self):
-        _, sent, _ = self._drive("sonnet", cursor_start=4)
-        self.assertEqual(sent, ["s"])
+    def test_survey_leaves_the_cursor_where_it_found_it(self):
+        # Already on Sonnet: the survey lap still runs — it is the only way to
+        # read the folded rows — but it comes back around and commits in place.
+        _, sent, state = self._drive("sonnet", cursor_start=4)
+        self.assertEqual(sent, ["Down"] * 5 + ["s"])
+        self.assertEqual(state["cursor"], 4)
 
     def test_unknown_alias_escapes_the_dialog(self):
         r, sent, _ = self._drive("gpt5")
         self.assertFalse(r["ok"])
         self.assertIn("not in the /model dialog", r["error"])
-        self.assertEqual(sent, ["Escape"])
+        self.assertEqual(sent, ["Down"] * 5 + ["Escape"])
         self.assertNotIn("s", sent)
+
+    def test_reaches_a_model_folded_out_of_view(self):
+        # The regression: in an 80x24 pane the picker draws two rows and folds the
+        # rest, so Fable is nowhere on the capture the dialog opens with. Reading
+        # the target off that one capture is what reported Fable as not offered.
+        r, sent, state = self._drive("fable", cursor_start=1, window=2)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["cursor"], 3)
+        self.assertEqual(sent[-1], "s")
+
+    def test_offered_list_names_the_folded_rows_too(self):
+        # A model that really isn't there has to say so against the whole list,
+        # not against the two rows that happened to be on screen.
+        r, _, _ = self._drive("gpt5", cursor_start=1, window=2)
+        self.assertFalse(r["ok"])
+        for name in ("Default", "Opus", "Fable", "Sonnet", "Haiku"):
+            self.assertIn(name, r["error"])
+
+    def test_opus_lands_on_the_bare_row_not_the_1m_one(self):
+        # A session on plain Opus 5 gets its own row on top of "Opus (1M
+        # context)". Matching on first words alone would take the 1M row.
+        _, _, state = self._drive(
+            "opus", cursor_start=3, rows=6,
+            names=["Default (recommended)", "Opus (1M context)", "Fable",
+                   "Sonnet", "Haiku", "Opus ✔"])
+        self.assertEqual(state["cursor"], 6)
 
     def test_confirms_the_cached_history_dialog(self):
         # Mid-conversation, "s" raises a second dialog instead of closing. The
