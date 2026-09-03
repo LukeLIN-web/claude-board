@@ -54,12 +54,68 @@ class State:
                 # fields, so without this the board would keep broadcasting
                 # them as live and never redraw them dimmed.
                 w.get("peer_stale"),
+                # The model readout can move on its own: a cleared session is
+                # idle, its updated_at frozen, and the banner that names its
+                # model is only picked up on a later poll (see _banner_model).
+                w.get("model_label"),
             )
             for w in snap["windows"]
         )
 
 
 state = State()
+
+
+# Model labels read off a session's welcome banner, keyed by (pid, session id).
+# The transcript is the primary source (it records what actually answered), but
+# it only names a model on assistant rows: from a /clear — or a launch — until
+# the session's next reply there is nothing in it to read, and the card's model
+# readout would go blank on exactly the idle sessions you are deciding what to
+# send next. The banner covers that gap, at the price of a capture-pane, which
+# this cache keeps off the 2s poll: a banner never changes within one session id,
+# and /clear starts a new one, so the next banner is picked up on its own.
+_banner_models: dict[tuple[int, str], tuple[str, float]] = {}
+# A miss is cached too — a session whose banner has scrolled away must not be
+# re-scraped every tick — but only for a while: a pane caught mid-launch, before
+# the banner is painted, has to get a second look or the card stays blank until
+# the session first replies.
+_BANNER_RETRY = 30.0
+
+
+def _banner_model(w: dict) -> str:
+    """The model `w`'s session prints in its welcome banner ("" if unreadable).
+
+    Read from the live pane, so it only answers for a session still running in
+    one; a dead or tmux-less window keeps its blank readout rather than borrowing
+    a label from somewhere else.
+    """
+    pid = w.get("pid")
+    if not isinstance(pid, int) or not w.get("alive") or not w.get("tty"):
+        return ""
+    # A `.slock` agent sub-session runs on its parent's tty, so the banner in
+    # that pane is the parent's — and a sub-agent is routinely on a different
+    # model. Its own transcript answers for it a turn later; until then the card
+    # says nothing rather than the window above it.
+    if w.get("hidden"):
+        return ""
+    key = (pid, w.get("session_id") or "")
+    hit = _banner_models.get(key)
+    if hit and (hit[0] or time.time() - hit[1] < _BANNER_RETRY):
+        return hit[0]
+    try:
+        label = actions.pane_model(w["tty"])
+    except Exception:
+        label = ""  # scrape failures degrade to no readout, never to a guess
+    _banner_models[key] = (label, time.time())
+    return label
+
+
+def _prune_banner_models(live_pids: set) -> None:
+    """Drop cached banners for pids that are gone, so the cache tracks the board
+    instead of growing an entry per session for the life of the process."""
+    for key in list(_banner_models):
+        if key[0] not in live_pids:
+            _banner_models.pop(key, None)
 
 
 def _local_snapshot() -> dict:
@@ -102,6 +158,12 @@ def _local_snapshot() -> dict:
             w["current_task"] = None
             w["model"] = ""
         w["model_label"] = transcripts.pretty_model(w["model"])
+        w["model_source"] = "transcript" if w["model"] else ""
+        if not w["model_label"]:
+            banner = _banner_model(w)
+            if banner:
+                w["model_label"] = banner
+                w["model_source"] = "banner"
         # Claude reports waitingFor="dialog open" for ANY open overlay — the
         # /goal panel included, which has nothing to answer and doesn't block
         # the agent. Only a verifiable picker in the pane earns the waiting
@@ -175,6 +237,7 @@ def _local_snapshot() -> dict:
             # An aside whose answer is still generating: show it live so /btw
             # never looks dead while it works (nothing is archived yet).
             w["btw"] = {"question": pending_q, "answer": "", "pending": True}
+    _prune_banner_models({w.get("pid") for w in snap["windows"]})
     # Merge live Codex windows in, then address every card. `key` — not pid — is
     # what the UI and the action routes carry: once a peer host's cards sit in
     # the same list, pids alone collide (see core/peers.py).

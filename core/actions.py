@@ -1441,6 +1441,90 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     return res
 
 
+# Claude repaints this welcome block on startup and after every /clear:
+#
+#      ▐▛███▛█   Claude Code v2.1.259
+#     ▝▜██████▀  Opus 5 (1M context) with xhigh effort · Claude Max
+#       ▝▝ ▝▝    /shared/user75/workspace/juyi/claude-board
+#
+# Its middle line is the only place a session that hasn't answered yet says which
+# model it is on. The transcript names a model on assistant rows and nowhere
+# else, and /clear starts a FRESH transcript — so from the clear until the next
+# reply transcripts.current_model has nothing to report, and without this the
+# card's model readout (and the picker's label with it) sits blank on exactly the
+# sessions you are deciding what to send next.
+_BANNER_HEAD_RE = re.compile(r"Claude Code v\d")
+# Left gutter of the banner: the block glyphs of the logo and the spaces around
+# them. Stripped off both ends, which also trims the pane's right-edge padding.
+_BANNER_GUTTER = "▐▛▜▝▘▗▖▀▄█▁▂▃▅▆▇ \t"
+_BANNER_SCROLLBACK = 200   # a not-yet-answered session's banner is still near the fold
+_BANNER_LABEL_MAX = 40     # "Opus 5 (1M context)" and friends; longer means misparse
+
+
+# A context-window qualifier on the banner's model name: "Opus 5 (1M context)".
+# Dropped, because the transcript — the readout's other source — never carries
+# one (the id it records is plain "claude-opus-5" either way, see
+# transcripts.pretty_model). Keeping it would make the label change the moment
+# the session first replies, which on a board is how a model SWITCH looks.
+_BANNER_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _banner_label(line: str) -> str:
+    """The model name off a banner's middle line, "" if `line` isn't one.
+
+    "▝▜██████▀  Opus 5 (1M context) with xhigh effort · Claude Max" → "Opus 5".
+    Effort and plan go too: this readout names a model, and all three of those
+    change without the model changing.
+    """
+    s = line.strip(_BANNER_GUTTER)
+    s = s.split(" with ")[0].split(" · ")[0].strip()
+    s = _BANNER_QUALIFIER_RE.sub("", s).strip()
+    # The cwd line sitting under the model one starts with the path separator;
+    # leftover logo art has no leading letter either.
+    if not s or len(s) > _BANNER_LABEL_MAX or not s[0].isalnum():
+        return ""
+    return s
+
+
+def banner_model(text: str) -> str:
+    """Model label from the LAST welcome banner in `text` ("" when there is none).
+
+    The last one, not the first: /clear reprints the banner, so a session that
+    was cleared after a /model switch carries both the model it used to run on
+    and the one it runs on now, in that order.
+    """
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if not _BANNER_HEAD_RE.search(lines[i]):
+            continue
+        # The model line follows the version line, give or take a redraw
+        # artifact; the cwd line closes the block, so nothing below it is read.
+        for line in lines[i + 1:i + 4]:
+            label = _banner_label(line)
+            if label:
+                return label
+        return ""
+    return ""
+
+
+def pane_model(tty: Optional[str]) -> str:
+    """The model the session on `tty` says it is running, per its welcome banner.
+
+    "" whenever that can't be established — no tty, no pane, a failed capture, or
+    a banner scrolled out of reach. Every one of those means "nothing to claim",
+    not "no model", so callers must leave the readout as they found it.
+    """
+    if not tty:
+        return ""
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return ""
+    cap = tmux.capture_pane(pane, scrollback=_BANNER_SCROLLBACK)
+    if not cap["ok"]:
+        return ""
+    return banner_model(cap["text"])
+
+
 # Claude's /model dialog. Its footer is the marker that the dialog is up, and it
 # spells out the two ways to commit a pick: Enter also saves the model as the
 # default for NEW sessions, while "s" scopes it to the running session. The board
