@@ -21,7 +21,9 @@ cd claude-board && bash run.sh
 ```
 
 The first run creates a venv and installs dependencies automatically — nothing to
-set up. Change the port with `CLAUDE_FLEET_PORT=9000 bash run.sh`.
+set up. Change the port with `CLAUDE_FLEET_PORT=9000 bash run.sh`. Detached mode
+is supervised and restarts the board automatically if it exits. Use
+`bash run.sh status`, `bash run.sh restart`, or `bash run.sh stop` to manage it.
 
 ## What it solves
 

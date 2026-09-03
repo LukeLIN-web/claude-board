@@ -38,15 +38,11 @@ echo "[claude-fleet] listening on http://127.0.0.1:${PORT}"
 export WATCHFILES_FORCE_POLLING=1
 RELOAD_ARGS=(--reload --reload-dir .)
 
-# By default run detached so the server survives the launching shell/session.
-# Set CLAUDE_FLEET_FOREGROUND=1 to run in the foreground instead.
+# Foreground mode is intentionally unsupervised: it belongs to the calling
+# terminal and Ctrl-C should stop it. Detached mode goes through the supervisor,
+# which survives the shell and restarts uvicorn whenever it exits.
 if [ -n "$CLAUDE_FLEET_FOREGROUND" ]; then
     exec uvicorn app:app --host 127.0.0.1 --port "$PORT" "${RELOAD_ARGS[@]}"
 fi
 
-# This repo is shared across hosts, so each host gets its own log file —
-# a single uvicorn.log would be truncated/interleaved by the other host.
-LOG_FILE="uvicorn.$(hostname).log"
-setsid uvicorn app:app --host 127.0.0.1 --port "$PORT" "${RELOAD_ARGS[@]}" \
-    > "$LOG_FILE" 2>&1 < /dev/null &
-echo "[claude-fleet] started detached (pid $!), logs -> $LOG_FILE"
+exec scripts/board-supervisor.sh "${1:-start}"
