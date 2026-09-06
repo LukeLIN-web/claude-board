@@ -1383,11 +1383,21 @@ function fleet() {
           if (attempt === 0) { await new Promise((res) => setTimeout(res, 400)); continue; }
           return { ok: false, error: 'could not reach the server — is it still running?', netError: true };
         }
+        let payload;
         try {
-          return await r.json();
+          payload = await r.json();
         } catch {
           return { ok: false, error: `server returned a non-JSON response (HTTP ${r.status})` };
         }
+        // A refusal answers with FastAPI's {"detail": …} and no `ok`, so every
+        // caller would render it as a bare "Spawn failed:" with no reason. Give
+        // it the action shape the buttons expect — the same normalization
+        // peers.forward already does for a peer's refusal.
+        if (!r.ok) {
+          const detail = payload && payload.detail;
+          return { ok: false, error: typeof detail === 'string' && detail ? detail : `HTTP ${r.status}` };
+        }
+        return payload;
       }
     },
 
