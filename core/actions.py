@@ -113,7 +113,12 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     if tmux.available():
         r = tmux.new_window(cwd, ["claude", *claude_args])
         if r["ok"]:
-            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
+            # A resume/fork into a never-opened directory hits the folder-trust
+            # prompt before it gets anywhere near the resume picker the caller
+            # goes on to answer, so clear it first (see confirm_trust_prompt).
+            trust = confirm_trust_prompt(r.get("pane_id"))
+            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"),
+                    "backend": "tmux", "trust": trust}
         return {"ok": False, "error": r["error"], "backend": "tmux"}
 
     if not shutil.which("osascript"):
@@ -430,7 +435,148 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         return {"ok": False, "error": f"not a directory: {resolved}"}
     if platform == "codex":
         return tmux.new_window(resolved, ["codex", "--yolo"])
-    return tmux.new_window(resolved)
+    r = tmux.new_window(resolved)
+    # First spawn into a directory raises Claude's folder-trust prompt, which no
+    # digit answers — leaving the new card stuck on a dialog the spawner isn't
+    # watching. Answer it here (see confirm_trust_prompt) so a spawn lands on a
+    # live composer, not on a modal.
+    if r.get("ok") and r.get("pane_id"):
+        r["trust"] = confirm_trust_prompt(r["pane_id"])
+    return r
+
+
+# Claude's first-run folder-trust prompt ("Quick safety check: Is this a project
+# you created or one you trust?"), raised the first time a session opens a
+# directory — a `--dangerously-skip-permissions` spawn included, which is how the
+# board's own cards land on it. It is the one blocking dialog whose options carry
+# no numbers: arrows move the cursor, Enter commits it. Both labels are required
+# to call it, so a session that merely printed one of these strings in its output
+# isn't mistaken for the dialog.
+_TRUST_YES = "Yes, I trust this folder"
+_TRUST_NO = "No, exit"
+_TRUST_MARKERS = (_TRUST_YES, _TRUST_NO)
+
+# The option the cursor sits on, e.g. "❯ No, exit" (nbsp-padded on some builds).
+_TRUST_CURSOR_RE = re.compile(r"^[\s ]*[❯>][\s ]+(\S.*?)\s*$")
+
+# Any one of these means the prompt is on screen or still painting — enough to
+# keep waiting, not enough to answer. A half-drawn dialog shows its cursor row
+# ("❯ No, exit") before the Yes row below it, and that ❯ is indistinguishable
+# from a live composer's: without this, a poll landing in that one-paint gap
+# would call the directory trusted and walk away from the dialog it came for.
+_TRUST_HINTS = (_TRUST_YES, _TRUST_NO, "Quick safety check")
+
+_TRUST_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
+_TRUST_WAIT = 6.0          # seconds to wait for the dialog to close after Enter
+_TRUST_POLL = 0.2
+
+
+def trust_prompt_up(text: str) -> bool:
+    """Whether a captured pane currently shows the folder-trust prompt."""
+    return all(m in text for m in _TRUST_MARKERS)
+
+
+def _trust_prompt_painting(text: str) -> bool:
+    """Whether any part of the trust prompt is on screen (see _TRUST_HINTS)."""
+    return any(h in text for h in _TRUST_HINTS)
+
+
+def _trust_cursor_label(text: str) -> str:
+    """Which trust option the cursor sits on; "" if it isn't on one.
+
+    Only the dialog's own two labels count. The pane draws "❯ " for the composer
+    and for every queued message too, and neither is an option to commit.
+    """
+    for ln in text.split("\n"):
+        m = _TRUST_CURSOR_RE.match(ln)
+        if m and m.group(1) in _TRUST_MARKERS:
+            return m.group(1)
+    return ""
+
+
+def answer_trust_prompt(pane: str) -> dict:
+    """Answer the folder-trust prompt in `pane` with "Yes, I trust this folder".
+
+    Enter commits whatever the cursor is on, and this dialog opens on "No, exit"
+    — the option that quits the session — so this never presses Enter on faith.
+    Down steps the cursor (the list wraps), the pane is re-read after every
+    press, and Enter goes only once the pane itself shows the cursor on the Yes
+    row. A pane that never gets there is left as it was found, dialog and all: a
+    card stuck waiting is recoverable, a session killed by a blind Enter is not.
+    """
+    for _ in range(len(_TRUST_MARKERS) + 1):
+        cap = tmux.capture_pane(pane)
+        if not cap.get("ok"):
+            return {"ok": False, "error": "could not read the pane"}
+        if not trust_prompt_up(cap["text"]):
+            # Answered already — by an earlier click of ours, or in the terminal.
+            return {"ok": True, "answered": False, "note": "no trust prompt on screen"}
+        if _trust_cursor_label(cap["text"]) == _TRUST_YES:
+            break
+        tmux.send_keys(pane, "Down")
+        time.sleep(_TRUST_KEY_SETTLE)
+    else:
+        return {"ok": False, "error": f"could not move the cursor onto '{_TRUST_YES}'"}
+
+    r = tmux.send_keys(pane, "Enter")
+    if not r.get("ok"):
+        return r
+    deadline = time.time() + _TRUST_WAIT
+    while time.time() < deadline:
+        cap = tmux.capture_pane(pane)
+        if cap.get("ok") and not trust_prompt_up(cap["text"]):
+            return {"ok": True, "answered": True, "label": _TRUST_YES}
+        time.sleep(_TRUST_POLL)
+    return {"ok": False, "error": "the trust prompt did not close"}
+
+
+# A dialog that has just painted is not yet listening: Claude draws the trust
+# prompt before arming its input handler, and keys sent into that gap are lost
+# or replayed as something else — a spawn that answered the instant the prompt
+# appeared got its Down/Enter swallowed, sat out the confirm wait with the
+# dialog still up, and the session exited on its own afterwards. Same settle,
+# and same reason, as confirm_resume_picker's.
+_TRUST_ARM_SETTLE = 0.6
+
+
+def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3,
+                         settle: float = _TRUST_ARM_SETTLE) -> dict:
+    """Poll a freshly launched `pane_id` for the folder-trust prompt, answer it.
+
+    A board launch is unattended by construction: nobody is watching a detached
+    pane, so a session parked on this prompt is a red card that stays red until
+    someone goes looking. Answering it at launch is what the resume picker
+    already gets (confirm_resume_picker) — and the gate is redundant here, since
+    the directory was one the dashboard's cwd filter admitted and the user typed
+    or picked, launched with --dangerously-skip-permissions either way.
+
+    Polling ends at the first of three things: the prompt (answer it), a drawn
+    composer (this directory is already trusted — no prompt is coming), or the
+    attempt budget. The composer test is the delicate one: the dialog's cursor
+    row draws the same "❯", so a pane showing any part of the prompt is never
+    read as a composer (see _TRUST_HINTS). Erring that way costs a slow spawn;
+    erring the other way is the stuck card this exists to prevent.
+
+    Returns {answered, waited, reason}; never raises.
+    """
+    if not pane_id:
+        return {"answered": False, "waited": 0.0, "reason": "no pane"}
+    waited = 0.0
+    for _ in range(max(1, attempts)):
+        cap = tmux.capture_pane(pane_id)
+        text = cap.get("text", "") if cap.get("ok") else ""
+        if trust_prompt_up(text):
+            # Let the dialog arm its input handler before the first key.
+            time.sleep(settle)
+            waited += settle
+            r = answer_trust_prompt(pane_id)
+            return {"answered": bool(r.get("answered")), "waited": round(waited, 2),
+                    "reason": "" if r.get("ok") else r.get("error", "")}
+        if not _trust_prompt_painting(text) and ("❯" in text or "›" in text):
+            return {"answered": False, "waited": round(waited, 2), "reason": "already trusted"}
+        time.sleep(interval)
+        waited += interval
+    return {"answered": False, "waited": round(waited, 2), "reason": "no prompt"}
 
 
 # Claude's permission prompt is a numbered select list:
@@ -448,7 +594,15 @@ _PERM_KEYS = {
 
 
 def respond_permission(pid: int, choice: str) -> dict:
-    """Answer the permission prompt in `pid`'s tmux pane via a menu keypress."""
+    """Answer the dialog in `pid`'s tmux pane.
+
+    Usually that is the numbered permission prompt, answered with its digit. The
+    folder-trust prompt is the exception: it has no numbers, so the digit lands
+    on nothing and the card keeps reading "waiting for your input" however often
+    the button is clicked. Approving there means driving its cursor (see
+    answer_trust_prompt). "deny" stays Escape for both — cancelling the trust
+    prompt does end the session, which is what refusing to trust a folder means.
+    """
     keys = _PERM_KEYS.get(choice)
     if keys is None:
         return {"ok": False, "error": f"unknown choice '{choice}' (expected: {', '.join(_PERM_KEYS)})"}
@@ -460,6 +614,12 @@ def respond_permission(pid: int, choice: str) -> dict:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return {"ok": False, "error": "session not in a tmux pane"}
+    if choice in ("approve", "approve_always"):
+        cap = tmux.capture_pane(pane)
+        if cap.get("ok") and trust_prompt_up(cap["text"]):
+            r = answer_trust_prompt(pane)
+            r["choice"] = choice
+            return r
     r = tmux.send_keys(pane, *keys)
     r["choice"] = choice
     return r
@@ -700,15 +860,19 @@ def _menu_markers_present(text: str) -> bool:
     )
 
 
-def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
-    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable.
+def pane_dialog(tty: Optional[str]) -> Optional[dict]:
+    """What `tty`'s pane is showing: {menu, trust}. None if unknowable.
 
     Claude's session registry reports waitingFor="dialog open" for ANY open
     overlay — including informational ones like the /goal panel, which has no
-    options and doesn't block the agent. This is the pane-level ground truth
-    the triage uses to tell a real picker from such an overlay. The
-    three-valued return matters: None (no tty / no pane / failed capture)
-    means "can't verify", and callers should keep trusting the registry.
+    options and doesn't block the agent. `menu` is the pane-level ground truth
+    the triage uses to tell a real picker from such an overlay. `trust` names
+    the one picker that is answered differently from all the others (see
+    answer_trust_prompt), so a card can say which dialog it is stuck on instead
+    of the useless "dialog open". Both come from a single capture.
+
+    None (no tty / no pane / failed capture) means "can't verify", and callers
+    should keep trusting the registry.
     """
     if not tty:
         return None
@@ -718,7 +882,14 @@ def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
     cap = tmux.capture_pane(pane)
     if not cap["ok"]:
         return None
-    return _menu_markers_present(cap["text"])
+    return {"menu": _menu_markers_present(cap["text"]),
+            "trust": trust_prompt_up(cap["text"])}
+
+
+def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
+    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable."""
+    d = pane_dialog(tty)
+    return None if d is None else d["menu"]
 
 
 def get_pane_menu(pid: int) -> Optional[dict]:

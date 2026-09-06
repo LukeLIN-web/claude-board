@@ -472,14 +472,21 @@
           <!-- Waiting on a prompt: open the timeline to see the actual options and respond -->
           <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
                x-show="w.triage === 'waiting_perm' && tmuxAvailable">
-            <span class="text-xs text-red-700 font-medium shrink-0">⏳ Waiting for your input</span>
-            <button @click="toggleExpand(w.key)"
+            <!-- The folder-trust prompt is the one dialog whose options carry no
+                 numbers, so it gets its own label and its own button text: the
+                 timeline can't render it as a menu, and "Quick Approve (1)" would
+                 promise a keypress that does nothing there. -->
+            <span class="text-xs text-red-700 font-medium shrink-0"
+                  x-text="w.waiting_for === 'trust prompt' ? '⏳ Trust this folder?' : '⏳ Waiting for your input'"></span>
+            <button @click="toggleExpand(w.key)" x-show="w.waiting_for !== 'trust prompt'"
                     class="text-xs border border-red-300 text-red-700 px-2 py-1 rounded hover:bg-red-100 transition">
               Open & respond ↓</button>
             <button @click="respondPermission(w.key, 'approve')" :disabled="!!permSending[w.key]"
                     class="text-xs border border-emerald-300 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50"
-                    title="Sends key 1 (Yes / first option)">
-              Quick Approve (1)</button>
+                    :title="w.waiting_for === 'trust prompt'
+                            ? 'Answers Claude\'s folder-trust prompt with “Yes, I trust this folder”'
+                            : 'Sends key 1 (Yes / first option)'"
+                    x-text="w.waiting_for === 'trust prompt' ? 'Trust folder' : 'Quick Approve (1)'"></button>
           </div>
           <!-- Send a single prompt into this session's tmux pane (hidden when tmux unavailable) -->
           <div class="flex items-end gap-2 w-full mt-1" x-show="tmuxAvailable">

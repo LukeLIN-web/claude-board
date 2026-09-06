@@ -41,6 +41,37 @@ def _preflight_ok(foreground="node"):
 
 
 class CreateSessionTests(unittest.TestCase):
+    def setUp(self):
+        # A spawn now answers the folder-trust prompt in the pane it just made.
+        # These tests are about the dispatch; the poll has its own tests below.
+        p = mock.patch.object(actions, "confirm_trust_prompt",
+                              return_value={"answered": True, "waited": 0.3, "reason": ""})
+        self.trust = p.start()
+        self.addCleanup(p.stop)
+
+    def test_spawn_answers_the_trust_prompt(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(actions.tmux, "new_window",
+                                   return_value={"ok": True, "pane_id": "%1"}):
+                r = actions.create_session(d)
+        self.trust.assert_called_once_with("%1")
+        self.assertTrue(r["trust"]["answered"])
+
+    def test_codex_spawn_has_no_trust_prompt_to_answer(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(actions.tmux, "new_window",
+                                   return_value={"ok": True, "pane_id": "%1"}):
+                actions.create_session(d, platform="codex")
+        self.trust.assert_not_called()
+
+    def test_failed_spawn_is_not_polled(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(actions.tmux, "new_window",
+                                   return_value={"ok": False, "error": "no server"}):
+                r = actions.create_session(d)
+        self.assertFalse(r["ok"])
+        self.trust.assert_not_called()
+
     def test_existing_dir_delegates_to_new_window(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(actions.tmux, "new_window", return_value={"ok": True, "pane_id": "%1"}) as m:
@@ -1244,3 +1275,252 @@ class SwitchModelTests(unittest.TestCase):
             r = actions.switch_model(1234, "opus")
         self.assertFalse(r["ok"])
         self.assertIn("Claude-only", r["error"])
+
+
+# Claude's first-run folder-trust prompt (v2.1.x), as captured from a pane. Its
+# options carry no numbers and the cursor opens on "No, exit" — the two facts
+# that make it unanswerable by the numbered-permission path.
+_TRUST_PROMPT = (
+    "\u2500" * 40 + "\n"
+    " Accessing workspace:\n"
+    " /tmp/proj\n"
+    " Quick safety check: Is this a project you created or one you trust? (Like your\n"
+    " own code, a well-known open source project, or work from your team). If not,\n"
+    " take a moment to review what's in this folder first.\n"
+    " Claude Code'll be able to read, edit, and execute files here.\n"
+    " Security guide\n"
+    " \u276f No, exit\n"
+    "   Yes, I trust this folder\n"
+    " Enter to confirm \u00b7 Esc to cancel"
+)
+# The same dialog after one Down: the cursor has moved onto the Yes row.
+_TRUST_PROMPT_ON_YES = _TRUST_PROMPT.replace(
+    " \u276f No, exit\n   Yes", "   No, exit\n \u276f Yes")
+
+
+def _keys_recorder(sent):
+    """A send_keys stub that records the keys and answers like the real one."""
+    def fake(pane, *keys):
+        sent.append(keys)
+        return {"ok": True}
+    return fake
+
+
+class TrustPromptTests(unittest.TestCase):
+    """The folder-trust prompt: recognizing it, and answering it by its cursor.
+
+    Every other dialog the board answers is a numbered list, so "approve" is the
+    digit 1. This one has no numbers — the digit lands on nothing and the card
+    stays waiting — and Enter commits whatever the cursor is on, which starts on
+    "No, exit". Both halves are load-bearing: reach the Yes row, and never press
+    Enter without having read the cursor onto it.
+    """
+
+    def test_recognizes_the_prompt(self):
+        self.assertTrue(actions.trust_prompt_up(_TRUST_PROMPT))
+        self.assertTrue(actions.trust_prompt_up(_TRUST_PROMPT_ON_YES))
+
+    def test_other_dialogs_are_not_the_trust_prompt(self):
+        self.assertFalse(actions.trust_prompt_up(_PICKER_TEXT))
+        self.assertFalse(actions.trust_prompt_up(_LIVE_TEXT))
+        # One label alone is a session that printed the words, not the dialog.
+        self.assertFalse(actions.trust_prompt_up("I said: Yes, I trust this folder"))
+
+    def test_cursor_label_reads_the_selected_option(self):
+        self.assertEqual(actions._trust_cursor_label(_TRUST_PROMPT), "No, exit")
+        self.assertEqual(actions._trust_cursor_label(_TRUST_PROMPT_ON_YES),
+                         "Yes, I trust this folder")
+
+    def test_cursor_label_ignores_the_composer_prompt(self):
+        # The composer and every queued message draw "\u276f " too; neither is an
+        # option, and mistaking one for the cursor would commit the wrong row.
+        self.assertEqual(actions._trust_cursor_label(_LIVE_TEXT), "")
+        self.assertEqual(actions._trust_cursor_label("\u276f do the thing"), "")
+
+    def test_steps_onto_yes_then_confirms(self):
+        # Cursor on No, then on Yes after the Down, then the dialog is gone.
+        caps = [_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT]
+
+        def fake_capture(pane, **kw):
+            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
+
+        sent = []
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["answered"])
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_never_confirms_a_cursor_it_could_not_move(self):
+        # A dialog whose cursor never reaches Yes must be left alone: Enter here
+        # would commit "No, exit" and kill the session.
+        with mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": _TRUST_PROMPT}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertFalse(r["ok"])
+        self.assertNotIn(("Enter",), [c.args[1:] for c in sk.call_args_list])
+
+    def test_unreadable_pane_sends_nothing(self):
+        with mock.patch.object(actions.tmux, "capture_pane", return_value={"ok": False}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertFalse(r["ok"])
+        sk.assert_not_called()
+
+    def test_already_answered_prompt_is_a_no_op(self):
+        with mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": _LIVE_TEXT}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["answered"])
+        sk.assert_not_called()
+
+
+class RespondPermissionRoutingTests(unittest.TestCase):
+    """Which dialog is on screen decides how "approve" is delivered."""
+
+    def _respond(self, pane_text, choice="approve"):
+        sent = []
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/9")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%0"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": pane_text}), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.respond_permission(100, choice)
+        return r, sent
+
+    def test_numbered_permission_still_gets_the_digit(self):
+        r, sent = self._respond("Do you want to proceed?\n\u276f 1. Yes\n  2. No")
+        self.assertTrue(r["ok"])
+        self.assertEqual(sent, [("1",)])
+
+    def test_trust_prompt_is_not_answered_with_a_digit(self):
+        # The bug this guards: "1" is swallowed by the trust dialog, so the card
+        # went on reading "waiting for your input" no matter how often it was
+        # clicked. Here the pane never leaves the prompt, so the attempt fails —
+        # what matters is that it never sent a digit that does nothing.
+        r, sent = self._respond(_TRUST_PROMPT)
+        self.assertFalse(r["ok"])
+        self.assertNotIn(("1",), sent)
+
+    def test_deny_is_escape_on_the_trust_prompt(self):
+        r, sent = self._respond(_TRUST_PROMPT, choice="deny")
+        self.assertEqual(sent, [("Escape",)])
+
+
+class PaneDialogTests(unittest.TestCase):
+    """One capture, both facts the snapshot needs about an open dialog."""
+
+    def _run(self, text):
+        with mock.patch.object(actions.tmux, "pane_for_tty", return_value="%9"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": text}):
+            return actions.pane_dialog("/dev/pts/9")
+
+    def test_trust_prompt_is_a_menu_and_names_itself(self):
+        self.assertEqual(self._run(_TRUST_PROMPT), {"menu": True, "trust": True})
+
+    def test_other_picker_is_a_menu_but_not_trust(self):
+        self.assertEqual(self._run(_PICKER_TEXT), {"menu": True, "trust": False})
+
+    def test_live_pane_has_no_dialog(self):
+        self.assertEqual(self._run(_LIVE_TEXT), {"menu": False, "trust": False})
+
+    def test_unreadable_pane_is_unknown(self):
+        self.assertIsNone(actions.pane_dialog(None))
+
+
+class ConfirmTrustPromptTests(unittest.TestCase):
+    """Answering the folder-trust prompt on a pane that was just launched.
+
+    The pane is empty for the first moment, then shows either the prompt or a
+    live composer. Both endings have to be cheap: a spawn into an already
+    trusted directory must not sit through the whole attempt budget.
+    """
+
+    def _run(self, caps, default=_LIVE_TEXT, **kw):
+        seq = list(caps)
+
+        def fake_capture(pane, **_kw):
+            return {"ok": True, "text": seq.pop(0) if seq else default}
+
+        sent = []
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
+             mock.patch.object(actions.time, "sleep"):
+            return actions.confirm_trust_prompt("%0", **kw), sent
+
+    def test_answers_the_prompt_once_it_paints(self):
+        # Two empty polls while Claude boots, then the dialog: cursor on "No,
+        # exit" as it opens, on Yes after the Down, gone after the Enter.
+        r, sent = self._run(["", "", _TRUST_PROMPT,
+                             _TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT])
+        self.assertTrue(r["answered"])
+        self.assertEqual(r["reason"], "")
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_prompt_is_tested_before_the_composer_marker(self):
+        # The dialog's cursor row draws "❯" too. Reading that as a live composer
+        # would walk away from the very prompt this exists to answer.
+        r, sent = self._run([_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT])
+        self.assertTrue(r["answered"])
+        self.assertNotEqual(r["reason"], "already trusted")
+
+    def test_settles_before_the_first_keypress(self):
+        # Keys sent the instant the dialog paints are swallowed by a TUI that
+        # has not armed its input handler yet — and the session exits on its own
+        # some moments later. Nothing may be sent before that settle.
+        order = []
+
+        # Cursor already on Yes, and the dialog clears once the key lands — so
+        # the run ends at the Enter instead of sitting out the confirm wait.
+        seq = [_TRUST_PROMPT_ON_YES, _TRUST_PROMPT_ON_YES]
+
+        def fake_capture(pane, **_kw):
+            order.append("capture")
+            return {"ok": True, "text": seq.pop(0) if seq else _LIVE_TEXT}
+
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys",
+                               side_effect=lambda p, *k: (order.append("key"), {"ok": True})[1]), \
+             mock.patch.object(actions.time, "sleep",
+                               side_effect=lambda s: order.append(f"sleep{s}")):
+            actions.confirm_trust_prompt("%0")
+        self.assertIn(f"sleep{actions._TRUST_ARM_SETTLE}", order)
+        self.assertLess(order.index(f"sleep{actions._TRUST_ARM_SETTLE}"),
+                        order.index("key"))
+
+    def test_half_painted_dialog_is_not_mistaken_for_a_composer(self):
+        # The cursor row lands on screen a paint before the Yes row. That "❯" is
+        # the composer marker; treating it as one here would leave the session
+        # parked on the dialog — the exact stuck card this poll exists to stop.
+        half = " \u276f No, exit\n"
+        r, sent = self._run([half, _TRUST_PROMPT, _TRUST_PROMPT,
+                             _TRUST_PROMPT_ON_YES, _LIVE_TEXT])
+        self.assertTrue(r["answered"])
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_already_trusted_directory_returns_immediately(self):
+        r, sent = self._run([_LIVE_TEXT])
+        self.assertFalse(r["answered"])
+        self.assertEqual(r["reason"], "already trusted")
+        self.assertEqual(sent, [])
+
+    def test_budget_runs_out_without_sending_keys(self):
+        # A pane that never paints anything: give up, quietly.
+        r, sent = self._run([], default="", attempts=2)
+        self.assertFalse(r["answered"])
+        self.assertEqual(r["reason"], "no prompt")
+        self.assertEqual(sent, [])
+
+    def test_no_pane_is_a_no_op(self):
+        self.assertEqual(actions.confirm_trust_prompt("")["reason"], "no pane")

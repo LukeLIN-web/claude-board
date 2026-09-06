@@ -324,7 +324,7 @@ class StaleDialogOpenTests(unittest.TestCase):
     (Quick Approve would type "1" into the input box) nor count as waiting in
     the header; a verifiable picker in the pane keeps the normal behavior."""
 
-    def _run(self, menu_active):
+    def _run(self, dialog):
         import time
         win = {"pid": 100, "status": "waiting", "waiting_for": "dialog open",
                "hidden": False, "alive": True, "tty": "/dev/pts/9",
@@ -338,24 +338,32 @@ class StaleDialogOpenTests(unittest.TestCase):
              mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
              mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
              mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
-             mock.patch.object(appmod.actions, "pane_menu_active", return_value=menu_active):
+             mock.patch.object(appmod.actions, "pane_dialog", return_value=dialog):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_dialog_without_menu_is_not_waiting(self):
-        w = self._run(menu_active=False)
+        w = self._run({"menu": False, "trust": False})
         self.assertNotEqual(w["triage"], "waiting_perm")
         self.assertNotEqual(w["status"], "waiting")
 
     def test_dialog_with_real_menu_stays_waiting(self):
-        w = self._run(menu_active=True)
+        w = self._run({"menu": True, "trust": False})
         self.assertEqual(w["triage"], "waiting_perm")
         self.assertEqual(w["status"], "waiting")
 
     def test_unverifiable_pane_stays_waiting(self):
         # tmux can't see the pane: keep the conservative waiting card.
-        w = self._run(menu_active=None)
+        w = self._run(None)
         self.assertEqual(w["triage"], "waiting_perm")
         self.assertEqual(w["status"], "waiting")
+
+    def test_trust_prompt_is_named_on_the_card(self):
+        # "dialog open" tells the user nothing, and the trust prompt is answered
+        # by its own route — so the card has to say which dialog it is stuck on.
+        w = self._run({"menu": True, "trust": True})
+        self.assertEqual(w["triage"], "waiting_perm")
+        self.assertEqual(w["waiting_for"], "trust prompt")
+        self.assertEqual(w["triage_reason"], "trust prompt")
 
 
 if __name__ == "__main__":

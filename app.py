@@ -170,10 +170,16 @@ def _local_snapshot() -> dict:
         # card (Quick Approve types "1" into the input box otherwise); when
         # the pane shows none, treat the session as busy. An unverifiable
         # pane (no tmux) keeps the conservative waiting card.
-        if (w.get("status") == "waiting" and w.get("waiting_for") == "dialog open"
-                and actions.pane_menu_active(w.get("tty")) is False):
-            w["status"] = "busy"
-            w["waiting_for"] = None
+        if w.get("status") == "waiting" and w.get("waiting_for") == "dialog open":
+            dlg = actions.pane_dialog(w.get("tty"))
+            if dlg is not None and not dlg["menu"]:
+                w["status"] = "busy"
+                w["waiting_for"] = None
+            elif dlg is not None and dlg["trust"]:
+                # Name the dialog rather than leave the card on "dialog open":
+                # the folder-trust prompt is answered by its own route, and it
+                # is the one a spawn into a never-opened directory always hits.
+                w["waiting_for"] = "trust prompt"
         tri = patrol.classify(w)
         w["triage"] = tri["triage"]
         w["triage_reason"] = tri["reason"]
