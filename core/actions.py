@@ -1117,15 +1117,14 @@ _BTW_SCROLL_SETTLE = 0.18      # let the overlay redraw before re-capturing
 _BTW_ANSWER_MAX = 20000        # sanity cap on a fully-stitched answer
 
 # A pane captured mid-repaint yields a half-applied frame: the overlay footer's
-# "↑/" hint and the composer's ─ rules land spliced into the answer region. Such a
-# frame is worse than no frame — its lines match neither the accumulator's suffix
-# nor the next window's prefix, so _stitch_btw falls through to a bare concat and
-# the "complete" answer gains a duplicated block. That answer is then not a prefix
-# of the next poll's top slice either, so btwcapture's gate reopens and the whole
-# scroll runs again, garbling a little differently each round — the observed
-# eight-archived-copies-of-one-aside failure. So every scroll position is read
-# until two consecutive reads agree, and a position that never settles aborts the
-# round rather than being stitched.
+# "↑/" hint and the composer's ─ rules land spliced into the answer region, and a
+# diff-rendered line comes back with leftover cells from the line it replaced
+# ("max-pos 36864 / af10" read as "max-posg36864c/paf10"). Such a frame is worse
+# than no frame: its lines match neither the accumulator's suffix nor the next
+# window's prefix, which is the no-overlap case _stitch_btw refuses. Two defences,
+# because one round of ↓ presses is long enough to catch a repaint either way:
+# every scroll position is read until two consecutive reads agree, and a position
+# that never settles aborts the round rather than being stitched.
 _BTW_FRAME_TRIES = 3            # reads per scroll position before calling it unstable
 _BTW_FRAME_RECHECK = 0.12       # settle between those reads
 _BTW_FRAME_UNSTABLE = object()  # sentinel: pane repainting, no frame worth stitching
@@ -1158,16 +1157,24 @@ def _stable_btw_regions(pane: str) -> tuple[str, list[str]] | None | object:
     return _BTW_FRAME_UNSTABLE
 
 
-def _stitch_btw(acc: list[str], window: list[str]) -> list[str]:
+def _stitch_btw(acc: list[str], window: list[str]) -> Optional[list[str]]:
     """Append a later, overlapping scroll `window` onto `acc`, dropping the longest
     prefix of `window` that is already the suffix of `acc`. Equal frames (the
-    window clamped at the bottom) leave `acc` unchanged — the caller's stop signal."""
+    window clamped at the bottom) leave `acc` unchanged — the caller's stop signal.
+
+    None when the two share no overlap at all. ↓ scrolls the answer by a few lines
+    inside a window-height view, so consecutive frames ALWAYS overlap: no overlap
+    does not mean the answer jumped, it means the frame was read mid-repaint and
+    its lines are spliced. Concatenating one anyway is what grew a single aside
+    four duplicated copies of itself — and a stitch corrupted that way is no
+    longer a prefix of the next poll's top slice, so the gate meant to end the
+    retry reopens and archives another mangled copy every time the pane blinks."""
     if not acc:
         return list(window)
     for o in range(min(len(acc), len(window)), 0, -1):
         if acc[-o:] == window[:o]:
             return acc + window[o:]
-    return acc + window
+    return None
 
 
 def capture_full_btw_answer(pid: int) -> Optional[dict]:
@@ -1206,6 +1213,9 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
             unstable = True
             break  # restore the view below, then abandon the round
         merged = _stitch_btw(acc, cur[1])
+        if merged is None:
+            unstable = True
+            break  # spliced frame — same answer as an unreadable pane
         if merged == acc:
             break  # window clamped at the bottom — whole answer captured
         acc = merged

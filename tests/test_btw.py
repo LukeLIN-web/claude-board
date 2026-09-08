@@ -217,9 +217,12 @@ class StitchBtwTests(unittest.TestCase):
         self.assertEqual(actions._stitch_btw(["a", "b", "c"], ["a", "b", "c"]),
                          ["a", "b", "c"])
 
-    def test_no_overlap_concatenates(self):
-        self.assertEqual(actions._stitch_btw(["a", "b"], ["c", "d"]),
-                         ["a", "b", "c", "d"])
+    def test_no_overlap_is_a_spliced_frame(self):
+        # ↓ moves the answer a few lines inside a window-height view, so two real
+        # frames always share lines. None of them shared means the frame was read
+        # mid-repaint — concatenating it is what put duplicated blocks in the
+        # archive, so it is refused instead.
+        self.assertIsNone(actions._stitch_btw(["a", "b"], ["c", "d"]))
 
 
 class CaptureFullBtwAnswerTests(unittest.TestCase):
@@ -300,6 +303,19 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
             _btw_frame(["L2", "L3", "──── L4"]),
         ]
         got, sent = self._run_reads(reads)
+        self.assertIsNone(got)
+        self.assertEqual(sent, ["Down", "Up"])
+
+    def test_abandons_round_when_a_frame_shares_no_lines(self):
+        # A spliced frame can read the same twice (the pane settles into the
+        # half-applied state) and still be garbage: nothing in it overlaps what
+        # was already read. Stitching it anyway grew one aside into several
+        # mangled copies, so the round is abandoned and the view restored.
+        frames = [
+            _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["X9", "Y9", "Z9"]),
+        ]
+        got, sent = self._run(frames)
         self.assertIsNone(got)
         self.assertEqual(sent, ["Down", "Up"])
 
@@ -441,6 +457,73 @@ class BtwLogTests(unittest.TestCase):
         self.assertTrue(all(e["extra"]["source"] == "btw" for e in evs))
         self.assertTrue(evs[0]["text"].startswith("/btw "))
         self.assertEqual(evs[1]["text"], "a1")
+
+
+class OneAsidePerRunTests(unittest.TestCase):
+    """One aside answered once must be ONE timeline row, however many times the
+    pane was scraped for it. The archive keeps every capture (which one is best is
+    only decidable once the later ones exist); `entries` is what picks."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._orig = btwlog._DIR
+        btwlog._DIR = Path(self.tmp)
+        btwlog._cache.clear()
+
+    def tearDown(self):
+        btwlog._DIR = self._orig
+        btwlog._cache.clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_dedupes_a_tail_differing_only_by_crumbs(self):
+        # Re-scrape of a still-open overlay, with a redraw crumb painted over it.
+        btwlog.record("sess1", "q1", "L1\nL2\nL3")
+        self.assertIsNone(btwlog.record("sess1", "q1", "L1\n↑/L2\n─── L3"))
+        self.assertEqual(len(btwlog._load("sess1")), 1)
+
+    def test_run_of_captures_is_one_aside(self):
+        btwlog.record("sess1", "q1", "L1\nL2\nL3")
+        btwlog.record("sess1", "q1", "L1\nL2\nL1\nL2\nL3")   # bad stitch
+        btwlog.record("sess1", "q1", "L1\n↑/L2\nL3\nL1\nL2")  # and another
+        self.assertEqual(len(btwlog._load("sess1")), 3)          # log keeps all
+        got = btwlog.entries("sess1")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["answer"], "L1\nL2\nL3")
+        self.assertEqual(len(btwlog.timeline_events("sess1")), 2)
+
+    def test_a_longer_clean_capture_wins(self):
+        # The cheap top slice first, then a scroll-stitch that reached further:
+        # both are frame-consistent, so the one that saw more of the answer wins.
+        btwlog.record("sess1", "q1", "L1\nL2")
+        btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4")
+        got = btwlog.entries("sess1")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["answer"], "L1\nL2\nL3\nL4")
+
+    def test_a_second_aside_is_its_own_row(self):
+        btwlog.record("sess1", "q1", "a1")
+        btwlog.record("sess1", "q2", "a2")
+        btwlog.record("sess1", "q2", "a2\na2")
+        self.assertEqual([e["question"] for e in btwlog.entries("sess1")], ["q1", "q2"])
+        self.assertEqual(len(btwlog.timeline_events("sess1")), 4)
+
+    def test_dismiss_survives_collapse(self):
+        # The ✕ names whichever capture the card was showing; the aside is what
+        # got dismissed, so it must not come back as a different capture of itself.
+        btwlog.record("sess1", "q1", "L1\nL2\nL3")
+        e2 = btwlog.record("sess1", "q1", "L1\nL2\nL1\nL2\nL3")
+        self.assertTrue(btwlog.dismiss("sess1", e2["id"]))
+        self.assertIsNone(btwlog.latest("sess1"))
+        btwlog._cache.clear()  # and again from disk
+        self.assertIsNone(btwlog.latest("sess1"))
+
+    def test_gate_holds_against_the_kept_capture(self):
+        # has_prefix answers for the aside, not for every capture of it: the top
+        # slice of an archived aside must still close the gate after a bad stitch
+        # was logged next to the good capture.
+        btwlog.record("sess1", "q1", "L1\nL2\nL3")
+        btwlog.record("sess1", "q1", "L1\nL2\nL1\nL2\nL3")
+        self.assertTrue(btwlog.has_prefix("sess1", "q1", "L1\nL2"))
 
 
 class TimelineMergeTests(unittest.TestCase):
