@@ -11,6 +11,7 @@ This is the reliable half of the card's "Queued (N)" list; the best-effort half
 from __future__ import annotations
 
 import itertools
+import re
 import time
 from typing import Optional
 
@@ -19,6 +20,17 @@ from . import transcripts
 # pid -> [{id, norm, text, ts}]  (ts = epoch seconds when we sent it)
 _sent: dict[int, list[dict]] = {}
 _ids = itertools.count(1)
+
+# "/btw <question>" is an aside, not a prompt: Claude answers it in an ephemeral
+# TUI overlay that never reaches the transcript (see core.btwlog), so `pending`'s
+# reconcile has nothing to match it against — a tracked aside sits on the card as
+# "Queued (1)" until the session next goes idle. There is nothing to track in the
+# first place: an aside is answered while the turn runs, so it never enters
+# Claude's own queue. The card still shows it, from the overlay (see app's
+# btwcapture call), which is where an aside actually lives.
+# Matched on the raw text, not `norm` (which sheds the leading slash), so an
+# ordinary prompt merely opening with the word "btw" is still tracked.
+_ASIDE_RE = re.compile(r"^/btw(\s|$)")
 
 
 def _bare_command(text: str) -> str:
@@ -48,7 +60,11 @@ def record_sent(pid: int, text: str, ts: Optional[float] = None) -> None:
     Claude timestamps its transcript row the moment it receives the prompt. Stamp
     it afterwards and that row lands *earlier* than the send time, so the `ts >=`
     guard in `pending` rejects the real match and the prompt sticks on the card.
+
+    A "/btw" aside is not recorded at all — see _ASIDE_RE.
     """
+    if _ASIDE_RE.match((text or "").strip()):
+        return
     n = norm(text)
     if not n:
         return

@@ -134,21 +134,37 @@ class PromptQueueTests(unittest.TestCase):
         self.assertEqual([o["text"] for o in out], ["ping"])  # one still queued
 
     def test_slash_command_reconciles_against_bare_label(self):
-        # The dashboard sends "/btw"; the transcript logs it as the bare label
-        # "btw" (transcripts._clean_command_text drops the envelope + slash). The
+        # The dashboard sends "/clear"; the transcript logs it as the bare label
+        # "clear" (transcripts._clean_command_text drops the envelope + slash). The
         # two must still match or the command sticks in the queue forever.
-        promptqueue.record_sent(1, "/btw")
+        promptqueue.record_sent(1, "/clear")
         future = time.time() + 10
         with mock.patch.object(promptqueue.transcripts, "consumed_prompt_texts",
-                               return_value=[(future, "btw")]):
+                               return_value=[(future, "clear")]):
             out = promptqueue.pending(1, "t.jsonl", "busy")
         self.assertEqual(out, [])
 
     def test_slash_command_display_text_keeps_slash(self):
         # Match is slash-insensitive, but the card label keeps the "/" the user typed.
-        promptqueue.record_sent(1, "/btw")
+        promptqueue.record_sent(1, "/clear")
         out = promptqueue.pending(1, None, "busy")
-        self.assertEqual([o["text"] for o in out], ["/btw"])
+        self.assertEqual([o["text"] for o in out], ["/clear"])
+
+    def test_aside_is_not_tracked(self):
+        # A "/btw" aside is answered in an ephemeral overlay that never reaches
+        # the transcript, so pending() can never retire it: tracked, it pins
+        # "Queued (1)" to the card until the session next goes idle.
+        promptqueue.record_sent(1, "/btw R4 or R9 first?")
+        promptqueue.record_sent(1, "/btw")
+        self.assertEqual(promptqueue.pending(1, None, "busy"), [])
+
+    def test_prompt_merely_opening_with_btw_is_tracked(self):
+        # Only the slash command is an aside; prose that starts with the word is
+        # an ordinary prompt and has an ordinary transcript row to reconcile with.
+        promptqueue.record_sent(1, "btw the eval finished, look at it")
+        out = promptqueue.pending(1, None, "busy")
+        self.assertEqual([o["text"] for o in out],
+                         ["btw the eval finished, look at it"])
 
     def test_fifo_sweep_drops_older_item_once_a_newer_one_is_consumed(self):
         # Claude drains its queue in order, so if a later send was picked up, an
