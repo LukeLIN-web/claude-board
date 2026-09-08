@@ -121,25 +121,33 @@ def _fingerprint(text: str) -> str:
     return "".join(_BTW_CRUMBS_RE.sub("", text or "").split())
 
 
-def has_prefix(session_id: str, question: str, answer_prefix: str) -> bool:
-    """Is an aside with this question, whose stored answer *starts with*
-    `answer_prefix`, already archived? The scroll-stitch capture is top-anchored,
-    so the visible top slice is a prefix of the full answer — this lets the gate
-    (core.btwcapture) recognise an already-fully-captured aside from its cheap top
-    slice and skip re-scraping it (which would re-inject scroll keys).
+def has_slice(session_id: str, question: str, answer_slice: str) -> bool:
+    """Is a scrape of this aside already archived? The gate (core.btwcapture) asks
+    this of the cheap one-capture read, so an aside whose full answer is already
+    stored is skipped instead of re-scraped (which re-injects scroll keys).
 
-    Compared on `_fingerprint`, not raw text: redraw crumbs in the top slice must
-    not be able to pry the gate open. A probe that is *only* crumbs fingerprints to
+    Containment, not prefix: the read is whatever the overlay happened to be
+    showing. That is the head of the answer right after a stitch (which restores
+    the view to the top), but the reader can scroll, and an answer taller than the
+    pane opens part-way in — a prefix test reopens the gate on every poll there
+    and drags the reader's view back to the top every two seconds.
+
+    `question` is "" when the question line was above the visible pane. Identity
+    rests on the answer alone then, which is why the answer test has to be the one
+    that holds on its own.
+
+    Compared on `_fingerprint`, not raw text: redraw crumbs in the read must not
+    be able to pry the gate open. A probe that is *only* crumbs fingerprints to
     "" and is rejected rather than matching everything — a false True here would
     swallow a genuinely new aside."""
     if not session_id:
         return False
     q = _fingerprint(question)
-    a = _fingerprint(answer_prefix)
+    a = _fingerprint(answer_slice)
     if not a:
         return False
-    return any(_fingerprint(e.get("question")) == q
-               and _fingerprint(e.get("answer")).startswith(a)
+    return any((not q or _fingerprint(e.get("question")) == q)
+               and a in _fingerprint(e.get("answer"))
                for e in entries(session_id))
 
 

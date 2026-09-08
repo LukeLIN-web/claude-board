@@ -983,8 +983,11 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     region is just an animated spinner ("✽ Answering…") and the footer lacks the
     "c to copy · f to fork" hints (you can't copy an unfinished answer). Requiring
     "to copy" in the footer gates out mid-generation frames — this also stops the
-    animating spinner from defeating the archive's de-dupe. Best-effort otherwise:
-    a long answer that scrolls the ▔ border off-screen is missed by design.
+    animating spinner from defeating the archive's de-dupe.
+
+    An answer taller than the pane pushes the question line off the top; the
+    question then comes back "" and only capture_full_btw_answer, which can
+    scroll, recovers it (see _overlay_anchors).
     """
     got = _btw_regions(text)
     if got is None:
@@ -996,22 +999,28 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     return {"question": question, "answer": answer}
 
 
-def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
+def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, Optional[int], int]]:
     """(lines, top, q_idx, foot) anchors of any open /btw overlay, or None.
 
-    The overlay pins the "/btw …" question line and the footer in place while
-    only the answer region scrolls, so this same anchor logic works at any
-    scroll position — capture_full_btw_answer relies on that to walk a long
-    answer window-by-window. Settled-or-not is the caller's judgment (the footer
-    at `foot` carries the signal): _btw_regions wants finished answers only,
-    parse_btw_pending wants the mid-generation state.
+    The footer ("… Esc to close") is the one anchor always on screen, and it is
+    what "an overlay is open" means here — capture_full_btw_answer walks a long
+    answer window-by-window off these anchors, at every scroll position.
+    Settled-or-not is the caller's judgment (the footer at `foot` carries the
+    signal): _btw_regions wants finished answers only, parse_btw_pending wants
+    the mid-generation state.
+
+    `q_idx` — the echoed "/btw …" question line — is None when the answer is tall
+    enough to push the top of the overlay above the visible pane. Requiring it
+    made exactly the longest answers unreadable to us, which are the ones worth
+    archiving; callers that need the question sit those out, and the answer region
+    falls back to the `top` bound.
 
     Top anchor: older Claude builds draw a ▔ border above the overlay; current
     builds (v2.1.20x) draw none, so fall back to the composer marker line (the
-    overlay always renders below the composer) and finally to the capture
-    start. The composer line is only ever the (exclusive) top bound — while the
-    aside is open it still shows the just-submitted "/btw …" command itself,
-    and must never be mistaken for the overlay's question line."""
+    overlay renders below the composer while it fits on screen) and finally to
+    the capture start. The composer line is only ever the (exclusive) top bound —
+    while the aside is open it still shows the just-submitted "/btw …" command
+    itself, and must never be mistaken for the overlay's question line."""
     if not text:
         return None
     lines = text.split("\n")
@@ -1027,8 +1036,6 @@ def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
         top = marker if marker is not None else -1
     q_idx = next((i for i in range(foot - 1, top, -1)
                   if lines[i].lstrip().startswith("/btw")), None)
-    if q_idx is None:
-        return None
     return lines, top, q_idx, foot
 
 
@@ -1042,17 +1049,20 @@ def _overlay_question(line: str) -> str:
 def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
     """The (question, visible-answer-lines) of a *settled* /btw overlay, or None.
 
-    Returns None when there is no settled overlay on the pane (no footer,
-    mid-generation, or border/question scrolled off), which is also the signal
-    that the overlay has been dismissed."""
+    Returns None when there is no settled overlay on the pane (no footer, or
+    mid-generation), which is also the signal that the overlay has been
+    dismissed. The question is "" when the overlay's question line sits above the
+    visible pane — the answer is still worth reading, and it is the whole region
+    between the top bound and the footer."""
     got = _overlay_anchors(text)
     if got is None:
         return None
-    lines, _top, q_idx, foot = got
+    lines, top, q_idx, foot = got
     if "to copy" not in lines[foot]:
         return None  # answer still generating — don't latch a partial/spinner
-    question = _overlay_question(lines[q_idx])
-    answer_lines = [ln.strip() for ln in lines[q_idx + 1:foot] if ln.strip()]
+    question = "" if q_idx is None else _overlay_question(lines[q_idx])
+    body = top if q_idx is None else q_idx
+    answer_lines = [ln.strip() for ln in lines[body + 1:foot] if ln.strip()]
     return question, answer_lines
 
 
@@ -1070,6 +1080,8 @@ def parse_btw_pending(text: str) -> Optional[str]:
     lines, _top, q_idx, foot = got
     if "to copy" in lines[foot]:
         return None  # settled — parse_btw_overlay territory
+    if q_idx is None:
+        return None  # the indicator *is* the question; nothing to show without it
     return _overlay_question(lines[q_idx])
 
 
@@ -1192,10 +1204,27 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return None
-    first = _stable_btw_regions(pane)
-    if first is None or first is _BTW_FRAME_UNSTABLE:
+    frame = _stable_btw_regions(pane)
+    if frame is None or frame is _BTW_FRAME_UNSTABLE:
         return None  # no settled overlay, or an unreadable pane — no keystrokes
-    question, acc = first
+    # Walk to the top before stitching. The overlay does not have to be sitting
+    # there: the reader scrolls it, and an answer taller than the pane opens with
+    # its head already off the top edge. The stitch below only ever goes down, so
+    # starting anywhere else drops the head of the answer — and with it the
+    # question line, which is what a "" question from _btw_regions means. ↑ clamps
+    # at the top and never dismisses the overlay, so this runs the same key
+    # discipline as the ↓ walk: re-read after every press, and stop the moment the
+    # overlay is gone rather than type into the composer behind it.
+    for _ in range(_BTW_SCROLL_MAX):
+        tmux.send_keys(pane, "Up")
+        time.sleep(_BTW_SCROLL_SETTLE)
+        cur = _stable_btw_regions(pane)
+        if cur is None or cur is _BTW_FRAME_UNSTABLE:
+            return None
+        if cur == frame:
+            break  # frame stopped changing — clamped at the top
+        frame = cur
+    question, acc = frame
     presses = 0
     overlay_alive = True
     unstable = False

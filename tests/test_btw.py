@@ -95,6 +95,23 @@ CAP_BORDERLESS_MIDGEN = """\
   Esc to close
 """
 
+# Real capture: an answer taller than the terminal. The overlay's border AND its
+# "/btw …" question line are both above the visible top, so the capture opens
+# part-way into the answer and the footer is the only anchor left. The composer
+# renders BELOW the footer here — the overlay is only drawn under it while it
+# fits on screen.
+CAP_CLIPPED = """\
+    - R4 融合键 —— 优先做。零训练,只需重排 + 四场答题前向。
+    - R9 均匀前缀窗臂 —— 也做,顺手就能补。
+
+  ↑/↓ to scroll · c to copy · f to fork · Esc to close
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage
+"""
+
 
 class ParseBtwOverlayTests(unittest.TestCase):
     def test_multi_aside_takes_newest_qa_only(self):
@@ -134,14 +151,25 @@ class ParseBtwOverlayTests(unittest.TestCase):
 
     def test_borderless_composer_text_is_not_the_question(self):
         # The ❯ composer line still shows the /btw command while the overlay is
-        # open; the question must come from the overlay's own /btw lines, and a
-        # capture with ONLY the composer line (question scrolled off) must miss.
+        # open. With the overlay's own /btw lines gone, the question is unknown —
+        # it must come back empty rather than be read off the composer.
         stack_removed = CAP_BORDERLESS.replace("  /btw why the 917-question short regime?\n", "")
         stack_removed = stack_removed.replace("  /btw why run base too?\n", "")
-        self.assertIsNone(actions.parse_btw_overlay(stack_removed))
+        got = actions.parse_btw_overlay(stack_removed)
+        self.assertEqual(got["question"], "")
+        self.assertNotIn("why run base too", got["answer"])
 
-    def test_none_without_btw_line(self):
-        self.assertIsNone(actions.parse_btw_overlay(CAP_BTW.replace("/btw ", "")))
+    def test_clipped_overlay_keeps_the_answer_without_a_question(self):
+        # A tall answer pushes the question line off the top of the pane. Reading
+        # that as "no overlay" made exactly the longest answers unarchivable, and
+        # an aside is unrecoverable once its overlay is dismissed.
+        got = actions.parse_btw_overlay(CAP_CLIPPED)
+        self.assertEqual(got["question"], "")
+        self.assertEqual(
+            got["answer"],
+            "- R4 融合键 —— 优先做。零训练,只需重排 + 四场答题前向。\n"
+            "- R9 均匀前缀窗臂 —— 也做,顺手就能补。",
+        )
 
     def test_none_when_answer_empty(self):
         cap = f"{_BORDER}\n    /btw hi?\n\n    ↑/↓ to scroll · c to copy · f to fork · Esc to close\n"
@@ -172,6 +200,12 @@ class ParseBtwPendingTests(unittest.TestCase):
         # A finished answer is parse_btw_overlay's territory, not pending.
         self.assertIsNone(actions.parse_btw_pending(CAP_MULTI))
 
+    def test_none_when_the_question_is_off_screen(self):
+        # The card's live indicator *is* the question, so a clipped overlay has
+        # nothing to show — unlike a settled one, whose answer is worth keeping.
+        midgen = CAP_CLIPPED.replace("c to copy · f to fork · ", "")
+        self.assertIsNone(actions.parse_btw_pending(midgen))
+
     def test_none_without_overlay(self):
         self.assertIsNone(actions.parse_btw_pending("some normal pane text\n❯ \n"))
 
@@ -192,15 +226,20 @@ class GetBtwAnswerTests(unittest.TestCase):
         self.assertEqual(got["answer"], "Red\nYellow\nBlue")
 
 
-def _btw_frame(answer_lines, question="print the integers", *, overlay=True, settled=True):
+def _btw_frame(answer_lines, question="print the integers", *, overlay=True,
+               settled=True, clipped=False):
     """Build a captured-pane string mimicking a /btw overlay at some scroll
-    position: pinned ▔ border, pinned "/btw …" line, the currently-visible answer
-    window, then the pinned footer. overlay=False yields a plain (dismissed) pane
-    so parse/extract return None; settled=False drops the "c to copy" hint."""
+    position: ▔ border, the "/btw …" line, the currently-visible answer window,
+    then the footer. overlay=False yields a plain (dismissed) pane so
+    parse/extract return None; settled=False drops the "c to copy" hint;
+    clipped=True drops the border and the question line, which is what a capture
+    sees while the top of the overlay is above the visible pane."""
     if not overlay:
         return "some normal pane text\n❯ \n"
     foot = "↑/↓ to scroll · " + ("c to copy · f to fork · " if settled else "") + "Esc to close"
     body = "\n".join(f"      {ln}" for ln in answer_lines)
+    if clipped:
+        return f"{body}\n\n    {foot}\n"
     return f"{'▔' * 60}\n\n    /btw {question}\n\n{body}\n\n    {foot}\n"
 
 
@@ -243,8 +282,10 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
 
     def _run(self, frames):
         """One logical scroll position per frame, each reading identically twice —
-        what a quiet pane looks like to _stable_btw_regions."""
-        return self._run_reads([f for f in frames for _ in (0, 1)])
+        what a quiet pane looks like to _stable_btw_regions. The first frame is
+        served one extra time: the capture probes upward before stitching, and an
+        overlay already at the top reads back unchanged after that ↑."""
+        return self._run_reads([f for f in [frames[0]] + list(frames) for _ in (0, 1)])
 
     def test_scrolls_and_stitches_full_answer(self):
         # window of 3 lines, full answer L1..L6, scrolling 1 line per Down until
@@ -258,13 +299,45 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
         ]
         got, sent = self._run(frames)
         self.assertEqual(got["answer"], "L1\nL2\nL3\nL4\nL5\nL6")
-        # 4 Downs advanced the window; the view is then restored with 4 Ups.
-        self.assertEqual(sent, ["Down"] * 4 + ["Up"] * 4)
+        # One Up confirmed the overlay was already at the top; 4 Downs advanced
+        # the window; the view is then restored with 4 Ups.
+        self.assertEqual(sent, ["Up"] + ["Down"] * 4 + ["Up"] * 4)
+
+    def test_walks_up_to_the_top_before_stitching(self):
+        # The overlay need not be sitting at the top when we find it: the reader
+        # scrolls it, and a tall answer opens with its head already off-screen —
+        # which is also what hides the question line. The stitch only ever walks
+        # down, so without the walk up the head of the answer is dropped and the
+        # aside is archived with no question.
+        reads = [
+            _btw_frame(["L3", "L4"], clipped=True), _btw_frame(["L3", "L4"], clipped=True),
+            _btw_frame(["L2", "L3"], clipped=True), _btw_frame(["L2", "L3"], clipped=True),
+            _btw_frame(["L1", "L2"]), _btw_frame(["L1", "L2"]),  # top: question back
+            _btw_frame(["L1", "L2"]), _btw_frame(["L1", "L2"]),  # Up clamps -> stop
+            _btw_frame(["L2", "L3"]), _btw_frame(["L2", "L3"]),
+            _btw_frame(["L3", "L4"]), _btw_frame(["L3", "L4"]),
+            _btw_frame(["L3", "L4"]), _btw_frame(["L3", "L4"]),  # bottom clamp
+        ]
+        got, sent = self._run_reads(reads)
+        self.assertEqual(got["question"], "print the integers")
+        self.assertEqual(got["answer"], "L1\nL2\nL3\nL4")
+        self.assertEqual(sent, ["Up"] * 3 + ["Down"] * 3 + ["Up"] * 3)
 
     def test_none_when_no_overlay(self):
         got, sent = self._run([_btw_frame([], overlay=False)])
         self.assertIsNone(got)
         self.assertEqual(sent, [])  # never touch the keyboard without an overlay
+
+    def test_stops_without_restoring_when_overlay_vanishes_on_the_way_up(self):
+        # Same rule as the walk down: once the overlay is gone the arrows drive
+        # the composer's history, so stop at once and send nothing further.
+        reads = [
+            _btw_frame(["L3", "L4"], clipped=True), _btw_frame(["L3", "L4"], clipped=True),
+            _btw_frame([], overlay=False),
+        ]
+        got, sent = self._run_reads(reads)
+        self.assertIsNone(got)
+        self.assertEqual(sent, ["Up"])
 
     def test_aborts_without_restoring_when_overlay_vanishes(self):
         # If the overlay disappears mid-scroll, stop immediately and send NO Ups —
@@ -276,20 +349,21 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
         ]
         got, sent = self._run(frames)
         self.assertEqual(got["answer"], "L1\nL2\nL3\nL4")
-        self.assertEqual(sent, ["Down", "Down"])  # no Up restore
+        self.assertEqual(sent, ["Up", "Down", "Down"])  # no Up restore
 
     def test_tolerates_a_single_jittery_read(self):
         # One disagreeing read is a redraw caught mid-flight, not an unreadable
         # pane: the third read agrees with the second, so the position is used.
         reads = [
             _btw_frame(["L1", "L2", "L3"]), _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["L1", "L2", "L3"]), _btw_frame(["L1", "L2", "L3"]),  # at top
             _btw_frame(["L2", "↑/ L3", "L4"]), _btw_frame(["L2", "L3", "L4"]),
             _btw_frame(["L2", "L3", "L4"]),
             _btw_frame(["L2", "L3", "L4"]), _btw_frame(["L2", "L3", "L4"]),  # clamp
         ]
         got, sent = self._run_reads(reads)
         self.assertEqual(got["answer"], "L1\nL2\nL3\nL4")
-        self.assertEqual(sent, ["Down", "Down", "Up", "Up"])
+        self.assertEqual(sent, ["Up", "Down", "Down", "Up", "Up"])
 
     def test_abandons_round_when_frame_never_settles(self):
         # A pane repainting under us reads differently every time. Stitching such a
@@ -298,13 +372,14 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
         # view is still restored since the overlay is alive.
         reads = [
             _btw_frame(["L1", "L2", "L3"]), _btw_frame(["L1", "L2", "L3"]),
+            _btw_frame(["L1", "L2", "L3"]), _btw_frame(["L1", "L2", "L3"]),  # at top
             _btw_frame(["L2", "L3", "L4"]),
             _btw_frame(["L2", "↑/ L3", "L4"]),
             _btw_frame(["L2", "L3", "──── L4"]),
         ]
         got, sent = self._run_reads(reads)
         self.assertIsNone(got)
-        self.assertEqual(sent, ["Down", "Up"])
+        self.assertEqual(sent, ["Up", "Down", "Up"])
 
     def test_abandons_round_when_a_frame_shares_no_lines(self):
         # A spliced frame can read the same twice (the pane settles into the
@@ -317,7 +392,7 @@ class CaptureFullBtwAnswerTests(unittest.TestCase):
         ]
         got, sent = self._run(frames)
         self.assertIsNone(got)
-        self.assertEqual(sent, ["Down", "Up"])
+        self.assertEqual(sent, ["Up", "Down", "Up"])
 
     def test_no_keystrokes_when_first_frame_never_settles(self):
         # Unstable before the first Down: never touch the keyboard at all.
@@ -376,32 +451,43 @@ class BtwLogTests(unittest.TestCase):
         self.assertEqual(btwlog.entries("sess1"), [])
         self.assertFalse((Path(self.tmp) / "sess1.jsonl").exists())
 
-    def test_has_prefix_matches_stored_answer_prefix(self):
+    def test_has_slice_matches_any_window_of_the_stored_answer(self):
+        # Whatever the overlay happens to be showing: its head right after a
+        # stitch, or the middle of the answer once the reader has scrolled.
         btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4")
-        self.assertTrue(btwlog.has_prefix("sess1", "q1", "L1\nL2"))
-        self.assertTrue(btwlog.has_prefix("sess1", "q1", "L1\nL2\nL3\nL4"))
+        self.assertTrue(btwlog.has_slice("sess1", "q1", "L1\nL2"))
+        self.assertTrue(btwlog.has_slice("sess1", "q1", "L1\nL2\nL3\nL4"))
+        self.assertTrue(btwlog.has_slice("sess1", "q1", "L2\nL3"))
 
-    def test_has_prefix_false_on_mismatch(self):
+    def test_has_slice_matches_on_the_answer_when_the_question_is_unknown(self):
+        # A clipped read has no question line to compare, so the answer carries
+        # identity alone — otherwise the gate reopens on every 2s poll and drags
+        # the reader's view back to the top of the overlay each time.
         btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4")
-        self.assertFalse(btwlog.has_prefix("sess1", "q1", "X"))
-        self.assertFalse(btwlog.has_prefix("sess1", "other", "L1"))
-        self.assertFalse(btwlog.has_prefix("sess1", "q1", "   "))
+        self.assertTrue(btwlog.has_slice("sess1", "", "L2\nL3"))
+        self.assertFalse(btwlog.has_slice("sess1", "", "nothing like it"))
 
-    def test_has_prefix_ignores_redraw_crumbs(self):
+    def test_has_slice_false_on_mismatch(self):
+        btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4")
+        self.assertFalse(btwlog.has_slice("sess1", "q1", "X"))
+        self.assertFalse(btwlog.has_slice("sess1", "other", "L1"))
+        self.assertFalse(btwlog.has_slice("sess1", "q1", "   "))
+
+    def test_has_slice_ignores_redraw_crumbs(self):
         # The top slice scraped off a repainting pane carries the footer's "↑/"
         # hint and ─ rules, and a redraw re-wraps lines. It must still read as
         # already-archived, or the gate reopens and the overlay is re-scrolled on
         # every 2s poll — the eight-copies-of-one-aside bug.
         btwlog.record("sess1", "q1", "统一到 e11 协议\n不是反过来\n第三行")
-        self.assertTrue(btwlog.has_prefix("sess1", "q1", "统一到 e11 协议\n↑/不是反过来"))
-        self.assertTrue(btwlog.has_prefix("sess1", "q1", "────统一到 e11 协议\n不是反\n过来"))
-        self.assertTrue(btwlog.has_prefix("sess1", "  q1 ", "统一到 e11 协议"))
+        self.assertTrue(btwlog.has_slice("sess1", "q1", "统一到 e11 协议\n↑/不是反过来"))
+        self.assertTrue(btwlog.has_slice("sess1", "q1", "────统一到 e11 协议\n不是反\n过来"))
+        self.assertTrue(btwlog.has_slice("sess1", "  q1 ", "统一到 e11 协议"))
 
-    def test_has_prefix_false_when_probe_is_only_crumbs(self):
-        # A slice of nothing but crumbs fingerprints to "" — treating that as a
-        # prefix of every entry would gate out a genuinely new aside.
+    def test_has_slice_false_when_probe_is_only_crumbs(self):
+        # A read of nothing but crumbs fingerprints to "" — treating that as
+        # part of every entry would gate out a genuinely new aside.
         btwlog.record("sess1", "q1", "L1\nL2")
-        self.assertFalse(btwlog.has_prefix("sess1", "q1", "↑/ ────"))
+        self.assertFalse(btwlog.has_slice("sess1", "q1", "↑/ ────"))
 
     def test_dismiss_hides_latest_from_card(self):
         e = btwlog.record("sess1", "q1", "a1")
@@ -518,12 +604,12 @@ class OneAsidePerRunTests(unittest.TestCase):
         self.assertIsNone(btwlog.latest("sess1"))
 
     def test_gate_holds_against_the_kept_capture(self):
-        # has_prefix answers for the aside, not for every capture of it: the top
-        # slice of an archived aside must still close the gate after a bad stitch
-        # was logged next to the good capture.
+        # has_slice answers for the aside, not for every capture of it: a read of
+        # an archived aside must still close the gate after a bad stitch was
+        # logged next to the good capture.
         btwlog.record("sess1", "q1", "L1\nL2\nL3")
         btwlog.record("sess1", "q1", "L1\nL2\nL1\nL2\nL3")
-        self.assertTrue(btwlog.has_prefix("sess1", "q1", "L1\nL2"))
+        self.assertTrue(btwlog.has_slice("sess1", "q1", "L1\nL2"))
 
 
 class TimelineMergeTests(unittest.TestCase):
@@ -618,6 +704,18 @@ class BtwCaptureGateTests(unittest.TestCase):
              mock.patch.object(self.btwcapture.actions, "capture_full_btw_answer") as cf:
             self.btwcapture.maybe_capture(123, "sess1")
         cf.assert_not_called()  # already have it — no key injection
+
+    def test_skips_archived_aside_read_part_way_in(self):
+        # The reader scrolled the overlay, so the cheap read is a middle window
+        # with no question line on it. It is still the aside we already have, and
+        # firing the stitch would drag their view back to the top every 2s poll.
+        btwlog.record("sess1", "q1", "L1\nL2\nL3\nL4\nL5\nL6")
+        slice_ov = {"question": "", "answer": "L3\nL4"}
+        with mock.patch.object(self.btwcapture.actions, "get_btw_state",
+                               return_value={"settled": slice_ov}), \
+             mock.patch.object(self.btwcapture.actions, "capture_full_btw_answer") as cf:
+            self.btwcapture.maybe_capture(123, "sess1")
+        cf.assert_not_called()
 
     def test_skips_when_no_overlay(self):
         with mock.patch.object(self.btwcapture.actions, "get_btw_state", return_value=None), \

@@ -6,13 +6,14 @@ which injects ↓ keys into the live pane and takes seconds. Neither belongs on 
 2 s dashboard-refresh path, so this module:
 
   1. does the cheap, key-free top-slice scrape first (actions.get_btw_state);
-  2. skips entirely if that aside is already fully archived (btwlog.has_prefix) —
+  2. skips entirely if that aside is already fully archived (btwlog.has_slice) —
      so a still-open overlay is not re-scrolled on every poll;
   3. otherwise runs the slow scroll-stitch on a daemon thread, one at a time per
      session, and latches the full answer to btwlog.
 
-The disk gate (has_prefix) is durable: after the full answer is stored, later
-polls see the top slice as a prefix of it and stop, even across a fleet restart.
+The disk gate (has_slice) is durable: after the full answer is stored, later
+polls see whatever slice of it is on screen as part of the stored answer and
+stop, even across a fleet restart and wherever the reader has scrolled to.
 
 capture_sync is the blocking variant for callers that are about to DESTROY the
 overlay (the next prompt's dismiss-Escape, the dashboard Esc button): once the
@@ -53,7 +54,7 @@ def maybe_capture(pid: int, session_id: str) -> str | None:
     if "pending" in state:
         return state["pending"]
     slice_ov = state["settled"]
-    if btwlog.has_prefix(session_id, slice_ov["question"], slice_ov["answer"]):
+    if btwlog.has_slice(session_id, slice_ov["question"], slice_ov["answer"]):
         return None  # already fully archived — don't re-scroll the overlay
     with _lock:
         if session_id in _inflight:
@@ -81,7 +82,7 @@ def capture_sync(pid: int, session_id: str) -> None:
         return
     deadline = time.time() + _SYNC_INFLIGHT_WAIT
     while True:
-        if btwlog.has_prefix(session_id, slice_ov["question"], slice_ov["answer"]):
+        if btwlog.has_slice(session_id, slice_ov["question"], slice_ov["answer"]):
             return  # archived (possibly by the stitch we were waiting out)
         with _lock:
             if session_id not in _inflight:
