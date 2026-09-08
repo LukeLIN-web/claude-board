@@ -180,10 +180,6 @@ def _local_snapshot() -> dict:
                 # the folder-trust prompt is answered by its own route, and it
                 # is the one a spawn into a never-opened directory always hits.
                 w["waiting_for"] = "trust prompt"
-        tri = patrol.classify(w)
-        w["triage"] = tri["triage"]
-        w["triage_reason"] = tri["reason"]
-        w["triage_suggestion"] = tri["suggestion"]
         if tp:
             w["skills_used"] = transcripts.extract_skills_used(tp)
             w["memory_ops"] = transcripts.extract_memory_ops(tp)
@@ -197,6 +193,12 @@ def _local_snapshot() -> dict:
             w["memory_ops"] = []
             w["background_tasks"] = []
             w["loop"] = None
+        # After background_tasks, not before: that list is how patrol tells a
+        # session waiting on background work from one waiting on a person.
+        tri = patrol.classify(w)
+        w["triage"] = tri["triage"]
+        w["triage_reason"] = tri["reason"]
+        w["triage_suggestion"] = tri["suggestion"]
         # Queued prompts: reliable dashboard-sent items (reconciled against the
         # transcript) plus best-effort TUI-typed items scraped from the pane.
         # A queue only exists while busy, which also bounds the extra capture.

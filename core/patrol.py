@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from pathlib import Path
 from typing import Optional
 
 IDLE_THRESHOLD = 300     # 5 min
 CLOSEABLE_THRESHOLD = 3600  # 1 hour
+# How long a finished task's notification may sit undelivered before the card
+# calls it stuck. Delivery normally takes milliseconds (the notification is
+# enqueued and removed in the same tenth of a second), so this is not a tuned
+# threshold — it is wide enough that a snapshot can never catch a healthy
+# handover mid-flight and flash the card amber.
+DELIVERY_GRACE = 60
 
 TRIAGE_PRIORITY = {
     "waiting_perm": 0,
@@ -19,11 +24,16 @@ TRIAGE_PRIORITY = {
 }
 
 
-_BG_KEYWORDS = re.compile(r"等待|等.*通知|后台|background|polling|monitor|run_in_background", re.IGNORECASE)
-
-
 def _last_assistant_info(transcript_path: str) -> Optional[dict]:
-    """Extract stop_reason, last content block type, and background task status."""
+    """Extract stop_reason and the last content block of the last assistant turn.
+
+    Whether background work is in flight is NOT decided here. It used to be, two
+    ways, and both were guesses: any `queue-operation` row after the last
+    end_turn counted as work in progress — including `remove`, the row that says
+    the queue drained — and failing that, a keyword regex over the assistant's
+    last message, so a session that merely mentioned "后台" read as busy. The
+    answer comes from unresolved tool calls instead (transcripts.
+    extract_background_tasks), which is where it was already computed."""
     p = Path(transcript_path)
     if not p.exists():
         return None
@@ -34,24 +44,6 @@ def _last_assistant_info(transcript_path: str) -> Optional[dict]:
                 lines.append(line)
     except Exception:
         return None
-
-    # Check for active background tasks: only queue-operations AFTER the
-    # last assistant end_turn count. If the session moved on past the bg
-    # task phase, stale queue-ops don't indicate active work.
-    has_pending_background = False
-    last_end_turn_idx = -1
-    tail = lines[-30:]
-    for i, raw in enumerate(tail):
-        try:
-            d = json.loads(raw)
-        except Exception:
-            continue
-        t = d.get("type", "")
-        if t == "assistant" and (d.get("message") or {}).get("stop_reason") == "end_turn":
-            last_end_turn_idx = i
-            has_pending_background = False
-        elif t == "queue-operation" and i > last_end_turn_idx:
-            has_pending_background = True
 
     # Find the last assistant message for stop_reason etc.
     stop_reason = ""
@@ -81,16 +73,11 @@ def _last_assistant_info(transcript_path: str) -> Optional[dict]:
                     break
         break
 
-    # Keyword fallback: if the assistant's last text mentions waiting for background work
-    if not has_pending_background and last_text and _BG_KEYWORDS.search(last_text):
-        has_pending_background = True
-
     return {
         "stop_reason": stop_reason,
         "last_block_type": last_block_type,
         "last_text": last_text[:200],
         "last_tool": last_tool,
-        "has_pending_background": has_pending_background,
     }
 
 
@@ -109,6 +96,20 @@ def classify(window_dict: dict) -> dict:
             "triage": "waiting_perm",
             "reason": window_dict.get("waiting_for") or "等待授权",
             "suggestion": "去终端批准",
+        }
+
+    # Ahead of the busy shortcut, because that is what hid this: a session
+    # holding a finished task's undelivered notification keeps reporting itself
+    # busy, so the card read "working, nothing to do" for as long as it sat
+    # there. Work that is done and unread needs a person, not patience.
+    stuck = [t for t in (window_dict.get("background_tasks") or [])
+             if t.get("state") == "undelivered"
+             and time.time() - (t.get("ts") or 0) >= DELIVERY_GRACE]
+    if stuck:
+        return {
+            "triage": "stalled",
+            "reason": f"后台任务已完成但通知没被取走{_count(stuck)}。{_what(stuck[0])}",
+            "suggestion": "去终端敲一下",
         }
 
     if status == "busy" and idle < IDLE_THRESHOLD:
@@ -143,11 +144,13 @@ def classify(window_dict: dict) -> dict:
     stop = info["stop_reason"]
     idle_str = _format_idle(idle)
 
-    if info.get("has_pending_background"):
-        summary = info["last_text"].split("\n")[0][:80] if info["last_text"] else ""
+    # Async work still out: a backgrounded Bash, a persistent Monitor, a subagent.
+    # app.py fills this in before classifying (transcripts.extract_background_tasks).
+    background = window_dict.get("background_tasks") or []
+    if background:
         return {
             "triage": "working",
-            "reason": f"有后台任务在执行。{summary}",
+            "reason": f"有后台任务在执行{_count(background)}。{_what(background[0])}",
             "suggestion": "",
         }
 
@@ -191,6 +194,16 @@ def classify(window_dict: dict) -> dict:
         "reason": f"空闲 {idle_str}",
         "suggestion": "",
     }
+
+
+def _count(tasks: list) -> str:
+    """"（N 件）" when there is more than one; the reason names only the first."""
+    return f"（{len(tasks)} 件）" if len(tasks) > 1 else ""
+
+
+def _what(task: dict) -> str:
+    """One line naming a background task, for the card's reason."""
+    return (task.get("description") or task.get("command") or "").split("\n")[0][:80]
 
 
 def _format_idle(seconds: int) -> str:

@@ -1010,38 +1010,110 @@ def extract_memory_ops(path: str | Path) -> list[dict]:
     return ops
 
 
+# The two task-notification fields the ledger below keys on (status and summary
+# are already parsed above, for rendering the row). <task-id> is the only field
+# every row for a task carries — the final "finished" notification can omit
+# <tool-use-id> — so it is the identity; <tool-use-id> joins a notification back
+# to the launch that started the work.
+_TN_TASK_ID_RE = re.compile(r"<task-id>\s*(.*?)\s*</task-id>", re.DOTALL)
+_TN_TOOL_USE_RE = re.compile(r"<tool-use-id>\s*(.*?)\s*</tool-use-id>", re.DOTALL)
+
+
+def _async_launch_kind(name: str, inp: dict) -> str:
+    """Which kind of async work this tool call starts, or "" if it starts none."""
+    if name == "Agent":
+        return "agent"
+    if name == "Bash" and inp.get("run_in_background"):
+        return "bash_bg"
+    if name == "Monitor" and inp.get("persistent"):
+        return "monitor"
+    return ""
+
+
 def extract_background_tasks(path: str | Path) -> list[dict]:
-    """Extract ACTIVE (unresolved) background Bash/Monitor tasks."""
+    """Async work this session started and has not finished with, as
+    [{type, description, command, state, ts}].
+
+    `state` is "running" while the work is still going, and "undelivered" once it
+    has reported completion that the session has not picked up — the work is
+    done and its answer is sitting in a queue nobody is draining. That gap is the
+    one a person has to close, and it looks exactly like a session still working.
+
+    Not "a tool_use with no tool_result": every async launch gets its tool_result
+    back *at launch* ("Async agent launched successfully", "Command running in
+    background"), so that test matched nothing on any transcript and this list
+    was always empty. What actually tracks the work is the notification ledger —
+    the task reports completion in a `queue-operation` row, and the session takes
+    delivery in a `remove` row or in a user row carrying the same <task-id>.
+    """
     p = Path(path)
     if not p.exists():
         return []
-    bg_by_id: dict[str, dict] = {}
-    resolved_ids: set[str] = set()
+    launched: dict[str, dict] = {}   # tool_use_id -> {type, description, command}
+    notified: dict[str, dict] = {}   # task_id -> {tool_use_id, summary, ts}
+    delivered: set[str] = set()      # task_ids the session has taken
     for d in _iter_lines(p):
-        if d.get("type") == "assistant":
+        t = d.get("type")
+        if t == "assistant":
             for c in ((d.get("message") or {}).get("content") or []):
                 if not isinstance(c, dict) or c.get("type") != "tool_use":
                     continue
-                name = c.get("name", "")
                 inp = c.get("input") or {}
-                tid = c.get("id", "")
-                if name == "Bash" and inp.get("run_in_background") and tid:
-                    bg_by_id[tid] = {
-                        "type": "bash_bg",
+                kind = _async_launch_kind(c.get("name", ""), inp)
+                if kind and c.get("id"):
+                    launched[c["id"]] = {
+                        "type": kind,
                         "description": (inp.get("description") or "")[:200],
-                        "command": (inp.get("command") or "")[:200],
+                        "command": (inp.get("command") or inp.get("prompt") or "")[:200],
                     }
-                elif name == "Monitor" and inp.get("persistent") and tid:
-                    bg_by_id[tid] = {
-                        "type": "monitor",
-                        "description": (inp.get("description") or "")[:200],
-                        "command": (inp.get("command") or "")[:200],
-                    }
-        elif d.get("type") == "user":
-            for c in ((d.get("message") or {}).get("content") or []):
-                if isinstance(c, dict) and c.get("type") == "tool_result":
-                    resolved_ids.add(c.get("tool_use_id", ""))
-    return [t for tid, t in bg_by_id.items() if tid not in resolved_ids]
+        elif t == "queue-operation":
+            body = d.get("content") or ""
+            op = d.get("operation")
+            if op == "dequeue":
+                # Carries no content, so it cannot be attributed. It appears
+                # alongside real deliveries, so read it as one: a missed stall is
+                # quieter than a card that cries stall at every flush.
+                delivered.update(notified)
+                continue
+            hit = _TN_TASK_ID_RE.search(body)
+            if not hit:
+                continue
+            task_id = hit.group(1)
+            if op != "enqueue":
+                delivered.add(task_id)
+                continue
+            status = _TN_STATUS_RE.search(body)
+            if not status or status.group(1) != "completed":
+                continue  # a progress event, not the task finishing
+            summary = _TN_SUMMARY_RE.search(body)
+            entry = notified.setdefault(
+                task_id,
+                {"tool_use_id": "", "ts": _parse_ts(d.get("timestamp", "")),
+                 "summary": summary.group(1) if summary else ""},
+            )
+            tool_use = _TN_TOOL_USE_RE.search(body)
+            if tool_use and not entry["tool_use_id"]:
+                entry["tool_use_id"] = tool_use.group(1)
+        elif t == "user" and not d.get("isSidechain"):
+            body = json.dumps((d.get("message") or {}).get("content"), ensure_ascii=False)
+            hit = _TN_TASK_ID_RE.search(body)
+            if hit:
+                delivered.add(hit.group(1))
+
+    out: list[dict] = []
+    settled: set[str] = set()  # tool_use_ids whose completion has been delivered
+    for task_id, n in notified.items():
+        if task_id in delivered:
+            settled.add(n["tool_use_id"])
+            continue
+        info = launched.get(n["tool_use_id"]) or {
+            "type": "task", "description": n["summary"][:200], "command": ""}
+        out.append({**info, "state": "undelivered", "ts": n["ts"]})
+        settled.add(n["tool_use_id"])
+    for tool_use_id, info in launched.items():
+        if tool_use_id not in settled:
+            out.append({**info, "state": "running", "ts": 0.0})
+    return out
 
 
 def extract_plan_history(path: str | Path) -> list[dict]:
