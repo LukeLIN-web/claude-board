@@ -5,47 +5,55 @@ from unittest import mock
 from core import sessions
 
 
+def _load_filters(include: str = "", exclude: str = "") -> None:
+    """Load the cwd filter from exactly these two values, nothing ambient.
+
+    Both vars are always patched, and the default is "" — no filtering. Setting
+    only the one a test is about (with `clear=False`) is not enough: run.sh
+    exports CLAUDE_FLEET_CWD_INCLUDE out of .env.local, and the Claude sessions
+    the board spawns inherit it — which is where these tests get run. A test that
+    set only EXCLUDE then ran against the board's own allowlist and failed on the
+    machine the board was running on.
+    """
+    with mock.patch.dict("os.environ",
+                         {"CLAUDE_FLEET_CWD_INCLUDE": include,
+                          "CLAUDE_FLEET_CWD_EXCLUDE": exclude},
+                         clear=False):
+        sessions._reload_cwd_filters()
+
+
 class CwdFilterTests(unittest.TestCase):
     def tearDown(self):
-        # Restore default (no filtering) so other tests are unaffected.
-        with mock.patch.dict("os.environ", {}, clear=False):
-            sessions._reload_cwd_filters()
-
-    def _set(self, **env):
-        with mock.patch.dict("os.environ", env, clear=False):
-            sessions._reload_cwd_filters()
+        _load_filters()  # no filtering, so other tests are unaffected
 
     def test_no_env_shows_everything(self):
-        sessions._CWD_INCLUDE, sessions._CWD_EXCLUDE = [], []
+        _load_filters()
         self.assertTrue(sessions._cwd_visible("/home/user1/workspace/x"))
         self.assertTrue(sessions._cwd_visible("/anything"))
 
     def test_include_allowlist(self):
-        self._set(CLAUDE_FLEET_CWD_INCLUDE="/shared/ws/proj/")
+        _load_filters(include="/shared/ws/proj/")
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj/board"))
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj"))
         self.assertFalse(sessions._cwd_visible("/home/user1/workspace/x"))
 
     def test_include_respects_path_boundary(self):
-        self._set(CLAUDE_FLEET_CWD_INCLUDE="/shared/ws/proj")
+        _load_filters(include="/shared/ws/proj")
         # A sibling dir that merely shares the prefix string must not match.
         self.assertFalse(sessions._cwd_visible("/shared/ws/proj-evil"))
 
     def test_exclude_denylist(self):
-        self._set(CLAUDE_FLEET_CWD_EXCLUDE="/home/user1/workspace")
+        _load_filters(exclude="/home/user1/workspace")
         self.assertFalse(sessions._cwd_visible("/home/user1/workspace/x"))
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj/board"))
 
     def test_exclude_wins_over_include(self):
-        self._set(
-            CLAUDE_FLEET_CWD_INCLUDE="/shared",
-            CLAUDE_FLEET_CWD_EXCLUDE="/shared/ws/secret",
-        )
+        _load_filters(include="/shared", exclude="/shared/ws/secret")
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj"))
         self.assertFalse(sessions._cwd_visible("/shared/ws/secret/x"))
 
     def test_multiple_prefixes(self):
-        self._set(CLAUDE_FLEET_CWD_INCLUDE="/a/b:/c/d,/e/f")
+        _load_filters(include="/a/b:/c/d,/e/f")
         for p in ("/a/b/x", "/c/d/y", "/e/f/z"):
             self.assertTrue(sessions._cwd_visible(p))
         self.assertFalse(sessions._cwd_visible("/g/h"))
@@ -53,16 +61,10 @@ class CwdFilterTests(unittest.TestCase):
 
 class SlugFilterTests(unittest.TestCase):
     def tearDown(self):
-        with mock.patch.dict("os.environ", {}, clear=False):
-            sessions._reload_cwd_filters()
+        _load_filters()
 
     def test_slug_matches_cwd_filter(self):
-        with mock.patch.dict(
-            "os.environ",
-            {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj"},
-            clear=False,
-        ):
-            sessions._reload_cwd_filters()
+        _load_filters(include="/shared/ws/proj")
         # slug form of an allowed cwd is visible...
         self.assertTrue(sessions.slug_visible("-shared-ws-proj-board"))
         # ...a sibling sharing the string prefix is not (boundary on "-")...
@@ -75,8 +77,7 @@ class HistoryFilterTests(unittest.TestCase):
     """history.list_sessions must drop sessions whose project is hidden."""
 
     def tearDown(self):
-        with mock.patch.dict("os.environ", {}, clear=False):
-            sessions._reload_cwd_filters()
+        _load_filters()
 
     def test_list_sessions_drops_hidden_projects(self):
         from core import history
@@ -93,16 +94,11 @@ class HistoryFilterTests(unittest.TestCase):
             mk("a", "/shared/ws/proj/board"),
             mk("b", "/home/user1/arman/lingbot-va"),
         ]
-        with mock.patch.dict(
-            "os.environ",
-            {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj"},
-            clear=False,
-        ):
-            sessions._reload_cwd_filters()
-            with mock.patch.object(history, "_build_index", return_value=fake), \
-                 mock.patch.object(history, "_cache", []), \
-                 mock.patch.object(history, "_cache_ts", 0):
-                out = history.list_sessions(limit=9999)
+        _load_filters(include="/shared/ws/proj")
+        with mock.patch.object(history, "_build_index", return_value=fake), \
+             mock.patch.object(history, "_cache", []), \
+             mock.patch.object(history, "_cache_ts", 0):
+            out = history.list_sessions(limit=9999)
         sids = {s["session_id"] for s in out["sessions"]}
         self.assertEqual(sids, {"a"})
         self.assertEqual(out["total"], 1)
