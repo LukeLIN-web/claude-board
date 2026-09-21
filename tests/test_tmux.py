@@ -39,6 +39,16 @@ def _patch_run(side_effect=None, **proc_kwargs):
     return mock.patch.object(tmux.subprocess, "run", return_value=FakeProc(**proc_kwargs))
 
 
+# Stand-in for the resolved CLI. new_window launches by absolute path, so argv
+# assertions would otherwise read whatever `claude` this machine has installed —
+# or fail outright on one that has none.
+_EXE = "/opt/bin/claude"
+
+
+def _pin_cli(path=_EXE):
+    return mock.patch.object(tmux, "_resolve_cli", return_value=path)
+
+
 class RunHelperTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
@@ -119,7 +129,9 @@ class SocketArgsTests(unittest.TestCase):
                 return FakeProc(returncode=0, stdout="beauty\n")
             return FakeProc(returncode=0, stdout="%3\n")
 
-        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True):
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True), \
+             _pin_cli(), mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)), \
+             mock.patch.object(tmux, "pane_alive", return_value=True):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
@@ -208,6 +220,14 @@ class PaneForTtyTests(unittest.TestCase):
 class NewWindowTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
+        # Pin what the argv assertions below see. The post-spawn liveness probe
+        # is SpawnLandedTests' subject, not theirs — stubbed here so it neither
+        # sleeps nor needs every fake to model `list-panes`.
+        for patcher in (_pin_cli(),
+                        mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)),
+                        mock.patch.object(tmux, "pane_alive", return_value=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_argv_uses_env_target(self):
         calls = []
@@ -227,7 +247,7 @@ class NewWindowTests(unittest.TestCase):
             new_win_argv,
             ["tmux", "new-window", "-P", "-F", "#{pane_id}",
              "-t", "mysess", "-c", "/home/u/proj",
-             "claude", "--dangerously-skip-permissions"],
+             _EXE, "--dangerously-skip-permissions"],
         )
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%12")
@@ -277,7 +297,7 @@ class NewWindowTests(unittest.TestCase):
             new_sess_argv,
             ["tmux", "new-session", "-d", "-s", "fleet",
              "-P", "-F", "#{pane_id}", "-c", "/tmp",
-             "claude", "--dangerously-skip-permissions"],
+             _EXE, "--dangerously-skip-permissions"],
         )
 
     def test_spawned_command_force_unsets_board_venv_markers(self):
@@ -300,7 +320,7 @@ class NewWindowTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         new_win_argv = [a for a in calls if "new-window" in a][0]
         # `env -u VIRTUAL_ENV -u VIRTUAL_ENV_PROMPT -u PYTHONHOME` precedes `claude`.
-        claude_idx = new_win_argv.index("claude")
+        claude_idx = new_win_argv.index(_EXE)
         self.assertEqual(new_win_argv[claude_idx - 7:claude_idx],
                          ["env", "-u", "VIRTUAL_ENV",
                           "-u", "VIRTUAL_ENV_PROMPT", "-u", "PYTHONHOME"])
@@ -335,6 +355,96 @@ class NewWindowTests(unittest.TestCase):
         new_sess_argv = [a for a in calls if "new-session" in a][0]
         self.assertIn("ghost", new_sess_argv)
         self.assertFalse(any("new-window" in a for a in calls))
+
+
+    def test_missing_cli_fails_before_opening_a_window(self):
+        # The board's PATH is what the pane gets, not the tmux server's. When
+        # the board cannot see the CLI, spawning would open a window that dies
+        # 127 and disappears — a "success" with no card behind it. Refuse.
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0, stdout="alpha\n")
+
+        with _pin_cli(None), mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertFalse(r["ok"])
+        self.assertIn("claude not found", r["error"])
+        self.assertFalse(any("new-window" in a for a in calls))
+
+
+class SpawnLandedTests(unittest.TestCase):
+    """The post-spawn probe: a pane id is not yet a running session."""
+
+    def setUp(self):
+        tmux._clear_caches()
+        for patcher in (_pin_cli(),
+                        mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_pane_that_dies_immediately_is_not_reported_as_spawned(self):
+        # tmux prints a pane id for a window it created even when the command in
+        # it exits before anyone looks. Re-probing the pane is what turns that
+        # into an error the dashboard can show instead of a phantom spawn.
+        def fake_run(argv, **kw):
+            if "list-sessions" in argv:
+                return FakeProc(returncode=0, stdout="alpha\n")
+            if "list-panes" in argv:
+                # The window is already gone; only the old panes are listed.
+                return FakeProc(returncode=0, stdout="%1\t/dev/pts/1\talpha\t/tmp\n")
+            return FakeProc(returncode=0, stdout="%9\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["pane_id"], "%9")
+        self.assertIn("exited immediately", r["error"])
+
+    def test_live_pane_is_reported_as_spawned(self):
+        def fake_run(argv, **kw):
+            if "list-sessions" in argv:
+                return FakeProc(returncode=0, stdout="alpha\n")
+            if "list-panes" in argv:
+                return FakeProc(returncode=0, stdout="%9\t/dev/pts/9\talpha\t/tmp\n")
+            return FakeProc(returncode=0, stdout="%9\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["pane_id"], "%9")
+
+
+class ResolveCliTests(unittest.TestCase):
+    def setUp(self):
+        tmux._clear_caches()
+
+    def test_prefers_what_the_spawn_path_resolves(self):
+        with mock.patch.object(tmux.shutil, "which", return_value="/usr/bin/claude") as w:
+            self.assertEqual(tmux._resolve_cli("claude"), "/usr/bin/claude")
+        self.assertEqual(w.call_args[0][0], "claude")
+
+    def test_falls_back_to_user_install_when_path_is_bare(self):
+        # The bare PATH a supervisor restart leaves behind has no ~/.local/bin,
+        # which is exactly where claude and codex install themselves.
+        with mock.patch.dict("os.environ", {"HOME": "/home/u"}), \
+             mock.patch.object(tmux.shutil, "which", return_value=None), \
+             mock.patch.object(tmux.os, "access",
+                               lambda path, mode: path == "/home/u/.local/bin/claude"):
+            self.assertEqual(tmux._resolve_cli("claude"), "/home/u/.local/bin/claude")
+
+    def test_returns_none_when_nothing_on_disk_matches(self):
+        with mock.patch.object(tmux.shutil, "which", return_value=None), \
+             mock.patch.object(tmux.os, "access", return_value=False):
+            self.assertIsNone(tmux._resolve_cli("codex"))
+
+    def test_absolute_path_is_taken_as_given(self):
+        with mock.patch.object(tmux.os, "access", return_value=True):
+            self.assertEqual(tmux._resolve_cli("/opt/claude"), "/opt/claude")
 
 
 class SendTextTests(unittest.TestCase):

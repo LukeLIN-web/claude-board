@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -114,6 +115,39 @@ def _venv_unset_prefix() -> list[str]:
     return prefix
 
 
+# Where a user-installed CLI lives when the board's own PATH cannot see it.
+# `claude` and `codex` install into ~/.local/bin — an entry a login shell adds
+# to PATH and a bare environment does not, so a board brought up by a
+# supervisor restart, a systemd unit or a cron line never has it.
+_CLI_FALLBACK_DIRS = ("~/.local/bin", "/usr/local/bin")
+
+
+def _resolve_cli(name: str) -> Optional[str]:
+    """Absolute path to the CLI `name`, or None when it is nowhere on disk.
+
+    A spawned pane does NOT inherit the tmux *server's* PATH: tmux hands it the
+    environment of the client that ran `new-window` — the board process. So a
+    board whose own PATH lacks ~/.local/bin spawns `claude` into a pane that
+    cannot find it, and tmux still creates the window and prints its pane id
+    before the exec fails 127 and takes the window with it. That is the spawn
+    that reports success and never becomes a card (dashboard toast "Spawned",
+    no session anywhere), and it is why the launch must not depend on whichever
+    PATH the board happened to be started with.
+    """
+    if not name:
+        return None
+    if os.path.isabs(name):
+        return name if os.access(name, os.X_OK) else None
+    found = shutil.which(name, path=_spawn_env().get("PATH"))
+    if found:
+        return found
+    for d in _CLI_FALLBACK_DIRS:
+        candidate = os.path.join(os.path.expanduser(d), name)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _run(*args: str) -> dict:
     """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise."""
     try:
@@ -208,6 +242,20 @@ def pane_current_command(pane: str) -> Optional[str]:
     return r["stdout"].strip() or None
 
 
+def pane_alive(pane: str) -> bool:
+    """Whether `pane` still exists on the server.
+
+    tmux tears a pane down the moment its command exits, so this is also how a
+    spawn that died on exec is told apart from one that is running. Asked of
+    the pane *list* rather than of the pane: `display-message -p -t %dead`
+    exits 0 with empty output on tmux 3.2 instead of failing, so probing the
+    target directly reports every dead pane as a live one.
+    """
+    if not pane:
+        return False
+    return any(p["pane_id"] == pane for p in list_panes())
+
+
 def exit_copy_mode(pane: str) -> None:
     """Kick `pane` out of copy-mode before injecting keystrokes.
 
@@ -260,6 +308,24 @@ def _resolve_target() -> dict:
     return {"target": _DEFAULT_SESSION, "exists": False}
 
 
+# A pane id printed by `new-window` says the window was created, not that
+# anything is running in it: a command that dies on exec takes the window with
+# it milliseconds later. Re-probe the pane before calling a spawn good. A live
+# pane answers the first probe, and a dead one is only declared dead once every
+# wait has passed — a server too busy to answer one probe must never be
+# reported as a failed spawn.
+_SPAWN_LANDED_WAITS = (0.15, 0.35, 0.5)
+
+
+def _spawn_landed(pane_id: str) -> bool:
+    """Whether a freshly spawned pane is still there a moment later."""
+    for wait in _SPAWN_LANDED_WAITS:
+        time.sleep(wait)
+        if pane_alive(pane_id):
+            return True
+    return False
+
+
 def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     """Open a new tmux window in `cwd` running `cmd`; returns {ok, pane_id, error?}.
 
@@ -273,9 +339,17 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     work from a cold start instead of failing on an empty tmux server.
     """
     cmd = cmd or ["claude", "--dangerously-skip-permissions"]
+    # Launch by absolute path: the pane gets the board's PATH, not the server's
+    # (see _resolve_cli). Refusing here beats spawning a window that dies 127.
+    exe = _resolve_cli(cmd[0])
+    if exe is None:
+        return {"ok": False,
+                "error": f"{cmd[0]} not found on the board's PATH or in "
+                         f"{', '.join(_CLI_FALLBACK_DIRS)} — restart the board "
+                         f"from a shell that can run {cmd[0]}"}
     # Force-unset the board's venv markers on the pane command itself so a stale
     # tmux server can't re-inject VIRTUAL_ENV into the spawned session.
-    cmd = [*_venv_unset_prefix(), *cmd]
+    cmd = [*_venv_unset_prefix(), exe, *cmd[1:]]
     target = _resolve_target()
     if target["exists"]:
         r = _run("new-window", "-P", "-F", "#{pane_id}",
@@ -293,7 +367,13 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
                  "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
     if not r["ok"]:
         return {"ok": False, "error": r["error"]}
-    return {"ok": True, "pane_id": r["stdout"].strip()}
+    pane_id = r["stdout"].strip()
+    if not pane_id:
+        return {"ok": False, "error": "tmux opened the window but reported no pane id"}
+    if not _spawn_landed(pane_id):
+        return {"ok": False, "pane_id": pane_id,
+                "error": f"the spawned pane exited immediately: {' '.join(cmd)}"}
+    return {"ok": True, "pane_id": pane_id}
 
 
 def capture_pane(pane: str, scrollback: int = 0) -> dict:
