@@ -610,8 +610,9 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     A busy pane can drop the injected keystrokes during a re-render, so the text
     never arrives and a following Enter submits nothing — the prompt vanishes
     with no transcript trace (the dashboard then shows a phantom "Queued"). Re-
-    send until the composer holds our text, clearing any partial paste first
-    (see _clear_composer) so a retry can't concatenate into a corrupted prompt.
+    send until the composer holds our text, clearing the composer before EVERY
+    attempt (see _clear_composer) so nothing already sitting there can
+    concatenate into a corrupted prompt.
     Returns False if the text never lands after the retries — the caller then
     reports the failure rather than pressing Enter on a lost prompt.
 
@@ -624,8 +625,17 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     """
     needle = "".join(text.split())[-24:]
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
-        if attempt:
-            _clear_composer(pane)  # drop any partial before retry
+        # Clear before every attempt, the FIRST one included. Whatever is in the
+        # composer when we arrive takes the lead and our text lands appended to
+        # it — and the landed check below matches a TAIL, so the concatenation
+        # reads as a clean landing and the Enter submits the corrupted prompt.
+        # The leftover is usually the board's own previous send: submit-verify
+        # gives up with the text still sitting there, so pressing the card's
+        # Clear on a wedged session typed "/clear", failed to submit it, and the
+        # next Clear submitted the literal text "/clear/clear" — which Claude
+        # answers as prose ("type /clear on its own line") instead of clearing,
+        # leaving the session unclearable from the board for good.
+        _clear_composer(pane)
         literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "

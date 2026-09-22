@@ -704,12 +704,40 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=True):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 1)  # text sent once
-        self.assertNotIn(["tmux", "send-keys", "-t", "%5", "C-u"], calls)  # no clear
+        # Landing first try still costs one clear: the composer is emptied
+        # before the text is typed, never after it lands.
+        cc.assert_called_once_with("%5")
+
+    def test_composer_is_cleared_before_the_first_keystroke(self):
+        # Regression: the clear used to run only on RETRIES, so whatever a
+        # previous send left in the composer took the lead and our text was
+        # appended to it. Because the landed check matches a tail, the
+        # concatenation passed as a clean landing and Enter submitted it —
+        # the board's Clear button on a wedged session stranded "/clear", and
+        # the next press submitted the literal text "/clear/clear".
+        order = []
+
+        def fake_run(argv, **kw):
+            if "-l" in argv:
+                order.append("type")
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_clear_composer",
+                                  side_effect=lambda p: order.append("clear")), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=[True, False]):  # landed, then submitted
+            r = tmux.send_text("%5", "/clear", verify_landed=True)
+        self.assertTrue(r["ok"])
+        # The clear precedes the very first keystroke, not just the resends.
+        self.assertEqual(order[:2], ["clear", "type"])
 
     def test_resends_text_after_clearing_when_dropped_once(self):
         calls = []
@@ -723,9 +751,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 2)  # initial + one resend
-        # The retry clears any partial paste before re-sending, so a retry can't
-        # concatenate into a corrupted prompt.
-        cc.assert_called_once_with("%5")
+        # Every attempt clears first, so neither a leftover from an earlier send
+        # nor a partial paste can concatenate into a corrupted prompt.
+        self.assertEqual(cc.call_args_list, [mock.call("%5")] * 2)
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
@@ -741,9 +769,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         # A stalled TUI buffers the keystrokes rather than dropping them — they
         # land AFTER we give up and would strand in the composer, corrupting the
         # next send. Giving up must end with a cleanup clear so the buffered
-        # text is wiped whenever the pane wakes: one clear per retry plus the
+        # text is wiped whenever the pane wakes: one clear per attempt plus the
         # final cleanup.
-        self.assertEqual(cc.call_count, len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(cc.call_count, len(tmux._LANDED_VERIFY_WAITS) + 1)
 
     def test_landed_waits_escalate_for_laggy_panes(self):
         # A busy pane can take well over 0.15s to echo the paste; the between-
