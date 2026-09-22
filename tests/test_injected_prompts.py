@@ -282,3 +282,22 @@ class QueuedPromptShapeTests(unittest.TestCase):
         }]))
         self.assertEqual(_last_prompt(evs), "你可以看下[Image #6]")
         self.assertNotIn("iVBORw0K", evs[0]["text"])
+
+
+class PasteEnvelopeTests(unittest.TestCase):
+    """A pasted prompt is logged as `<pasted_content id="c5b9">…</pasted_content
+    id="c5b9">`. The id is never shown in the composer, so the row — and a copy
+    of it — must carry only the paste itself."""
+
+    RAW = '\n\n<pasted_content id="c5b9">\ngoal  | 件 | 盘上是什么\n第二行\n</pasted_content id="c5b9">\n'
+
+    def test_tags_are_stripped_and_text_kept(self):
+        self.assertEqual(transcripts.clean_user_text(self.RAW),
+                         "goal  | 件 | 盘上是什么\n第二行")
+
+    def test_typed_text_around_a_paste_survives(self):
+        raw = '看看这个\n<pasted_content id="aeb3">\n日志内容\n</pasted_content id="aeb3">\n怎么修'
+        self.assertEqual(transcripts.clean_user_text(raw), "看看这个\n日志内容\n怎么修")
+
+    def test_plain_text_untouched(self):
+        self.assertEqual(transcripts.clean_user_text("  hi there "), "  hi there ")

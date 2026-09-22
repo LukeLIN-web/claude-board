@@ -31,6 +31,10 @@ _RECAP_HINT_RE = re.compile(r"\s*\(\s*disable recaps in /config\s*\)\s*$")
 # a background task reporting back; `<local-command-stdout>` is a slash command's
 # own output echoed into the turn.
 _INJECTED_ENVELOPES = ("<task-notification>", "<local-command-stdout>")
+# A paste is logged wrapped in `<pasted_content id="c5b9">…</pasted_content id="c5b9">`.
+# The id is a per-paste random tag the person never sees in the composer, so it
+# has no business on the board row or in a copy of it.
+_PASTE_TAG_RE = re.compile(r'</?pasted_content\b[^>]*>\n?')
 _TN_STATUS_RE = re.compile(r"<status>\s*(.*?)\s*</status>", re.DOTALL)
 _TN_SUMMARY_RE = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
 _TN_EVENT_RE = re.compile(r"<event>\s*(.*?)\s*</event>", re.DOTALL)
@@ -103,9 +107,22 @@ def _clean_command_text(text: str) -> str:
     return f"{name} {args}".strip()
 
 
+def _strip_paste_envelope(text: str) -> str:
+    """The text of a paste without the `<pasted_content id=…>` tags around it.
+
+    Both tags carry the same id, and the closing one repeats it, so a plain
+    `</pasted_content>` match would leave half of them behind. Each tag sits on
+    a line of its own, so the line break after it goes with it — otherwise a
+    paste in the middle of typed text keeps a blank line where each tag was.
+    """
+    if "<pasted_content" not in text:
+        return text
+    return _PASTE_TAG_RE.sub("", text).strip()
+
+
 def clean_user_text(text: str) -> str:
     """A user row's envelope reduced to what it actually says."""
-    return _clean_task_notification(_clean_command_text(text))
+    return _strip_paste_envelope(_clean_task_notification(_clean_command_text(text)))
 
 
 @dataclass
