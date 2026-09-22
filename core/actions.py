@@ -1858,19 +1858,26 @@ def _survey_model_rows(pane: str) -> dict[int, str]:
     return seen
 
 
+# What the dialog appends to a family's name for its wide-window row: "Opus" and
+# "Opus (1M context)" are two rows, not one row with a qualifier.
+_MODEL_1M_SUFFIX = " (1m context)"
+
+
 def _pick_model_row(rows: dict[int, str], alias: str) -> int:
     """Row number for `alias` in a surveyed list, 0 if it isn't offered.
 
-    Whole name first, first word only as a fallback. A session sitting on a model
-    the base list doesn't carry gets a second row for its own family — "Opus (1M
-    context)" up top and a plain "Opus ✔" at the bottom — and first-word matching
-    alone hands "opus" whichever comes first, which is the 1M row rather than the
-    one the board's Opus means. The fallback is still needed for the rows that
-    never appear bare, like "Default (recommended)".
+    The family's 1M row first, then its bare row, then first word only. A family
+    can hold two rows — "Opus (1M context)" and a plain "Opus" — and the board's
+    Opus means the wide one: its sessions are the long-running ones, and the
+    window can't be widened later without re-reading the whole cached history.
+    The bare-name step is what reaches the families offered at one width only,
+    and the first-word fallback the rows that never appear bare, like "Default
+    (recommended)".
     """
-    exact = [n for n in sorted(rows) if rows[n].lower() == alias]
-    if exact:
-        return exact[0]
+    for name in (alias + _MODEL_1M_SUFFIX, alias):
+        exact = [n for n in sorted(rows) if rows[n].lower() == name]
+        if exact:
+            return exact[0]
     loose = [n for n in sorted(rows) if rows[n].lower().split()[:1] == [alias]]
     return loose[0] if loose else 0
 
@@ -1897,6 +1904,9 @@ def switch_model(pid: int, alias: str) -> dict:
     its "Yes" row, then Enter. Only a pane clear of BOTH dialogs counts as a
     switch; anything else escapes out and reports failure, because a session left
     on an open modal is a session that answers nothing.
+
+    Success carries the dialog's name for the row that was committed ("Opus (1M
+    context)"), not the alias that reached it.
     """
     alias = (alias or "").strip().lower()
     if not alias.isalnum():
@@ -1933,6 +1943,11 @@ def switch_model(pid: int, alias: str) -> dict:
         _escape_model_dialogs(pane)
         offered = ", ".join(rows[n] for n in sorted(rows)) or "none"
         return {"ok": False, "error": f"'{alias}' is not in the /model dialog (offered: {offered})"}
+    # The dialog's own name for the row, not the alias that reached it: an alias
+    # can stand for either of a family's two rows, and nothing downstream can tell
+    # them apart afterwards — the transcript records the same model id at both
+    # widths — so the committed row name is the only place "1M" gets said.
+    picked = rows[target]
 
     if not _step_cursor_onto(pane, target, len(rows),
                              lambda t: _model_dialog_rows(t)[1]):
@@ -1955,7 +1970,7 @@ def switch_model(pid: int, alias: str) -> dict:
         return {"ok": False, "error": "the /model dialog did not close after pressing s"}
 
     if not yes_row:
-        return {"ok": True, "model": alias}
+        return {"ok": True, "model": picked}
 
     # Confirm dialog: two rows, and it opens on "Yes" — but commit the row we can
     # see the cursor on, not the row we hope it's on.
@@ -1967,7 +1982,7 @@ def switch_model(pid: int, alias: str) -> dict:
     deadline = time.time() + _MODEL_DIALOG_WAIT
     while time.time() < deadline:
         if _model_dialogs_closed(tmux.capture_pane(pane).get("text", "")):
-            return {"ok": True, "model": alias}
+            return {"ok": True, "model": picked}
         time.sleep(_MODEL_DIALOG_POLL)
     _escape_model_dialogs(pane)
     return {"ok": False, "error": f"the confirm dialog did not close after confirming {alias}"}

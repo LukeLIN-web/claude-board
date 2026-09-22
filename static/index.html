@@ -1559,7 +1559,10 @@ function fleet() {
       this.promptSending[key] = true;
       try {
         const d = await this.apiPost(`/api/windows/${key}/model`, { model: alias });
-        this.toast(d.ok ? `Model → ${alias} (this session only)` : 'Model switch failed: ' + (d.error || ''));
+        // d.model is the dialog row that was committed — "Opus (1M context)" where the
+        // alias only said "opus", and neither the card's label nor the transcript
+        // behind it can say which width the session actually got.
+        this.toast(d.ok ? `Model → ${d.model || alias} (this session only)` : 'Model switch failed: ' + (d.error || ''));
       } finally {
         this.promptSending[key] = false;
       }

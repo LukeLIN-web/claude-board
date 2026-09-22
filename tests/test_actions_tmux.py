@@ -1082,23 +1082,22 @@ class ModelDialogParseTests(unittest.TestCase):
 
 
 class PickModelRowTests(unittest.TestCase):
-    """A session on a model the base list doesn't carry gets a second row for its
-    own family, so "Opus" is two different rows and the alias has to land on the
-    one the board's dropdown means."""
+    """"Opus" is two rows — a 1M one and a bare one — and the dropdown's Opus means
+    the 1M row, so the alias has to pick between them."""
 
     _ROWS = {1: "Default (recommended)", 2: "Opus (1M context)", 3: "Fable",
              4: "Sonnet", 5: "Haiku", 6: "Opus"}
 
-    def test_whole_name_wins_over_first_word(self):
-        self.assertEqual(actions._pick_model_row(self._ROWS, "opus"), 6)
+    def test_the_1m_row_wins_over_the_bare_one(self):
+        self.assertEqual(actions._pick_model_row(self._ROWS, "opus"), 2)
 
     def test_first_word_is_the_fallback(self):
         # Nothing is named bare "Default" — the fallback is the only way in.
         self.assertEqual(actions._pick_model_row(self._ROWS, "default"), 1)
 
-    def test_first_word_still_reaches_a_lone_variant_row(self):
-        rows = {n: name for n, name in self._ROWS.items() if n != 6}
-        self.assertEqual(actions._pick_model_row(rows, "opus"), 2)
+    def test_bare_row_when_the_family_has_no_1m_one(self):
+        rows = {n: name for n, name in self._ROWS.items() if n != 2}
+        self.assertEqual(actions._pick_model_row(rows, "opus"), 6)
 
     def test_absent_model_is_zero(self):
         self.assertEqual(actions._pick_model_row(self._ROWS, "gpt5"), 0)
@@ -1191,7 +1190,8 @@ class SwitchModelTests(unittest.TestCase):
     def test_commits_with_s_not_enter(self):
         r, sent, _ = self._drive("fable")
         self.assertTrue(r["ok"], r)
-        self.assertEqual(r["model"], "fable")
+        # The dialog's row name, not the alias that was asked for.
+        self.assertEqual(r["model"], "Fable")
         self.assertEqual(sent[-1], "s")
         self.assertNotIn("Enter", sent)
 
@@ -1234,14 +1234,17 @@ class SwitchModelTests(unittest.TestCase):
         for name in ("Default", "Opus", "Fable", "Sonnet", "Haiku"):
             self.assertIn(name, r["error"])
 
-    def test_opus_lands_on_the_bare_row_not_the_1m_one(self):
-        # A session on plain Opus 5 gets its own row on top of "Opus (1M
-        # context)". Matching on first words alone would take the 1M row.
-        _, _, state = self._drive(
+    def test_opus_lands_on_the_1m_row_not_the_bare_one(self):
+        # A session on plain Opus gets its own row below the 1M one, and both
+        # answer to "opus". The dropdown's Opus is the 1M row either way.
+        r, _, state = self._drive(
             "opus", cursor_start=3, rows=6,
             names=["Default (recommended)", "Opus (1M context)", "Fable",
                    "Sonnet", "Haiku", "Opus ✔"])
-        self.assertEqual(state["cursor"], 6)
+        self.assertEqual(state["cursor"], 2)
+        # Which width was committed is unreadable anywhere else, so the answer
+        # has to name the row rather than echo "opus" back.
+        self.assertEqual(r["model"], "Opus (1M context)")
 
     def test_confirms_the_cached_history_dialog(self):
         # Mid-conversation, "s" raises a second dialog instead of closing. The
