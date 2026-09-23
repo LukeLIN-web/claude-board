@@ -243,7 +243,7 @@ def extract_codex_session_activity(path: Path | str) -> dict:
     p = Path(path)
     if not p.exists():
         return {
-            "skills_used": [], "memory_ops": [], "model": "",
+            "skills_used": [], "memory_ops": [], "model": "", "effort": "",
             "skill_breakdown": {
                 "per_skill_invokes": {}, "per_skill_reads": {},
                 "per_skill_writes": {}, "per_skill_bash_refs": {},
@@ -256,6 +256,7 @@ def extract_codex_session_activity(path: Path | str) -> dict:
     memory_ops_seen: set[tuple[str, str]] = set()
     memory_ops: list[dict] = []
     model = ""
+    effort = ""
 
     try:
         with p.open() as f:
@@ -271,6 +272,9 @@ def extract_codex_session_activity(path: Path | str) -> dict:
                     m = payload.get("model", "")
                     if m:
                         model = m
+                    e = payload.get("effort", "")
+                    if e:
+                        effort = e
 
                 if t != "response_item":
                     continue
@@ -323,6 +327,7 @@ def extract_codex_session_activity(path: Path | str) -> dict:
         "skills_used": skills_used,
         "memory_ops": memory_ops,
         "model": model,
+        "effort": effort,
         "skill_breakdown": {
             "per_skill_invokes": {},
             "per_skill_reads": skill_reads,
@@ -858,7 +863,7 @@ def codex_window_dicts() -> list[dict]:
         tp = Path(w.transcript_path) if w.transcript_path else None
         since = cleared_at_ms(w.pid)
         activity = extract_codex_session_activity(tp) if tp else {
-            "skills_used": [], "memory_ops": [], "model": "",
+            "skills_used": [], "memory_ops": [], "model": "", "effort": "",
         }
         current_task = _last_assistant_text(tp, since) if tp else ""
         last_error = _last_turn_error(tp, since) if tp else None
@@ -877,7 +882,13 @@ def codex_window_dicts() -> list[dict]:
             "memory_ops": activity.get("memory_ops", []),
             "background_tasks": [],
             "queued": [],
+            # What the last turn ran on, per the rollout. The card prefers the
+            # pane's status line (app._local_snapshot), which also knows about a
+            # switch no turn has run on yet; this is the readout without a pane.
             "model": activity.get("model", ""),
+            "effort": activity.get("effort", ""),
+            "model_label": " ".join(x for x in (activity.get("model", ""), activity.get("effort", "")) if x),
+            "model_source": "transcript" if activity.get("model") else "",
         })
         out.append(d)
     return out

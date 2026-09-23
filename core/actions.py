@@ -1882,8 +1882,192 @@ def _pick_model_row(rows: dict[int, str], alias: str) -> int:
     return loose[0] if loose else 0
 
 
-def switch_model(pid: int, alias: str) -> dict:
+# ---------------------------------------------------------------------------
+# Codex: the model readout and its /model picker.
+#
+# Codex prints what it runs on in the composer's status line — "gpt-6-astra
+# medium · /path/to/cwd", model then reasoning effort — whenever the composer is
+# drawn (a working session appends its elapsed-time tag after the cwd). The line
+# updates the instant a /model pick commits, before any turn has run on the new
+# model, which is what makes it the readout: the rollout's turn_context only
+# says what the LAST turn ran on and lags a switch by a whole turn.
+_CODEX_STATUS_RE = re.compile(
+    r"^[\s ]*(?P<model>[a-z][\w.-]*)[\s ]+(?P<effort>[a-z]+)[\s ]+·[\s ]+\S"
+)
+
+
+def codex_status_model(text: str) -> str:
+    """"<model> <effort>" off the LAST status line in `text`, "" when none is drawn."""
+    for line in reversed(text.splitlines()):
+        m = _CODEX_STATUS_RE.match(line)
+        if m:
+            return f"{m.group('model')} {m.group('effort')}"
+    return ""
+
+
+def codex_pane_model(tty: Optional[str]) -> str:
+    """The model + effort the Codex session on `tty` runs, per its status line.
+
+    "" whenever that can't be read — same contract as pane_model: nothing to
+    claim, not "no model"."""
+    if not tty:
+        return ""
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return ""
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return ""
+    return codex_status_model(cap["text"])
+
+
+# Codex's /model is two pickers in a row — the model list, then the reasoning
+# levels for the model just picked — sharing one row shape and one footer. Rows
+# tag the session's current pick "(current)" and a model's default effort
+# "(default)"; each picker opens with its cursor on the current row. Enter
+# commits and moves on, Escape backs up one picker, and the list wraps, so Down
+# alone reaches every row.
+#
+# Unlike Claude's dialog there is no session-only scope: a commit also rewrites
+# `model` / `model_reasoning_effort` in ~/.codex/config.toml — the default for
+# every Codex session started afterwards. The board can't avoid that, so the
+# card says so instead.
+_CODEX_MODEL_PICKER_HEAD = "Select Model and Effort"
+_CODEX_EFFORT_PICKER_HEAD = "Select Reasoning Level for"
+_CODEX_ROW_RE = re.compile(r"^[\s ]*(?P<cur>›)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<rest>\S.*)")
+_CODEX_TAG_RE = re.compile(r"[\s ]*\((?:current|default)\)")
+_CODEX_MODEL_NAME_RE = re.compile(r"^[a-z][\w.-]*$")
+# The board's effort names → the picker's row names. "Extra high" is the row the
+# status line then prints as "xhigh". Max and Ultra sit behind a further "More
+# reasoning…" picker and are not offered.
+_CODEX_EFFORTS = {"low": "low", "medium": "medium", "high": "high", "xhigh": "extra high"}
+
+
+def _codex_picker_rows(text: str) -> tuple[list[tuple[int, str]], int, int]:
+    """Rows of a Codex picker: [(row number, name)], the highlighted row, and the
+    row tagged (current) — 0 for either when absent. Tags are stripped from the
+    names: they mark the row, not the model."""
+    rows: list[tuple[int, str]] = []
+    cursor = current = 0
+    for line in text.splitlines():
+        m = _CODEX_ROW_RE.match(line)
+        if not m:
+            continue
+        n = int(m.group("n"))
+        head = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
+        if "(current)" in head:
+            current = n
+        rows.append((n, _CODEX_TAG_RE.sub("", head).strip()))
+        if m.group("cur"):
+            cursor = n
+    return rows, cursor, current
+
+
+def _codex_picker(text: str, head: str) -> Optional[tuple[list[tuple[int, str]], int, int]]:
+    """The picker headed `head` if it is on the pane, else None. Only the lines
+    under the header are read: numbered rows of anything drawn above it (the
+    startup update prompt, a trust prompt) are not this picker's rows."""
+    lines = text.splitlines()
+    idx = next((i for i in range(len(lines) - 1, -1, -1) if head in lines[i]), -1)
+    if idx < 0:
+        return None
+    return _codex_picker_rows("\n".join(lines[idx + 1:]))
+
+
+def _codex_pickers_closed(text: str) -> bool:
+    return _CODEX_MODEL_PICKER_HEAD not in text and _CODEX_EFFORT_PICKER_HEAD not in text
+
+
+def _escape_codex_pickers(pane: str) -> None:
+    """Leave the session at its composer, not parked in a picker."""
+    for _ in range(_MODEL_ESCAPES):
+        if _codex_pickers_closed(tmux.capture_pane(pane).get("text", "")):
+            return
+        tmux.send_keys(pane, "Escape")
+        time.sleep(_MODEL_KEY_SETTLE)
+
+
+def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
+    """Drive one Codex picker: wait for it, put the cursor on the row named
+    `wanted` — or, with `wanted` empty, on the row tagged current — and press
+    Enter. {"ok": True, "name": <row name>}, or an error with the pickers backed
+    out of so the session is left at its composer."""
+    text = ""
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        text = tmux.capture_pane(pane).get("text", "")
+        if head in text:
+            break
+        time.sleep(_MODEL_DIALOG_POLL)
+    else:
+        _escape_codex_pickers(pane)
+        return {"ok": False, "error": f"the Codex {what} picker never opened"}
+    rows, cursor, current = _codex_picker(text, head)
+    target = (next((n for n, name in rows if name.lower() == wanted), 0) if wanted
+              else current or cursor)
+    if not target:
+        _escape_codex_pickers(pane)
+        offered = ", ".join(name for _, name in rows) or "none"
+        return {"ok": False,
+                "error": f"'{wanted}' is not in the Codex {what} picker (offered: {offered})"}
+    if not _step_cursor_onto(pane, target, len(rows),
+                             lambda t: (_codex_picker(t, head) or ([], 0, 0))[1]):
+        _escape_codex_pickers(pane)
+        return {"ok": False,
+                "error": f"could not move the Codex {what} picker cursor onto {wanted or 'the current row'}"}
+    tmux.send_keys(pane, "Enter")
+    return {"ok": True, "name": dict(rows)[target]}
+
+
+def _switch_codex_model(pid: int, w, model: str, effort: str) -> dict:
+    """Switch a Codex session's model and/or reasoning effort via its /model pickers.
+
+    Either can be left empty: an empty model keeps the current one (its row is
+    tagged in the picker), an empty effort keeps whatever the effort picker opens
+    on — the current level for the current model, the default for a new one.
+    Only a pane clear of both pickers counts as a switch; anything else escapes
+    out and reports failure. Note the config.toml side effect above."""
+    model = (model or "").strip().lower()
+    effort = (effort or "").strip().lower()
+    if model and not _CODEX_MODEL_NAME_RE.match(model):
+        return {"ok": False, "error": f"invalid Codex model name '{model}'"}
+    if effort and effort not in _CODEX_EFFORTS:
+        return {"ok": False,
+                "error": f"unknown reasoning effort '{effort}' (one of {', '.join(_CODEX_EFFORTS)})"}
+    if not model and not effort:
+        return {"ok": False, "error": "nothing to switch: give a model, an effort, or both"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+
+    r = send_prompt(pid, "/model")
+    if not r.get("ok"):
+        return r
+    picked = _codex_pick(pane, _CODEX_MODEL_PICKER_HEAD, model, "model")
+    if not picked["ok"]:
+        return picked
+    model_name = picked["name"]
+    picked = _codex_pick(pane, _CODEX_EFFORT_PICKER_HEAD, _CODEX_EFFORTS.get(effort, ""), "effort")
+    if not picked["ok"]:
+        return picked
+    effort_name = picked["name"].lower()
+
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        if _codex_pickers_closed(tmux.capture_pane(pane).get("text", "")):
+            return {"ok": True, "model": f"{model_name} {effort_name}"}
+        time.sleep(_MODEL_DIALOG_POLL)
+    _escape_codex_pickers(pane)
+    return {"ok": False, "error": "the Codex /model picker did not close after confirming"}
+
+
+def switch_model(pid: int, alias: str, effort: str = "") -> dict:
     """Switch `pid`'s session to model `alias` (e.g. "opus") for THIS SESSION ONLY.
+
+    A Codex session goes to _switch_codex_model instead (`alias` is then a model
+    name, `effort` a reasoning level, either optional). The rest is Claude.
 
     Drives Claude's /model dialog rather than sending `/model <alias>`: the
     argument form works, but it also rewrites the user's default model for new
@@ -1908,14 +2092,14 @@ def switch_model(pid: int, alias: str) -> dict:
     Success carries the dialog's name for the row that was committed ("Opus (1M
     context)"), not the alias that reached it.
     """
-    alias = (alias or "").strip().lower()
-    if not alias.isalnum():
-        return {"ok": False, "error": f"invalid model alias '{alias}'"}
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
     if getattr(w, "platform", "claude") == "codex":
-        return {"ok": False, "error": "model switching is Claude-only"}
+        return _switch_codex_model(pid, w, alias, effort)
+    alias = (alias or "").strip().lower()
+    if not alias.isalnum():
+        return {"ok": False, "error": f"invalid model alias '{alias}'"}
     if not w.tty:
         return {"ok": False, "error": "no tty for this session"}
     pane = tmux.pane_for_tty(w.tty)

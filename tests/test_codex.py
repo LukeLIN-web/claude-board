@@ -422,3 +422,27 @@ class TestSubagentRolloutIsNotTheCard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTurnContextModel(unittest.TestCase):
+    """The model + reasoning effort a session ran on come from turn_context; the
+    last one wins, since /model rewrites both mid-session."""
+
+    def test_last_turn_context_wins(self):
+        path = _write_rollout(ROLLOUT_LINES + [
+            {"type": "turn_context", "payload": {"model": "gpt-6-astra", "effort": "medium"}},
+            {"type": "turn_context", "payload": {"model": "gpt-5.6-sol", "effort": "high"}},
+        ])
+        try:
+            act = codex.extract_codex_session_activity(path)
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual((act["model"], act["effort"]), ("gpt-5.6-sol", "high"))
+
+    def test_no_turn_context_means_blank(self):
+        path = _write_rollout(ROLLOUT_LINES)
+        try:
+            act = codex.extract_codex_session_activity(path)
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual((act["model"], act["effort"]), ("", ""))

@@ -132,6 +132,13 @@ def _local_snapshot() -> dict:
     )
     for cw in codex_windows:
         cw["shell_proc_count"] = shell_counts.get(cw.get("pid"), 0)
+        # Codex's status line names the model + effort the session is on right
+        # now, a /model pick included; the rollout label it arrives with only
+        # says what the last turn ran on.
+        live = actions.codex_pane_model(cw.get("tty"))
+        if live:
+            cw["model_label"] = live
+            cw["model_source"] = "pane"
     for w in snap["windows"]:
         w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
         tty = w.get("tty")
@@ -586,21 +593,24 @@ def api_window_clear(key: str) -> dict:
 
 
 class ModelBody(BaseModel):
-    model: str  # a /model dialog alias, e.g. "opus" | "fable"
+    model: str = ""   # Claude: a /model dialog alias ("opus" | "fable"); Codex: a model name
+    effort: str = ""  # Codex only: low | medium | high | xhigh
 
 
 @app.post("/api/windows/{key}/model")
 def api_window_model(key: str, body: ModelBody) -> dict:
-    """Switch this session's model for the running session only.
+    """Switch this session's model (Claude: for the running session only).
 
     Not a plain `/model <alias>` prompt: that form also saves the pick as the
     user's default for new sessions. actions.switch_model drives the dialog and
-    commits with "s" instead (see its docstring)."""
+    commits with "s" instead (see its docstring). A Codex card goes through its
+    two-step picker with `model` and/or `effort`; that picker has no session-only
+    scope and also rewrites ~/.codex/config.toml."""
     host, pid = _split(key)
     if host:
         return peers.forward(host, "POST", f"/api/windows/{pid}/model", body.model_dump())
     _require_window(pid)
-    return actions.switch_model(pid, body.model)
+    return actions.switch_model(pid, body.model, body.effort)
 
 
 class PermissionBody(BaseModel):

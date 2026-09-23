@@ -1272,12 +1272,208 @@ class SwitchModelTests(unittest.TestCase):
         # modal unless we keep going until the pane is clean.
         self.assertEqual(state["screen"], "closed")
 
-    def test_codex_is_rejected(self):
+    def test_codex_takes_the_codex_path(self):
+        # The Claude alias rules don't apply: "gpt-5.6-sol" is not alnum, and the
+        # codex driver is what answers (here: rejected before any key, no tty).
         with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/9", platform="codex")):
-            r = actions.switch_model(1234, "opus")
+                               return_value=_fake_window(None, platform="codex")):
+            r = actions.switch_model(1234, "gpt-5.6-sol")
         self.assertFalse(r["ok"])
-        self.assertIn("Claude-only", r["error"])
+        self.assertIn("no tty", r["error"])
+
+
+# Codex's composer status line, idle and mid-turn, plus the two things near it
+# that are NOT the status line: the startup banner box (it names the model too,
+# in a different shape) and the /model picker.
+CODEX_STATUS_IDLE = """\
+• Model changed to gpt-6-astra high
+› Ask Codex to do anything
+  gpt-6-astra high · /tmp/claude-1000/-shared-user62-workspace-juyi-qwen3omni/68473c29-b8ca-4346-bc…
+"""
+CODEX_STATUS_BUSY = """\
+› Ask Codex to do anything
+  gpt-6-astra medium · /shared/user62/workspace/juyi/qwen3… Pursuing goal (1m)
+"""
+CODEX_BANNER_BOX = """\
+│ >_ OpenAI Codex (v0.153.4)                          │
+│ model:     gpt-6-astra medium   /model to change    │
+│ directory: /tmp/claude-1000/…/scratchpad/codexprobe │
+"""
+CODEX_MODEL_PICKER = """\
+  Select Model and Effort
+  Access legacy models by running codex -m <model_name> or in your config.toml
+
+  1. gpt-6-astra (default)   Frontier intelligence for the most demanding work.
+  2. gpt-5.6-sol             Older coding model for complex work.
+  3. gpt-5.6-terra           Older balanced model for straightforward work.
+› 4. gpt-5.6-luna (current)  Older fast and efficient model.
+  5. gpt-5.5                 Legacy coding model.
+
+  Press enter to confirm or esc to go back
+"""
+CODEX_EFFORT_PICKER = """\
+  Select Reasoning Level for gpt-6-astra
+  1. Low                         Fast responses with lighter reasoning
+› 2. Medium (default) (current)  Balances speed and reasoning depth for everyday tasks
+  3. High                        Greater reasoning depth for complex problems
+  4. Extra high                  Extra high reasoning depth for complex problems
+  5. More reasoning…             Max and Ultra consume usage limits faster
+  Press enter to confirm or esc to go back
+"""
+
+
+class CodexStatusModelTests(unittest.TestCase):
+    def test_idle_status_line(self):
+        self.assertEqual(actions.codex_status_model(CODEX_STATUS_IDLE), "gpt-6-astra high")
+
+    def test_busy_status_line_carries_the_elapsed_tag(self):
+        self.assertEqual(actions.codex_status_model(CODEX_STATUS_BUSY), "gpt-6-astra medium")
+
+    def test_last_status_line_wins(self):
+        # A switch reprints the line; the readout is the newest one.
+        text = CODEX_STATUS_BUSY + CODEX_STATUS_IDLE
+        self.assertEqual(actions.codex_status_model(text), "gpt-6-astra high")
+
+    def test_banner_box_and_pickers_are_not_the_status_line(self):
+        for text in (CODEX_BANNER_BOX, CODEX_MODEL_PICKER, CODEX_EFFORT_PICKER, ""):
+            self.assertEqual(actions.codex_status_model(text), "", text[:30])
+
+
+class CodexPickerParseTests(unittest.TestCase):
+    def test_model_picker_rows_cursor_and_current(self):
+        rows, cursor, current = actions._codex_picker(CODEX_MODEL_PICKER, actions._CODEX_MODEL_PICKER_HEAD)
+        self.assertEqual(rows, [(1, "gpt-6-astra"), (2, "gpt-5.6-sol"), (3, "gpt-5.6-terra"),
+                                (4, "gpt-5.6-luna"), (5, "gpt-5.5")])
+        self.assertEqual((cursor, current), (4, 4))
+
+    def test_effort_picker_keeps_two_word_names_and_drops_tags(self):
+        rows, cursor, current = actions._codex_picker(CODEX_EFFORT_PICKER, actions._CODEX_EFFORT_PICKER_HEAD)
+        self.assertEqual([n for _, n in rows], ["Low", "Medium", "High", "Extra high", "More reasoning…"])
+        self.assertEqual((cursor, current), (2, 2))
+
+    def test_absent_picker_is_none(self):
+        self.assertIsNone(actions._codex_picker(CODEX_STATUS_IDLE, actions._CODEX_MODEL_PICKER_HEAD))
+        # The other picker's header doesn't stand in for this one.
+        self.assertIsNone(actions._codex_picker(CODEX_EFFORT_PICKER, actions._CODEX_MODEL_PICKER_HEAD))
+
+    def test_numbered_rows_above_the_header_are_not_rows(self):
+        text = "› 1. Update now\n  2. Skip\n  3. Skip until next version\n" + CODEX_MODEL_PICKER
+        rows, cursor, _ = actions._codex_picker(text, actions._CODEX_MODEL_PICKER_HEAD)
+        self.assertEqual(rows[0], (1, "gpt-6-astra"))
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(cursor, 4)
+
+
+class SwitchCodexModelTests(unittest.TestCase):
+    """The codex driver walks two pickers by keypress; the fake below plays both,
+    with a wrapping cursor and the (current) tags the real ones carry."""
+
+    _MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+    _EFFORTS = ["Low", "Medium", "High", "Extra high", "More reasoning…"]
+
+    def _drive(self, model, effort, current=4, effort_cursor=2, close_sticks=False):
+        state = {"screen": "model", "cursor": current, "picks": []}
+
+        def picker(head, names, cursor, current_row):
+            lines = [f"  {head}" + (" gpt-x" if head.endswith("for") else "")]
+            for i, name in enumerate(names, 1):
+                mark = "› " if i == cursor else "  "
+                tag = " (current)" if i == current_row else ""
+                lines.append(f"{mark}{i}. {name}{tag}  blurb")
+            lines.append("  Press enter to confirm or esc to go back")
+            return "\n".join(lines) + "\n"
+
+        def capture(pane, scrollback=0):
+            if state["screen"] == "model":
+                text = "• an earlier turn\n" + picker(
+                    actions._CODEX_MODEL_PICKER_HEAD, self._MODELS, state["cursor"], current)
+            elif state["screen"] == "effort":
+                text = picker(actions._CODEX_EFFORT_PICKER_HEAD, self._EFFORTS,
+                              state["cursor"], effort_cursor)
+            else:
+                text = CODEX_STATUS_IDLE
+            return {"ok": True, "text": text}
+
+        sent = []
+
+        def send_keys(pane, *keys):
+            sent.extend(keys)
+            for k in keys:
+                if k == "Down":
+                    state["cursor"] = state["cursor"] % 5 + 1
+                elif k == "Enter":
+                    state["picks"].append((state["screen"], state["cursor"]))
+                    if state["screen"] == "model":
+                        state["screen"], state["cursor"] = "effort", effort_cursor
+                    elif state["screen"] == "effort" and not close_sticks:
+                        state["screen"] = "closed"
+                elif k == "Escape":
+                    state["screen"] = {"effort": "model"}.get(state["screen"], "closed")
+            return {"ok": True}
+
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/9", platform="codex")), \
+             mock.patch.object(actions, "send_prompt", return_value={"ok": True}) as sp, \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
+             mock.patch.object(actions.tmux, "capture_pane", side_effect=capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.switch_model(1234, model, effort)
+        return r, sent, state, sp
+
+    def test_model_and_effort(self):
+        r, sent, state, sp = self._drive("gpt-5.6-sol", "high")
+        self.assertTrue(r["ok"], r)
+        sp.assert_called_once_with(1234, "/model")
+        self.assertEqual(state["picks"], [("model", 2), ("effort", 3)])
+        self.assertEqual(r["model"], "gpt-5.6-sol high")
+        self.assertEqual(state["screen"], "closed")
+
+    def test_wraps_down_to_a_row_above_the_cursor(self):
+        # Cursor opens on luna (4); sol (2) is reached by wrapping: 4→5→1→2.
+        _, sent, _, _ = self._drive("gpt-5.6-sol", "high")
+        self.assertEqual(sent[:4], ["Down", "Down", "Down", "Enter"])
+
+    def test_effort_only_keeps_the_current_model(self):
+        r, _, state, _ = self._drive("", "xhigh")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 4), ("effort", 4)])
+        self.assertEqual(r["model"], "gpt-5.6-luna extra high")
+
+    def test_model_only_keeps_the_effort_the_picker_opens_on(self):
+        r, sent, state, _ = self._drive("gpt-6-astra", "")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 1), ("effort", 2)])
+        self.assertEqual(r["model"], "gpt-6-astra medium")
+        # Nothing pressed in the effort picker but Enter.
+        self.assertEqual(sent[sent.index("Enter") + 1:], ["Enter"])
+
+    def test_absent_model_escapes_out(self):
+        r, sent, state, _ = self._drive("gpt-9", "high")
+        self.assertFalse(r["ok"])
+        self.assertIn("not in the Codex model picker", r["error"])
+        self.assertIn("gpt-5.6-sol", r["error"])
+        self.assertEqual(state["screen"], "closed")
+        self.assertNotIn("Enter", sent)
+
+    def test_bad_effort_is_rejected_before_any_key(self):
+        r, sent, _, sp = self._drive("gpt-6-astra", "ultra")
+        self.assertFalse(r["ok"])
+        self.assertIn("ultra", r["error"])
+        self.assertEqual(sent, [])
+        sp.assert_not_called()
+
+    def test_nothing_to_switch(self):
+        r, sent, _, _ = self._drive("", "")
+        self.assertFalse(r["ok"])
+        self.assertEqual(sent, [])
+
+    def test_picker_that_never_closes_is_a_failure_and_escapes_out(self):
+        with mock.patch.object(actions, "_MODEL_DIALOG_WAIT", 0.05):
+            r, _, state, _ = self._drive("gpt-6-astra", "high", close_sticks=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("did not close", r["error"])
+        self.assertEqual(state["screen"], "closed")
 
 
 # Claude's first-run folder-trust prompt (v2.1.x), as captured from a pane. Its

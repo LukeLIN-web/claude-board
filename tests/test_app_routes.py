@@ -368,3 +368,50 @@ class StaleDialogOpenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexCardModelTests(unittest.TestCase):
+    """A Codex card reads its model + effort off the pane's status line when it
+    can, and off the rollout (what the last turn ran on) otherwise."""
+
+    def _card(self):
+        return {"pid": 7, "platform": "codex", "status": "idle", "hidden": False,
+                "alive": True, "tty": "pts/7", "transcript_path": "/r.jsonl",
+                "cwd": "/x", "name": None, "updated_at": 0, "triage": "",
+                "model": "gpt-6-astra", "effort": "medium",
+                "model_label": "gpt-6-astra medium", "model_source": "transcript"}
+
+    def _run(self, pane_label):
+        snap = {"windows": [], "counts": {}, "ts": 0}
+        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[self._card()]), \
+             mock.patch.object(appmod.tmux, "available", return_value=True), \
+             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
+             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
+             mock.patch.object(appmod.actions, "codex_pane_model", return_value=pane_label) as pm:
+            w = appmod._enriched_snapshot()["windows"][0]
+        pm.assert_called_once_with("pts/7")
+        return w
+
+    def test_status_line_wins(self):
+        w = self._run("gpt-5.6-sol high")
+        self.assertEqual(w["model_label"], "gpt-5.6-sol high")
+        self.assertEqual(w["model_source"], "pane")
+
+    def test_rollout_label_stands_without_a_readable_pane(self):
+        w = self._run("")
+        self.assertEqual(w["model_label"], "gpt-6-astra medium")
+        self.assertEqual(w["model_source"], "transcript")
+
+
+class ModelRouteTests(unittest.TestCase):
+    def test_body_fields_are_optional(self):
+        self.assertEqual(appmod.ModelBody(effort="high").model, "")
+        self.assertEqual(appmod.ModelBody(model="opus").effort, "")
+
+    def test_route_hands_both_fields_to_the_switch(self):
+        with mock.patch.object(appmod, "_require_window"), \
+             mock.patch.object(appmod.actions, "switch_model",
+                               return_value={"ok": True}) as sw:
+            appmod.api_window_model("1234", appmod.ModelBody(model="gpt-5.6-sol", effort="high"))
+        sw.assert_called_once_with(1234, "gpt-5.6-sol", "high")
