@@ -600,6 +600,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
             return FakeProc(returncode=0)
         return fake_run
 
+
     def test_no_resend_when_composer_already_empty(self):
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
@@ -688,7 +689,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
 
 class SendTextVerifyLandedTests(unittest.TestCase):
     """verify_landed confirms the literal text reached the composer before Enter,
-    re-sending it (Ctrl-U first) when a busy-pane re-render dropped it."""
+    re-sending it (clearing the composer first) when a busy-pane re-render dropped it."""
 
     def setUp(self):
         tmux._clear_caches()
@@ -961,8 +962,8 @@ class ComposerTextTests(unittest.TestCase):
 
 
 class ClearComposerTests(unittest.TestCase):
-    """_clear_composer must press Ctrl-U once per visual LINE (Claude's composer
-    kills only the current line per press, seen live on v2.1.211), verified
+    """_clear_composer must send one clearing press (End, Ctrl-U, Backspace) per
+    visual LINE (Claude's composer removes only one line per press), verified
     against the pane, falling back to blind presses when the pane won't redraw."""
 
     @staticmethod
@@ -971,6 +972,29 @@ class ClearComposerTests(unittest.TestCase):
             calls.append(argv)
             return FakeProc(returncode=0)
         return fake_run
+
+    @staticmethod
+    def _presses(calls):
+        n = len(tmux._CLEAR_KEYS)
+        return [c for c in calls if tuple(c[-n:]) == tmux._CLEAR_KEYS]
+
+    def test_press_is_end_then_ctrl_u_then_backspace(self):
+        # Ctrl-U alone only kills LEFT of the cursor on its visual row (live on
+        # v2.1.286/287): a leftover with the cursor mid-line kept its tail and the
+        # next prompt went out with it appended. End first takes the whole row;
+        # Backspace joins an emptied row onto the one above. Pin the order: the
+        # keys go in one send-keys.
+        calls = []
+        screens = iter(["❯ aaa\n  bbb\n────────────\n", "❯ \n────────────\n"])
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "capture_pane",
+                                  side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
+            tmux._clear_composer("%5")
+        self.assertEqual(tmux._CLEAR_KEYS, ("End", "C-u", "BSpace"))
+        sends = [c for c in calls if "send-keys" in c]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][-3:], ["End", "C-u", "BSpace"])
 
     def test_presses_once_per_line_until_empty(self):
         screens = iter([
@@ -984,8 +1008,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
             tmux._clear_composer("%5")
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertEqual(len(clears), 2)  # one per non-empty read, none once empty
+        self.assertEqual(len(self._presses(calls)), 2)  # one per non-empty read, none once empty
 
     def test_already_empty_composer_sends_nothing(self):
         calls = []
@@ -994,20 +1017,19 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ \n────────────\n"}):
             tmux._clear_composer("%5")
-        self.assertEqual([c for c in calls if c[-1] == "C-u"], [])
+        self.assertEqual(self._presses(calls), [])
 
     def test_stalled_pane_falls_back_to_blind_presses(self):
         # A stalled TUI never redraws: the same screen comes back after a press
         # (no progress), so the loop must stop reading and queue enough blind
-        # Ctrl-Us to clear a worst-case wrapped paste whenever the pane wakes.
+        # presses to clear a worst-case wrapped paste whenever the pane wakes.
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ stuck text\n────────────\n"}):
             tmux._clear_composer("%5")
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertGreaterEqual(len(clears), tmux._CLEAR_BLIND_PRESSES)
+        self.assertGreaterEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
 
     def test_capture_failure_falls_back_to_blind_presses(self):
         calls = []
@@ -1015,8 +1037,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane", return_value={"ok": False}):
             tmux._clear_composer("%5")
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertEqual(len(clears), tmux._CLEAR_BLIND_PRESSES)
+        self.assertEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
 
 
 class CodexEnterSettleTests(unittest.TestCase):

@@ -376,7 +376,7 @@ class SendPromptReadinessTests(unittest.TestCase):
     """send_prompt must not type until a composer marker is on screen.
 
     Typing into a still-booting TUI is lost or replayed doubled (the retry's
-    C-u sits unread in the same pty buffer as the text it should clear), and a
+    clearing keys sit unread in the same pty buffer as the text they should clear), and a
     pane wedged on the Rewind panel (double-Escape — e.g. the board's own Esc
     button pressed twice on an idle card) eats every send until dismissed.
     """

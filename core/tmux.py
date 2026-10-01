@@ -505,13 +505,25 @@ def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
 
 
 # One verified-clear pass reads the pane at most this many times; the blind
-# fallback queues this many Ctrl-Us. Sized to out-clear the worst wrapped
-# paste a composer can hold: anything past ~1000 chars collapses to a one-line
-# placeholder, and 1000 double-width CJK chars on a narrow (~60 col) pane wrap
-# to ~35 lines.
+# fallback queues this many clearing presses. Sized to out-clear the worst
+# wrapped paste a composer can hold: anything past ~1000 chars collapses to a
+# one-line placeholder, and 1000 double-width CJK chars on a narrow (~60 col)
+# pane wrap to ~35 lines.
 _CLEAR_VERIFY_TRIES = 40
 _CLEAR_BLIND_PRESSES = 40
 _CLEAR_POLL = 0.1
+
+# One clearing press. Ctrl-U alone is not enough (seen live on v2.1.286/287):
+# it is readline's kill-to-start of the cursor's visual row, so text RIGHT of
+# the cursor survives every press. With the cursor parked mid-line, a
+# Ctrl-U-only clear left that tail in place, our text was typed in front of
+# it, landed-verify still matched (it looks for our tail as a substring), and
+# the prompt went out corrupted ("...DONELEFTOVER-tail"). End first takes the
+# whole row. Ctrl-U on an emptied row deletes the newline above, but that reads
+# as no progress on screen and sent multi-line leftovers to the blind fallback;
+# Backspace joins the rows within the same press instead. On an empty composer
+# all three keys are no-ops.
+_CLEAR_KEYS = ("End", "C-u", "BSpace")
 
 # Chrome the composer is boxed in: horizontal rules in the current borderless
 # layout, box borders in older bordered builds.
@@ -543,15 +555,14 @@ def _composer_text(cap_text: str) -> Optional[str]:
 def _clear_composer(pane: str) -> None:
     """Empty `pane`'s composer before a retry / after giving up on a send.
 
-    Claude's composer kills one visual LINE per Ctrl-U (seen live on v2.1.211:
-    a wrapped paste keeps every line but the last), so the single press this
-    path used to send left most of a partial paste in place — the retry then
-    concatenated into a corrupted prompt. Press per line, re-reading the pane
-    until the composer is empty. When reading stops making progress (a stalled
-    pane never redraws; ghost hint text never deletes) or the pane can't be
-    captured, fall back to queueing blind Ctrl-Us: a stalled pty delivers them
-    after the buffered text whenever it wakes, clearing it line by line, and
-    every extra press is a no-op on an empty composer.
+    Claude's composer removes at most one visual LINE per clearing press (see
+    _CLEAR_KEYS), so a single press leaves most of a partial paste in place —
+    the retry then concatenates into a corrupted prompt. Press per line,
+    re-reading the pane until the composer is empty. When reading stops making
+    progress (a stalled pane never redraws; ghost hint text never deletes) or
+    the pane can't be captured, fall back to queueing blind presses: a stalled
+    pty delivers them after the buffered text whenever it wakes, clearing it
+    line by line, and every extra press is a no-op on an empty composer.
     """
     prev = None
     for _ in range(_CLEAR_VERIFY_TRIES):
@@ -562,10 +573,10 @@ def _clear_composer(pane: str) -> None:
         if content is None or content == prev:
             break  # unreadable or no progress — go blind
         prev = content
-        _run("send-keys", "-t", pane, "C-u")
+        _run("send-keys", "-t", pane, *_CLEAR_KEYS)
         time.sleep(_CLEAR_POLL)
     for _ in range(_CLEAR_BLIND_PRESSES):
-        _run("send-keys", "-t", pane, "C-u")
+        _run("send-keys", "-t", pane, *_CLEAR_KEYS)
 
 
 # Post-mortem trace for the send path: landed-verify attempts append what the

@@ -1421,7 +1421,7 @@ def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
 
 # A prompt injected before the TUI paints its composer is lost or, worse,
 # replayed doubled: the pty buffers the keystrokes unread, so the landed-verify
-# retry's C-u sits inert in the same buffer as the text it was meant to clear,
+# retry's clearing keys sit inert in the same buffer as the text they were meant to clear,
 # and both copies pour into the composer when the TUI wakes (seen live on a
 # fresh spawn — boot takes seconds on this class of shared-filesystem host,
 # past the whole landed-verify window). So never type until a composer marker
