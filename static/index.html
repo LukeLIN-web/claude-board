@@ -83,7 +83,7 @@
       Memory</button>
     <!-- New session (tmux spawn) — hidden when tmux is unavailable -->
     <div class="relative" x-show="tmuxAvailable" @click.outside="showSpawn = false">
-      <button @click="showSpawn = !showSpawn"
+      <button @click="showSpawn = !showSpawn; if (showSpawn) refreshSpawnDirs()"
               class="text-xs border px-2 py-1 rounded hover:bg-emerald-50 transition"
               :class="showSpawn ? 'border-emerald-400 text-emerald-600 bg-emerald-50' : 'border-gray-200 text-gray-600'">
         + New session</button>
@@ -107,7 +107,8 @@
         <template x-if="hosts.length > 1">
           <div>
             <label class="text-xs text-gray-500">Machine</label>
-            <select x-model="spawnHost" class="w-full border rounded px-2 py-1 text-sm bg-white">
+            <select x-model="spawnHost" @change="refreshSpawnDirs()"
+                    class="w-full border rounded px-2 py-1 text-sm bg-white">
               <template x-for="h in hosts" :key="h.host">
                 <option :value="h.host" x-text="h.host + (h.online ? '' : ' (offline)')"></option>
               </template>
@@ -121,6 +122,13 @@
           <option value="">— recent directory —</option>
           <template x-for="d in recentCwds" :key="d">
             <option :value="d" x-text="d"></option>
+          </template>
+          <template x-if="otherCwds.length">
+            <optgroup label="in use on other machines">
+              <template x-for="d in otherCwds" :key="d">
+                <option :value="d" x-text="d"></option>
+              </template>
+            </optgroup>
           </template>
         </select>
         <input type="text" x-model="spawnCwd" placeholder="…or type a path"
@@ -1100,6 +1108,7 @@ function fleet() {
     // Machine the spawn runs on — this board's own host until the user picks
     // another. Only meaningful when peers are configured (see `hosts`).
     spawnHost: '',
+    spawnOtherDirs: { host: '', paths: [] },
     promptDrafts: {},
     promptSending: {},
     permSending: {},
@@ -1148,6 +1157,28 @@ function fleet() {
         if (w.cwd && !seen.includes(w.cwd)) seen.push(w.cwd);
       }
       return seen;
+    },
+    // Other machines' card directories that the spawn host confirmed it has
+    // (refreshSpawnDirs) — most live on the shared mount, so a fresh machine
+    // with no cards of its own still gets a list to pick from.
+    get otherCwds() {
+      const host = this.spawnHost || this.localHost;
+      if (this.spawnOtherDirs.host !== host) return [];
+      return this.spawnOtherDirs.paths.filter(d => !this.recentCwds.includes(d));
+    },
+    async refreshSpawnDirs() {
+      if (this.hosts.length < 2) return;
+      const host = this.spawnHost || this.localHost;
+      const paths = [];
+      for (const w of this.windows) {
+        if (w.host !== host && w.cwd && !paths.includes(w.cwd)) paths.push(w.cwd);
+      }
+      const d = paths.length ? await this.apiPost('/api/spawn-dirs', { paths, host })
+                             : { ok: true, paths: [] };
+      // The answer is for the host asked; drop it if the picker moved on meanwhile.
+      if (d.ok && host === (this.spawnHost || this.localHost)) {
+        this.spawnOtherDirs = { host, paths: d.paths || [] };
+      }
     },
 
     get waitingWindows() {

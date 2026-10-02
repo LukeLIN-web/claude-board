@@ -40,6 +40,23 @@ class CreateRouteTests(unittest.TestCase):
         m.assert_called_once_with("/tmp", "claude")
         self.assertTrue(r["ok"])
 
+    def test_spawn_dirs_keeps_only_existing_dirs(self):
+        r = appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp", "/no/such/dir", __file__]))
+        self.assertEqual(r, {"ok": True, "paths": ["/tmp"]})
+
+    def test_spawn_dirs_drops_hidden_dirs(self):
+        # The spawn itself would be refused (test_hidden_cwd_is_refused), so the
+        # picker must not offer it either.
+        with mock.patch.object(appmod.sessions, "_cwd_visible", return_value=False):
+            r = appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp"]))
+        self.assertEqual(r["paths"], [])
+
+    def test_spawn_dirs_asks_the_peer_it_would_spawn_on(self):
+        with mock.patch.object(appmod.peers, "configured", return_value={"63": "http://x"}), \
+             mock.patch.object(appmod.peers, "forward", return_value={"ok": True, "paths": []}) as m:
+            appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp"], host="63"))
+        m.assert_called_once_with("63", "POST", "/api/spawn-dirs", {"paths": ["/tmp"]})
+
     def test_dispatches_codex_platform(self):
         with mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
             r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp", platform="codex"))

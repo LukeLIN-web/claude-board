@@ -574,6 +574,25 @@ def api_window_create(body: CreateBody) -> dict:
     return actions.create_session(body.cwd, body.platform)
 
 
+class SpawnDirsBody(BaseModel):
+    paths: list[str]
+    host: str = ""
+
+
+@app.post("/api/spawn-dirs")
+def api_spawn_dirs(body: SpawnDirsBody) -> dict:
+    """The subset of `paths` a spawn on `host` would accept: directories that
+    exist there and pass that board's cwd filter — the same two checks
+    api_window_create makes. Lets the New session picker offer the directories
+    other machines' cards are in, without offering one that only exists on them
+    (a host-local /home path, say)."""
+    if body.host and body.host in peers.configured():
+        return peers.forward(body.host, "POST", "/api/spawn-dirs", {"paths": body.paths})
+    ok = [p for p in body.paths[:200]
+          if sessions._cwd_visible(p) and os.path.isdir(os.path.expanduser(p))]
+    return {"ok": True, "paths": ok}
+
+
 @app.post("/api/windows/{key}/prompt")
 def api_window_prompt(key: str, body: PromptBody) -> dict:
     host, pid = _split(key)
