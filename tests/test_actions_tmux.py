@@ -41,6 +41,37 @@ def _preflight_ok(foreground="node"):
 
 
 class CreateSessionTests(unittest.TestCase):
+    def setUp(self):
+        # A spawn now answers the folder-trust prompt in the pane it just made.
+        # These tests are about the dispatch; the poll has its own tests below.
+        p = mock.patch.object(actions, "confirm_trust_prompt",
+                              return_value={"answered": True, "waited": 0.3, "reason": ""})
+        self.trust = p.start()
+        self.addCleanup(p.stop)
+
+    def test_spawn_answers_the_trust_prompt(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(actions.tmux, "new_window",
+                                   return_value={"ok": True, "pane_id": "%1"}):
+                r = actions.create_session(d)
+        self.trust.assert_called_once_with("%1")
+        self.assertTrue(r["trust"]["answered"])
+
+    def test_codex_spawn_has_no_trust_prompt_to_answer(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(actions.tmux, "new_window",
+                                   return_value={"ok": True, "pane_id": "%1"}):
+                actions.create_session(d, platform="codex")
+        self.trust.assert_not_called()
+
+    def test_failed_spawn_is_not_polled(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(actions.tmux, "new_window",
+                                   return_value={"ok": False, "error": "no server"}):
+                r = actions.create_session(d)
+        self.assertFalse(r["ok"])
+        self.trust.assert_not_called()
+
     def test_existing_dir_delegates_to_new_window(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(actions.tmux, "new_window", return_value={"ok": True, "pane_id": "%1"}) as m:
@@ -345,7 +376,7 @@ class SendPromptReadinessTests(unittest.TestCase):
     """send_prompt must not type until a composer marker is on screen.
 
     Typing into a still-booting TUI is lost or replayed doubled (the retry's
-    C-u sits unread in the same pty buffer as the text it should clear), and a
+    clearing keys sit unread in the same pty buffer as the text they should clear), and a
     pane wedged on the Rewind panel (double-Escape — e.g. the board's own Esc
     button pressed twice on an idle card) eats every send until dismissed.
     """
@@ -354,7 +385,7 @@ class SendPromptReadinessTests(unittest.TestCase):
     _BOOTING = (
         " ▐▛███▜▌   Claude Code v2.1.211\n"
         "▝▜█████▛▘  Fable 5 · Claude Max\n"
-        "  ▘▘ ▝▝    /shared/user60/workspace/juyi/qwen3omni\n"
+        "  ▘▘ ▝▝    /shared/ws/proj\n"
     )
     _READY = _BOOTING + "❯ \n⏵⏵ bypass permissions on"
     # The Rewind panel replacing the composer (lifted from a live wedged pane).
@@ -995,11 +1026,37 @@ MODEL_DIALOG = """\
 """
 
 
+# The same dialog in an 80x24 pane (v2.1.259) — the size the board's sessions
+# actually run at. The list becomes a scrolling window: Default is off the top,
+# the boundary rows carry ↑/↓ where the cursor would go, and what didn't fit is
+# folded into "… +N model".
+MODEL_DIALOG_SCROLLED = """\
+  Select model
+  Switch between Claude models. Your pick becomes the default for new
+  sessions. For other/previous model names, specify with --model.
+
+  ↑ 2. Opus (1M context)      Opus 5 with 1M context · Best for everyday,
+                              complex tasks
+    3. Fable                  Fable 5.1 · Most capable for your hardest and
+                              longest-running tasks
+    4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+    5. Haiku                  Haiku 4.5 · Fastest for quick answers
+  ❯ 6. Opus ✔                 Opus 5 · Best for everyday, complex tasks
+     … +1 model
+
+  ◉ xHigh effort ←/→ to adjust
+
+  Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+
 class ModelDialogParseTests(unittest.TestCase):
     def test_rows_and_cursor(self):
         rows, cursor = actions._model_dialog_rows(MODEL_DIALOG)
         self.assertEqual(
-            rows, [(1, "Default"), (2, "Opus"), (3, "Fable"), (4, "Sonnet"), (5, "Haiku")]
+            rows,
+            [(1, "Default (recommended)"), (2, "Opus"), (3, "Fable"),
+             (4, "Sonnet"), (5, "Haiku")],
         )
         self.assertEqual(cursor, 4)
 
@@ -1008,14 +1065,55 @@ class ModelDialogParseTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(cursor, 0)
 
+    def test_scroll_marker_rows_are_rows(self):
+        # ↑/↓ sit in the cursor's column. Reading them as anything but a row is
+        # how the row under the fold went missing from the offered list.
+        rows, cursor = actions._model_dialog_rows(MODEL_DIALOG_SCROLLED)
+        self.assertEqual(
+            rows,
+            [(2, "Opus (1M context)"), (3, "Fable"), (4, "Sonnet"),
+             (5, "Haiku"), (6, "Opus")],
+        )
+        self.assertEqual(cursor, 6)
+
+    def test_fold_counter_is_not_a_row(self):
+        rows, _ = actions._model_dialog_rows("     … +4 models\n")
+        self.assertEqual(rows, [])
+
+
+class PickModelRowTests(unittest.TestCase):
+    """"Opus" is two rows — a 1M one and a bare one — and the dropdown's Opus means
+    the 1M row, so the alias has to pick between them."""
+
+    _ROWS = {1: "Default (recommended)", 2: "Opus (1M context)", 3: "Fable",
+             4: "Sonnet", 5: "Haiku", 6: "Opus"}
+
+    def test_the_1m_row_wins_over_the_bare_one(self):
+        self.assertEqual(actions._pick_model_row(self._ROWS, "opus"), 2)
+
+    def test_first_word_is_the_fallback(self):
+        # Nothing is named bare "Default" — the fallback is the only way in.
+        self.assertEqual(actions._pick_model_row(self._ROWS, "default"), 1)
+
+    def test_bare_row_when_the_family_has_no_1m_one(self):
+        rows = {n: name for n, name in self._ROWS.items() if n != 2}
+        self.assertEqual(actions._pick_model_row(rows, "opus"), 6)
+
+    def test_absent_model_is_zero(self):
+        self.assertEqual(actions._pick_model_row(self._ROWS, "gpt5"), 0)
+
 
 class SwitchModelTests(unittest.TestCase):
     """switch_model drives the dialog by keypress, so the tests assert on the keys
     it sends — Enter would save the pick as the user's default, "s" must not."""
 
-    def _drive(self, alias, cursor_start=4, rows=5,
+    def _drive(self, alias, cursor_start=4, rows=5, names=None, window=None,
                confirm=False, confirm_cursor=1, confirm_sticks=False):
         """Fake a dialog whose cursor wraps 1..rows and moves on each Down.
+
+        `window` caps how many rows the dialog draws at once, the way Claude does
+        in a short pane: the rest is folded behind "… +N models" and the boundary
+        rows carry ↑/↓ in the cursor's column. Left None the whole list is drawn.
 
         `confirm` adds the second dialog Claude raises when the switch happens
         mid-conversation ("Switch model?" — the cached history has to be re-read).
@@ -1023,6 +1121,7 @@ class SwitchModelTests(unittest.TestCase):
         footer to vanish will call the switch done while the session sits on it.
         Escape backs out of it to the picker, not to the prompt.
         """
+        names = (names or ["Default", "Opus", "Fable", "Sonnet", "Haiku"])[:rows]
         state = {"cursor": cursor_start, "screen": "picker", "confirm_cursor": confirm_cursor}
 
         def capture(pane, scrollback=0):
@@ -1038,11 +1137,22 @@ class SwitchModelTests(unittest.TestCase):
                     mark = "❯ " if i == state["confirm_cursor"] else "  "
                     lines.append(f"  {mark}{i}. {name}")
                 return {"ok": True, "text": "\n".join(lines) + "\n"}
+            span = min(window or rows, rows)
+            lo = min(max(1, state["cursor"] - span // 2), rows - span + 1)
+            hi = lo + span - 1
             lines = ["  Select model"]
-            names = ["Default", "Opus", "Fable", "Sonnet", "Haiku"][:rows]
-            for i, name in enumerate(names, 1):
-                mark = "❯ " if i == state["cursor"] else "  "
-                lines.append(f"  {mark}{i}. {name}   blurb")
+            for i in range(lo, hi + 1):
+                if i == state["cursor"]:
+                    mark = "❯ "
+                elif i == lo and lo > 1:
+                    mark = "↑ "
+                elif i == hi and hi < rows:
+                    mark = "↓ "
+                else:
+                    mark = "  "
+                lines.append(f"  {mark}{i}. {names[i - 1]}   blurb")
+            if span < rows:
+                lines.append(f"     … +{rows - span} models")
             lines.append("  Enter to set as default · s to use this session only · Esc to cancel")
             return {"ok": True, "text": "\n".join(lines) + "\n"}
 
@@ -1080,26 +1190,61 @@ class SwitchModelTests(unittest.TestCase):
     def test_commits_with_s_not_enter(self):
         r, sent, _ = self._drive("fable")
         self.assertTrue(r["ok"], r)
-        self.assertEqual(r["model"], "fable")
+        # The dialog's row name, not the alias that was asked for.
+        self.assertEqual(r["model"], "Fable")
         self.assertEqual(sent[-1], "s")
         self.assertNotIn("Enter", sent)
 
     def test_wraps_around_to_reach_target(self):
         # Cursor starts on Sonnet (4); Fable (3) is reachable only by wrapping.
+        # Two laps: 5 Downs to survey the list back to where it started, then 4
+        # more to step onto Fable.
         _, sent, state = self._drive("fable", cursor_start=4)
-        self.assertEqual(sent.count("Down"), 4)
+        self.assertEqual(sent.count("Down"), 5 + 4)
         self.assertEqual(state["cursor"], 3)
 
-    def test_no_move_when_already_on_target(self):
-        _, sent, _ = self._drive("sonnet", cursor_start=4)
-        self.assertEqual(sent, ["s"])
+    def test_survey_leaves_the_cursor_where_it_found_it(self):
+        # Already on Sonnet: the survey lap still runs — it is the only way to
+        # read the folded rows — but it comes back around and commits in place.
+        _, sent, state = self._drive("sonnet", cursor_start=4)
+        self.assertEqual(sent, ["Down"] * 5 + ["s"])
+        self.assertEqual(state["cursor"], 4)
 
     def test_unknown_alias_escapes_the_dialog(self):
         r, sent, _ = self._drive("gpt5")
         self.assertFalse(r["ok"])
         self.assertIn("not in the /model dialog", r["error"])
-        self.assertEqual(sent, ["Escape"])
+        self.assertEqual(sent, ["Down"] * 5 + ["Escape"])
         self.assertNotIn("s", sent)
+
+    def test_reaches_a_model_folded_out_of_view(self):
+        # The regression: in an 80x24 pane the picker draws two rows and folds the
+        # rest, so Fable is nowhere on the capture the dialog opens with. Reading
+        # the target off that one capture is what reported Fable as not offered.
+        r, sent, state = self._drive("fable", cursor_start=1, window=2)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["cursor"], 3)
+        self.assertEqual(sent[-1], "s")
+
+    def test_offered_list_names_the_folded_rows_too(self):
+        # A model that really isn't there has to say so against the whole list,
+        # not against the two rows that happened to be on screen.
+        r, _, _ = self._drive("gpt5", cursor_start=1, window=2)
+        self.assertFalse(r["ok"])
+        for name in ("Default", "Opus", "Fable", "Sonnet", "Haiku"):
+            self.assertIn(name, r["error"])
+
+    def test_opus_lands_on_the_1m_row_not_the_bare_one(self):
+        # A session on plain Opus gets its own row below the 1M one, and both
+        # answer to "opus". The dropdown's Opus is the 1M row either way.
+        r, _, state = self._drive(
+            "opus", cursor_start=3, rows=6,
+            names=["Default (recommended)", "Opus (1M context)", "Fable",
+                   "Sonnet", "Haiku", "Opus ✔"])
+        self.assertEqual(state["cursor"], 2)
+        # Which width was committed is unreadable anywhere else, so the answer
+        # has to name the row rather than echo "opus" back.
+        self.assertEqual(r["model"], "Opus (1M context)")
 
     def test_confirms_the_cached_history_dialog(self):
         # Mid-conversation, "s" raises a second dialog instead of closing. The
@@ -1127,9 +1272,454 @@ class SwitchModelTests(unittest.TestCase):
         # modal unless we keep going until the pane is clean.
         self.assertEqual(state["screen"], "closed")
 
-    def test_codex_is_rejected(self):
+    def test_codex_takes_the_codex_path(self):
+        # The Claude alias rules don't apply: "gpt-5.6-sol" is not alnum, and the
+        # codex driver is what answers (here: rejected before any key, no tty).
         with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/9", platform="codex")):
-            r = actions.switch_model(1234, "opus")
+                               return_value=_fake_window(None, platform="codex")):
+            r = actions.switch_model(1234, "gpt-5.6-sol")
         self.assertFalse(r["ok"])
-        self.assertIn("Claude-only", r["error"])
+        self.assertIn("no tty", r["error"])
+
+
+# Codex's composer status line, idle and mid-turn, plus the two things near it
+# that are NOT the status line: the startup banner box (it names the model too,
+# in a different shape) and the /model picker.
+CODEX_STATUS_IDLE = """\
+• Model changed to gpt-6-astra high
+› Ask Codex to do anything
+  gpt-6-astra high · /tmp/claude-1000/-shared-user62-workspace-juyi-qwen3omni/68473c29-b8ca-4346-bc…
+"""
+CODEX_STATUS_BUSY = """\
+› Ask Codex to do anything
+  gpt-6-astra medium · /shared/user62/workspace/juyi/qwen3… Pursuing goal (1m)
+"""
+CODEX_BANNER_BOX = """\
+│ >_ OpenAI Codex (v0.153.4)                          │
+│ model:     gpt-6-astra medium   /model to change    │
+│ directory: /tmp/claude-1000/…/scratchpad/codexprobe │
+"""
+CODEX_MODEL_PICKER = """\
+  Select Model and Effort
+  Access legacy models by running codex -m <model_name> or in your config.toml
+
+  1. gpt-6-astra (default)   Frontier intelligence for the most demanding work.
+  2. gpt-5.6-sol             Older coding model for complex work.
+  3. gpt-5.6-terra           Older balanced model for straightforward work.
+› 4. gpt-5.6-luna (current)  Older fast and efficient model.
+  5. gpt-5.5                 Legacy coding model.
+
+  Press enter to confirm or esc to go back
+"""
+CODEX_EFFORT_PICKER = """\
+  Select Reasoning Level for gpt-6-astra
+  1. Low                         Fast responses with lighter reasoning
+› 2. Medium (default) (current)  Balances speed and reasoning depth for everyday tasks
+  3. High                        Greater reasoning depth for complex problems
+  4. Extra high                  Extra high reasoning depth for complex problems
+  5. More reasoning…             Max and Ultra consume usage limits faster
+  Press enter to confirm or esc to go back
+"""
+
+
+class CodexStatusModelTests(unittest.TestCase):
+    def test_idle_status_line(self):
+        self.assertEqual(actions.codex_status_model(CODEX_STATUS_IDLE), "gpt-6-astra high")
+
+    def test_busy_status_line_carries_the_elapsed_tag(self):
+        self.assertEqual(actions.codex_status_model(CODEX_STATUS_BUSY), "gpt-6-astra medium")
+
+    def test_last_status_line_wins(self):
+        # A switch reprints the line; the readout is the newest one.
+        text = CODEX_STATUS_BUSY + CODEX_STATUS_IDLE
+        self.assertEqual(actions.codex_status_model(text), "gpt-6-astra high")
+
+    def test_banner_box_and_pickers_are_not_the_status_line(self):
+        for text in (CODEX_BANNER_BOX, CODEX_MODEL_PICKER, CODEX_EFFORT_PICKER, ""):
+            self.assertEqual(actions.codex_status_model(text), "", text[:30])
+
+
+class CodexPickerParseTests(unittest.TestCase):
+    def test_model_picker_rows_cursor_and_current(self):
+        rows, cursor, current = actions._codex_picker(CODEX_MODEL_PICKER, actions._CODEX_MODEL_PICKER_HEAD)
+        self.assertEqual(rows, [(1, "gpt-6-astra"), (2, "gpt-5.6-sol"), (3, "gpt-5.6-terra"),
+                                (4, "gpt-5.6-luna"), (5, "gpt-5.5")])
+        self.assertEqual((cursor, current), (4, 4))
+
+    def test_effort_picker_keeps_two_word_names_and_drops_tags(self):
+        rows, cursor, current = actions._codex_picker(CODEX_EFFORT_PICKER, actions._CODEX_EFFORT_PICKER_HEAD)
+        self.assertEqual([n for _, n in rows], ["Low", "Medium", "High", "Extra high", "More reasoning…"])
+        self.assertEqual((cursor, current), (2, 2))
+
+    def test_absent_picker_is_none(self):
+        self.assertIsNone(actions._codex_picker(CODEX_STATUS_IDLE, actions._CODEX_MODEL_PICKER_HEAD))
+        # The other picker's header doesn't stand in for this one.
+        self.assertIsNone(actions._codex_picker(CODEX_EFFORT_PICKER, actions._CODEX_MODEL_PICKER_HEAD))
+
+    def test_numbered_rows_above_the_header_are_not_rows(self):
+        text = "› 1. Update now\n  2. Skip\n  3. Skip until next version\n" + CODEX_MODEL_PICKER
+        rows, cursor, _ = actions._codex_picker(text, actions._CODEX_MODEL_PICKER_HEAD)
+        self.assertEqual(rows[0], (1, "gpt-6-astra"))
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(cursor, 4)
+
+
+class SwitchCodexModelTests(unittest.TestCase):
+    """The codex driver walks two pickers by keypress; the fake below plays both,
+    with a wrapping cursor and the (current) tags the real ones carry."""
+
+    _MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+    _EFFORTS = ["Low", "Medium", "High", "Extra high", "More reasoning…"]
+
+    def _drive(self, model, effort, current=4, effort_cursor=2, close_sticks=False):
+        state = {"screen": "model", "cursor": current, "picks": []}
+
+        def picker(head, names, cursor, current_row):
+            lines = [f"  {head}" + (" gpt-x" if head.endswith("for") else "")]
+            for i, name in enumerate(names, 1):
+                mark = "› " if i == cursor else "  "
+                tag = " (current)" if i == current_row else ""
+                lines.append(f"{mark}{i}. {name}{tag}  blurb")
+            lines.append("  Press enter to confirm or esc to go back")
+            return "\n".join(lines) + "\n"
+
+        def capture(pane, scrollback=0):
+            if state["screen"] == "model":
+                text = "• an earlier turn\n" + picker(
+                    actions._CODEX_MODEL_PICKER_HEAD, self._MODELS, state["cursor"], current)
+            elif state["screen"] == "effort":
+                text = picker(actions._CODEX_EFFORT_PICKER_HEAD, self._EFFORTS,
+                              state["cursor"], effort_cursor)
+            else:
+                text = CODEX_STATUS_IDLE
+            return {"ok": True, "text": text}
+
+        sent = []
+
+        def send_keys(pane, *keys):
+            sent.extend(keys)
+            for k in keys:
+                if k == "Down":
+                    state["cursor"] = state["cursor"] % 5 + 1
+                elif k == "Enter":
+                    state["picks"].append((state["screen"], state["cursor"]))
+                    if state["screen"] == "model":
+                        state["screen"], state["cursor"] = "effort", effort_cursor
+                    elif state["screen"] == "effort" and not close_sticks:
+                        state["screen"] = "closed"
+                elif k == "Escape":
+                    state["screen"] = {"effort": "model"}.get(state["screen"], "closed")
+            return {"ok": True}
+
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/9", platform="codex")), \
+             mock.patch.object(actions, "send_prompt", return_value={"ok": True}) as sp, \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
+             mock.patch.object(actions.tmux, "capture_pane", side_effect=capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.switch_model(1234, model, effort)
+        return r, sent, state, sp
+
+    def test_model_and_effort(self):
+        r, sent, state, sp = self._drive("gpt-5.6-sol", "high")
+        self.assertTrue(r["ok"], r)
+        sp.assert_called_once_with(1234, "/model")
+        self.assertEqual(state["picks"], [("model", 2), ("effort", 3)])
+        self.assertEqual(r["model"], "gpt-5.6-sol high")
+        self.assertEqual(state["screen"], "closed")
+
+    def test_wraps_down_to_a_row_above_the_cursor(self):
+        # Cursor opens on luna (4); sol (2) is reached by wrapping: 4→5→1→2.
+        _, sent, _, _ = self._drive("gpt-5.6-sol", "high")
+        self.assertEqual(sent[:4], ["Down", "Down", "Down", "Enter"])
+
+    def test_effort_only_keeps_the_current_model(self):
+        r, _, state, _ = self._drive("", "xhigh")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 4), ("effort", 4)])
+        self.assertEqual(r["model"], "gpt-5.6-luna extra high")
+
+    def test_model_only_keeps_the_effort_the_picker_opens_on(self):
+        r, sent, state, _ = self._drive("gpt-6-astra", "")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 1), ("effort", 2)])
+        self.assertEqual(r["model"], "gpt-6-astra medium")
+        # Nothing pressed in the effort picker but Enter.
+        self.assertEqual(sent[sent.index("Enter") + 1:], ["Enter"])
+
+    def test_absent_model_escapes_out(self):
+        r, sent, state, _ = self._drive("gpt-9", "high")
+        self.assertFalse(r["ok"])
+        self.assertIn("not in the Codex model picker", r["error"])
+        self.assertIn("gpt-5.6-sol", r["error"])
+        self.assertEqual(state["screen"], "closed")
+        self.assertNotIn("Enter", sent)
+
+    def test_bad_effort_is_rejected_before_any_key(self):
+        r, sent, _, sp = self._drive("gpt-6-astra", "ultra")
+        self.assertFalse(r["ok"])
+        self.assertIn("ultra", r["error"])
+        self.assertEqual(sent, [])
+        sp.assert_not_called()
+
+    def test_nothing_to_switch(self):
+        r, sent, _, _ = self._drive("", "")
+        self.assertFalse(r["ok"])
+        self.assertEqual(sent, [])
+
+    def test_picker_that_never_closes_is_a_failure_and_escapes_out(self):
+        with mock.patch.object(actions, "_MODEL_DIALOG_WAIT", 0.05):
+            r, _, state, _ = self._drive("gpt-6-astra", "high", close_sticks=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("did not close", r["error"])
+        self.assertEqual(state["screen"], "closed")
+
+
+# Claude's first-run folder-trust prompt (v2.1.x), as captured from a pane. Its
+# options carry no numbers and the cursor opens on "No, exit" — the two facts
+# that make it unanswerable by the numbered-permission path.
+_TRUST_PROMPT = (
+    "\u2500" * 40 + "\n"
+    " Accessing workspace:\n"
+    " /tmp/proj\n"
+    " Quick safety check: Is this a project you created or one you trust? (Like your\n"
+    " own code, a well-known open source project, or work from your team). If not,\n"
+    " take a moment to review what's in this folder first.\n"
+    " Claude Code'll be able to read, edit, and execute files here.\n"
+    " Security guide\n"
+    " \u276f No, exit\n"
+    "   Yes, I trust this folder\n"
+    " Enter to confirm \u00b7 Esc to cancel"
+)
+# The same dialog after one Down: the cursor has moved onto the Yes row.
+_TRUST_PROMPT_ON_YES = _TRUST_PROMPT.replace(
+    " \u276f No, exit\n   Yes", "   No, exit\n \u276f Yes")
+
+
+def _keys_recorder(sent):
+    """A send_keys stub that records the keys and answers like the real one."""
+    def fake(pane, *keys):
+        sent.append(keys)
+        return {"ok": True}
+    return fake
+
+
+class TrustPromptTests(unittest.TestCase):
+    """The folder-trust prompt: recognizing it, and answering it by its cursor.
+
+    Every other dialog the board answers is a numbered list, so "approve" is the
+    digit 1. This one has no numbers — the digit lands on nothing and the card
+    stays waiting — and Enter commits whatever the cursor is on, which starts on
+    "No, exit". Both halves are load-bearing: reach the Yes row, and never press
+    Enter without having read the cursor onto it.
+    """
+
+    def test_recognizes_the_prompt(self):
+        self.assertTrue(actions.trust_prompt_up(_TRUST_PROMPT))
+        self.assertTrue(actions.trust_prompt_up(_TRUST_PROMPT_ON_YES))
+
+    def test_other_dialogs_are_not_the_trust_prompt(self):
+        self.assertFalse(actions.trust_prompt_up(_PICKER_TEXT))
+        self.assertFalse(actions.trust_prompt_up(_LIVE_TEXT))
+        # One label alone is a session that printed the words, not the dialog.
+        self.assertFalse(actions.trust_prompt_up("I said: Yes, I trust this folder"))
+
+    def test_cursor_label_reads_the_selected_option(self):
+        self.assertEqual(actions._trust_cursor_label(_TRUST_PROMPT), "No, exit")
+        self.assertEqual(actions._trust_cursor_label(_TRUST_PROMPT_ON_YES),
+                         "Yes, I trust this folder")
+
+    def test_cursor_label_ignores_the_composer_prompt(self):
+        # The composer and every queued message draw "\u276f " too; neither is an
+        # option, and mistaking one for the cursor would commit the wrong row.
+        self.assertEqual(actions._trust_cursor_label(_LIVE_TEXT), "")
+        self.assertEqual(actions._trust_cursor_label("\u276f do the thing"), "")
+
+    def test_steps_onto_yes_then_confirms(self):
+        # Cursor on No, then on Yes after the Down, then the dialog is gone.
+        caps = [_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT]
+
+        def fake_capture(pane, **kw):
+            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
+
+        sent = []
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["answered"])
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_never_confirms_a_cursor_it_could_not_move(self):
+        # A dialog whose cursor never reaches Yes must be left alone: Enter here
+        # would commit "No, exit" and kill the session.
+        with mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": _TRUST_PROMPT}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertFalse(r["ok"])
+        self.assertNotIn(("Enter",), [c.args[1:] for c in sk.call_args_list])
+
+    def test_unreadable_pane_sends_nothing(self):
+        with mock.patch.object(actions.tmux, "capture_pane", return_value={"ok": False}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertFalse(r["ok"])
+        sk.assert_not_called()
+
+    def test_already_answered_prompt_is_a_no_op(self):
+        with mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": _LIVE_TEXT}), \
+             mock.patch.object(actions.tmux, "send_keys") as sk, \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.answer_trust_prompt("%0")
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["answered"])
+        sk.assert_not_called()
+
+
+class RespondPermissionRoutingTests(unittest.TestCase):
+    """Which dialog is on screen decides how "approve" is delivered."""
+
+    def _respond(self, pane_text, choice="approve"):
+        sent = []
+        with mock.patch.object(actions, "find_window",
+                               return_value=_fake_window("/dev/pts/9")), \
+             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%0"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": pane_text}), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
+             mock.patch.object(actions.time, "sleep"):
+            r = actions.respond_permission(100, choice)
+        return r, sent
+
+    def test_numbered_permission_still_gets_the_digit(self):
+        r, sent = self._respond("Do you want to proceed?\n\u276f 1. Yes\n  2. No")
+        self.assertTrue(r["ok"])
+        self.assertEqual(sent, [("1",)])
+
+    def test_trust_prompt_is_not_answered_with_a_digit(self):
+        # The bug this guards: "1" is swallowed by the trust dialog, so the card
+        # went on reading "waiting for your input" no matter how often it was
+        # clicked. Here the pane never leaves the prompt, so the attempt fails —
+        # what matters is that it never sent a digit that does nothing.
+        r, sent = self._respond(_TRUST_PROMPT)
+        self.assertFalse(r["ok"])
+        self.assertNotIn(("1",), sent)
+
+    def test_deny_is_escape_on_the_trust_prompt(self):
+        r, sent = self._respond(_TRUST_PROMPT, choice="deny")
+        self.assertEqual(sent, [("Escape",)])
+
+
+class PaneDialogTests(unittest.TestCase):
+    """One capture, both facts the snapshot needs about an open dialog."""
+
+    def _run(self, text):
+        with mock.patch.object(actions.tmux, "pane_for_tty", return_value="%9"), \
+             mock.patch.object(actions.tmux, "capture_pane",
+                               return_value={"ok": True, "text": text}):
+            return actions.pane_dialog("/dev/pts/9")
+
+    def test_trust_prompt_is_a_menu_and_names_itself(self):
+        self.assertEqual(self._run(_TRUST_PROMPT), {"menu": True, "trust": True})
+
+    def test_other_picker_is_a_menu_but_not_trust(self):
+        self.assertEqual(self._run(_PICKER_TEXT), {"menu": True, "trust": False})
+
+    def test_live_pane_has_no_dialog(self):
+        self.assertEqual(self._run(_LIVE_TEXT), {"menu": False, "trust": False})
+
+    def test_unreadable_pane_is_unknown(self):
+        self.assertIsNone(actions.pane_dialog(None))
+
+
+class ConfirmTrustPromptTests(unittest.TestCase):
+    """Answering the folder-trust prompt on a pane that was just launched.
+
+    The pane is empty for the first moment, then shows either the prompt or a
+    live composer. Both endings have to be cheap: a spawn into an already
+    trusted directory must not sit through the whole attempt budget.
+    """
+
+    def _run(self, caps, default=_LIVE_TEXT, **kw):
+        seq = list(caps)
+
+        def fake_capture(pane, **_kw):
+            return {"ok": True, "text": seq.pop(0) if seq else default}
+
+        sent = []
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
+             mock.patch.object(actions.time, "sleep"):
+            return actions.confirm_trust_prompt("%0", **kw), sent
+
+    def test_answers_the_prompt_once_it_paints(self):
+        # Two empty polls while Claude boots, then the dialog: cursor on "No,
+        # exit" as it opens, on Yes after the Down, gone after the Enter.
+        r, sent = self._run(["", "", _TRUST_PROMPT,
+                             _TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT])
+        self.assertTrue(r["answered"])
+        self.assertEqual(r["reason"], "")
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_prompt_is_tested_before_the_composer_marker(self):
+        # The dialog's cursor row draws "❯" too. Reading that as a live composer
+        # would walk away from the very prompt this exists to answer.
+        r, sent = self._run([_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT])
+        self.assertTrue(r["answered"])
+        self.assertNotEqual(r["reason"], "already trusted")
+
+    def test_settles_before_the_first_keypress(self):
+        # Keys sent the instant the dialog paints are swallowed by a TUI that
+        # has not armed its input handler yet — and the session exits on its own
+        # some moments later. Nothing may be sent before that settle.
+        order = []
+
+        # Cursor already on Yes, and the dialog clears once the key lands — so
+        # the run ends at the Enter instead of sitting out the confirm wait.
+        seq = [_TRUST_PROMPT_ON_YES, _TRUST_PROMPT_ON_YES]
+
+        def fake_capture(pane, **_kw):
+            order.append("capture")
+            return {"ok": True, "text": seq.pop(0) if seq else _LIVE_TEXT}
+
+        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
+             mock.patch.object(actions.tmux, "send_keys",
+                               side_effect=lambda p, *k: (order.append("key"), {"ok": True})[1]), \
+             mock.patch.object(actions.time, "sleep",
+                               side_effect=lambda s: order.append(f"sleep{s}")):
+            actions.confirm_trust_prompt("%0")
+        self.assertIn(f"sleep{actions._TRUST_ARM_SETTLE}", order)
+        self.assertLess(order.index(f"sleep{actions._TRUST_ARM_SETTLE}"),
+                        order.index("key"))
+
+    def test_half_painted_dialog_is_not_mistaken_for_a_composer(self):
+        # The cursor row lands on screen a paint before the Yes row. That "❯" is
+        # the composer marker; treating it as one here would leave the session
+        # parked on the dialog — the exact stuck card this poll exists to stop.
+        half = " \u276f No, exit\n"
+        r, sent = self._run([half, _TRUST_PROMPT, _TRUST_PROMPT,
+                             _TRUST_PROMPT_ON_YES, _LIVE_TEXT])
+        self.assertTrue(r["answered"])
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_already_trusted_directory_returns_immediately(self):
+        r, sent = self._run([_LIVE_TEXT])
+        self.assertFalse(r["answered"])
+        self.assertEqual(r["reason"], "already trusted")
+        self.assertEqual(sent, [])
+
+    def test_budget_runs_out_without_sending_keys(self):
+        # A pane that never paints anything: give up, quietly.
+        r, sent = self._run([], default="", attempts=2)
+        self.assertFalse(r["answered"])
+        self.assertEqual(r["reason"], "no prompt")
+        self.assertEqual(sent, [])
+
+    def test_no_pane_is_a_no_op(self):
+        self.assertEqual(actions.confirm_trust_prompt("")["reason"], "no pane")

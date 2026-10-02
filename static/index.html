@@ -28,8 +28,8 @@
      x-show="waitingWindows.length > 0" x-transition>
   <span class="font-bold shrink-0">PENDING (<span x-text="waitingWindows.length"></span>)</span>
   <div class="flex gap-2 overflow-x-auto">
-    <template x-for="w in waitingWindows" :key="w.pid">
-      <button @click="focusWindow(w.pid)"
+    <template x-for="w in waitingWindows" :key="w.key">
+      <button @click="focusWindow(w.key)"
               class="bg-red-700 hover:bg-red-800 rounded px-3 py-1 shrink-0 flex items-center gap-1 transition">
         <span class="inline-block w-2 h-2 rounded-full bg-white pulse-red"></span>
         <span x-text="w.name || w.project_name"></span>
@@ -56,6 +56,21 @@
             :class="statusFilter==='completed' || statusFilter==='closeable' ? 'ring-2 ring-gray-400' : ''"
             @click="statusFilter = (statusFilter==='completed' ? 'closeable' : statusFilter==='closeable' ? '' : 'completed')"
             x-text="counts.idle + ' idle'"></span>
+    </div>
+    <!-- One chip per machine, shown only once this board is aggregating more
+         than its own host. Click to see just that machine's cards; a peer whose
+         board stopped answering goes red and says so on hover. -->
+    <div class="flex gap-1 text-xs" x-show="hosts.length > 1">
+      <template x-for="h in hosts" :key="h.host">
+        <span class="px-2 py-0.5 rounded-full cursor-pointer border"
+              :class="[hostFilter === h.host ? 'ring-2 ring-slate-400' : '',
+                       h.online ? 'bg-slate-100 text-slate-700 border-slate-200'
+                                : 'bg-red-50 text-red-700 border-red-200']"
+              :title="h.online ? (h.host + ' · ' + h.count + ' cards')
+                               : ('no answer from ' + h.host + (h.error ? ' — ' + h.error : ''))"
+              @click="hostFilter = (hostFilter === h.host ? '' : h.host)"
+              x-text="h.host + ' · ' + h.count"></span>
+      </template>
     </div>
     <!-- Skills / Memory buttons -->
     <button @click="showSkills = !showSkills; if(showSkills) loadSkills()"
@@ -84,9 +99,24 @@
                   class="flex-1 text-xs px-2 py-1 rounded border transition"
                   :class="spawnPlatform === 'codex' ? 'border-green-400 text-green-700 bg-green-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
             Codex</button>
+          <button @click="spawnPlatform = 'hmz'"
+                  class="flex-1 text-xs px-2 py-1 rounded border transition"
+                  :class="spawnPlatform === 'hmz' ? 'border-violet-400 text-violet-700 bg-violet-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
+            hmz</button>
         </div>
+        <template x-if="hosts.length > 1">
+          <div>
+            <label class="text-xs text-gray-500">Machine</label>
+            <select x-model="spawnHost" class="w-full border rounded px-2 py-1 text-sm bg-white">
+              <template x-for="h in hosts" :key="h.host">
+                <option :value="h.host" x-text="h.host + (h.online ? '' : ' (offline)')"></option>
+              </template>
+            </select>
+          </div>
+        </template>
         <label class="text-xs text-gray-500">Spawn
-          <code x-text="spawnPlatform === 'codex' ? 'codex --yolo' : 'claude'"></code> in a directory</label>
+          <code x-text="spawnPlatform === 'codex' ? 'codex --yolo' : spawnPlatform"></code> in a directory
+          <span x-show="hosts.length > 1" class="text-gray-400">on <span x-text="spawnHost"></span></span></label>
         <select x-model="spawnCwdSelect" class="border rounded px-2 py-1 text-sm bg-white">
           <option value="">— recent directory —</option>
           <template x-for="d in recentCwds" :key="d">
@@ -284,19 +314,24 @@
 
   <!-- ===== Window cards grid ===== -->
   <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-    <template x-for="w in filteredWindows" :key="w.pid">
+    <template x-for="w in filteredWindows" :key="w.key">
       <div class="bg-white rounded-xl shadow-sm border hover:shadow-md transition cursor-pointer relative"
-           :class="{ 'ring-2 ring-red-400': w.triage === 'waiting_perm', 'ring-2 ring-blue-400': expandedPid === w.pid }"
-           @click="toggleExpand(w.pid)">
+           :class="{ 'ring-2 ring-red-400': w.triage === 'waiting_perm', 'ring-2 ring-blue-400': expandedKey === w.key,
+                     'opacity-50': w.peer_stale }"
+           @click="toggleExpand(w.key)">
         <div class="p-4 pb-2">
           <div class="flex items-center gap-2 mb-1">
             <span class="inline-block w-3 h-3 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
             <span class="font-semibold text-sm truncate" x-text="w.name || w.first_input || w.project_name"></span>
             <span class="text-[10px] text-white px-1.5 rounded-full shrink-0 font-medium"
-                  :class="w.platform === 'codex' ? 'bg-green-500' : 'bg-blue-500'"
-                  x-text="w.platform === 'codex' ? 'codex' : 'cc'"></span>
+                  :class="w.platform === 'codex' ? 'bg-green-500' : w.platform === 'hmz' ? 'bg-violet-500' : 'bg-blue-500'"
+                  x-text="w.platform === 'codex' || w.platform === 'hmz' ? w.platform : 'cc'"></span>
             <span class="text-[10px] px-1.5 rounded-full text-white shrink-0" :class="'triage-' + w.triage"
                   x-text="w.triage"></span>
+            <span x-show="hosts.length > 1"
+                  class="text-[10px] px-1.5 rounded-full shrink-0 bg-slate-200 text-slate-700 font-medium"
+                  :title="w.peer_stale ? 'this machine\'s board has stopped answering' : 'runs on ' + w.host"
+                  x-text="w.host"></span>
           </div>
           <div class="text-xs text-gray-500 truncate" x-text="w.cwd"></div>
         </div>
@@ -318,11 +353,22 @@
                     x-text="'👁 ' + (w.background_tasks||[]).filter(t => t.type === 'monitor').length + ' monitor'"></span>
             </div>
             <template x-for="(bt, i) in (w.background_tasks||[])" :key="i">
-              <div class="text-[10px] text-amber-700 bg-amber-50 rounded px-1.5 py-0.5 truncate">
-                <span class="font-medium" x-text="bt.type === 'monitor' ? 'Monitor' : 'Bash bg'"></span>:
+              <div class="text-[10px] rounded px-1.5 py-0.5 truncate"
+                   :class="bt.state === 'undelivered' ? 'text-red-700 bg-red-50' : 'text-amber-700 bg-amber-50'">
+                <span class="font-medium"
+                      x-text="{monitor: 'Monitor', agent: 'Agent', task: '任务'}[bt.type] || 'Bash bg'"></span>:
                 <span x-text="bt.description || bt.command"></span>
+                <span x-show="bt.state === 'undelivered'" class="font-medium">— 已完成，通知没被取走</span>
               </div>
             </template>
+          </div>
+          <!-- The session's looping prompt. Unlike a shell or a Monitor it has
+               no process to count, so the card would otherwise show nothing at
+               all for a session re-running a prompt every half hour. -->
+          <div x-show="w.loop?.text" class="text-[10px] text-violet-800 bg-violet-50 rounded px-1.5 py-0.5 truncate"
+               :title="loopSourceHint(w.loop)">
+            <span class="font-medium" x-text="'🔁 ' + (w.loop?.cadence || '尚未排期')"></span>:
+            <span x-text="w.loop?.text"></span>
           </div>
           <!-- Skill tags -->
           <div class="flex gap-1 flex-wrap" x-show="w.skills_used?.length || w.memory_ops?.length">
@@ -384,70 +430,86 @@
           </div>
         </div>
         <div class="px-4 pb-3 pt-1 flex gap-2 flex-wrap" @click.stop>
-          <button x-show="false" @click="focusWindow(w.pid)"
+          <button x-show="false" @click="focusWindow(w.key)"
                   class="text-xs px-2 py-1 rounded border transition"
                   :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
             Focus</button>
-          <button x-show="tmuxAvailable && w.platform !== 'codex'" @click="sendReview(w.pid)" :disabled="!!promptSending[w.pid]"
+          <button x-show="tmuxAvailable && w.platform !== 'codex' && w.platform !== 'hmz'" @click="sendReview(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /humanize:ask-codex review to this session">
             Review</button>
-          <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.pid)"
+          <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.key)"
                   class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
             Close</button>
-          <button x-show="w.platform !== 'codex'" @click="forkWindow(w.pid)"
+          <button x-show="w.platform !== 'codex' && w.platform !== 'hmz'" @click="forkWindow(w.key)"
                   class="text-xs border border-green-200 text-green-600 px-2 py-1 rounded hover:bg-green-50 transition">
             Fork</button>
-          <button x-show="false" @click="exportWindow(w.pid)"
+          <button x-show="false" @click="exportWindow(w.key)"
                   class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
             Export</button>
-          <button x-show="tmuxAvailable" @click="sendClear(w.pid)" :disabled="!!promptSending[w.pid]"
+          <button x-show="tmuxAvailable" @click="sendClear(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
             Clear</button>
-          <button x-show="tmuxAvailable" @click="sendCommit(w.pid)" :disabled="!!promptSending[w.pid]"
+          <button x-show="tmuxAvailable" @click="sendCommit(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Ask this session to commit and push">
             Commit</button>
-          <button x-show="tmuxAvailable" @click="sendEscape(w.pid)"
+          <button x-show="tmuxAvailable" @click="sendEscape(w.key)"
                   class="text-xs border border-orange-200 text-orange-600 px-2 py-1 rounded hover:bg-orange-50 transition"
                   title="Press Esc in this session to interrupt what it's doing">
             Esc</button>
-          <!-- Codex's /model ignores an argument (it opens an interactive picker), so this is Claude-only. -->
-          <select x-show="tmuxAvailable && w.platform !== 'codex'"
-                  @change="switchModel(w.pid, $event.target.value); $event.target.value = ''"
-                  :disabled="!!promptSending[w.pid]"
+          <!-- One control per platform. Claude: its /model dialog, committed with
+               "s" so the pick stays session-only. Codex: its two-step picker
+               (model, then reasoning effort — modelOptions offers both as
+               groups, a pick of one keeps the other), which also rewrites
+               ~/.codex/config.toml, so modelTitle says so. -->
+          <select x-show="tmuxAvailable && w.platform !== 'hmz'"
+                  @change="switchModel(w, $event.target.value); $event.target.value = ''"
+                  :disabled="!!promptSending[w.key]"
                   class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded bg-white hover:bg-purple-50 transition disabled:opacity-50 disabled:cursor-wait"
-                  :title="(w.model ? 'Running on ' + w.model + '. ' : '') + 'Switch this session\'s model (this session only — your default for new sessions is untouched). Shows the model that last answered, so it updates on the session\'s next reply.'">
+                  :title="modelTitle(w)">
             <!-- The idle label doubles as the readout: the select snaps back to
                  this option after every pick, so it always reads the model the
-                 session is actually on (blank until it has answered once). -->
+                 session is actually on — from the transcript once it has
+                 answered, from its welcome banner until then (a cleared session
+                 has no assistant row to read, and blank is the one thing the
+                 readout must not say about a session that is plainly on a
+                 model). -->
             <option value="" x-text="(w.model_label || 'Model') + ' ▾'"></option>
-            <option value="opus">Opus</option>
-            <option value="fable">Fable</option>
+            <template x-for="o in modelOptions(w)" :key="o.value">
+              <option :value="o.value" x-text="o.label"></option>
+            </template>
           </select>
           <!-- Waiting on a prompt: open the timeline to see the actual options and respond -->
           <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
                x-show="w.triage === 'waiting_perm' && tmuxAvailable">
-            <span class="text-xs text-red-700 font-medium shrink-0">⏳ Waiting for your input</span>
-            <button @click="toggleExpand(w.pid)"
+            <!-- The folder-trust prompt is the one dialog whose options carry no
+                 numbers, so it gets its own label and its own button text: the
+                 timeline can't render it as a menu, and "Quick Approve (1)" would
+                 promise a keypress that does nothing there. -->
+            <span class="text-xs text-red-700 font-medium shrink-0"
+                  x-text="w.waiting_for === 'trust prompt' ? '⏳ Trust this folder?' : '⏳ Waiting for your input'"></span>
+            <button @click="toggleExpand(w.key)" x-show="w.waiting_for !== 'trust prompt'"
                     class="text-xs border border-red-300 text-red-700 px-2 py-1 rounded hover:bg-red-100 transition">
               Open & respond ↓</button>
-            <button @click="respondPermission(w.pid, 'approve')" :disabled="!!permSending[w.pid]"
+            <button @click="respondPermission(w.key, 'approve')" :disabled="!!permSending[w.key]"
                     class="text-xs border border-emerald-300 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50"
-                    title="Sends key 1 (Yes / first option)">
-              Quick Approve (1)</button>
+                    :title="w.waiting_for === 'trust prompt'
+                            ? 'Answers Claude\'s folder-trust prompt with “Yes, I trust this folder”'
+                            : 'Sends key 1 (Yes / first option)'"
+                    x-text="w.waiting_for === 'trust prompt' ? 'Trust folder' : 'Quick Approve (1)'"></button>
           </div>
           <!-- Send a single prompt into this session's tmux pane (hidden when tmux unavailable) -->
           <div class="flex items-end gap-2 w-full mt-1" x-show="tmuxAvailable">
-            <textarea x-model="promptDrafts[w.pid]" rows="3"
+            <textarea x-model="promptDrafts[w.key]" rows="3"
                    placeholder="Send a prompt…  (Shift+Enter to send · Enter for newline)"
-                   @keydown.enter.shift.prevent="sendPrompt(w.pid)"
-                   :disabled="!!promptSending[w.pid]"
+                   @keydown.enter.shift.prevent="sendPrompt(w.key)"
+                   :disabled="!!promptSending[w.key]"
                    class="text-sm leading-snug border border-gray-200 rounded px-3 py-2 flex-1 resize-y min-h-[4.5rem] focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50"></textarea>
-            <button @click="sendPrompt(w.pid)" :disabled="!!promptSending[w.pid]"
+            <button @click="sendPrompt(w.key)" :disabled="!!promptSending[w.key]"
                     class="text-sm border border-emerald-200 text-emerald-600 px-4 py-2 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait self-stretch shrink-0">
-              <span x-text="promptSending[w.pid] ? 'Sending…' : 'Send'"></span></button>
+              <span x-text="promptSending[w.key] ? 'Sending…' : 'Send'"></span></button>
           </div>
         </div>
       </div>
@@ -456,7 +518,7 @@
 
   <!-- ===== Timeline panel ===== -->
   <div x-ref="timelinePanel"
-       x-show="(expandedPid !== null && timelineData) || (expandedHistoryId && timelineData)"
+       x-show="(expandedKey !== null && timelineData) || (expandedHistoryId && timelineData)"
        @copy="copyAsPlainText($event)"
        class="mt-6 bg-white rounded-xl shadow border p-5" x-transition>
     <div class="flex items-center justify-between mb-4">
@@ -464,6 +526,7 @@
         <span x-text="timelineData?.project_name || timelineData?.project_slug || ''"></span>
         <span class="text-xs text-gray-400 font-normal" x-text="'session:' + (timelineData?.session_id || '').slice(0,8)"></span>
         <span x-show="timelineData?.platform === 'codex'" class="text-[10px] bg-green-500 text-white px-1.5 rounded">codex</span>
+        <span x-show="timelineData?.platform === 'hmz'" class="text-[10px] bg-violet-500 text-white px-1.5 rounded">hmz</span>
       </h2>
       <div class="flex items-center gap-2">
         <!-- Assistant font-size adjuster -->
@@ -479,12 +542,12 @@
                 class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded hover:bg-purple-50 transition"
                 :class="showPlanHistory ? 'bg-purple-50' : ''">
           Plan · <span x-text="timelineData?.plan_history?.length || 0"></span> 版本</button>
-        <button @click="expandedPid = null; expandedHistoryId = null; timelineData = null; planData = null"
+        <button @click="expandedKey = null; expandedHistoryId = null; timelineData = null; planData = null"
                 class="text-gray-400 hover:text-gray-700 text-lg">&times;</button>
       </div>
     </div>
     <!-- Live interactive menu (AskUserQuestion / permission prompt) parsed from the pane -->
-    <div x-show="expandedPid !== null && tmuxAvailable && timelineData?.menu"
+    <div x-show="expandedKey !== null && tmuxAvailable && timelineData?.menu"
          class="mb-4 rounded-lg p-4 text-sm border"
          :class="timelineData?.menu?.kind === 'permission' ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-300'"
          x-transition>
@@ -496,7 +559,7 @@
       <div class="font-medium text-gray-800 mb-2" x-text="timelineData?.menu?.prompt"></div>
       <div class="space-y-1">
         <template x-for="opt in (timelineData?.menu?.options || [])" :key="opt.num">
-          <button @click="answerMenuKey(expandedPid, opt.num)"
+          <button @click="answerMenuKey(expandedKey, opt.num)"
                   class="block w-full text-left border bg-white rounded px-2 py-1.5 hover:bg-gray-50 transition"
                   :class="timelineData?.menu?.kind === 'permission' ? 'border-red-200' : 'border-amber-200'">
             <span x-show="opt.checked !== undefined" class="mr-1" x-text="opt.checked ? '☑' : '☐'"></span>
@@ -508,15 +571,15 @@
       </div>
       <div class="flex items-center gap-2 mt-2 flex-wrap">
         <!-- Single-select / review: Enter confirms the highlighted option. -->
-        <button x-show="!timelineData?.menu?.multi" @click="answerQuestionSubmit(expandedPid)"
+        <button x-show="!timelineData?.menu?.multi" @click="answerQuestionSubmit(expandedKey)"
                 class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
           Submit (Enter)</button>
         <!-- multiSelect: Enter only TOGGLES the highlighted row, so advance with
              Tab to the next question / the "Ready to submit" review screen. -->
-        <button x-show="timelineData?.menu?.multi" @click="answerMenuAdvance(expandedPid)"
+        <button x-show="timelineData?.menu?.multi" @click="answerMenuAdvance(expandedKey)"
                 class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
           Continue → (Tab)</button>
-        <button @click="answerQuestionCancel(expandedPid)"
+        <button @click="answerQuestionCancel(expandedKey)"
                 class="text-xs border border-gray-300 text-gray-600 px-3 py-1 rounded hover:bg-gray-100 transition">
           Cancel (Esc)</button>
         <button @click="refreshTimeline()"
@@ -542,28 +605,43 @@
       <pre class="text-cyan-900 whitespace-pre-wrap break-words m-0 font-sans"
            :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="timelineData?.goal?.text || ''"></pre>
     </div>
+    <!-- The prompt this session is looping on. Pinned for the same reason as the
+         goal, plus one of its own: a loop keeps producing turns nobody just
+         sent, and without the banner the timeline reads as a session that talks
+         to itself. It disappears the moment the loop is stopped. -->
+    <div class="mb-3 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2" x-show="timelineData?.loop?.text">
+      <div class="flex items-baseline gap-2 mb-1">
+        <span class="text-[10px] font-semibold text-violet-800 uppercase tracking-wide">🔁 loop</span>
+        <span class="text-[10px] text-violet-600/70"
+              :title="loopSourceHint(timelineData?.loop)"
+              x-text="(timelineData?.loop?.cadence || '尚未排期')
+                      + ' · ' + fmtDateTimeET(timelineData?.loop?.ts)"></span>
+      </div>
+      <pre class="text-violet-900 whitespace-pre-wrap break-words m-0 font-sans"
+           :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="timelineData?.loop?.text || ''"></pre>
+    </div>
     <!-- Most recent prompt the user sent — always visible while a session is open -->
     <div class="mb-3 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2" x-show="timelineData && lastUserPrompt()">
       <div class="text-[10px] font-semibold text-blue-700 uppercase tracking-wide mb-1">最近发送的 prompt</div>
       <pre class="text-xs text-blue-900 whitespace-pre-wrap break-words max-h-32 overflow-y-auto m-0 font-sans" x-text="lastUserPrompt()"></pre>
     </div>
     <!-- Send a single prompt into this live session's tmux pane (only for live sessions) -->
-    <div class="flex items-end gap-2 mb-4" x-show="expandedPid !== null && tmuxAvailable">
-      <textarea x-model="promptDrafts[expandedPid]" rows="3"
+    <div class="flex items-end gap-2 mb-4" x-show="expandedKey !== null && tmuxAvailable">
+      <textarea x-model="promptDrafts[expandedKey]" rows="3"
                 placeholder="Send a prompt to this session…  (Shift+Enter to send · Enter for newline)"
-                @keydown.enter.shift.prevent="sendPrompt(expandedPid)"
-                :disabled="!!promptSending[expandedPid]"
+                @keydown.enter.shift.prevent="sendPrompt(expandedKey)"
+                :disabled="!!promptSending[expandedKey]"
                 class="text-sm leading-snug border border-gray-200 rounded px-3 py-2 flex-1 resize-y min-h-[4.5rem] focus:outline-none focus:ring-2 focus:ring-emerald-400 disabled:opacity-50"></textarea>
-      <button @click="sendPrompt(expandedPid)" :disabled="!!promptSending[expandedPid]"
+      <button @click="sendPrompt(expandedKey)" :disabled="!!promptSending[expandedKey]"
               class="text-sm border border-emerald-200 text-emerald-600 px-4 py-2 rounded hover:bg-emerald-50 transition disabled:opacity-50 disabled:cursor-wait self-stretch shrink-0">
-        <span x-text="promptSending[expandedPid] ? 'Sending…' : 'Send'"></span></button>
+        <span x-text="promptSending[expandedKey] ? 'Sending…' : 'Send'"></span></button>
     </div>
     <!-- Plan version history -->
     <div x-show="showPlanHistory && timelineData?.plan_history?.length" class="mb-4 bg-purple-50 rounded-lg p-4 border border-purple-200 text-sm" x-transition>
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-2">
           <span class="font-semibold text-purple-800">Plan</span>
-          <button @click="showCurrentPlan(expandedPid || timelineData?.session_id)"
+          <button @click="showCurrentPlan(expandedKey || timelineData?.session_id)"
                   class="text-xs border border-purple-400 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100 font-medium"
                   :class="planData ? 'bg-purple-100' : ''">
             查看当前 plan
@@ -651,6 +729,9 @@
       <pre class="text-xs text-gray-700 max-h-48 overflow-y-auto whitespace-pre-wrap bg-gray-50 rounded p-2"
            x-text="memoryDetail?.content || '(loading...)'"></pre>
     </div>
+    <!-- Why the list below is empty, when the backend knows (an hmz with no run yet). -->
+    <div x-show="timelineData?.note" class="mb-3 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-600"
+         x-text="timelineData?.note || ''"></div>
     <div class="space-y-2 max-h-[32rem] overflow-y-auto" x-ref="eventsList">
       <!-- Only the newest `timelineWindow` events are rendered; older ones load
            on demand so a 1000-event session doesn't re-render in full on every poll. -->
@@ -664,7 +745,8 @@
         <div :id="'tl-ev-'+ev._idx" class="text-sm border-l-2 pl-3 py-1"
              x-show="ev.kind !== 'system'"
              :class="{
-               'border-blue-400': ev.kind==='user_text',
+               'border-blue-400': ev.kind==='user_text' && !ev.extra?.pending,
+               'border-orange-300 border-dashed': ev.extra?.pending,
                'border-emerald-400': ev.kind==='assistant_text',
                'border-amber-400': ev.kind==='tool_use',
                'border-amber-500': ev.kind==='ask_question',
@@ -710,8 +792,17 @@
             </template>
             <!-- Harness-injected, not typed: a skill body, a command caveat.
                  Say so, or a row cut at 200 chars reads as a truncated prompt. -->
-            <template x-if="ev.extra?.meta">
+            <template x-if="ev.extra?.meta && !ev.extra?.pending">
               <span class="text-gray-400">（注入）</span>
+            </template>
+            <!-- Fired, but Claude hasn't been handed it. An idle session doesn't
+                 wake for a background task: the notification sits in the CLI's
+                 own queue until a turn starts, which in practice means until
+                 someone types. Shown at the time it fired, so a Monitor's
+                 progress reads live instead of arriving as one burst hours late. -->
+            <template x-if="ev.extra?.pending">
+              <span class="text-orange-500 font-medium"
+                    title="后台任务通知已入队但尚未送达 Claude：session 空闲时不会被唤醒，要等下一轮 turn（通常是你发下一句）才会一次性投递。这里的时间是事件真实触发的时刻。">⏳（待送达）</span>
             </template>
             <!-- Typed while the session was busy, so Claude took it off its own
                  queue here instead of at the top of a turn. The time is when it
@@ -761,7 +852,8 @@
           <!-- User prompt: same deal — a prompt cut off mid-sentence is worse
                than a tall row, so it wraps in full at the same adjustable size. -->
           <template x-if="ev.kind === 'user_text'">
-            <pre class="text-gray-800 whitespace-pre-wrap break-words"
+            <pre class="whitespace-pre-wrap break-words"
+                 :class="ev.extra?.pending ? 'text-orange-700' : 'text-gray-800'"
                  :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="ev.text || ''"></pre>
           </template>
           <!-- AskUserQuestion: full question text + every option, no truncation -->
@@ -812,20 +904,18 @@
   <!-- ===== History section ===== -->
   <div class="mt-8 bg-white rounded-xl shadow-sm border">
     <div class="px-5 py-3 border-b flex items-center justify-between">
-      <h2 class="font-semibold text-sm">History (<span x-text="historyTotal"></span>)</h2>
+      <h2 class="font-semibold text-sm">History (<span x-text="historyTotal"></span>)
+        <!-- The list stops at HISTORY_LIMIT. Say so, or a 1300-session archive
+             showing twenty rows reads as an archive that lost the rest. -->
+        <span class="font-normal text-gray-400 text-xs" x-show="historyTotal > historySessions.length"
+              x-text="'· 显示' + (historyQuery ? '前 ' : '最近 ') + historySessions.length + ' 条'"></span>
+      </h2>
       <div class="flex items-center gap-2">
         <input type="text" placeholder="Search history..." x-model="historyQuery"
-               @keydown.enter="loadHistory(1)"
+               @keydown.enter="loadHistory()"
                class="border rounded px-2 py-1 text-xs w-48 focus:outline-none focus:ring-1 focus:ring-blue-400">
-        <button @click="loadHistory(1)" class="text-xs text-blue-600 hover:underline">Go</button>
-        <button @click="historyQuery=''; loadHistory(1)" class="text-xs text-gray-400 hover:text-gray-600" x-show="historyQuery">Clear</button>
-        <select x-model.number="historyLimit" @change="loadHistory(1)" class="border rounded px-1 py-1 text-xs bg-white">
-          <option value="10">10</option>
-          <option value="20">20</option>
-          <option value="50">50</option>
-          <option value="100">100</option>
-          <option value="500">All</option>
-        </select>
+        <button @click="loadHistory()" class="text-xs text-blue-600 hover:underline">Go</button>
+        <button @click="historyQuery=''; loadHistory()" class="text-xs text-gray-400 hover:text-gray-600" x-show="historyQuery">Clear</button>
       </div>
     </div>
     <div class="divide-y max-h-[28rem] overflow-y-auto" x-show="historySessions.length > 0">
@@ -878,16 +968,6 @@
         </div>
       </template>
     </div>
-    <div class="px-5 py-2 border-t flex items-center justify-between text-xs text-gray-500"
-         x-show="historyTotal > historyLimit">
-      <span>Page <span x-text="historyPage"></span> / <span x-text="Math.ceil(historyTotal / historyLimit)"></span></span>
-      <div class="flex gap-2">
-        <button @click="loadHistory(historyPage - 1)" :disabled="historyPage <= 1"
-                class="px-2 py-1 border rounded disabled:opacity-30 hover:bg-gray-100">Prev</button>
-        <button @click="loadHistory(historyPage + 1)" :disabled="historyPage * historyLimit >= historyTotal"
-                class="px-2 py-1 border rounded disabled:opacity-30 hover:bg-gray-100">Next</button>
-      </div>
-    </div>
   </div>
 
   <!-- ===== Hidden internal agent sub-sessions (.slock) ===== -->
@@ -899,10 +979,10 @@
       <span class="text-xs font-normal text-gray-400">internal <code>.slock</code> agent sub-sessions</span>
     </h2>
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-      <template x-for="w in hiddenWindows" :key="w.pid">
+      <template x-for="w in hiddenWindows" :key="w.key">
         <div class="bg-white rounded-xl shadow-sm border hover:shadow-md transition cursor-pointer relative"
-             :class="{ 'ring-2 ring-blue-400': expandedPid === w.pid }"
-             @click="toggleExpand(w.pid)">
+             :class="{ 'ring-2 ring-blue-400': expandedKey === w.key }"
+             @click="toggleExpand(w.key)">
           <div class="p-3 pb-2">
             <div class="flex items-center gap-2 mb-1">
               <span class="inline-block w-2.5 h-2.5 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
@@ -935,14 +1015,43 @@
 </div>
 
 <script>
+// When the board is published behind the password gate (core/auth.py), an
+// expired cookie turns every /api/* call into a 401. The call sites below all
+// go straight to r.json(), so without this they'd fail on parsing HTML-less
+// error bodies and the board would just sit there looking broken. Wrapping
+// fetch once puts the redirect in one place instead of at fourteen call sites
+// and any added later.
+(function () {
+  const inner = window.fetch;
+  window.fetch = async function (...args) {
+    const r = await inner.apply(this, args);
+    if (r.status === 401) {
+      location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search + location.hash);
+      // Never settles, so callers don't run their .json() against a redirect
+      // that is already navigating the page away.
+      return new Promise(() => {});
+    }
+    return r;
+  };
+})();
+
+// Rows the History panel lists: the newest this many, or the first this many
+// matches when searching.
+const HISTORY_LIMIT = 20;
+
 function fleet() {
   return {
     windows: [],
     counts: { total: 0, busy: 0, waiting: 0, idle: 0 },
     statusFilter: '',
+    // Show only one machine's cards. '' = every machine.
+    hostFilter: '',
+    // This board's own host label, and the peer health rows it reports.
+    localHost: '',
+    peers: [],
     searchQuery: '',
     searchResults: null,
-    expandedPid: null,
+    expandedKey: null,
     expandedHistoryId: null,
     // Last-seen updated_at of the open live timeline; lets applySnapshot detect
     // new activity (e.g. the assistant replied) and auto-refresh the timeline.
@@ -961,10 +1070,15 @@ function fleet() {
     toasts: [],
     toastSeq: 0,
     evtSource: null,
+    // Pending SSE reconnect, so a burst of onerror firings schedules one retry
+    // rather than one per firing.
+    _reconnectTimer: null,
+    // Watchdog for a stream that is connected but delivering nothing, and the
+    // polling fallback it turns on. See _openEvents.
+    _streamWatchdog: null,
+    _snapshotPoll: null,
     historySessions: [],
     historyTotal: 0,
-    historyPage: 1,
-    historyLimit: 20,
     historyQuery: '',
     showSkills: false,
     skillsList: null,
@@ -979,14 +1093,17 @@ function fleet() {
     memorySessions: {},
     tmuxAvailable: false,
     showSpawn: false,
-    spawnPlatform: 'claude',   // 'claude' | 'codex'
+    spawnPlatform: 'claude',   // 'claude' | 'codex' | 'hmz'
     spawnCwd: '',
     spawnCwdSelect: '',
     spawning: false,
+    // Machine the spawn runs on — this board's own host until the user picks
+    // another. Only meaningful when peers are configured (see `hosts`).
+    spawnHost: '',
     promptDrafts: {},
     promptSending: {},
     permSending: {},
-    // Per-aside expand state for long /btw answers, keyed by pid:entry-id so a
+    // Per-aside expand state for long /btw answers, keyed by card-key:entry-id so a
     // new aside on the same card starts collapsed again.
     btwExpanded: {},
     assistantFontPx: Number(localStorage.getItem('assistantFontPx')) || 14,
@@ -1005,9 +1122,29 @@ function fleet() {
       e.clipboardData.setData('text/plain', text);
     },
 
+    // Every machine this board is showing: its own first, then each configured
+    // peer. Peers appear even while offline — a machine whose board died should
+    // read as "no answer from 75", not quietly vanish from the header.
+    get hosts() {
+      const counts = {};
+      for (const w of this.windows) counts[w.host] = (counts[w.host] || 0) + 1;
+      const rows = [{ host: this.localHost, online: true, error: null,
+                      count: counts[this.localHost] || 0 }];
+      for (const p of this.peers) {
+        rows.push({ host: p.host, online: !!p.online, error: p.error,
+                    count: counts[p.host] || 0 });
+      }
+      return rows.filter(r => r.host);
+    },
+
+    // Directories to offer when spawning. Scoped to the machine the spawn will
+    // run on: another host's paths may not exist there, and a spawn into a
+    // missing directory is a confusing failure.
     get recentCwds() {
+      const host = this.spawnHost || this.localHost;
       const seen = [];
       for (const w of this.windows) {
+        if (this.hosts.length > 1 && w.host !== host) continue;
         if (w.cwd && !seen.includes(w.cwd)) seen.push(w.cwd);
       }
       return seen;
@@ -1017,7 +1154,8 @@ function fleet() {
       return this.windows.filter(w => w.triage === 'waiting_perm');
     },
     get filteredWindows() {
-      const base = this.windows.filter(w => !w.hidden);
+      let base = this.windows.filter(w => !w.hidden);
+      if (this.hostFilter) base = base.filter(w => w.host === this.hostFilter);
       const list = this.statusFilter
         ? base.filter(w => w.triage === this.statusFilter)
         : base;
@@ -1064,23 +1202,11 @@ function fleet() {
 
     init() {
       fetch('/api/windows').then(r => r.json()).then(d => this.applySnapshot(d));
-      this.loadHistory(1);
+      this.loadHistory();
       // ?snapshot renders a one-shot static view (no live SSE) — handy for
       // embeds and for headless screenshots.
       if (!new URLSearchParams(location.search).has('snapshot')) {
-        this.evtSource = new EventSource('/api/events');
-        this.evtSource.addEventListener('snapshot', (e) => {
-          this.applySnapshot(JSON.parse(e.data));
-        });
-        this.evtSource.onerror = () => {
-          setTimeout(() => {
-            if (this.evtSource) this.evtSource.close();
-            this.evtSource = new EventSource('/api/events');
-            this.evtSource.addEventListener('snapshot', (e) => {
-              this.applySnapshot(JSON.parse(e.data));
-            });
-          }, 5000);
-        };
+        this._openEvents();
       }
       this._applyHashRoute();
       window.addEventListener('hashchange', () => this._applyHashRoute());
@@ -1088,15 +1214,82 @@ function fleet() {
       // same as clicking the card's Esc button. Skip when typing in an input so
       // Esc keeps its normal meaning inside text fields / pickers.
       window.addEventListener('keydown', (e) => {
-        if (e.key !== 'Escape' || this.expandedPid === null || !this.tmuxAvailable) return;
+        if (e.key !== 'Escape' || this.expandedKey === null || !this.tmuxAvailable) return;
         const t = e.target;
         if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-        this.sendEscape(this.expandedPid);
+        this.sendEscape(this.expandedKey);
       });
       // Poll the open live timeline every 2.5s. SSE only fires on state changes,
       // but a session can sit silently at a question/permission picker — polling
       // guarantees the menu (captured from the pane) shows up and stays current.
-      setInterval(() => { if (this.expandedPid !== null) this.refreshTimeline(); }, 2500);
+      setInterval(() => { if (this.expandedKey !== null) this.refreshTimeline(); }, 2500);
+    },
+
+    // Open the snapshot stream that feeds the card list.
+    //
+    // A stream can also fail without ever erroring: some proxies buffer a
+    // streaming response instead of passing it through, and a Cloudflare quick
+    // tunnel does exactly that — the headers arrive, then not one body byte
+    // until the stream closes. To the browser that connection looks open and
+    // healthy, onerror never fires, and the cards silently sit at whatever the
+    // page loaded with while everything fetched normally (the open timeline,
+    // which polls) keeps updating. So don't take "connected" for delivering:
+    // arm a watchdog, and if no event shows up, poll the same snapshot over
+    // plain requests, which proxies do pass through. The stream stays open —
+    // if it ever starts delivering, the polling stops again.
+    _openEvents() {
+      if (this.evtSource) this.evtSource.close();
+      this.evtSource = new EventSource('/api/events');
+      this.evtSource.addEventListener('snapshot', (e) => {
+        this._noteStreamAlive();
+        this.applySnapshot(JSON.parse(e.data));
+      });
+      // Carries no payload; its only job is to prove the stream still flows
+      // through a stretch where nothing on the board changed.
+      this.evtSource.addEventListener('heartbeat', () => this._noteStreamAlive());
+      this.evtSource.onerror = () => {
+        // onerror fires once per failed connection attempt, so without this
+        // guard a flapping phone connection stacks a new timer — and now a
+        // new server round trip — on every firing, while the streams they
+        // opened are never closed.
+        if (this._reconnectTimer) return;
+        this._reconnectTimer = setTimeout(() => {
+          this._reconnectTimer = null;
+          // EventSource hides the status code, so a stream dropped by an
+          // expired auth cookie is indistinguishable from a network blip.
+          // This probe goes through the wrapped fetch above, which turns a
+          // 401 into a redirect to the login page.
+          fetch('/api/windows').catch(() => {});
+          this._openEvents();
+        }, 5000);
+      };
+      // The server sends a snapshot the moment the stream opens, so silence
+      // this long means the body is not getting through.
+      this._armStreamWatchdog(8000);
+    },
+
+    // An event arrived, so the stream is delivering: stop any fallback polling
+    // and re-arm the watchdog. The server sends a heartbeat every 20s when the
+    // board is quiet, so 45s of silence means the stream has gone dark.
+    _noteStreamAlive() {
+      if (this._snapshotPoll) { clearInterval(this._snapshotPoll); this._snapshotPoll = null; }
+      this._armStreamWatchdog(45000);
+    },
+
+    _armStreamWatchdog(ms) {
+      clearTimeout(this._streamWatchdog);
+      this._streamWatchdog = setTimeout(() => {
+        if (this._snapshotPoll) return;
+        this._snapshotPoll = setInterval(() => {
+          // A backgrounded tab isn't being read; skip the round trip and let
+          // the next tick after the user returns bring the cards current.
+          if (document.hidden) return;
+          fetch('/api/windows')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => { if (d) this.applySnapshot(d); })
+            .catch(() => { /* transient; next tick retries */ });
+        }, 3000);
+      }, ms);
     },
 
     // Deep-link panels via URL hash: #skills, #memory, #search=<q>, #timeline=<sid>
@@ -1111,13 +1304,18 @@ function fleet() {
 
     applySnapshot(snap) {
       this.windows = snap.windows || [];
+      if (snap.host) {
+        this.localHost = snap.host;
+        if (!this.spawnHost) this.spawnHost = snap.host;
+      }
+      this.peers = snap.peers || [];
       this.counts = snap.counts || this.counts;
       if ('tmux_available' in snap) this.tmuxAvailable = !!snap.tmux_available;
       // If a live session's timeline is open and its activity advanced (the
       // assistant replied, a tool ran, etc.), re-fetch the timeline so the user
       // sees the new events without reopening the panel.
-      if (this.expandedPid !== null) {
-        const w = this.windows.find((x) => x.pid === this.expandedPid);
+      if (this.expandedKey !== null) {
+        const w = this.windows.find((x) => x.key === this.expandedKey);
         if (w && w.updated_at !== this.expandedUpdatedAt) {
           this.expandedUpdatedAt = w.updated_at;
           this.refreshTimeline();
@@ -1129,15 +1327,15 @@ function fleet() {
     // only snap to the bottom if they were already near it (so reading older
     // events isn't interrupted, but new replies stay visible by default).
     async refreshTimeline() {
-      const pid = this.expandedPid;
-      if (pid === null) return;
+      const key = this.expandedKey;
+      if (key === null) return;
       const el = this.$refs.eventsList;
       const stick = !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 60;
       try {
-        const r = await fetch(`/api/windows/${pid}/timeline`);
+        const r = await fetch(`/api/windows/${key}/timeline`);
         if (!r.ok) return;
         const data = await r.json();
-        if (this.expandedPid !== pid) return; // user navigated away mid-fetch
+        if (this.expandedKey !== key) return; // user navigated away mid-fetch
         // Skip the re-render when nothing changed — the poller calls this every
         // few seconds, and reassigning would flicker the list and fight scroll.
         const sig = JSON.stringify(data);
@@ -1188,6 +1386,10 @@ function fleet() {
     // body; on a hard network failure after the retry it returns a normalized
     // { ok:false, error, netError:true } so callers show "couldn't reach the
     // server" instead of leaking a raw TypeError or a misleading server message.
+    // One case never resolves at all: a 401 from the password gate, which the
+    // fetch wrapper at the top of this script turns into a navigation to
+    // /login. Callers with a `finally` that clears a spinner won't run it —
+    // harmless, because the page is already leaving.
     async apiPost(url, body) {
       const opts = { method: 'POST' };
       if (body !== undefined) {
@@ -1204,11 +1406,21 @@ function fleet() {
           if (attempt === 0) { await new Promise((res) => setTimeout(res, 400)); continue; }
           return { ok: false, error: 'could not reach the server — is it still running?', netError: true };
         }
+        let payload;
         try {
-          return await r.json();
+          payload = await r.json();
         } catch {
           return { ok: false, error: `server returned a non-JSON response (HTTP ${r.status})` };
         }
+        // A refusal answers with FastAPI's {"detail": …} and no `ok`, so every
+        // caller would render it as a bare "Spawn failed:" with no reason. Give
+        // it the action shape the buttons expect — the same normalization
+        // peers.forward already does for a peer's refusal.
+        if (!r.ok) {
+          const detail = payload && payload.detail;
+          return { ok: false, error: typeof detail === 'string' && detail ? detail : `HTTP ${r.status}` };
+        }
+        return payload;
       }
     },
 
@@ -1236,13 +1448,23 @@ function fleet() {
       return s ? s.replace(',', '') + ' ET' : (ts?.slice(0, 19) || '');
     },
 
-    async focusWindow(pid) {
-      const d = await this.apiPost(`/api/windows/${pid}/focus`);
+    // Where a loop banner's cadence comes from. Worth spelling out on hover:
+    // "尚未排期" is the honest reading of a /loop nobody has scheduled yet, and
+    // it looks identical to a loop that quietly failed to start.
+    loopSourceHint(loop) {
+      if (!loop) return '';
+      if (loop.source === 'cron') return 'CronCreate 注册的定时循环';
+      if (loop.source === 'wakeup') return 'ScheduleWakeup 自定节奏循环';
+      return '发起过 /loop · 还没看到它排期';
+    },
+
+    async focusWindow(key) {
+      const d = await this.apiPost(`/api/windows/${key}/focus`);
       if (!d.ok) this.toast('Focus failed: ' + (d.error || ''));
     },
 
     btwKey(w) {
-      return w.pid + ':' + (w.btw?.id || 0);
+      return w.key + ':' + (w.btw?.id || 0);
     },
     // The answer is clamped to 3 rendered lines; offer expand when it plausibly
     // overflows that — by newline count or by enough text to wrap past 3 lines.
@@ -1253,13 +1475,13 @@ function fleet() {
     async dismissBtw(w) {
       const id = w.btw?.id;
       if (!id) return;
-      const d = await this.apiPost(`/api/windows/${w.pid}/btw/dismiss`, { id });
+      const d = await this.apiPost(`/api/windows/${w.key}/btw/dismiss`, { id });
       if (d.ok) w.btw = null;  // optimistic; the next snapshot agrees
       else this.toast('Dismiss failed: ' + (d.error || ''));
     },
 
-    async forkWindow(pid) {
-      const d = await this.apiPost(`/api/windows/${pid}/fork`);
+    async forkWindow(key) {
+      const d = await this.apiPost(`/api/windows/${key}/fork`);
       this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
     },
 
@@ -1269,9 +1491,11 @@ function fleet() {
       if (!cwd) { this.toast('Pick or type a directory'); return; }
       this.spawning = true;
       try {
-        const d = await this.apiPost('/api/windows/create', { cwd, platform: this.spawnPlatform });
+        const d = await this.apiPost('/api/windows/create',
+                                     { cwd, platform: this.spawnPlatform, host: this.spawnHost });
         if (d.ok) {
-          this.toast('Spawned ' + (this.spawnPlatform === 'codex' ? 'codex' : 'claude') + ' in ' + cwd);
+          this.toast('Spawned ' + this.spawnPlatform + ' in ' + cwd
+                     + (this.hosts.length > 1 ? ' on ' + this.spawnHost : ''));
           this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = '';
         } else {
           this.toast('Spawn failed: ' + (d.error || ''));
@@ -1281,21 +1505,21 @@ function fleet() {
       }
     },
 
-    async sendPrompt(pid) {
-      if (this.promptSending[pid]) return;
-      const text = (this.promptDrafts[pid] || '').trim();
+    async sendPrompt(key) {
+      if (this.promptSending[key]) return;
+      const text = (this.promptDrafts[key] || '').trim();
       if (!text) { this.toast('Type a prompt first'); return; }
-      this.promptSending[pid] = true;
+      this.promptSending[key] = true;
       try {
-        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text });
+        const d = await this.apiPost(`/api/windows/${key}/prompt`, { text });
         if (d.ok) {
           this.toast(d.note || 'Sent prompt');
-          this.promptDrafts[pid] = '';
+          this.promptDrafts[key] = '';
         } else {
           this.toast('Send failed: ' + (d.error || ''));
         }
       } finally {
-        this.promptSending[pid] = false;
+        this.promptSending[key] = false;
       }
     },
 
@@ -1313,104 +1537,137 @@ function fleet() {
       return '';
     },
 
-    async sendClear(pid) {
-      if (this.promptSending[pid]) return;
-      this.promptSending[pid] = true;
+    async sendClear(key) {
+      if (this.promptSending[key]) return;
+      this.promptSending[key] = true;
       // Dedicated endpoint: sends /clear AND (for Codex, whose /clear leaves the
       // rollout file intact) blanks the card's pre-clear preview server-side.
       try {
-        const d = await this.apiPost(`/api/windows/${pid}/clear`);
+        const d = await this.apiPost(`/api/windows/${key}/clear`);
         this.toast(d.ok ? 'Sent /clear' : 'Clear failed: ' + (d.error || ''));
       } finally {
-        this.promptSending[pid] = false;
+        this.promptSending[key] = false;
       }
     },
 
-    async sendCommit(pid) {
-      if (this.promptSending[pid]) return;
-      this.promptSending[pid] = true;
+    async sendCommit(key) {
+      if (this.promptSending[key]) return;
+      this.promptSending[key] = true;
       try {
-        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text: 'commit and push' });
+        const d = await this.apiPost(`/api/windows/${key}/prompt`, { text: 'commit and push' });
         this.toast(d.ok ? 'Sent commit and push' : 'Commit failed: ' + (d.error || ''));
       } finally {
-        this.promptSending[pid] = false;
+        this.promptSending[key] = false;
       }
     },
 
     // The select snaps back to its idle option, which carries w.model_label — the
-    // model that last answered. So the readout follows the transcript, not the
-    // pick: a switch shows up once the session replies on the new model, and a
-    // switch that didn't land shows nothing rather than a label that lies.
-    async switchModel(pid, alias) {
-      if (!alias) return;
-      if (this.promptSending[pid]) return;
-      this.promptSending[pid] = true;
+    // model that last answered, or the one the session's welcome banner names
+    // while it hasn't answered at all. Either way the readout follows the
+    // session, not the pick: a switch shows up once the session replies on the
+    // new model, and a switch that didn't land never puts a label on the card.
+    // What the model select offers, as {value: '<kind>:<name>', label}. Claude:
+    // the two families the board switches between. Codex: its picker's models,
+    // and its reasoning levels as a second group — the API takes either alone.
+    codexModels: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+    codexEfforts: ['low', 'medium', 'high', 'xhigh'],
+    modelOptions(w) {
+      if (w.platform === 'codex') {
+        return [
+          ...this.codexModels.map(m => ({ value: 'model:' + m, label: m })),
+          ...this.codexEfforts.map(e => ({ value: 'effort:' + e, label: 'effort: ' + e })),
+        ];
+      }
+      return [{ value: 'model:opus', label: 'Opus' }, { value: 'model:fable', label: 'Fable' }];
+    },
+    modelTitle(w) {
+      if (w.platform === 'codex') {
+        return (w.model_label ? 'On ' + w.model_label + ' (model, reasoning effort), per its status line. ' : '')
+          + 'Switch this session\'s model or reasoning effort. Codex\'s picker also saves the pick to ~/.codex/config.toml as the default for sessions started afterwards.';
+      }
+      return (w.model ? 'Running on ' + w.model + '. ' : (w.model_source === 'banner' ? 'On ' + w.model_label + ', per the banner it printed at startup / after /clear — it has not answered since. ' : ''))
+        + 'Switch this session\'s model (this session only — your default for new sessions is untouched). Shows the model that last answered; before its first reply, the one its welcome banner names.';
+    },
+    async switchModel(w, pick) {
+      if (!pick) return;
+      const key = w.key;
+      if (this.promptSending[key]) return;
+      // 'model:gpt-5.6-sol' / 'effort:high' / 'model:opus' — one field per pick,
+      // the other left to the session (see actions._switch_codex_model).
+      const i = pick.indexOf(':');
+      const kind = pick.slice(0, i), name = pick.slice(i + 1);
+      const body = kind === 'effort' ? { effort: name } : { model: name };
+      this.promptSending[key] = true;
       try {
-        const d = await this.apiPost(`/api/windows/${pid}/model`, { model: alias });
-        this.toast(d.ok ? `Model → ${alias} (this session only)` : 'Model switch failed: ' + (d.error || ''));
+        const d = await this.apiPost(`/api/windows/${key}/model`, body);
+        // d.model is the row that was committed — "Opus (1M context)" where the
+        // alias only said "opus", "gpt-5.6-sol high" where only one of the two
+        // was picked — which the card's label can't say on its own.
+        const scope = w.platform === 'codex' ? 'also the new default in ~/.codex/config.toml' : 'this session only';
+        this.toast(d.ok ? `Model → ${d.model || name} (${scope})` : 'Model switch failed: ' + (d.error || ''));
       } finally {
-        this.promptSending[pid] = false;
+        this.promptSending[key] = false;
       }
     },
 
-    async sendReview(pid) {
-      if (this.promptSending[pid]) return;
-      this.promptSending[pid] = true;
+    async sendReview(key) {
+      if (this.promptSending[key]) return;
+      this.promptSending[key] = true;
       try {
-        const d = await this.apiPost(`/api/windows/${pid}/prompt`, { text: '/humanize:ask-codex review' });
+        const d = await this.apiPost(`/api/windows/${key}/prompt`, { text: '/humanize:ask-codex review' });
         this.toast(d.ok ? 'Sent /humanize:ask-codex review' : 'Review failed: ' + (d.error || ''));
       } finally {
-        this.promptSending[pid] = false;
+        this.promptSending[key] = false;
       }
     },
 
-    async respondPermission(pid, choice) {
-      if (this.permSending[pid]) return;
-      this.permSending[pid] = true;
+    async respondPermission(key, choice) {
+      if (this.permSending[key]) return;
+      this.permSending[key] = true;
       const labels = { approve: 'Approved', approve_always: 'Approved (always)', deny: 'Denied' };
       try {
-        const d = await this.apiPost(`/api/windows/${pid}/permission`, { choice });
+        const d = await this.apiPost(`/api/windows/${key}/permission`, { choice });
         this.toast(d.ok ? (labels[choice] || 'Sent') : 'Permission failed: ' + (d.error || ''));
       } finally {
-        this.permSending[pid] = false;
+        this.permSending[key] = false;
       }
     },
 
-    async sendKeys(pid, keys) {
-      const d = await this.apiPost(`/api/windows/${pid}/keys`, { keys });
+    async sendKeys(key, keys) {
+      const d = await this.apiPost(`/api/windows/${key}/keys`, { keys });
       if (!d.ok) this.toast('Failed: ' + (d.error || ''));
       return d.ok;
     },
     // Press an option's number key in the live menu (question or permission).
     // Single-select: the digit selects + submits immediately. multiSelect: the
     // digit just toggles that option's checkbox, so refresh to redraw the state.
-    async answerMenuKey(pid, n) {
-      if (await this.sendKeys(pid, [String(n)])) {
+    async answerMenuKey(key, n) {
+      if (await this.sendKeys(key, [String(n)])) {
         // Pull the next screen state (next question, toggled state, or menu gone).
         setTimeout(() => this.refreshTimeline(), 400);
       }
     },
     // multiSelect advance: Enter only toggles a row, so Tab moves on to the next
     // question / the "Ready to submit" review screen (which renders as a picker).
-    answerMenuAdvance(pid) { this.sendKeys(pid, ['Tab']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
-    answerQuestionSubmit(pid) { this.sendKeys(pid, ['Enter']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
-    answerQuestionCancel(pid) { this.sendKeys(pid, ['Escape']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
+    answerMenuAdvance(key) { this.sendKeys(key, ['Tab']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
+    answerQuestionSubmit(key) { this.sendKeys(key, ['Enter']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
+    answerQuestionCancel(key) { this.sendKeys(key, ['Escape']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     // Interrupt whatever the session is doing — same as pressing Esc in the terminal.
-    async sendEscape(pid) {
-      if (await this.sendKeys(pid, ['Escape'])) {
+    async sendEscape(key) {
+      if (await this.sendKeys(key, ['Escape'])) {
         this.toast('Esc sent');
         setTimeout(() => this.refreshTimeline(), 400);
       }
     },
 
-    async closeWindow(pid) {
-      const d = await this.apiPost(`/api/windows/${pid}/close`);
-      this.toast(d.ok ? 'Closed ' + (d.name || pid) : 'Failed: ' + (d.error || ''));
+    async closeWindow(key) {
+      const d = await this.apiPost(`/api/windows/${key}/close`);
+      this.toast(d.ok ? 'Closed ' + (d.name || key) : 'Failed: ' + (d.error || ''));
     },
 
-    async exportWindow(pid) {
+    async exportWindow(key) {
       this.toast('Exporting...');
-      const d = await this.apiPost(`/api/windows/${pid}/export`);
+      const d = await this.apiPost(`/api/windows/${key}/export`);
       if (d.ok && d.doc_url) {
         this.toast('Exported: ' + d.doc_url);
         window.open(d.doc_url, '_blank');
@@ -1421,13 +1678,13 @@ function fleet() {
       }
     },
 
-    async toggleExpand(pid) {
-      if (this.expandedPid === pid) {
-        this.expandedPid = null; this.expandedUpdatedAt = null;
+    async toggleExpand(key) {
+      if (this.expandedKey === key) {
+        this.expandedKey = null; this.expandedUpdatedAt = null;
         this.timelineData = null; this.planData = null;
         return;
       }
-      this.expandedPid = pid;
+      this.expandedKey = key;
       this.expandedHistoryId = null;
       this.planData = null;
       this.showPlanHistory = false;
@@ -1435,9 +1692,9 @@ function fleet() {
       this.eventExpanded = {};   // indices belong to the old session's events
       // Baseline the activity marker so the next bump (assistant reply, tool
       // call) triggers an auto-refresh via applySnapshot.
-      this.expandedUpdatedAt = this.windows.find((w) => w.pid === pid)?.updated_at ?? null;
+      this.expandedUpdatedAt = this.windows.find((w) => w.key === key)?.updated_at ?? null;
       this._timelineSig = null; // force first poll/refresh to render this session
-      const r = await fetch(`/api/windows/${pid}/timeline`);
+      const r = await fetch(`/api/windows/${key}/timeline`);
       this.timelineData = await r.json();
       this._timelineSig = JSON.stringify(this.timelineData);
       this.$nextTick(() => {
@@ -1446,15 +1703,15 @@ function fleet() {
       });
     },
 
-    async loadPlan(pid) {
-      const r = await fetch(`/api/windows/${pid}/plan`);
+    async loadPlan(key) {
+      const r = await fetch(`/api/windows/${key}/plan`);
       this.planData = await r.json();
     },
 
     async openTimelineForSession(sessionId) {
       const w = this.windows.find(w => w.session_id === sessionId);
       if (w) {
-        this.toggleExpand(w.pid);
+        this.toggleExpand(w.key);
         this.searchResults = null;
       } else {
         await this.openHistoryTimeline(sessionId);
@@ -1469,18 +1726,20 @@ function fleet() {
       this.searchResults = d.hits || [];
     },
 
-    async loadHistory(page) {
-      if (page < 1) return;
+    // The archive runs to four figures and nobody pages through it — the rows
+    // worth a click are the ones near the top, and search covers the rest. One
+    // page of HISTORY_LIMIT, no pager. `total` still comes back, so the header
+    // can say how much is being held back.
+    async loadHistory() {
       const q = this.historyQuery ? `&q=${encodeURIComponent(this.historyQuery)}` : '';
-      const r = await fetch(`/api/history?page=${page}&limit=${this.historyLimit}${q}`);
+      const r = await fetch(`/api/history?page=1&limit=${HISTORY_LIMIT}${q}`);
       const d = await r.json();
       this.historySessions = d.sessions || [];
       this.historyTotal = d.total || 0;
-      this.historyPage = d.page || 1;
     },
 
     async openHistoryTimeline(sessionId) {
-      this.expandedPid = null;
+      this.expandedKey = null;
       this.expandedHistoryId = sessionId;
       this.planData = null;
       this.timelineWindow = 200;
@@ -1550,8 +1809,8 @@ function fleet() {
     async showCurrentPlan(pidOrSid) {
       // For active windows use /api/windows/{pid}/plan; for history sessions
       // fall back to scanning plan_history for the latest write content.
-      if (this.expandedPid) {
-        const r = await fetch(`/api/windows/${this.expandedPid}/plan`);
+      if (this.expandedKey) {
+        const r = await fetch(`/api/windows/${this.expandedKey}/plan`);
         this.planData = await r.json();
         if (!this.planData?.plan) this.planData = null;
       } else {

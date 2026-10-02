@@ -127,7 +127,10 @@ class CardModelTests(unittest.TestCase):
     """The card carries the model the session is actually running on — without it,
     a switch driven from the board changes nothing visible."""
 
-    def _run(self, win):
+    def setUp(self):
+        appmod._banner_models.clear()
+
+    def _run(self, win, model="claude-fable-5", banner=""):
         snap = {"windows": [win], "counts": {}, "ts": 0}
         with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
              mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
@@ -140,7 +143,8 @@ class CardModelTests(unittest.TestCase):
              mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
              mock.patch.object(appmod.transcripts, "current_task_hint", return_value=None), \
              mock.patch.object(appmod.transcripts, "current_model",
-                               return_value="claude-fable-5"):
+                               return_value=model), \
+             mock.patch.object(appmod.actions, "pane_model", return_value=banner):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_card_reports_the_running_model(self):
@@ -156,6 +160,92 @@ class CardModelTests(unittest.TestCase):
                        "name": "s", "updated_at": 0})
         self.assertEqual(w["model"], "")
         self.assertEqual(w["model_label"], "")
+
+    def test_transcript_wins_over_the_banner(self):
+        # The banner says what the session was on when it last started or was
+        # cleared; the transcript says what actually answered since. When both
+        # speak, the transcript is the one that can't be stale.
+        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                       "name": "s", "updated_at": 0}, banner="Opus 5")
+        self.assertEqual(w["model_label"], "Fable 5")
+        self.assertEqual(w["model_source"], "transcript")
+
+    def test_cleared_session_falls_back_to_its_banner(self):
+        # /clear starts a fresh transcript: no assistant row, hence no model —
+        # which is exactly when the card used to go blank.
+        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                       "name": "s", "updated_at": 0}, model="", banner="Opus 5")
+        self.assertEqual(w["model_label"], "Opus 5")
+        self.assertEqual(w["model_source"], "banner")
+        # No id is invented for it — the raw field stays empty.
+        self.assertEqual(w["model"], "")
+
+    def test_unreadable_banner_leaves_the_readout_blank(self):
+        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                       "name": "s", "updated_at": 0}, model="", banner="")
+        self.assertEqual(w["model_label"], "")
+        self.assertEqual(w["model_source"], "")
+
+    def test_banner_is_scraped_once_per_session_not_once_per_poll(self):
+        # A banner is printed at startup and at /clear and never rewritten, so
+        # one read answers for the whole session id — the poll runs every 2s and
+        # must not spend a capture-pane on each card each time. Proven by the
+        # cached answer surviving a pane that has since started saying something
+        # else, which cannot happen for real within one session id.
+        win = {"pid": 1, "session_id": "abc", "status": "idle", "hidden": False,
+               "alive": True, "tty": "pts/1", "transcript_path": "/t.jsonl",
+               "cwd": "/x", "name": "s", "updated_at": 0}
+        self.assertEqual(self._run(win, model="", banner="Opus 5")["model_label"],
+                         "Opus 5")
+        self.assertEqual(self._run(win, model="", banner="Fable 5.1")["model_label"],
+                         "Opus 5")
+
+    def test_a_clear_re_reads_the_banner(self):
+        # The new session id is the signal that the banner has been reprinted —
+        # and that the model may have changed with it.
+        base = {"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                "name": "s", "updated_at": 0}
+        first = self._run({**base, "session_id": "abc"}, model="", banner="Opus 5")
+        second = self._run({**base, "session_id": "def"}, model="", banner="Fable 5.1")
+        self.assertEqual(first["model_label"], "Opus 5")
+        self.assertEqual(second["model_label"], "Fable 5.1")
+
+    def test_dead_window_is_not_scraped(self):
+        with mock.patch.object(appmod.actions, "pane_model") as pm:
+            w = self._run({"pid": 1, "status": "idle", "hidden": False,
+                           "alive": False, "tty": None, "transcript_path": None,
+                           "cwd": "/x", "name": "s", "updated_at": 0}, model="")
+        pm.assert_not_called()
+        self.assertEqual(w["model_label"], "")
+
+    def test_hidden_agent_does_not_borrow_its_parents_banner(self):
+        # A `.slock` sub-session shares the parent's tty, so the banner in that
+        # pane names the parent's model — and sub-agents routinely run on
+        # another one.
+        with mock.patch.object(appmod.actions, "pane_model") as pm:
+            w = self._run({"pid": 1, "status": "unknown", "hidden": True,
+                           "alive": True, "tty": "pts/1", "cwd": "/x/.slock/a",
+                           "transcript_path": "/t.jsonl", "name": "s",
+                           "updated_at": 0}, model="")
+        pm.assert_not_called()
+        self.assertEqual(w["model_label"], "")
+
+    def test_cache_does_not_outlive_the_session(self):
+        win = {"pid": 1, "session_id": "abc", "status": "idle", "hidden": False,
+               "alive": True, "tty": "pts/1", "transcript_path": "/t.jsonl",
+               "cwd": "/x", "name": "s", "updated_at": 0}
+        self._run(win, model="", banner="Opus 5")
+        self.assertTrue(appmod._banner_models)
+        with mock.patch.object(appmod.sessions, "snapshot",
+                               return_value={"windows": [], "counts": {}, "ts": 0}), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
+             mock.patch.object(appmod.tmux, "available", return_value=True):
+            appmod._enriched_snapshot()
+        self.assertEqual(appmod._banner_models, {})
 
 
 class HiddenAgentQueueTests(unittest.TestCase):
@@ -199,7 +289,9 @@ class DiffSignatureTests(unittest.TestCase):
     still change the signature, or the card keeps showing a stale queue."""
 
     def _win(self, queued):
-        return {"pid": 100, "status": "busy", "waiting_for": None,
+        # `key` is the card's address (host-qualified pid); the signature is
+        # built on it, since pids only identify a card within one host.
+        return {"pid": 100, "key": "100", "status": "busy", "waiting_for": None,
                 "updated_at": 5, "queued": queued}
 
     def test_queue_change_alone_changes_signature(self):
@@ -232,7 +324,7 @@ class StaleDialogOpenTests(unittest.TestCase):
     (Quick Approve would type "1" into the input box) nor count as waiting in
     the header; a verifiable picker in the pane keeps the normal behavior."""
 
-    def _run(self, menu_active):
+    def _run(self, dialog):
         import time
         win = {"pid": 100, "status": "waiting", "waiting_for": "dialog open",
                "hidden": False, "alive": True, "tty": "/dev/pts/9",
@@ -246,25 +338,80 @@ class StaleDialogOpenTests(unittest.TestCase):
              mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
              mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
              mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
-             mock.patch.object(appmod.actions, "pane_menu_active", return_value=menu_active):
+             mock.patch.object(appmod.actions, "pane_dialog", return_value=dialog):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_dialog_without_menu_is_not_waiting(self):
-        w = self._run(menu_active=False)
+        w = self._run({"menu": False, "trust": False})
         self.assertNotEqual(w["triage"], "waiting_perm")
         self.assertNotEqual(w["status"], "waiting")
 
     def test_dialog_with_real_menu_stays_waiting(self):
-        w = self._run(menu_active=True)
+        w = self._run({"menu": True, "trust": False})
         self.assertEqual(w["triage"], "waiting_perm")
         self.assertEqual(w["status"], "waiting")
 
     def test_unverifiable_pane_stays_waiting(self):
         # tmux can't see the pane: keep the conservative waiting card.
-        w = self._run(menu_active=None)
+        w = self._run(None)
         self.assertEqual(w["triage"], "waiting_perm")
         self.assertEqual(w["status"], "waiting")
+
+    def test_trust_prompt_is_named_on_the_card(self):
+        # "dialog open" tells the user nothing, and the trust prompt is answered
+        # by its own route — so the card has to say which dialog it is stuck on.
+        w = self._run({"menu": True, "trust": True})
+        self.assertEqual(w["triage"], "waiting_perm")
+        self.assertEqual(w["waiting_for"], "trust prompt")
+        self.assertEqual(w["triage_reason"], "trust prompt")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexCardModelTests(unittest.TestCase):
+    """A Codex card reads its model + effort off the pane's status line when it
+    can, and off the rollout (what the last turn ran on) otherwise."""
+
+    def _card(self):
+        return {"pid": 7, "platform": "codex", "status": "idle", "hidden": False,
+                "alive": True, "tty": "pts/7", "transcript_path": "/r.jsonl",
+                "cwd": "/x", "name": None, "updated_at": 0, "triage": "",
+                "model": "gpt-6-astra", "effort": "medium",
+                "model_label": "gpt-6-astra medium", "model_source": "transcript"}
+
+    def _run(self, pane_label):
+        snap = {"windows": [], "counts": {}, "ts": 0}
+        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
+             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[self._card()]), \
+             mock.patch.object(appmod.tmux, "available", return_value=True), \
+             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
+             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
+             mock.patch.object(appmod.actions, "codex_pane_model", return_value=pane_label) as pm:
+            w = appmod._enriched_snapshot()["windows"][0]
+        pm.assert_called_once_with("pts/7")
+        return w
+
+    def test_status_line_wins(self):
+        w = self._run("gpt-5.6-sol high")
+        self.assertEqual(w["model_label"], "gpt-5.6-sol high")
+        self.assertEqual(w["model_source"], "pane")
+
+    def test_rollout_label_stands_without_a_readable_pane(self):
+        w = self._run("")
+        self.assertEqual(w["model_label"], "gpt-6-astra medium")
+        self.assertEqual(w["model_source"], "transcript")
+
+
+class ModelRouteTests(unittest.TestCase):
+    def test_body_fields_are_optional(self):
+        self.assertEqual(appmod.ModelBody(effort="high").model, "")
+        self.assertEqual(appmod.ModelBody(model="opus").effort, "")
+
+    def test_route_hands_both_fields_to_the_switch(self):
+        with mock.patch.object(appmod, "_require_window"), \
+             mock.patch.object(appmod.actions, "switch_model",
+                               return_value={"ok": True}) as sw:
+            appmod.api_window_model("1234", appmod.ModelBody(model="gpt-5.6-sol", effort="high"))
+        sw.assert_called_once_with(1234, "gpt-5.6-sol", "high")

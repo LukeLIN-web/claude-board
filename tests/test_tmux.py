@@ -39,6 +39,16 @@ def _patch_run(side_effect=None, **proc_kwargs):
     return mock.patch.object(tmux.subprocess, "run", return_value=FakeProc(**proc_kwargs))
 
 
+# Stand-in for the resolved CLI. new_window launches by absolute path, so argv
+# assertions would otherwise read whatever `claude` this machine has installed —
+# or fail outright on one that has none.
+_EXE = "/opt/bin/claude"
+
+
+def _pin_cli(path=_EXE):
+    return mock.patch.object(tmux, "_resolve_cli", return_value=path)
+
+
 class RunHelperTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
@@ -119,7 +129,9 @@ class SocketArgsTests(unittest.TestCase):
                 return FakeProc(returncode=0, stdout="beauty\n")
             return FakeProc(returncode=0, stdout="%3\n")
 
-        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True):
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True), \
+             _pin_cli(), mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)), \
+             mock.patch.object(tmux, "pane_alive", return_value=True):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
@@ -208,6 +220,14 @@ class PaneForTtyTests(unittest.TestCase):
 class NewWindowTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
+        # Pin what the argv assertions below see. The post-spawn liveness probe
+        # is SpawnLandedTests' subject, not theirs — stubbed here so it neither
+        # sleeps nor needs every fake to model `list-panes`.
+        for patcher in (_pin_cli(),
+                        mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)),
+                        mock.patch.object(tmux, "pane_alive", return_value=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_argv_uses_env_target(self):
         calls = []
@@ -227,7 +247,7 @@ class NewWindowTests(unittest.TestCase):
             new_win_argv,
             ["tmux", "new-window", "-P", "-F", "#{pane_id}",
              "-t", "mysess", "-c", "/home/u/proj",
-             "claude", "--dangerously-skip-permissions"],
+             _EXE, "--dangerously-skip-permissions"],
         )
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%12")
@@ -277,7 +297,7 @@ class NewWindowTests(unittest.TestCase):
             new_sess_argv,
             ["tmux", "new-session", "-d", "-s", "fleet",
              "-P", "-F", "#{pane_id}", "-c", "/tmp",
-             "claude", "--dangerously-skip-permissions"],
+             _EXE, "--dangerously-skip-permissions"],
         )
 
     def test_spawned_command_force_unsets_board_venv_markers(self):
@@ -300,7 +320,7 @@ class NewWindowTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         new_win_argv = [a for a in calls if "new-window" in a][0]
         # `env -u VIRTUAL_ENV -u VIRTUAL_ENV_PROMPT -u PYTHONHOME` precedes `claude`.
-        claude_idx = new_win_argv.index("claude")
+        claude_idx = new_win_argv.index(_EXE)
         self.assertEqual(new_win_argv[claude_idx - 7:claude_idx],
                          ["env", "-u", "VIRTUAL_ENV",
                           "-u", "VIRTUAL_ENV_PROMPT", "-u", "PYTHONHOME"])
@@ -335,6 +355,105 @@ class NewWindowTests(unittest.TestCase):
         new_sess_argv = [a for a in calls if "new-session" in a][0]
         self.assertIn("ghost", new_sess_argv)
         self.assertFalse(any("new-window" in a for a in calls))
+
+
+    def test_missing_cli_fails_before_opening_a_window(self):
+        # The board's PATH is what the pane gets, not the tmux server's. When
+        # the board cannot see the CLI, spawning would open a window that dies
+        # 127 and disappears — a "success" with no card behind it. Refuse.
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeProc(returncode=0, stdout="alpha\n")
+
+        with _pin_cli(None), mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertFalse(r["ok"])
+        self.assertIn("claude not found", r["error"])
+        self.assertFalse(any("new-window" in a for a in calls))
+
+
+class SpawnLandedTests(unittest.TestCase):
+    """The post-spawn probe: a pane id is not yet a running session."""
+
+    def setUp(self):
+        tmux._clear_caches()
+        for patcher in (_pin_cli(),
+                        mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_pane_that_dies_immediately_is_not_reported_as_spawned(self):
+        # tmux prints a pane id for a window it created even when the command in
+        # it exits before anyone looks. Re-probing the pane is what turns that
+        # into an error the dashboard can show instead of a phantom spawn.
+        def fake_run(argv, **kw):
+            if "list-sessions" in argv:
+                return FakeProc(returncode=0, stdout="alpha\n")
+            if "list-panes" in argv:
+                # The window is already gone; only the old panes are listed.
+                return FakeProc(returncode=0, stdout="%1\t/dev/pts/1\talpha\t/tmp\n")
+            return FakeProc(returncode=0, stdout="%9\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["pane_id"], "%9")
+        self.assertIn("exited immediately", r["error"])
+
+    def test_live_pane_is_reported_as_spawned(self):
+        def fake_run(argv, **kw):
+            if "list-sessions" in argv:
+                return FakeProc(returncode=0, stdout="alpha\n")
+            if "list-panes" in argv:
+                return FakeProc(returncode=0, stdout="%9\t/dev/pts/9\talpha\t/tmp\n")
+            return FakeProc(returncode=0, stdout="%9\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["pane_id"], "%9")
+
+
+class ResolveCliTests(unittest.TestCase):
+    def setUp(self):
+        tmux._clear_caches()
+
+    def test_prefers_what_the_spawn_path_resolves(self):
+        with mock.patch.object(tmux.shutil, "which", return_value="/usr/bin/claude") as w:
+            self.assertEqual(tmux._resolve_cli("claude"), "/usr/bin/claude")
+        self.assertEqual(w.call_args[0][0], "claude")
+
+    def test_falls_back_to_user_install_when_path_is_bare(self):
+        # The bare PATH a supervisor restart leaves behind has no ~/.local/bin,
+        # which is exactly where claude and codex install themselves.
+        with mock.patch.dict("os.environ", {"HOME": "/home/u"}), \
+             mock.patch.object(tmux.shutil, "which", return_value=None), \
+             mock.patch.object(tmux.os, "access",
+                               lambda path, mode: path == "/home/u/.local/bin/claude"):
+            self.assertEqual(tmux._resolve_cli("claude"), "/home/u/.local/bin/claude")
+
+    def test_falls_back_to_conda_base_when_path_is_bare(self):
+        # hmz is a pip entry point in the conda base, which only .bashrc's
+        # `conda init` block puts on PATH.
+        with mock.patch.dict("os.environ", {"HOME": "/home/u"}), \
+             mock.patch.object(tmux.shutil, "which", return_value=None), \
+             mock.patch.object(tmux.os, "access",
+                               lambda path, mode: path == "/home/u/miniconda3/bin/hmz"):
+            self.assertEqual(tmux._resolve_cli("hmz"), "/home/u/miniconda3/bin/hmz")
+
+    def test_returns_none_when_nothing_on_disk_matches(self):
+        with mock.patch.object(tmux.shutil, "which", return_value=None), \
+             mock.patch.object(tmux.os, "access", return_value=False):
+            self.assertIsNone(tmux._resolve_cli("codex"))
+
+    def test_absolute_path_is_taken_as_given(self):
+        with mock.patch.object(tmux.os, "access", return_value=True):
+            self.assertEqual(tmux._resolve_cli("/opt/claude"), "/opt/claude")
 
 
 class SendTextTests(unittest.TestCase):
@@ -490,6 +609,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
             return FakeProc(returncode=0)
         return fake_run
 
+
     def test_no_resend_when_composer_already_empty(self):
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
@@ -578,7 +698,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
 
 class SendTextVerifyLandedTests(unittest.TestCase):
     """verify_landed confirms the literal text reached the composer before Enter,
-    re-sending it (Ctrl-U first) when a busy-pane re-render dropped it."""
+    re-sending it (clearing the composer first) when a busy-pane re-render dropped it."""
 
     def setUp(self):
         tmux._clear_caches()
@@ -594,12 +714,40 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=True):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 1)  # text sent once
-        self.assertNotIn(["tmux", "send-keys", "-t", "%5", "C-u"], calls)  # no clear
+        # Landing first try still costs one clear: the composer is emptied
+        # before the text is typed, never after it lands.
+        cc.assert_called_once_with("%5")
+
+    def test_composer_is_cleared_before_the_first_keystroke(self):
+        # Regression: the clear used to run only on RETRIES, so whatever a
+        # previous send left in the composer took the lead and our text was
+        # appended to it. Because the landed check matches a tail, the
+        # concatenation passed as a clean landing and Enter submitted it —
+        # the board's Clear button on a wedged session stranded "/clear", and
+        # the next press submitted the literal text "/clear/clear".
+        order = []
+
+        def fake_run(argv, **kw):
+            if "-l" in argv:
+                order.append("type")
+            return FakeProc(returncode=0)
+
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "_clear_composer",
+                                  side_effect=lambda p: order.append("clear")), \
+                mock.patch.object(tmux, "_composer_has_tail",
+                                  side_effect=[True, False]):  # landed, then submitted
+            r = tmux.send_text("%5", "/clear", verify_landed=True)
+        self.assertTrue(r["ok"])
+        # The clear precedes the very first keystroke, not just the resends.
+        self.assertEqual(order[:2], ["clear", "type"])
 
     def test_resends_text_after_clearing_when_dropped_once(self):
         calls = []
@@ -613,9 +761,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 2)  # initial + one resend
-        # The retry clears any partial paste before re-sending, so a retry can't
-        # concatenate into a corrupted prompt.
-        cc.assert_called_once_with("%5")
+        # Every attempt clears first, so neither a leftover from an earlier send
+        # nor a partial paste can concatenate into a corrupted prompt.
+        self.assertEqual(cc.call_args_list, [mock.call("%5")] * 2)
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
@@ -631,9 +779,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         # A stalled TUI buffers the keystrokes rather than dropping them — they
         # land AFTER we give up and would strand in the composer, corrupting the
         # next send. Giving up must end with a cleanup clear so the buffered
-        # text is wiped whenever the pane wakes: one clear per retry plus the
+        # text is wiped whenever the pane wakes: one clear per attempt plus the
         # final cleanup.
-        self.assertEqual(cc.call_count, len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(cc.call_count, len(tmux._LANDED_VERIFY_WAITS) + 1)
 
     def test_landed_waits_escalate_for_laggy_panes(self):
         # A busy pane can take well over 0.15s to echo the paste; the between-
@@ -660,6 +808,131 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
+
+
+class SendTextConfirmedTests(unittest.TestCase):
+    """send_text_confirmed (hmz) pastes once, waits out a slow intake, and
+    succeeds only on the caller's evidence that the line was taken."""
+
+    def setUp(self):
+        tmux._clear_caches()
+        self.now = [1000.0]
+        self.calls = []
+        self.inputs = []
+
+    def _run(self, *extra):
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            self.inputs.append(kw.get("input"))
+            return FakeProc(returncode=0)
+        sleep = lambda s: self.now.__setitem__(0, self.now[0] + s)
+        return [mock.patch.object(tmux.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(tmux.time, "sleep", side_effect=sleep),
+                mock.patch.object(tmux.time, "time", side_effect=lambda: self.now[0]),
+                mock.patch.object(tmux, "_clear_composer"), *extra]
+
+    def _send(self, landed, took, text="hello"):
+        patches = self._run(mock.patch.object(tmux, "_composer_has_tail", side_effect=landed))
+        for p in patches:
+            p.start()
+        try:
+            return tmux.send_text_confirmed("%5", text, took)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def _literals(self):
+        return [c for c in self.calls if "paste-buffer" in c or "-l" in c]
+
+    def _enters(self):
+        return [c for c in self.calls if c[-1] == "Enter"]
+
+    def test_text_goes_in_as_one_bracketed_paste(self):
+        # Typed a key at a time, 1700 chars took hmz 2.4s to ingest; pasted, 0.06s.
+        r = self._send(lambda *a: True, took=lambda: True, text="split the todo")
+        self.assertTrue(r["ok"])
+        load = next(c for c in self.calls if "load-buffer" in c)
+        paste = next(c for c in self.calls if "paste-buffer" in c)
+        self.assertEqual(self.inputs[self.calls.index(load)], "split the todo")
+        name = load[load.index("-b") + 1]
+        self.assertEqual(paste[paste.index("-b") + 1], name)
+        for flag in ("-p", "-r", "-d"):
+            self.assertIn(flag, paste)
+        self.assertEqual(paste[paste.index("-t") + 1], "%5")
+        self.assertFalse(any("-l" in c for c in self.calls))  # no per-key typing
+
+    def test_a_failed_paste_leaves_no_buffer_and_no_enter(self):
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return FakeProc(returncode=1 if "paste-buffer" in argv else 0, stderr="no pane")
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux, "_clear_composer"):
+            r = tmux.send_text_confirmed("%5", "hello", lambda: True)
+        self.assertFalse(r["ok"])
+        self.assertTrue(any("delete-buffer" in c for c in self.calls))
+        self.assertEqual(self._enters(), [])
+
+    def test_slow_intake_is_waited_out_not_retyped(self):
+        # Regression: a 0.15s check missed hmz still ingesting, and the clear +
+        # retype raced the first copy into an empty editor.
+        landed = iter([False] * 5 + [True])
+        r = self._send(lambda *a: next(landed), took=lambda: True)
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(self._literals()), 1)
+        self.assertEqual(len(self._enters()), 1)
+
+    def test_emptied_composer_without_evidence_is_a_failure(self):
+        # The live loss: Enter, the composer reads empty, hmz never took it.
+        tail = iter([True, False, False])
+        r = self._send(lambda *a: next(tail), took=lambda: False)
+        self.assertFalse(r["ok"])
+        self.assertIn("never taken", r["error"])
+        self.assertEqual(len(self._enters()), 1)  # an Enter more wouldn't help
+
+    def test_stranded_text_gets_enter_again(self):
+        polls = round(tmux._CONFIRMED_TOOK_WAIT / tmux._CONFIRMED_POLL)  # one Enter's full wait
+        took = iter([False] * polls + [True])
+        r = self._send(lambda *a: True, took=lambda: next(took))
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(self._enters()), 2)
+
+    def test_never_landed_presses_no_enter(self):
+        r = self._send(lambda *a: False, took=lambda: True)
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        self.assertEqual(self._enters(), [])
+        self.assertEqual(len(self._literals()), 1)
+
+    def test_landing_wait_grows_with_length_and_is_capped(self):
+        for n, wait in ((10, 3.03), (1000, 6.0), (100000, tmux._CONFIRMED_LANDED_MAX)):
+            self.now, self.calls = [1000.0], []
+            self._send(lambda *a: False, took=lambda: True, text="x" * n)
+            self.assertAlmostEqual(self.now[0] - 1000.0, wait, delta=tmux._CONFIRMED_POLL)
+
+
+class ShownAboveComposerTests(unittest.TestCase):
+    PANE = ("\n".join([
+        "split the todo across workers",
+        "── assistant",
+        "● assistant is working",
+        "─" * 40,
+        "❯ ",
+        "─" * 40,
+        "  ◉ chat · /home/u/proj",
+    ]))
+
+    def _shown(self, screen, text="split the todo across workers"):
+        with mock.patch.object(tmux, "capture_pane", return_value={"ok": True, "text": screen}):
+            return tmux._shown_above_composer("%1", text)
+
+    def test_echo_above_an_empty_composer(self):
+        self.assertTrue(self._shown(self.PANE))
+
+    def test_text_still_in_the_composer_is_not_an_echo(self):
+        self.assertFalse(self._shown(self.PANE.replace("❯ ", "❯ split the todo across workers")))
+
+    def test_absent(self):
+        self.assertFalse(self._shown(self.PANE, text="something else entirely"))
 
 
 class ComposerHasTailTests(unittest.TestCase):
@@ -823,8 +1096,8 @@ class ComposerTextTests(unittest.TestCase):
 
 
 class ClearComposerTests(unittest.TestCase):
-    """_clear_composer must press Ctrl-U once per visual LINE (Claude's composer
-    kills only the current line per press, seen live on v2.1.211), verified
+    """_clear_composer must send one clearing press (End, Ctrl-U, Backspace) per
+    visual LINE (Claude's composer removes only one line per press), verified
     against the pane, falling back to blind presses when the pane won't redraw."""
 
     @staticmethod
@@ -833,6 +1106,29 @@ class ClearComposerTests(unittest.TestCase):
             calls.append(argv)
             return FakeProc(returncode=0)
         return fake_run
+
+    @staticmethod
+    def _presses(calls):
+        n = len(tmux._CLEAR_KEYS)
+        return [c for c in calls if tuple(c[-n:]) == tmux._CLEAR_KEYS]
+
+    def test_press_is_end_then_ctrl_u_then_backspace(self):
+        # Ctrl-U alone only kills LEFT of the cursor on its visual row (live on
+        # v2.1.286/287): a leftover with the cursor mid-line kept its tail and the
+        # next prompt went out with it appended. End first takes the whole row;
+        # Backspace joins an emptied row onto the one above. Pin the order: the
+        # keys go in one send-keys.
+        calls = []
+        screens = iter(["❯ aaa\n  bbb\n────────────\n", "❯ \n────────────\n"])
+        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch.object(tmux, "capture_pane",
+                                  side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
+            tmux._clear_composer("%5")
+        self.assertEqual(tmux._CLEAR_KEYS, ("End", "C-u", "BSpace"))
+        sends = [c for c in calls if "send-keys" in c]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][-3:], ["End", "C-u", "BSpace"])
 
     def test_presses_once_per_line_until_empty(self):
         screens = iter([
@@ -846,8 +1142,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
             tmux._clear_composer("%5")
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertEqual(len(clears), 2)  # one per non-empty read, none once empty
+        self.assertEqual(len(self._presses(calls)), 2)  # one per non-empty read, none once empty
 
     def test_already_empty_composer_sends_nothing(self):
         calls = []
@@ -856,20 +1151,19 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ \n────────────\n"}):
             tmux._clear_composer("%5")
-        self.assertEqual([c for c in calls if c[-1] == "C-u"], [])
+        self.assertEqual(self._presses(calls), [])
 
     def test_stalled_pane_falls_back_to_blind_presses(self):
         # A stalled TUI never redraws: the same screen comes back after a press
         # (no progress), so the loop must stop reading and queue enough blind
-        # Ctrl-Us to clear a worst-case wrapped paste whenever the pane wakes.
+        # presses to clear a worst-case wrapped paste whenever the pane wakes.
         calls = []
         with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ stuck text\n────────────\n"}):
             tmux._clear_composer("%5")
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertGreaterEqual(len(clears), tmux._CLEAR_BLIND_PRESSES)
+        self.assertGreaterEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
 
     def test_capture_failure_falls_back_to_blind_presses(self):
         calls = []
@@ -877,8 +1171,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane", return_value={"ok": False}):
             tmux._clear_composer("%5")
-        clears = [c for c in calls if c[-1] == "C-u"]
-        self.assertEqual(len(clears), tmux._CLEAR_BLIND_PRESSES)
+        self.assertEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
 
 
 class CodexEnterSettleTests(unittest.TestCase):

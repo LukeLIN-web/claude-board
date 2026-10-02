@@ -8,6 +8,11 @@ is on-screen; see actions.parse_btw_overlay), latch each distinct Q+A here, and
 persist to disk so the answer survives the overlay being dismissed, the pane
 scrolling, and the fleet process restarting.
 
+What is persisted is a log of *captures*, not of asides: the same overlay can be
+scraped several times (see core.btwcapture's gate), and which of those reads came
+out cleanest is only decidable once the later ones exist. `entries()` is where a
+run of captures becomes the one aside it was all along.
+
 Surfaced two ways: `latest()` for the card, `timeline_events()` merged into the
 session timeline. Shape mirrors core.promptqueue (in-memory dict) but adds a
 disk backing so the archive is durable — disk is the source of record, the dict
@@ -16,6 +21,7 @@ is a warm cache.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -67,14 +73,20 @@ def _load(session_id: str) -> list[dict]:
 def record(session_id: str, question: str, answer: str) -> Optional[dict]:
     """Latch one scraped /btw Q+A. Returns the new entry, or None if it duplicated
     the most recent one — the same overlay is re-scraped every 2s, so de-duping
-    against the tail keeps a still-open aside from being stored repeatedly."""
+    against the tail keeps a still-open aside from being stored repeatedly.
+
+    Duplicate means `_fingerprint`-equal, not byte-equal: the gate below already
+    rules that redraw crumbs and re-wrapped whitespace are not content, and a
+    second notion of "same text" here just means two re-scrapes of one aside that
+    differ by a stray ─ get stored as two."""
     if not session_id or not (answer or "").strip():
         return None
     q = (question or "").strip()
     a = answer.strip()
     with _lock:
         items = _load(session_id)
-        if items and items[-1].get("question") == q and items[-1].get("answer") == a:
+        if (items and _fingerprint(items[-1].get("question")) == _fingerprint(q)
+                and _fingerprint(items[-1].get("answer")) == _fingerprint(a)):
             return None
         # Per-session max+1, not a process counter: dismiss tombstones reference
         # entries by id, so ids minted after a restart must not reuse ones
@@ -91,20 +103,52 @@ def record(session_id: str, question: str, answer: str) -> Optional[dict]:
     return entry
 
 
-def has_prefix(session_id: str, question: str, answer_prefix: str) -> bool:
-    """Is an aside with this question, whose stored answer *starts with*
-    `answer_prefix`, already archived? The scroll-stitch capture is top-anchored,
-    so the visible top slice is a prefix of the full answer — this lets the gate
-    (core.btwcapture) recognise an already-fully-captured aside from its cheap top
-    slice and skip re-scraping it (which would re-inject scroll keys)."""
+# Terminal crumbs a pane capture splices into the overlay's text while the pane
+# repaints: the footer's "↑/↓ to scroll" hint and the ─/▔ rules of the composer and
+# the overlay border get painted over the answer region, and a redraw re-wraps
+# lines so whitespace lands differently. None of it is part of the answer, but a
+# literal comparison treats it as content — which is how a slice of an
+# already-archived aside stops looking like a prefix of it and reopens the capture
+# gate on every poll (see core.btwcapture). Compare on a crumb-free, whitespace-free
+# fingerprint instead. Applied to BOTH sides, so a genuine ↑ or ─ inside an answer
+# is stripped from stored and probe alike and still matches.
+_BTW_CRUMBS_RE = re.compile(r"[↑↓]/?|[─━▔│]+")
+
+
+def _fingerprint(text: str) -> str:
+    """Crumb- and whitespace-free form of an aside's text, for gate comparisons
+    only — the archive always stores what was actually scraped."""
+    return "".join(_BTW_CRUMBS_RE.sub("", text or "").split())
+
+
+def has_slice(session_id: str, question: str, answer_slice: str) -> bool:
+    """Is a scrape of this aside already archived? The gate (core.btwcapture) asks
+    this of the cheap one-capture read, so an aside whose full answer is already
+    stored is skipped instead of re-scraped (which re-injects scroll keys).
+
+    Containment, not prefix: the read is whatever the overlay happened to be
+    showing. That is the head of the answer right after a stitch (which restores
+    the view to the top), but the reader can scroll, and an answer taller than the
+    pane opens part-way in — a prefix test reopens the gate on every poll there
+    and drags the reader's view back to the top every two seconds.
+
+    `question` is "" when the question line was above the visible pane. Identity
+    rests on the answer alone then, which is why the answer test has to be the one
+    that holds on its own.
+
+    Compared on `_fingerprint`, not raw text: redraw crumbs in the read must not
+    be able to pry the gate open. A probe that is *only* crumbs fingerprints to
+    "" and is rejected rather than matching everything — a false True here would
+    swallow a genuinely new aside."""
     if not session_id:
         return False
-    q = (question or "").strip()
-    a = (answer_prefix or "").strip()
+    q = _fingerprint(question)
+    a = _fingerprint(answer_slice)
     if not a:
         return False
-    return any(e.get("question") == q and (e.get("answer") or "").startswith(a)
-               for e in _load(session_id))
+    return any((not q or _fingerprint(e.get("question")) == q)
+               and a in _fingerprint(e.get("answer"))
+               for e in entries(session_id))
 
 
 def dismiss(session_id: str, entry_id: int) -> bool:
@@ -139,15 +183,57 @@ def latest(session_id: str) -> Optional[dict]:
     bug (one click must clear the card)."""
     if not session_id:
         return None
-    items = _load(session_id)
+    items = entries(session_id)
     if not items or items[-1].get("dismissed"):
         return None
     return items[-1]
 
 
+def _capture_rank(entry: dict) -> tuple[int, int, int]:
+    """Sort key over competing captures of one aside; lowest wins.
+
+    A stitch that swallowed a mid-repaint frame gives itself away two ways: whole
+    lines of the answer repeat (the frame it could not overlap used to get
+    appended wholesale), and the overlay's own chrome — border rules, the "↑/↓ to
+    scroll" footer — lands inside the answer. Neither can happen in a
+    frame-consistent read, so a capture carrying them loses to one that does not.
+    Length breaks the remaining ties: between two clean captures, the longer one
+    scrolled further into the answer."""
+    lines = [ln for ln in (entry.get("answer") or "").split("\n") if ln.strip()]
+    repeated = len(lines) - len({_fingerprint(ln) for ln in lines})
+    crumbs = len(_BTW_CRUMBS_RE.findall(entry.get("answer") or ""))
+    return repeated, crumbs, -len(entry.get("answer") or "")
+
+
 def entries(session_id: str) -> list[dict]:
-    """All archived asides for a session, oldest first."""
-    return list(_load(session_id)) if session_id else []
+    """The session's asides, oldest first — one entry per aside, not per capture.
+
+    The file is a log of what was scraped off the pane, and one aside is scraped
+    as many times as the gate reopens on it. Consecutive captures of the same
+    question are reads of one overlay (a second aside can only start after the
+    first is dismissed), so they collapse to the single best-looking capture; the
+    log keeps them all, because which capture is best is only decidable once the
+    later ones exist. An aside the reader dismissed stays dismissed whichever of
+    its captures was on the card at the time."""
+    items = _load(session_id) if session_id else []
+    out: list[dict] = []
+    run: list[dict] = []
+    for e in items:
+        if run and _fingerprint(run[-1].get("question")) != _fingerprint(e.get("question")):
+            out.append(_pick(run))
+            run = []
+        run.append(e)
+    if run:
+        out.append(_pick(run))
+    return out
+
+
+def _pick(run: list[dict]) -> dict:
+    """The one entry that represents a run of captures of the same aside."""
+    best = min(run, key=_capture_rank)
+    if not best.get("dismissed") and any(e.get("dismissed") for e in run):
+        best = {**best, "dismissed": True}
+    return best
 
 
 def clear(session_id: str) -> None:

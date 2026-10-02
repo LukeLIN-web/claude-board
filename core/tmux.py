@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 _TIMEOUT = 10
 # Availability is probed at most once per this many seconds so the 2s dashboard
@@ -114,14 +116,52 @@ def _venv_unset_prefix() -> list[str]:
     return prefix
 
 
-def _run(*args: str) -> dict:
-    """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise."""
+# Where a user-installed CLI lives when the board's own PATH cannot see it.
+# `claude` and `codex` install into ~/.local/bin — an entry a login shell adds
+# to PATH and a bare environment does not, so a board brought up by a
+# supervisor restart, a systemd unit or a cron line never has it. `hmz` is a pip
+# entry point, so it lands in the conda base's bin — added to PATH by `conda
+# init` in .bashrc, which a bare environment never sources either.
+_CLI_FALLBACK_DIRS = ("~/.local/bin", "/usr/local/bin",
+                      "~/miniconda3/bin", "~/anaconda3/bin", "~/miniforge3/bin")
+
+
+def _resolve_cli(name: str) -> Optional[str]:
+    """Absolute path to the CLI `name`, or None when it is nowhere on disk.
+
+    A spawned pane does NOT inherit the tmux *server's* PATH: tmux hands it the
+    environment of the client that ran `new-window` — the board process. So a
+    board whose own PATH lacks ~/.local/bin spawns `claude` into a pane that
+    cannot find it, and tmux still creates the window and prints its pane id
+    before the exec fails 127 and takes the window with it. That is the spawn
+    that reports success and never becomes a card (dashboard toast "Spawned",
+    no session anywhere), and it is why the launch must not depend on whichever
+    PATH the board happened to be started with.
+    """
+    if not name:
+        return None
+    if os.path.isabs(name):
+        return name if os.access(name, os.X_OK) else None
+    found = shutil.which(name, path=_spawn_env().get("PATH"))
+    if found:
+        return found
+    for d in _CLI_FALLBACK_DIRS:
+        candidate = os.path.join(os.path.expanduser(d), name)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _run(*args: str, input: Optional[str] = None) -> dict:
+    """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise.
+    `input` is fed to tmux's stdin (for `load-buffer -`); otherwise stdin is closed."""
+    stdin = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
     try:
         cp = subprocess.run(
             ["tmux", *_socket_args(), *args],
             capture_output=True, text=True, timeout=_TIMEOUT,
             env=_spawn_env(),
-            stdin=subprocess.DEVNULL,
+            **stdin,
         )
     except FileNotFoundError:
         return {"ok": False, "rc": None, "stdout": "", "stderr": "", "error": "tmux not found on PATH"}
@@ -208,6 +248,20 @@ def pane_current_command(pane: str) -> Optional[str]:
     return r["stdout"].strip() or None
 
 
+def pane_alive(pane: str) -> bool:
+    """Whether `pane` still exists on the server.
+
+    tmux tears a pane down the moment its command exits, so this is also how a
+    spawn that died on exec is told apart from one that is running. Asked of
+    the pane *list* rather than of the pane: `display-message -p -t %dead`
+    exits 0 with empty output on tmux 3.2 instead of failing, so probing the
+    target directly reports every dead pane as a live one.
+    """
+    if not pane:
+        return False
+    return any(p["pane_id"] == pane for p in list_panes())
+
+
 def exit_copy_mode(pane: str) -> None:
     """Kick `pane` out of copy-mode before injecting keystrokes.
 
@@ -260,6 +314,24 @@ def _resolve_target() -> dict:
     return {"target": _DEFAULT_SESSION, "exists": False}
 
 
+# A pane id printed by `new-window` says the window was created, not that
+# anything is running in it: a command that dies on exec takes the window with
+# it milliseconds later. Re-probe the pane before calling a spawn good. A live
+# pane answers the first probe, and a dead one is only declared dead once every
+# wait has passed — a server too busy to answer one probe must never be
+# reported as a failed spawn.
+_SPAWN_LANDED_WAITS = (0.15, 0.35, 0.5)
+
+
+def _spawn_landed(pane_id: str) -> bool:
+    """Whether a freshly spawned pane is still there a moment later."""
+    for wait in _SPAWN_LANDED_WAITS:
+        time.sleep(wait)
+        if pane_alive(pane_id):
+            return True
+    return False
+
+
 def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     """Open a new tmux window in `cwd` running `cmd`; returns {ok, pane_id, error?}.
 
@@ -273,9 +345,20 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     work from a cold start instead of failing on an empty tmux server.
     """
     cmd = cmd or ["claude", "--dangerously-skip-permissions"]
+    # Launch by absolute path: the pane gets the board's PATH, not the server's
+    # (see _resolve_cli). Refusing here beats spawning a window that dies 127.
+    exe = _resolve_cli(cmd[0])
+    if exe is None:
+        # Name the host: a peer's spawn error shows up on the aggregating
+        # board's page, where "the board" would read as the wrong machine.
+        return {"ok": False,
+                "error": f"{cmd[0]} not found on {socket.gethostname()}: not on "
+                         f"its board's PATH or in {', '.join(_CLI_FALLBACK_DIRS)} "
+                         f"— install it there, or restart that board from a "
+                         f"shell that can run {cmd[0]}"}
     # Force-unset the board's venv markers on the pane command itself so a stale
     # tmux server can't re-inject VIRTUAL_ENV into the spawned session.
-    cmd = [*_venv_unset_prefix(), *cmd]
+    cmd = [*_venv_unset_prefix(), exe, *cmd[1:]]
     target = _resolve_target()
     if target["exists"]:
         r = _run("new-window", "-P", "-F", "#{pane_id}",
@@ -293,7 +376,13 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
                  "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
     if not r["ok"]:
         return {"ok": False, "error": r["error"]}
-    return {"ok": True, "pane_id": r["stdout"].strip()}
+    pane_id = r["stdout"].strip()
+    if not pane_id:
+        return {"ok": False, "error": "tmux opened the window but reported no pane id"}
+    if not _spawn_landed(pane_id):
+        return {"ok": False, "pane_id": pane_id,
+                "error": f"the spawned pane exited immediately: {' '.join(cmd)}"}
+    return {"ok": True, "pane_id": pane_id}
 
 
 def capture_pane(pane: str, scrollback: int = 0) -> dict:
@@ -425,13 +514,25 @@ def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
 
 
 # One verified-clear pass reads the pane at most this many times; the blind
-# fallback queues this many Ctrl-Us. Sized to out-clear the worst wrapped
-# paste a composer can hold: anything past ~1000 chars collapses to a one-line
-# placeholder, and 1000 double-width CJK chars on a narrow (~60 col) pane wrap
-# to ~35 lines.
+# fallback queues this many clearing presses. Sized to out-clear the worst
+# wrapped paste a composer can hold: anything past ~1000 chars collapses to a
+# one-line placeholder, and 1000 double-width CJK chars on a narrow (~60 col)
+# pane wrap to ~35 lines.
 _CLEAR_VERIFY_TRIES = 40
 _CLEAR_BLIND_PRESSES = 40
 _CLEAR_POLL = 0.1
+
+# One clearing press. Ctrl-U alone is not enough (seen live on v2.1.286/287):
+# it is readline's kill-to-start of the cursor's visual row, so text RIGHT of
+# the cursor survives every press. With the cursor parked mid-line, a
+# Ctrl-U-only clear left that tail in place, our text was typed in front of
+# it, landed-verify still matched (it looks for our tail as a substring), and
+# the prompt went out corrupted ("...DONELEFTOVER-tail"). End first takes the
+# whole row. Ctrl-U on an emptied row deletes the newline above, but that reads
+# as no progress on screen and sent multi-line leftovers to the blind fallback;
+# Backspace joins the rows within the same press instead. On an empty composer
+# all three keys are no-ops.
+_CLEAR_KEYS = ("End", "C-u", "BSpace")
 
 # Chrome the composer is boxed in: horizontal rules in the current borderless
 # layout, box borders in older bordered builds.
@@ -463,15 +564,14 @@ def _composer_text(cap_text: str) -> Optional[str]:
 def _clear_composer(pane: str) -> None:
     """Empty `pane`'s composer before a retry / after giving up on a send.
 
-    Claude's composer kills one visual LINE per Ctrl-U (seen live on v2.1.211:
-    a wrapped paste keeps every line but the last), so the single press this
-    path used to send left most of a partial paste in place — the retry then
-    concatenated into a corrupted prompt. Press per line, re-reading the pane
-    until the composer is empty. When reading stops making progress (a stalled
-    pane never redraws; ghost hint text never deletes) or the pane can't be
-    captured, fall back to queueing blind Ctrl-Us: a stalled pty delivers them
-    after the buffered text whenever it wakes, clearing it line by line, and
-    every extra press is a no-op on an empty composer.
+    Claude's composer removes at most one visual LINE per clearing press (see
+    _CLEAR_KEYS), so a single press leaves most of a partial paste in place —
+    the retry then concatenates into a corrupted prompt. Press per line,
+    re-reading the pane until the composer is empty. When reading stops making
+    progress (a stalled pane never redraws; ghost hint text never deletes) or
+    the pane can't be captured, fall back to queueing blind presses: a stalled
+    pty delivers them after the buffered text whenever it wakes, clearing it
+    line by line, and every extra press is a no-op on an empty composer.
     """
     prev = None
     for _ in range(_CLEAR_VERIFY_TRIES):
@@ -482,10 +582,10 @@ def _clear_composer(pane: str) -> None:
         if content is None or content == prev:
             break  # unreadable or no progress — go blind
         prev = content
-        _run("send-keys", "-t", pane, "C-u")
+        _run("send-keys", "-t", pane, *_CLEAR_KEYS)
         time.sleep(_CLEAR_POLL)
     for _ in range(_CLEAR_BLIND_PRESSES):
-        _run("send-keys", "-t", pane, "C-u")
+        _run("send-keys", "-t", pane, *_CLEAR_KEYS)
 
 
 # Post-mortem trace for the send path: landed-verify attempts append what the
@@ -530,8 +630,9 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     A busy pane can drop the injected keystrokes during a re-render, so the text
     never arrives and a following Enter submits nothing — the prompt vanishes
     with no transcript trace (the dashboard then shows a phantom "Queued"). Re-
-    send until the composer holds our text, clearing any partial paste first
-    (see _clear_composer) so a retry can't concatenate into a corrupted prompt.
+    send until the composer holds our text, clearing the composer before EVERY
+    attempt (see _clear_composer) so nothing already sitting there can
+    concatenate into a corrupted prompt.
     Returns False if the text never lands after the retries — the caller then
     reports the failure rather than pressing Enter on a lost prompt.
 
@@ -544,8 +645,17 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     """
     needle = "".join(text.split())[-24:]
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
-        if attempt:
-            _clear_composer(pane)  # drop any partial before retry
+        # Clear before every attempt, the FIRST one included. Whatever is in the
+        # composer when we arrive takes the lead and our text lands appended to
+        # it — and the landed check below matches a TAIL, so the concatenation
+        # reads as a clean landing and the Enter submits the corrupted prompt.
+        # The leftover is usually the board's own previous send: submit-verify
+        # gives up with the text still sitting there, so pressing the card's
+        # Clear on a wedged session typed "/clear", failed to submit it, and the
+        # next Clear submitted the literal text "/clear/clear" — which Claude
+        # answers as prose ("type /clear on its own line") instead of clearing,
+        # leaving the session unclearable from the board for good.
+        _clear_composer(pane)
         literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
@@ -622,3 +732,103 @@ def send_text(
             if _composer_has_tail(pane, text, marker):
                 return {"ok": False, "error": "prompt still unsent after retries"}
     return {"ok": True}
+
+
+# A bracketed paste lands in hmz's composer in ~0.06s whatever its length. The
+# length-scaled wait is for a TUI that hasn't turned bracketed paste on, where
+# tmux delivers the paste as plain keystrokes and hmz re-renders per key (850
+# chars of CJK took 1s that way, 1700 took 2.4s). Polled, so a quick landing
+# costs nothing; nothing is resent meanwhile.
+_CONFIRMED_LANDED_BASE = 3.0
+_CONFIRMED_LANDED_PER_KCHAR = 3.0
+_CONFIRMED_LANDED_MAX = 12.0
+_CONFIRMED_POLL = 0.1
+# After each Enter, how long to look for the TUI's own record of the line before
+# deciding the Enter didn't take.
+_CONFIRMED_TOOK_WAIT = 3.0
+
+
+def _shown_above_composer(pane: str, text: str, marker: str = "❯") -> bool:
+    """True if the tail of `text` is on screen above an empty composer: the
+    line was submitted and echoed into the transcript."""
+    needle = "".join(text.split())[-24:]
+    cap = capture_pane(pane).get("text", "")
+    idx = cap.rfind(marker)
+    if not needle or idx == -1 or _composer_text(cap):
+        return False
+    return needle in "".join(cap[:idx].split())
+
+
+def _paste(pane: str, text: str) -> dict:
+    """Paste `text` into `pane` as one bracketed paste.
+
+    Through a uniquely named buffer (buffers are server-wide, and two sends can
+    overlap), loaded from stdin rather than argv, and deleted by the paste. -p
+    brackets it when the app has asked for bracketed paste, so the app takes it
+    as one Paste rather than a key per character; -r keeps a newline a newline
+    instead of tmux's default CR, which an app without bracketed paste would
+    read as Enter."""
+    name = f"fleet-send-{os.getpid()}-{time.monotonic_ns()}"
+    loaded = _run("load-buffer", "-b", name, "-", input=text)
+    if not loaded["ok"]:
+        return loaded
+    pasted = _run("paste-buffer", "-p", "-r", "-d", "-b", name, "-t", pane)
+    if not pasted["ok"]:
+        _run("delete-buffer", "-b", name)
+    return pasted
+
+
+def send_text_confirmed(
+    pane: str,
+    text: str,
+    took: Callable[[], bool],
+    marker: str = "❯",
+) -> dict:
+    """Paste `text` into `pane` once, Enter, and succeed only when `took()` says
+    the TUI actually took the line.
+
+    For hmz, where _send_until_landed + verify_submit lose prompts and report
+    them sent (seen live: a 621-char prompt, ok returned, nothing ran). Typed a
+    key at a time, a long prompt takes hmz seconds to ingest, and hmz resolves
+    bound keys — Backspace, Ctrl-U, End — on its app pump AHEAD of the
+    characters still queued at its editor. So the first 0.15s landed check
+    missed, the clear-and-retype fired mid-ingest, the clear keys jumped the
+    queue, the two copies and the clears interleaved, and the Enter sent an
+    editor that ended up empty — which hmz ignores, and which an "is our tail
+    gone from the composer" check reads as a submit.
+
+    So the text goes in as one paste (see _paste), once, never resent, and is
+    given as long as its length could need to land; and after Enter an emptied
+    composer counts for nothing — only `took()`, the caller's positive evidence,
+    does. Enter is resent only while the text still sits in the composer.
+    """
+    _clear_composer(pane)
+    pasted = _paste(pane, text)
+    if not pasted["ok"]:
+        return {"ok": False, "error": pasted["error"]}
+    wait = min(_CONFIRMED_LANDED_BASE + len(text) / 1000.0 * _CONFIRMED_LANDED_PER_KCHAR,
+               _CONFIRMED_LANDED_MAX)
+    deadline = time.time() + wait
+    while not _composer_has_tail(pane, text, marker):
+        if time.time() >= deadline:
+            _clear_composer(pane)
+            _send_debug(f"confirmed pane={pane} never landed in {wait:.1f}s")
+            return {"ok": False, "error": "prompt text never landed in composer"}
+        time.sleep(_CONFIRMED_POLL)
+    for _ in range(_SUBMIT_VERIFY_RETRIES):
+        enter = _run("send-keys", "-t", pane, "Enter")
+        if not enter["ok"]:
+            return {"ok": False, "error": enter["error"]}
+        until = time.time() + _CONFIRMED_TOOK_WAIT
+        while time.time() < until:
+            time.sleep(_CONFIRMED_POLL)
+            if took():
+                return {"ok": True}
+        if not _composer_has_tail(pane, text, marker):
+            break  # the composer let go of it and nothing took it; Enter won't help
+    stranded = _composer_has_tail(pane, text, marker)
+    _send_debug(f"confirmed pane={pane} not taken, stranded={stranded}")
+    if stranded:
+        return {"ok": False, "error": "prompt still unsent after retries"}
+    return {"ok": False,
+            "error": "the composer emptied but the prompt was never taken — not sent"}

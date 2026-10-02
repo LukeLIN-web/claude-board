@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import tmux
+from . import hmz, tmux
 from .sessions import CLAUDE_HOME, find_window, uninterruptible_wrappers
 from .transcripts import timeline, extract_plan_history, extract_skills_used, extract_memory_ops
 
@@ -113,7 +113,12 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     if tmux.available():
         r = tmux.new_window(cwd, ["claude", *claude_args])
         if r["ok"]:
-            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
+            # A resume/fork into a never-opened directory hits the folder-trust
+            # prompt before it gets anywhere near the resume picker the caller
+            # goes on to answer, so clear it first (see confirm_trust_prompt).
+            trust = confirm_trust_prompt(r.get("pane_id"))
+            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"),
+                    "backend": "tmux", "trust": trust}
         return {"ok": False, "error": r["error"], "backend": "tmux"}
 
     if not shutil.which("osascript"):
@@ -421,7 +426,8 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
 
     `platform` selects the CLI: "claude" (default) launches Claude Code with
     permission prompts skipped; "codex" launches the Codex TUI in `--yolo` mode
-    so the fleet can drive it without per-action approval prompts.
+    so the fleet can drive it without per-action approval prompts; "hmz" opens
+    the humanize interface, whose flows run every agent with approvals bypassed.
     """
     if not cwd or not cwd.strip():
         return {"ok": False, "error": "cwd is required"}
@@ -430,7 +436,150 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         return {"ok": False, "error": f"not a directory: {resolved}"}
     if platform == "codex":
         return tmux.new_window(resolved, ["codex", "--yolo"])
-    return tmux.new_window(resolved)
+    if platform == "hmz":
+        return tmux.new_window(resolved, ["hmz"])
+    r = tmux.new_window(resolved)
+    # First spawn into a directory raises Claude's folder-trust prompt, which no
+    # digit answers — leaving the new card stuck on a dialog the spawner isn't
+    # watching. Answer it here (see confirm_trust_prompt) so a spawn lands on a
+    # live composer, not on a modal.
+    if r.get("ok") and r.get("pane_id"):
+        r["trust"] = confirm_trust_prompt(r["pane_id"])
+    return r
+
+
+# Claude's first-run folder-trust prompt ("Quick safety check: Is this a project
+# you created or one you trust?"), raised the first time a session opens a
+# directory — a `--dangerously-skip-permissions` spawn included, which is how the
+# board's own cards land on it. It is the one blocking dialog whose options carry
+# no numbers: arrows move the cursor, Enter commits it. Both labels are required
+# to call it, so a session that merely printed one of these strings in its output
+# isn't mistaken for the dialog.
+_TRUST_YES = "Yes, I trust this folder"
+_TRUST_NO = "No, exit"
+_TRUST_MARKERS = (_TRUST_YES, _TRUST_NO)
+
+# The option the cursor sits on, e.g. "❯ No, exit" (nbsp-padded on some builds).
+_TRUST_CURSOR_RE = re.compile(r"^[\s ]*[❯>][\s ]+(\S.*?)\s*$")
+
+# Any one of these means the prompt is on screen or still painting — enough to
+# keep waiting, not enough to answer. A half-drawn dialog shows its cursor row
+# ("❯ No, exit") before the Yes row below it, and that ❯ is indistinguishable
+# from a live composer's: without this, a poll landing in that one-paint gap
+# would call the directory trusted and walk away from the dialog it came for.
+_TRUST_HINTS = (_TRUST_YES, _TRUST_NO, "Quick safety check")
+
+_TRUST_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
+_TRUST_WAIT = 6.0          # seconds to wait for the dialog to close after Enter
+_TRUST_POLL = 0.2
+
+
+def trust_prompt_up(text: str) -> bool:
+    """Whether a captured pane currently shows the folder-trust prompt."""
+    return all(m in text for m in _TRUST_MARKERS)
+
+
+def _trust_prompt_painting(text: str) -> bool:
+    """Whether any part of the trust prompt is on screen (see _TRUST_HINTS)."""
+    return any(h in text for h in _TRUST_HINTS)
+
+
+def _trust_cursor_label(text: str) -> str:
+    """Which trust option the cursor sits on; "" if it isn't on one.
+
+    Only the dialog's own two labels count. The pane draws "❯ " for the composer
+    and for every queued message too, and neither is an option to commit.
+    """
+    for ln in text.split("\n"):
+        m = _TRUST_CURSOR_RE.match(ln)
+        if m and m.group(1) in _TRUST_MARKERS:
+            return m.group(1)
+    return ""
+
+
+def answer_trust_prompt(pane: str) -> dict:
+    """Answer the folder-trust prompt in `pane` with "Yes, I trust this folder".
+
+    Enter commits whatever the cursor is on, and this dialog opens on "No, exit"
+    — the option that quits the session — so this never presses Enter on faith.
+    Down steps the cursor (the list wraps), the pane is re-read after every
+    press, and Enter goes only once the pane itself shows the cursor on the Yes
+    row. A pane that never gets there is left as it was found, dialog and all: a
+    card stuck waiting is recoverable, a session killed by a blind Enter is not.
+    """
+    for _ in range(len(_TRUST_MARKERS) + 1):
+        cap = tmux.capture_pane(pane)
+        if not cap.get("ok"):
+            return {"ok": False, "error": "could not read the pane"}
+        if not trust_prompt_up(cap["text"]):
+            # Answered already — by an earlier click of ours, or in the terminal.
+            return {"ok": True, "answered": False, "note": "no trust prompt on screen"}
+        if _trust_cursor_label(cap["text"]) == _TRUST_YES:
+            break
+        tmux.send_keys(pane, "Down")
+        time.sleep(_TRUST_KEY_SETTLE)
+    else:
+        return {"ok": False, "error": f"could not move the cursor onto '{_TRUST_YES}'"}
+
+    r = tmux.send_keys(pane, "Enter")
+    if not r.get("ok"):
+        return r
+    deadline = time.time() + _TRUST_WAIT
+    while time.time() < deadline:
+        cap = tmux.capture_pane(pane)
+        if cap.get("ok") and not trust_prompt_up(cap["text"]):
+            return {"ok": True, "answered": True, "label": _TRUST_YES}
+        time.sleep(_TRUST_POLL)
+    return {"ok": False, "error": "the trust prompt did not close"}
+
+
+# A dialog that has just painted is not yet listening: Claude draws the trust
+# prompt before arming its input handler, and keys sent into that gap are lost
+# or replayed as something else — a spawn that answered the instant the prompt
+# appeared got its Down/Enter swallowed, sat out the confirm wait with the
+# dialog still up, and the session exited on its own afterwards. Same settle,
+# and same reason, as confirm_resume_picker's.
+_TRUST_ARM_SETTLE = 0.6
+
+
+def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3,
+                         settle: float = _TRUST_ARM_SETTLE) -> dict:
+    """Poll a freshly launched `pane_id` for the folder-trust prompt, answer it.
+
+    A board launch is unattended by construction: nobody is watching a detached
+    pane, so a session parked on this prompt is a red card that stays red until
+    someone goes looking. Answering it at launch is what the resume picker
+    already gets (confirm_resume_picker) — and the gate is redundant here, since
+    the directory was one the dashboard's cwd filter admitted and the user typed
+    or picked, launched with --dangerously-skip-permissions either way.
+
+    Polling ends at the first of three things: the prompt (answer it), a drawn
+    composer (this directory is already trusted — no prompt is coming), or the
+    attempt budget. The composer test is the delicate one: the dialog's cursor
+    row draws the same "❯", so a pane showing any part of the prompt is never
+    read as a composer (see _TRUST_HINTS). Erring that way costs a slow spawn;
+    erring the other way is the stuck card this exists to prevent.
+
+    Returns {answered, waited, reason}; never raises.
+    """
+    if not pane_id:
+        return {"answered": False, "waited": 0.0, "reason": "no pane"}
+    waited = 0.0
+    for _ in range(max(1, attempts)):
+        cap = tmux.capture_pane(pane_id)
+        text = cap.get("text", "") if cap.get("ok") else ""
+        if trust_prompt_up(text):
+            # Let the dialog arm its input handler before the first key.
+            time.sleep(settle)
+            waited += settle
+            r = answer_trust_prompt(pane_id)
+            return {"answered": bool(r.get("answered")), "waited": round(waited, 2),
+                    "reason": "" if r.get("ok") else r.get("error", "")}
+        if not _trust_prompt_painting(text) and ("❯" in text or "›" in text):
+            return {"answered": False, "waited": round(waited, 2), "reason": "already trusted"}
+        time.sleep(interval)
+        waited += interval
+    return {"answered": False, "waited": round(waited, 2), "reason": "no prompt"}
 
 
 # Claude's permission prompt is a numbered select list:
@@ -448,7 +597,15 @@ _PERM_KEYS = {
 
 
 def respond_permission(pid: int, choice: str) -> dict:
-    """Answer the permission prompt in `pid`'s tmux pane via a menu keypress."""
+    """Answer the dialog in `pid`'s tmux pane.
+
+    Usually that is the numbered permission prompt, answered with its digit. The
+    folder-trust prompt is the exception: it has no numbers, so the digit lands
+    on nothing and the card keeps reading "waiting for your input" however often
+    the button is clicked. Approving there means driving its cursor (see
+    answer_trust_prompt). "deny" stays Escape for both — cancelling the trust
+    prompt does end the session, which is what refusing to trust a folder means.
+    """
     keys = _PERM_KEYS.get(choice)
     if keys is None:
         return {"ok": False, "error": f"unknown choice '{choice}' (expected: {', '.join(_PERM_KEYS)})"}
@@ -460,6 +617,12 @@ def respond_permission(pid: int, choice: str) -> dict:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return {"ok": False, "error": "session not in a tmux pane"}
+    if choice in ("approve", "approve_always"):
+        cap = tmux.capture_pane(pane)
+        if cap.get("ok") and trust_prompt_up(cap["text"]):
+            r = answer_trust_prompt(pane)
+            r["choice"] = choice
+            return r
     r = tmux.send_keys(pane, *keys)
     r["choice"] = choice
     return r
@@ -700,15 +863,19 @@ def _menu_markers_present(text: str) -> bool:
     )
 
 
-def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
-    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable.
+def pane_dialog(tty: Optional[str]) -> Optional[dict]:
+    """What `tty`'s pane is showing: {menu, trust}. None if unknowable.
 
     Claude's session registry reports waitingFor="dialog open" for ANY open
     overlay — including informational ones like the /goal panel, which has no
-    options and doesn't block the agent. This is the pane-level ground truth
-    the triage uses to tell a real picker from such an overlay. The
-    three-valued return matters: None (no tty / no pane / failed capture)
-    means "can't verify", and callers should keep trusting the registry.
+    options and doesn't block the agent. `menu` is the pane-level ground truth
+    the triage uses to tell a real picker from such an overlay. `trust` names
+    the one picker that is answered differently from all the others (see
+    answer_trust_prompt), so a card can say which dialog it is stuck on instead
+    of the useless "dialog open". Both come from a single capture.
+
+    None (no tty / no pane / failed capture) means "can't verify", and callers
+    should keep trusting the registry.
     """
     if not tty:
         return None
@@ -718,7 +885,14 @@ def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
     cap = tmux.capture_pane(pane)
     if not cap["ok"]:
         return None
-    return _menu_markers_present(cap["text"])
+    return {"menu": _menu_markers_present(cap["text"]),
+            "trust": trust_prompt_up(cap["text"])}
+
+
+def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
+    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable."""
+    d = pane_dialog(tty)
+    return None if d is None else d["menu"]
 
 
 def get_pane_menu(pid: int) -> Optional[dict]:
@@ -812,8 +986,11 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     region is just an animated spinner ("✽ Answering…") and the footer lacks the
     "c to copy · f to fork" hints (you can't copy an unfinished answer). Requiring
     "to copy" in the footer gates out mid-generation frames — this also stops the
-    animating spinner from defeating the archive's de-dupe. Best-effort otherwise:
-    a long answer that scrolls the ▔ border off-screen is missed by design.
+    animating spinner from defeating the archive's de-dupe.
+
+    An answer taller than the pane pushes the question line off the top; the
+    question then comes back "" and only capture_full_btw_answer, which can
+    scroll, recovers it (see _overlay_anchors).
     """
     got = _btw_regions(text)
     if got is None:
@@ -825,22 +1002,28 @@ def parse_btw_overlay(text: str) -> Optional[dict]:
     return {"question": question, "answer": answer}
 
 
-def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
+def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, Optional[int], int]]:
     """(lines, top, q_idx, foot) anchors of any open /btw overlay, or None.
 
-    The overlay pins the "/btw …" question line and the footer in place while
-    only the answer region scrolls, so this same anchor logic works at any
-    scroll position — capture_full_btw_answer relies on that to walk a long
-    answer window-by-window. Settled-or-not is the caller's judgment (the footer
-    at `foot` carries the signal): _btw_regions wants finished answers only,
-    parse_btw_pending wants the mid-generation state.
+    The footer ("… Esc to close") is the one anchor always on screen, and it is
+    what "an overlay is open" means here — capture_full_btw_answer walks a long
+    answer window-by-window off these anchors, at every scroll position.
+    Settled-or-not is the caller's judgment (the footer at `foot` carries the
+    signal): _btw_regions wants finished answers only, parse_btw_pending wants
+    the mid-generation state.
+
+    `q_idx` — the echoed "/btw …" question line — is None when the answer is tall
+    enough to push the top of the overlay above the visible pane. Requiring it
+    made exactly the longest answers unreadable to us, which are the ones worth
+    archiving; callers that need the question sit those out, and the answer region
+    falls back to the `top` bound.
 
     Top anchor: older Claude builds draw a ▔ border above the overlay; current
     builds (v2.1.20x) draw none, so fall back to the composer marker line (the
-    overlay always renders below the composer) and finally to the capture
-    start. The composer line is only ever the (exclusive) top bound — while the
-    aside is open it still shows the just-submitted "/btw …" command itself,
-    and must never be mistaken for the overlay's question line."""
+    overlay renders below the composer while it fits on screen) and finally to
+    the capture start. The composer line is only ever the (exclusive) top bound —
+    while the aside is open it still shows the just-submitted "/btw …" command
+    itself, and must never be mistaken for the overlay's question line."""
     if not text:
         return None
     lines = text.split("\n")
@@ -856,8 +1039,6 @@ def _overlay_anchors(text: str) -> Optional[tuple[list[str], int, int, int]]:
         top = marker if marker is not None else -1
     q_idx = next((i for i in range(foot - 1, top, -1)
                   if lines[i].lstrip().startswith("/btw")), None)
-    if q_idx is None:
-        return None
     return lines, top, q_idx, foot
 
 
@@ -871,17 +1052,20 @@ def _overlay_question(line: str) -> str:
 def _btw_regions(text: str) -> Optional[tuple[str, list[str]]]:
     """The (question, visible-answer-lines) of a *settled* /btw overlay, or None.
 
-    Returns None when there is no settled overlay on the pane (no footer,
-    mid-generation, or border/question scrolled off), which is also the signal
-    that the overlay has been dismissed."""
+    Returns None when there is no settled overlay on the pane (no footer, or
+    mid-generation), which is also the signal that the overlay has been
+    dismissed. The question is "" when the overlay's question line sits above the
+    visible pane — the answer is still worth reading, and it is the whole region
+    between the top bound and the footer."""
     got = _overlay_anchors(text)
     if got is None:
         return None
-    lines, _top, q_idx, foot = got
+    lines, top, q_idx, foot = got
     if "to copy" not in lines[foot]:
         return None  # answer still generating — don't latch a partial/spinner
-    question = _overlay_question(lines[q_idx])
-    answer_lines = [ln.strip() for ln in lines[q_idx + 1:foot] if ln.strip()]
+    question = "" if q_idx is None else _overlay_question(lines[q_idx])
+    body = top if q_idx is None else q_idx
+    answer_lines = [ln.strip() for ln in lines[body + 1:foot] if ln.strip()]
     return question, answer_lines
 
 
@@ -899,6 +1083,8 @@ def parse_btw_pending(text: str) -> Optional[str]:
     lines, _top, q_idx, foot = got
     if "to copy" in lines[foot]:
         return None  # settled — parse_btw_overlay territory
+    if q_idx is None:
+        return None  # the indicator *is* the question; nothing to show without it
     return _overlay_question(lines[q_idx])
 
 
@@ -945,17 +1131,65 @@ _BTW_SCROLL_MAX = 120          # hard cap on ↓ presses (far beyond any real an
 _BTW_SCROLL_SETTLE = 0.18      # let the overlay redraw before re-capturing
 _BTW_ANSWER_MAX = 20000        # sanity cap on a fully-stitched answer
 
+# A pane captured mid-repaint yields a half-applied frame: the overlay footer's
+# "↑/" hint and the composer's ─ rules land spliced into the answer region, and a
+# diff-rendered line comes back with leftover cells from the line it replaced
+# ("max-pos 36864 / af10" read as "max-posg36864c/paf10"). Such a frame is worse
+# than no frame: its lines match neither the accumulator's suffix nor the next
+# window's prefix, which is the no-overlap case _stitch_btw refuses. Two defences,
+# because one round of ↓ presses is long enough to catch a repaint either way:
+# every scroll position is read until two consecutive reads agree, and a position
+# that never settles aborts the round rather than being stitched.
+_BTW_FRAME_TRIES = 3            # reads per scroll position before calling it unstable
+_BTW_FRAME_RECHECK = 0.12       # settle between those reads
+_BTW_FRAME_UNSTABLE = object()  # sentinel: pane repainting, no frame worth stitching
 
-def _stitch_btw(acc: list[str], window: list[str]) -> list[str]:
+
+def _stable_btw_regions(pane: str) -> tuple[str, list[str]] | None | object:
+    """`_btw_regions` for the overlay at the pane's current scroll position, read
+    repeatedly until two consecutive reads agree.
+
+    Returns (question, answer_lines) for a settled, stable overlay; None when
+    there is no settled overlay (including one that vanished between reads, so the
+    caller stops sending keys at once); the _BTW_FRAME_UNSTABLE sentinel when the
+    regions kept changing — the pane is repainting and any frame taken from it may
+    be a spliced half-redraw.
+
+    Only the overlay's OWN regions are compared, so a busy session's spinner and
+    elapsed-time counter ticking elsewhere on the pane never count as instability.
+    """
+    prev = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+    if prev is None:
+        return None
+    for _ in range(_BTW_FRAME_TRIES - 1):
+        time.sleep(_BTW_FRAME_RECHECK)
+        cur = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+        if cur is None:
+            return None
+        if cur == prev:
+            return cur
+        prev = cur
+    return _BTW_FRAME_UNSTABLE
+
+
+def _stitch_btw(acc: list[str], window: list[str]) -> Optional[list[str]]:
     """Append a later, overlapping scroll `window` onto `acc`, dropping the longest
     prefix of `window` that is already the suffix of `acc`. Equal frames (the
-    window clamped at the bottom) leave `acc` unchanged — the caller's stop signal."""
+    window clamped at the bottom) leave `acc` unchanged — the caller's stop signal.
+
+    None when the two share no overlap at all. ↓ scrolls the answer by a few lines
+    inside a window-height view, so consecutive frames ALWAYS overlap: no overlap
+    does not mean the answer jumped, it means the frame was read mid-repaint and
+    its lines are spliced. Concatenating one anyway is what grew a single aside
+    four duplicated copies of itself — and a stitch corrupted that way is no
+    longer a prefix of the next poll's top slice, so the gate meant to end the
+    retry reopens and archives another mangled copy every time the pane blinks."""
     if not acc:
         return list(window)
     for o in range(min(len(acc), len(window)), 0, -1):
         if acc[-o:] == window[:o]:
             return acc + window[o:]
-    return acc + window
+    return None
 
 
 def capture_full_btw_answer(pid: int) -> Optional[dict]:
@@ -964,6 +1198,8 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
 
     Injects ↓ keys into the live pane, so callers must gate this (see
     core.btwcapture): only run it for a not-yet-archived aside, off the hot path.
+    Returns None rather than a guess when the pane is repainting too hard to read
+    a trustworthy frame (see _stable_btw_regions).
     """
     w = find_window(pid)
     if not w or not w.tty:
@@ -971,23 +1207,47 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
     pane = tmux.pane_for_tty(w.tty)
     if pane is None:
         return None
-    first = _btw_regions(tmux.capture_pane(pane).get("text", ""))
-    if first is None:
-        return None  # no settled overlay — never touch the keyboard
-    question, acc = first
+    frame = _stable_btw_regions(pane)
+    if frame is None or frame is _BTW_FRAME_UNSTABLE:
+        return None  # no settled overlay, or an unreadable pane — no keystrokes
+    # Walk to the top before stitching. The overlay does not have to be sitting
+    # there: the reader scrolls it, and an answer taller than the pane opens with
+    # its head already off the top edge. The stitch below only ever goes down, so
+    # starting anywhere else drops the head of the answer — and with it the
+    # question line, which is what a "" question from _btw_regions means. ↑ clamps
+    # at the top and never dismisses the overlay, so this runs the same key
+    # discipline as the ↓ walk: re-read after every press, and stop the moment the
+    # overlay is gone rather than type into the composer behind it.
+    for _ in range(_BTW_SCROLL_MAX):
+        tmux.send_keys(pane, "Up")
+        time.sleep(_BTW_SCROLL_SETTLE)
+        cur = _stable_btw_regions(pane)
+        if cur is None or cur is _BTW_FRAME_UNSTABLE:
+            return None
+        if cur == frame:
+            break  # frame stopped changing — clamped at the top
+        frame = cur
+    question, acc = frame
     presses = 0
     overlay_alive = True
+    unstable = False
     while presses < _BTW_SCROLL_MAX:
         tmux.send_keys(pane, "Down")
         presses += 1
         time.sleep(_BTW_SCROLL_SETTLE)
-        cur = _btw_regions(tmux.capture_pane(pane).get("text", ""))
+        cur = _stable_btw_regions(pane)
         if cur is None:
             # Overlay dismissed mid-scroll: stop now and DO NOT restore — further
             # arrows would drive the composer's history instead of the overlay.
             overlay_alive = False
             break
+        if cur is _BTW_FRAME_UNSTABLE:
+            unstable = True
+            break  # restore the view below, then abandon the round
         merged = _stitch_btw(acc, cur[1])
+        if merged is None:
+            unstable = True
+            break  # spliced frame — same answer as an unreadable pane
         if merged == acc:
             break  # window clamped at the bottom — whole answer captured
         acc = merged
@@ -997,6 +1257,11 @@ def capture_full_btw_answer(pid: int) -> Optional[dict]:
         for _ in range(presses):
             tmux.send_keys(pane, "Up")
             time.sleep(_BTW_SCROLL_SETTLE)
+    if unstable:
+        # Archive nothing: the aside stays un-gated, so a later poll retries and a
+        # quieter pane yields a clean stitch. Storing the half-merged `acc` would
+        # poison the archive AND the gate that is supposed to end the retry loop.
+        return None
     answer = "\n".join(acc)[:_BTW_ANSWER_MAX]
     return {"question": question, "answer": answer} if answer else None
 
@@ -1159,7 +1424,7 @@ def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
 
 # A prompt injected before the TUI paints its composer is lost or, worse,
 # replayed doubled: the pty buffers the keystrokes unread, so the landed-verify
-# retry's C-u sits inert in the same buffer as the text it was meant to clear,
+# retry's clearing keys sit inert in the same buffer as the text they were meant to clear,
 # and both copies pour into the composer when the TUI wakes (seen live on a
 # fresh spawn — boot takes seconds on this class of shared-filesystem host,
 # past the whole landed-verify window). So never type until a composer marker
@@ -1353,12 +1618,19 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # shows a phantom "Queued"). For Claude, verify the text actually landed
     # before pressing Enter and that the composer emptied after, re-sending
     # whichever half a busy re-render dropped.
-    is_codex = getattr(w, "platform", "claude") == "codex"
-    if is_codex:
+    platform = getattr(w, "platform", "claude")
+    if platform == "codex":
         settle = tmux.codex_enter_settle(len(collapsed))
         res = tmux.send_text(
             pane, collapsed, settle_before_enter=settle, verify_submit=True,
             marker="›",
+        )
+    elif platform == "hmz":
+        # Same ❯ composer as Claude, but Claude's clear-and-retype races hmz's
+        # slow per-key intake and loses the prompt while reporting it sent; this
+        # path pastes once and waits for hmz's own record of the line.
+        res = tmux.send_text_confirmed(
+            pane, collapsed, hmz.prompt_taken(pid, w.cwd, collapsed, pane),
         )
     else:
         res = tmux.send_text(
@@ -1389,6 +1661,90 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     return res
 
 
+# Claude repaints this welcome block on startup and after every /clear:
+#
+#      ▐▛███▛█   Claude Code v2.1.259
+#     ▝▜██████▀  Opus 5 (1M context) with xhigh effort · Claude Max
+#       ▝▝ ▝▝    /shared/user75/workspace/juyi/claude-board
+#
+# Its middle line is the only place a session that hasn't answered yet says which
+# model it is on. The transcript names a model on assistant rows and nowhere
+# else, and /clear starts a FRESH transcript — so from the clear until the next
+# reply transcripts.current_model has nothing to report, and without this the
+# card's model readout (and the picker's label with it) sits blank on exactly the
+# sessions you are deciding what to send next.
+_BANNER_HEAD_RE = re.compile(r"Claude Code v\d")
+# Left gutter of the banner: the block glyphs of the logo and the spaces around
+# them. Stripped off both ends, which also trims the pane's right-edge padding.
+_BANNER_GUTTER = "▐▛▜▝▘▗▖▀▄█▁▂▃▅▆▇ \t"
+_BANNER_SCROLLBACK = 200   # a not-yet-answered session's banner is still near the fold
+_BANNER_LABEL_MAX = 40     # "Opus 5 (1M context)" and friends; longer means misparse
+
+
+# A context-window qualifier on the banner's model name: "Opus 5 (1M context)".
+# Dropped, because the transcript — the readout's other source — never carries
+# one (the id it records is plain "claude-opus-5" either way, see
+# transcripts.pretty_model). Keeping it would make the label change the moment
+# the session first replies, which on a board is how a model SWITCH looks.
+_BANNER_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _banner_label(line: str) -> str:
+    """The model name off a banner's middle line, "" if `line` isn't one.
+
+    "▝▜██████▀  Opus 5 (1M context) with xhigh effort · Claude Max" → "Opus 5".
+    Effort and plan go too: this readout names a model, and all three of those
+    change without the model changing.
+    """
+    s = line.strip(_BANNER_GUTTER)
+    s = s.split(" with ")[0].split(" · ")[0].strip()
+    s = _BANNER_QUALIFIER_RE.sub("", s).strip()
+    # The cwd line sitting under the model one starts with the path separator;
+    # leftover logo art has no leading letter either.
+    if not s or len(s) > _BANNER_LABEL_MAX or not s[0].isalnum():
+        return ""
+    return s
+
+
+def banner_model(text: str) -> str:
+    """Model label from the LAST welcome banner in `text` ("" when there is none).
+
+    The last one, not the first: /clear reprints the banner, so a session that
+    was cleared after a /model switch carries both the model it used to run on
+    and the one it runs on now, in that order.
+    """
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if not _BANNER_HEAD_RE.search(lines[i]):
+            continue
+        # The model line follows the version line, give or take a redraw
+        # artifact; the cwd line closes the block, so nothing below it is read.
+        for line in lines[i + 1:i + 4]:
+            label = _banner_label(line)
+            if label:
+                return label
+        return ""
+    return ""
+
+
+def pane_model(tty: Optional[str]) -> str:
+    """The model the session on `tty` says it is running, per its welcome banner.
+
+    "" whenever that can't be established — no tty, no pane, a failed capture, or
+    a banner scrolled out of reach. Every one of those means "nothing to claim",
+    not "no model", so callers must leave the readout as they found it.
+    """
+    if not tty:
+        return ""
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return ""
+    cap = tmux.capture_pane(pane, scrollback=_BANNER_SCROLLBACK)
+    if not cap["ok"]:
+        return ""
+    return banner_model(cap["text"])
+
+
 # Claude's /model dialog. Its footer is the marker that the dialog is up, and it
 # spells out the two ways to commit a pick: Enter also saves the model as the
 # default for NEW sessions, while "s" scopes it to the running session. The board
@@ -1398,9 +1754,18 @@ _MODEL_DIALOG_FOOTER = "s to use this session only"
 
 # A dialog row, e.g. "    2. Opus  Opus 4.8 …" or "  ❯ 3. Fable  Fable 5 …".
 # Group "cur" is the ❯ cursor (present on exactly one row), "n" the row number,
-# "label" the model name — the first token, so "Default (recommended)" ⇒ Default
-# and "Sonnet ✔" ⇒ Sonnet.
-_MODEL_ROW_RE = re.compile(r"^(?P<cur>[\s ]*❯)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<label>\S+)")
+# "rest" everything after it. The gutter carries more than the cursor: when the
+# list is scrolled Claude marks the first and last rows it drew with ↑/↓, and
+# those rows are as real as any other, so a marker has to be allowed to sit where
+# the cursor would.
+_MODEL_ROW_RE = re.compile(
+    r"^[\s ]*(?:(?P<cur>❯)|[↑↓])?[\s ]*(?P<n>\d+)\.[\s ]+(?P<rest>\S.*)"
+)
+
+# A run of spaces separates a row's name from its blurb: "Opus (1M context)
+# Opus 5 with 1M context · …". Keeping the whole name rather than its first word
+# is what tells that row apart from the plain "Opus" one below it.
+_MODEL_NAME_GAP_RE = re.compile(r"[\s ]{2,}")
 
 # Switching mid-conversation raises a SECOND dialog on top of the picker: the
 # history is cached against the old model and has to be re-read, so Claude asks
@@ -1415,11 +1780,16 @@ _MODEL_DIALOG_WAIT = 8.0   # seconds to wait for the dialog to open / close
 _MODEL_DIALOG_POLL = 0.2
 _MODEL_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
 _MODEL_ESCAPES = 3         # enough to back out of confirm -> picker -> prompt
+_MODEL_WALK_MAX = 24       # hard stop for the survey lap; the list is far shorter
 
 
 def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
-    """Parse the /model dialog: [(row number, model label)], plus the number of
-    the highlighted row (0 if no row carries the cursor)."""
+    """Parse the /model dialog: [(row number, model name)], plus the number of the
+    highlighted row (0 if no row carries the cursor).
+
+    Only the rows Claude currently has on screen — see _survey_model_rows for why
+    that is rarely the whole list. The ✔ on the session's current model is
+    stripped: it marks the row, not the model."""
     rows: list[tuple[int, str]] = []
     cursor = 0
     for line in text.splitlines():
@@ -1427,7 +1797,8 @@ def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
         if not m:
             continue
         n = int(m.group("n"))
-        rows.append((n, m.group("label")))
+        name = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
+        rows.append((n, name.removesuffix("✔").strip()))
         if m.group("cur"):
             cursor = n
     return rows, cursor
@@ -1468,35 +1839,277 @@ def _step_cursor_onto(pane: str, target: int, rows: int, read_cursor) -> bool:
     return False
 
 
-def switch_model(pid: int, alias: str) -> dict:
+def _survey_model_rows(pane: str) -> dict[int, str]:
+    """Walk the picker's cursor once around the list and return {row number: name}.
+
+    One capture shows only the rows Claude chose to draw. The list is a scrolling
+    window, and the board's sessions live in 80x24 panes with a transcript above
+    the dialog: at that height Claude renders two or three rows and folds the rest
+    behind "… +N models". Reading the target's row number off that slice is how
+    "fable" came back as "not in the /model dialog (offered: Default, Opus)" while
+    Fable sat one row below the fold.
+
+    Down scrolls the window, so a full lap is what makes the whole list readable.
+    The lap ends where it started — row numbers are stable, so coming back around
+    to the row we set out from means every row has passed under the cursor.
+    """
+    seen: dict[int, str] = {}
+    start = 0
+    for _ in range(_MODEL_WALK_MAX):
+        rows, cursor = _model_dialog_rows(tmux.capture_pane(pane).get("text", ""))
+        for n, name in rows:
+            seen.setdefault(n, name)
+        if not cursor or cursor == start:
+            break
+        if not start:
+            start = cursor
+        tmux.send_keys(pane, "Down")
+        time.sleep(_MODEL_KEY_SETTLE)
+    return seen
+
+
+# What the dialog appends to a family's name for its wide-window row: "Opus" and
+# "Opus (1M context)" are two rows, not one row with a qualifier.
+_MODEL_1M_SUFFIX = " (1m context)"
+
+
+def _pick_model_row(rows: dict[int, str], alias: str) -> int:
+    """Row number for `alias` in a surveyed list, 0 if it isn't offered.
+
+    The family's 1M row first, then its bare row, then first word only. A family
+    can hold two rows — "Opus (1M context)" and a plain "Opus" — and the board's
+    Opus means the wide one: its sessions are the long-running ones, and the
+    window can't be widened later without re-reading the whole cached history.
+    The bare-name step is what reaches the families offered at one width only,
+    and the first-word fallback the rows that never appear bare, like "Default
+    (recommended)".
+    """
+    for name in (alias + _MODEL_1M_SUFFIX, alias):
+        exact = [n for n in sorted(rows) if rows[n].lower() == name]
+        if exact:
+            return exact[0]
+    loose = [n for n in sorted(rows) if rows[n].lower().split()[:1] == [alias]]
+    return loose[0] if loose else 0
+
+
+# ---------------------------------------------------------------------------
+# Codex: the model readout and its /model picker.
+#
+# Codex prints what it runs on in the composer's status line — "gpt-6-astra
+# medium · /path/to/cwd", model then reasoning effort — whenever the composer is
+# drawn (a working session appends its elapsed-time tag after the cwd). The line
+# updates the instant a /model pick commits, before any turn has run on the new
+# model, which is what makes it the readout: the rollout's turn_context only
+# says what the LAST turn ran on and lags a switch by a whole turn.
+_CODEX_STATUS_RE = re.compile(
+    r"^[\s ]*(?P<model>[a-z][\w.-]*)[\s ]+(?P<effort>[a-z]+)[\s ]+·[\s ]+\S"
+)
+
+
+def codex_status_model(text: str) -> str:
+    """"<model> <effort>" off the LAST status line in `text`, "" when none is drawn."""
+    for line in reversed(text.splitlines()):
+        m = _CODEX_STATUS_RE.match(line)
+        if m:
+            return f"{m.group('model')} {m.group('effort')}"
+    return ""
+
+
+def codex_pane_model(tty: Optional[str]) -> str:
+    """The model + effort the Codex session on `tty` runs, per its status line.
+
+    "" whenever that can't be read — same contract as pane_model: nothing to
+    claim, not "no model"."""
+    if not tty:
+        return ""
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return ""
+    cap = tmux.capture_pane(pane)
+    if not cap["ok"]:
+        return ""
+    return codex_status_model(cap["text"])
+
+
+# Codex's /model is two pickers in a row — the model list, then the reasoning
+# levels for the model just picked — sharing one row shape and one footer. Rows
+# tag the session's current pick "(current)" and a model's default effort
+# "(default)"; each picker opens with its cursor on the current row. Enter
+# commits and moves on, Escape backs up one picker, and the list wraps, so Down
+# alone reaches every row.
+#
+# Unlike Claude's dialog there is no session-only scope: a commit also rewrites
+# `model` / `model_reasoning_effort` in ~/.codex/config.toml — the default for
+# every Codex session started afterwards. The board can't avoid that, so the
+# card says so instead.
+_CODEX_MODEL_PICKER_HEAD = "Select Model and Effort"
+_CODEX_EFFORT_PICKER_HEAD = "Select Reasoning Level for"
+_CODEX_ROW_RE = re.compile(r"^[\s ]*(?P<cur>›)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<rest>\S.*)")
+_CODEX_TAG_RE = re.compile(r"[\s ]*\((?:current|default)\)")
+_CODEX_MODEL_NAME_RE = re.compile(r"^[a-z][\w.-]*$")
+# The board's effort names → the picker's row names. "Extra high" is the row the
+# status line then prints as "xhigh". Max and Ultra sit behind a further "More
+# reasoning…" picker and are not offered.
+_CODEX_EFFORTS = {"low": "low", "medium": "medium", "high": "high", "xhigh": "extra high"}
+
+
+def _codex_picker_rows(text: str) -> tuple[list[tuple[int, str]], int, int]:
+    """Rows of a Codex picker: [(row number, name)], the highlighted row, and the
+    row tagged (current) — 0 for either when absent. Tags are stripped from the
+    names: they mark the row, not the model."""
+    rows: list[tuple[int, str]] = []
+    cursor = current = 0
+    for line in text.splitlines():
+        m = _CODEX_ROW_RE.match(line)
+        if not m:
+            continue
+        n = int(m.group("n"))
+        head = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
+        if "(current)" in head:
+            current = n
+        rows.append((n, _CODEX_TAG_RE.sub("", head).strip()))
+        if m.group("cur"):
+            cursor = n
+    return rows, cursor, current
+
+
+def _codex_picker(text: str, head: str) -> Optional[tuple[list[tuple[int, str]], int, int]]:
+    """The picker headed `head` if it is on the pane, else None. Only the lines
+    under the header are read: numbered rows of anything drawn above it (the
+    startup update prompt, a trust prompt) are not this picker's rows."""
+    lines = text.splitlines()
+    idx = next((i for i in range(len(lines) - 1, -1, -1) if head in lines[i]), -1)
+    if idx < 0:
+        return None
+    return _codex_picker_rows("\n".join(lines[idx + 1:]))
+
+
+def _codex_pickers_closed(text: str) -> bool:
+    return _CODEX_MODEL_PICKER_HEAD not in text and _CODEX_EFFORT_PICKER_HEAD not in text
+
+
+def _escape_codex_pickers(pane: str) -> None:
+    """Leave the session at its composer, not parked in a picker."""
+    for _ in range(_MODEL_ESCAPES):
+        if _codex_pickers_closed(tmux.capture_pane(pane).get("text", "")):
+            return
+        tmux.send_keys(pane, "Escape")
+        time.sleep(_MODEL_KEY_SETTLE)
+
+
+def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
+    """Drive one Codex picker: wait for it, put the cursor on the row named
+    `wanted` — or, with `wanted` empty, on the row tagged current — and press
+    Enter. {"ok": True, "name": <row name>}, or an error with the pickers backed
+    out of so the session is left at its composer."""
+    text = ""
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        text = tmux.capture_pane(pane).get("text", "")
+        if head in text:
+            break
+        time.sleep(_MODEL_DIALOG_POLL)
+    else:
+        _escape_codex_pickers(pane)
+        return {"ok": False, "error": f"the Codex {what} picker never opened"}
+    rows, cursor, current = _codex_picker(text, head)
+    target = (next((n for n, name in rows if name.lower() == wanted), 0) if wanted
+              else current or cursor)
+    if not target:
+        _escape_codex_pickers(pane)
+        offered = ", ".join(name for _, name in rows) or "none"
+        return {"ok": False,
+                "error": f"'{wanted}' is not in the Codex {what} picker (offered: {offered})"}
+    if not _step_cursor_onto(pane, target, len(rows),
+                             lambda t: (_codex_picker(t, head) or ([], 0, 0))[1]):
+        _escape_codex_pickers(pane)
+        return {"ok": False,
+                "error": f"could not move the Codex {what} picker cursor onto {wanted or 'the current row'}"}
+    tmux.send_keys(pane, "Enter")
+    return {"ok": True, "name": dict(rows)[target]}
+
+
+def _switch_codex_model(pid: int, w, model: str, effort: str) -> dict:
+    """Switch a Codex session's model and/or reasoning effort via its /model pickers.
+
+    Either can be left empty: an empty model keeps the current one (its row is
+    tagged in the picker), an empty effort keeps whatever the effort picker opens
+    on — the current level for the current model, the default for a new one.
+    Only a pane clear of both pickers counts as a switch; anything else escapes
+    out and reports failure. Note the config.toml side effect above."""
+    model = (model or "").strip().lower()
+    effort = (effort or "").strip().lower()
+    if model and not _CODEX_MODEL_NAME_RE.match(model):
+        return {"ok": False, "error": f"invalid Codex model name '{model}'"}
+    if effort and effort not in _CODEX_EFFORTS:
+        return {"ok": False,
+                "error": f"unknown reasoning effort '{effort}' (one of {', '.join(_CODEX_EFFORTS)})"}
+    if not model and not effort:
+        return {"ok": False, "error": "nothing to switch: give a model, an effort, or both"}
+    if not w.tty:
+        return {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return {"ok": False, "error": "session not in a tmux pane"}
+
+    r = send_prompt(pid, "/model")
+    if not r.get("ok"):
+        return r
+    picked = _codex_pick(pane, _CODEX_MODEL_PICKER_HEAD, model, "model")
+    if not picked["ok"]:
+        return picked
+    model_name = picked["name"]
+    picked = _codex_pick(pane, _CODEX_EFFORT_PICKER_HEAD, _CODEX_EFFORTS.get(effort, ""), "effort")
+    if not picked["ok"]:
+        return picked
+    effort_name = picked["name"].lower()
+
+    deadline = time.time() + _MODEL_DIALOG_WAIT
+    while time.time() < deadline:
+        if _codex_pickers_closed(tmux.capture_pane(pane).get("text", "")):
+            return {"ok": True, "model": f"{model_name} {effort_name}"}
+        time.sleep(_MODEL_DIALOG_POLL)
+    _escape_codex_pickers(pane)
+    return {"ok": False, "error": "the Codex /model picker did not close after confirming"}
+
+
+def switch_model(pid: int, alias: str, effort: str = "") -> dict:
     """Switch `pid`'s session to model `alias` (e.g. "opus") for THIS SESSION ONLY.
+
+    A Codex session goes to _switch_codex_model instead (`alias` is then a model
+    name, `effort` a reasoning level, either optional). The rest is Claude.
 
     Drives Claude's /model dialog rather than sending `/model <alias>`: the
     argument form works, but it also rewrites the user's default model for new
     sessions. The dialog's "s" key is the only way to scope the switch to the
     running session.
 
-    The dialog opens with its cursor on the session's *current* model, so the
-    number of keypresses to reach a target row isn't fixed — and the row list
-    wraps, so there's no edge to anchor against either. We step Down one row at a
-    time, re-reading the cursor from the pane after each press, until it sits on
-    the target. That read doubles as the check that we're about to commit the
-    right row.
+    Reaching the right row takes two laps. The first (_survey_model_rows) is what
+    reads the list at all: on a short pane most of it is folded behind "… +N
+    models", and only walking the cursor scrolls those rows into view. The second
+    (_step_cursor_onto) steps Down onto the row that survey picked, re-reading the
+    cursor from the pane after each press — the dialog opens on the session's
+    *current* model and the list wraps, so there is neither a fixed keypress count
+    nor an edge to anchor against, and the read doubles as the check that we're
+    about to commit the right row.
 
     Mid-conversation, "s" doesn't commit — it raises a confirm dialog (the cached
     history has to be re-read against the new model). Same treatment: step onto
     its "Yes" row, then Enter. Only a pane clear of BOTH dialogs counts as a
     switch; anything else escapes out and reports failure, because a session left
     on an open modal is a session that answers nothing.
+
+    Success carries the dialog's name for the row that was committed ("Opus (1M
+    context)"), not the alias that reached it.
     """
-    alias = (alias or "").strip().lower()
-    if not alias.isalnum():
-        return {"ok": False, "error": f"invalid model alias '{alias}'"}
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
     if getattr(w, "platform", "claude") == "codex":
-        return {"ok": False, "error": "model switching is Claude-only"}
+        return _switch_codex_model(pid, w, alias, effort)
+    alias = (alias or "").strip().lower()
+    if not alias.isalnum():
+        return {"ok": False, "error": f"invalid model alias '{alias}'"}
     if not w.tty:
         return {"ok": False, "error": "no tty for this session"}
     pane = tmux.pane_for_tty(w.tty)
@@ -1517,13 +2130,18 @@ def switch_model(pid: int, alias: str) -> dict:
     else:
         return {"ok": False, "error": "the /model dialog never opened"}
 
-    rows, _ = _model_dialog_rows(text)
-    target = next((n for n, label in rows if label.lower() == alias), 0)
+    rows = _survey_model_rows(pane)
+    target = _pick_model_row(rows, alias)
     if not target:
         # Leave the session as we found it rather than parked on an open modal.
         _escape_model_dialogs(pane)
-        offered = ", ".join(label for _, label in rows) or "none"
+        offered = ", ".join(rows[n] for n in sorted(rows)) or "none"
         return {"ok": False, "error": f"'{alias}' is not in the /model dialog (offered: {offered})"}
+    # The dialog's own name for the row, not the alias that reached it: an alias
+    # can stand for either of a family's two rows, and nothing downstream can tell
+    # them apart afterwards — the transcript records the same model id at both
+    # widths — so the committed row name is the only place "1M" gets said.
+    picked = rows[target]
 
     if not _step_cursor_onto(pane, target, len(rows),
                              lambda t: _model_dialog_rows(t)[1]):
@@ -1546,7 +2164,7 @@ def switch_model(pid: int, alias: str) -> dict:
         return {"ok": False, "error": "the /model dialog did not close after pressing s"}
 
     if not yes_row:
-        return {"ok": True, "model": alias}
+        return {"ok": True, "model": picked}
 
     # Confirm dialog: two rows, and it opens on "Yes" — but commit the row we can
     # see the cursor on, not the row we hope it's on.
@@ -1558,7 +2176,7 @@ def switch_model(pid: int, alias: str) -> dict:
     deadline = time.time() + _MODEL_DIALOG_WAIT
     while time.time() < deadline:
         if _model_dialogs_closed(tmux.capture_pane(pane).get("text", "")):
-            return {"ok": True, "model": alias}
+            return {"ok": True, "model": picked}
         time.sleep(_MODEL_DIALOG_POLL)
     _escape_model_dialogs(pane)
     return {"ok": False, "error": f"the confirm dialog did not close after confirming {alias}"}

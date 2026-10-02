@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, btwcapture, btwlog, codex, history, memory, patrol, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, auth, btwcapture, btwlog, codex, history, hmz, memory, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -25,6 +25,11 @@ STATIC_DIR = HERE / "static"
 class State:
     def __init__(self) -> None:
         self.last_snapshot: dict = {"windows": [], "counts": {}, "ts": 0}
+        # The local half of the snapshot above, served verbatim to a peer board
+        # asking what *this* host is running (see api_windows). Kept rather than
+        # recomputed: an aggregating peer polls every 2s, and enrichment walks
+        # transcripts and scrapes panes.
+        self.last_local_snapshot: dict = {"windows": [], "counts": {}, "ts": 0}
         self.last_signature: tuple = ()
         self.subscribers: set[asyncio.Queue] = set()
 
@@ -39,12 +44,20 @@ class State:
         # pending aside has no id yet — hence id+question+pending).
         return tuple(
             (
-                w["pid"], w["status"], w["waiting_for"], w["updated_at"],
+                w["key"], w["status"], w["waiting_for"], w["updated_at"],
                 tuple((q.get("source"), q.get("text"))
                       for q in w.get("queued", [])),
                 ((w.get("btw") or {}).get("id"),
                  (w.get("btw") or {}).get("question"),
                  (w.get("btw") or {}).get("pending")),
+                # A peer going quiet changes nothing about its cards' own
+                # fields, so without this the board would keep broadcasting
+                # them as live and never redraw them dimmed.
+                w.get("peer_stale"),
+                # The model readout can move on its own: a cleared session is
+                # idle, its updated_at frozen, and the banner that names its
+                # model is only picked up on a later poll (see _banner_model).
+                w.get("model_label"),
             )
             for w in snap["windows"]
         )
@@ -53,19 +66,82 @@ class State:
 state = State()
 
 
-def _enriched_snapshot() -> dict:
+# Model labels read off a session's welcome banner, keyed by (pid, session id).
+# The transcript is the primary source (it records what actually answered), but
+# it only names a model on assistant rows: from a /clear — or a launch — until
+# the session's next reply there is nothing in it to read, and the card's model
+# readout would go blank on exactly the idle sessions you are deciding what to
+# send next. The banner covers that gap, at the price of a capture-pane, which
+# this cache keeps off the 2s poll: a banner never changes within one session id,
+# and /clear starts a new one, so the next banner is picked up on its own.
+_banner_models: dict[tuple[int, str], tuple[str, float]] = {}
+# A miss is cached too — a session whose banner has scrolled away must not be
+# re-scraped every tick — but only for a while: a pane caught mid-launch, before
+# the banner is painted, has to get a second look or the card stays blank until
+# the session first replies.
+_BANNER_RETRY = 30.0
+
+
+def _banner_model(w: dict) -> str:
+    """The model `w`'s session prints in its welcome banner ("" if unreadable).
+
+    Read from the live pane, so it only answers for a session still running in
+    one; a dead or tmux-less window keeps its blank readout rather than borrowing
+    a label from somewhere else.
+    """
+    pid = w.get("pid")
+    if not isinstance(pid, int) or not w.get("alive") or not w.get("tty"):
+        return ""
+    # A `.slock` agent sub-session runs on its parent's tty, so the banner in
+    # that pane is the parent's — and a sub-agent is routinely on a different
+    # model. Its own transcript answers for it a turn later; until then the card
+    # says nothing rather than the window above it.
+    if w.get("hidden"):
+        return ""
+    key = (pid, w.get("session_id") or "")
+    hit = _banner_models.get(key)
+    if hit and (hit[0] or time.time() - hit[1] < _BANNER_RETRY):
+        return hit[0]
+    try:
+        label = actions.pane_model(w["tty"])
+    except Exception:
+        label = ""  # scrape failures degrade to no readout, never to a guess
+    _banner_models[key] = (label, time.time())
+    return label
+
+
+def _prune_banner_models(live_pids: set) -> None:
+    """Drop cached banners for pids that are gone, so the cache tracks the board
+    instead of growing an entry per session for the life of the process."""
+    for key in list(_banner_models):
+        if key[0] not in live_pids:
+            _banner_models.pop(key, None)
+
+
+def _local_snapshot() -> dict:
+    """This host's own cards, fully enriched. No peer traffic happens here."""
     snap = sessions.snapshot()
     perm_by_tty = perms.pending_by_tty()
     # Live Codex sessions arrive pre-enriched (codex transcripts have a different
     # shape than Claude's, so they can't go through the loop below). Shell-process
     # counts are platform-agnostic, so we fold their pids into the single ps walk.
     codex_windows = codex.codex_window_dicts()
+    hmz_windows = hmz.hmz_window_dicts()
     shell_counts = sessions.shell_descendant_counts(
-        [w["pid"] for w in snap["windows"] + codex_windows
+        [w["pid"] for w in snap["windows"] + codex_windows + hmz_windows
          if isinstance(w.get("pid"), int)]
     )
+    for hw in hmz_windows:
+        hw["shell_proc_count"] = shell_counts.get(hw.get("pid"), 0)
     for cw in codex_windows:
         cw["shell_proc_count"] = shell_counts.get(cw.get("pid"), 0)
+        # Codex's status line names the model + effort the session is on right
+        # now, a /model pick included; the rollout label it arrives with only
+        # says what the last turn ran on.
+        live = actions.codex_pane_model(cw.get("tty"))
+        if live:
+            cw["model_label"] = live
+            cw["model_source"] = "pane"
     for w in snap["windows"]:
         w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
         tty = w.get("tty")
@@ -92,28 +168,47 @@ def _enriched_snapshot() -> dict:
             w["current_task"] = None
             w["model"] = ""
         w["model_label"] = transcripts.pretty_model(w["model"])
+        w["model_source"] = "transcript" if w["model"] else ""
+        if not w["model_label"]:
+            banner = _banner_model(w)
+            if banner:
+                w["model_label"] = banner
+                w["model_source"] = "banner"
         # Claude reports waitingFor="dialog open" for ANY open overlay — the
         # /goal panel included, which has nothing to answer and doesn't block
         # the agent. Only a verifiable picker in the pane earns the waiting
         # card (Quick Approve types "1" into the input box otherwise); when
         # the pane shows none, treat the session as busy. An unverifiable
         # pane (no tmux) keeps the conservative waiting card.
-        if (w.get("status") == "waiting" and w.get("waiting_for") == "dialog open"
-                and actions.pane_menu_active(w.get("tty")) is False):
-            w["status"] = "busy"
-            w["waiting_for"] = None
-        tri = patrol.classify(w)
-        w["triage"] = tri["triage"]
-        w["triage_reason"] = tri["reason"]
-        w["triage_suggestion"] = tri["suggestion"]
+        if w.get("status") == "waiting" and w.get("waiting_for") == "dialog open":
+            dlg = actions.pane_dialog(w.get("tty"))
+            if dlg is not None and not dlg["menu"]:
+                w["status"] = "busy"
+                w["waiting_for"] = None
+            elif dlg is not None and dlg["trust"]:
+                # Name the dialog rather than leave the card on "dialog open":
+                # the folder-trust prompt is answered by its own route, and it
+                # is the one a spawn into a never-opened directory always hits.
+                w["waiting_for"] = "trust prompt"
         if tp:
             w["skills_used"] = transcripts.extract_skills_used(tp)
             w["memory_ops"] = transcripts.extract_memory_ops(tp)
             w["background_tasks"] = transcripts.extract_background_tasks(tp)
+            # A looping prompt is the one background thing a card can't show any
+            # other way: it leaves no shell and no task row, so an unmarked card
+            # just looks like a session talking to itself every half hour.
+            w["loop"] = transcripts.session_loop(tp)
         else:
             w["skills_used"] = []
             w["memory_ops"] = []
             w["background_tasks"] = []
+            w["loop"] = None
+        # After background_tasks, not before: that list is how patrol tells a
+        # session waiting on background work from one waiting on a person.
+        tri = patrol.classify(w)
+        w["triage"] = tri["triage"]
+        w["triage_reason"] = tri["reason"]
+        w["triage_suggestion"] = tri["suggestion"]
         # Queued prompts: reliable dashboard-sent items (reconciled against the
         # transcript) plus best-effort TUI-typed items scraped from the pane.
         # A queue only exists while busy, which also bounds the extra capture.
@@ -160,13 +255,32 @@ def _enriched_snapshot() -> dict:
             # An aside whose answer is still generating: show it live so /btw
             # never looks dead while it works (nothing is archived yet).
             w["btw"] = {"question": pending_q, "answer": "", "pending": True}
-    # Merge live Codex windows in, then recompute the header counts over every
-    # visible (non-hidden) window across both platforms. Count by `triage`, not
-    # the raw `status`: the header chips filter cards on triage, so a session
-    # stuck at status=busy but idle past the threshold (triage=completed) must
-    # land in the idle tally — otherwise it inflates "busy" yet vanishes when
-    # you click the busy filter.
-    snap["windows"].extend(codex_windows)
+    _prune_banner_models({w.get("pid") for w in snap["windows"]})
+    # Merge live Codex and hmz windows in, then address every card. `key` — not pid — is
+    # what the UI and the action routes carry: once a peer host's cards sit in
+    # the same list, pids alone collide (see core/peers.py).
+    snap["windows"].extend(codex_windows + hmz_windows)
+    label = peers.local_label()
+    for w in snap["windows"]:
+        w["host"] = label
+        w["key"] = str(w.get("pid"))
+    snap["host"] = label
+    # Capability flag for the UI to gate the tmux-backed controls. `available()`
+    # is cached, so this does not spawn a tmux subprocess on every 2s poll.
+    snap["tmux_available"] = tmux.available()
+    _finalize_snapshot(snap)
+    return snap
+
+
+def _finalize_snapshot(snap: dict) -> None:
+    """Recompute the header counts over every visible (non-hidden) window and
+    put the cards in display order. Counts go by `triage`, not the raw `status`:
+    the header chips filter cards on triage, so a session stuck at status=busy
+    but idle past the threshold (triage=completed) must land in the idle tally —
+    otherwise it inflates "busy" yet vanishes when you click the busy filter.
+
+    Run over the merged list too, so a peer's cards are counted and ordered
+    beside the local ones instead of being appended after them."""
     visible = [w for w in snap["windows"] if not w.get("hidden")]
     busy = [w for w in visible if w.get("triage") == "working"]
     waiting = [w for w in visible if w.get("triage") == "waiting_perm"]
@@ -181,10 +295,32 @@ def _enriched_snapshot() -> dict:
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
         -w.get("updated_at", 0),
     ))
-    # Capability flag for the UI to gate the tmux-backed controls. `available()`
-    # is cached, so this does not spawn a tmux subprocess on every 2s poll.
-    snap["tmux_available"] = tmux.available()
-    return snap
+
+
+def _enriched_snapshot() -> dict:
+    """The board's view: this host's cards plus every peer's, in one list.
+
+    Peer cards come from core.peers' cache, which a background thread refills —
+    nothing here waits on the network, so a wedged peer costs its own cards
+    going stale and nothing else."""
+    local = _local_snapshot()
+    state.last_local_snapshot = local
+    if not peers.enabled():
+        return local
+    # Shallow copy with a fresh window list: the local snapshot is handed to
+    # peers verbatim and must not grow their cards back into it.
+    merged = dict(local)
+    remote = peers.remote_windows()
+    merged["windows"] = list(local["windows"]) + remote
+    merged["peers"] = peers.status()
+    # The UI gates the tmux controls on one flag. A card whose own host has no
+    # tmux still gets buttons; pressing one returns that host's error, which is
+    # a clearer answer than a control that silently isn't there.
+    merged["tmux_available"] = bool(local.get("tmux_available")) or any(
+        p.get("online") for p in merged["peers"]
+    )
+    _finalize_snapshot(merged)
+    return merged
 
 
 async def _watcher() -> None:
@@ -212,6 +348,7 @@ async def _watcher() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    peers.start()
     task = asyncio.create_task(_watcher())
     try:
         yield
@@ -220,6 +357,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Fleet", lifespan=lifespan)
+
+# The password gate, if .env.local sets FLEET_AUTH_PASSWORD. This registers the
+# login routes and wraps the whole ASGI app, so every route below — and every
+# route added later — is behind it by construction. See core/auth.py for why
+# there is no loopback exemption. With no password set it is a pass-through and
+# the board behaves exactly as it always has on 127.0.0.1; scripts/cf-tunnel.sh
+# is the piece that refuses to publish an ungated board.
+auth.install(app)
 
 
 # ---------- routes ----------
@@ -234,31 +379,13 @@ def index() -> HTMLResponse:
     return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
-def _host_ip_octet() -> str:
-    """Return the last octet of this machine's primary outbound IP (e.g. "60"
-    for 10.145.87.60), so dashboards self-identify by host without manual
-    config. Empty string if the IP can't be determined."""
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # No packets are sent; this just picks the interface the kernel would
-        # use to reach an external address.
-        s.connect(("1.1.1.1", 80))
-        ip = s.getsockname()[0]
-    except OSError:
-        return ""
-    finally:
-        s.close()
-    return ip.rsplit(".", 1)[-1] if ip else ""
-
-
 def _apply_instance_label(html: str) -> str:
     """Stamp a per-host label into the tab title and header so multiple
     dashboards are tellable apart. Defaults to the host IP's last octet
     (e.g. "60"); CLAUDE_FLEET_LABEL overrides it. No label resolved ⇒ HTML is
-    returned unchanged."""
-    label = os.environ.get("CLAUDE_FLEET_LABEL", "").strip() or _host_ip_octet()
+    returned unchanged. Same label the cards carry as `host` (core/peers.py), so
+    the header badge and a local card's badge always agree."""
+    label = peers.local_label()
     if not label:
         return html
     html = html.replace(
@@ -275,14 +402,33 @@ def _apply_instance_label(html: str) -> str:
 
 
 @app.get("/api/windows")
-def api_windows() -> dict:
+def api_windows(request: Request) -> dict:
+    # A peer board asking what *this* host is running gets the local half only.
+    # Without this, two boards configured as each other's peer would each serve
+    # the other its own cards back and the page would show every session twice.
+    if request.headers.get(peers.PEER_HEADER):
+        if not state.last_local_snapshot["windows"]:
+            state.last_local_snapshot = _local_snapshot()
+        return state.last_local_snapshot
     if not state.last_snapshot["windows"]:
         state.last_snapshot = _enriched_snapshot()
     return state.last_snapshot
 
 
-@app.get("/api/windows/{pid}/timeline")
-def api_timeline(pid: int, limit: int = 2000) -> dict:
+def _split(key: str) -> tuple[str | None, int]:
+    """Card key → (peer host or None, pid on that host). A malformed key is a
+    404, the same answer an unknown pid gets."""
+    try:
+        return peers.split_key(key)
+    except ValueError:
+        raise HTTPException(404, "window not found")
+
+
+@app.get("/api/windows/{key}/timeline")
+def api_timeline(key: str, limit: int = 2000) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "GET", f"/api/windows/{pid}/timeline?limit={limit}")
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
@@ -300,8 +446,25 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
             "skills_used": activity.get("skills_used", []),
             "memory_ops": activity.get("memory_ops", []),
             "plan_history": [],
-            # Codex writes no recap, so there is no goal to pin.
+            # Codex writes no recap, so there is no goal to pin — and no
+            # /loop skill, so nothing schedules a looping prompt either.
             "goal": None,
+            "loop": None,
+            "menu": None,
+        }
+    if w.platform == "hmz":
+        return {
+            "pid": pid,
+            "session_id": w.session_id,
+            "project_name": w.project_name,
+            "platform": "hmz",
+            "events": hmz.hmz_timeline(tp, limit=limit) if tp else [],
+            "note": None if tp else hmz.NO_RUN_NOTE,
+            "skills_used": [],
+            "memory_ops": [],
+            "plan_history": [],
+            "goal": None,
+            "loop": None,
             "menu": None,
         }
     events = transcripts.timeline(tp, limit=limit) if tp else []
@@ -325,14 +488,20 @@ def api_timeline(pid: int, limit: int = 2000) -> dict:
         # The session's standing goal, pinned above the timeline so it stays put
         # while the events that stated it scroll away.
         "goal": transcripts.session_goal(tp) if tp else None,
+        # The /loop prompt this session keeps re-running, pinned for the same
+        # reason — and because it explains turns arriving that nobody just sent.
+        "loop": transcripts.session_loop(tp) if tp else None,
         # Live interactive menu (AskUserQuestion / permission prompt) parsed from
         # the tmux pane — the transcript doesn't record it until it's resolved.
         "menu": actions.get_pane_menu(pid),
     }
 
 
-@app.get("/api/windows/{pid}/plan")
-def api_plan(pid: int) -> dict:
+@app.get("/api/windows/{key}/plan")
+def api_plan(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "GET", f"/api/windows/{pid}/plan")
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
@@ -370,8 +539,11 @@ def _require_window(pid: int):
     return w
 
 
-@app.post("/api/windows/{pid}/focus")
-def api_focus(pid: int) -> dict:
+@app.post("/api/windows/{key}/focus")
+def api_focus(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/focus")
     w = _require_window(pid)
     if not w.tty:
         return {"ok": False, "error": "no tty available for this pid"}
@@ -380,7 +552,10 @@ def api_focus(pid: int) -> dict:
 
 class CreateBody(BaseModel):
     cwd: str
-    platform: str = "claude"  # "claude" | "codex"
+    platform: str = "claude"  # "claude" | "codex" | "hmz"
+    # Which board runs the spawn. Empty (or this host's own label) means here;
+    # a configured peer label spawns on that machine, in that machine's paths.
+    host: str = ""
 
 
 class PromptBody(BaseModel):
@@ -389,13 +564,21 @@ class PromptBody(BaseModel):
 
 @app.post("/api/windows/create")
 def api_window_create(body: CreateBody) -> dict:
+    if body.host and body.host in peers.configured():
+        # Forward with the host stripped: the peer spawns locally, and a peer
+        # list that ever names this board back can't bounce the request around.
+        return peers.forward(body.host, "POST", "/api/windows/create",
+                             {"cwd": body.cwd, "platform": body.platform})
     if not sessions._cwd_visible(body.cwd):
         raise HTTPException(403, "cwd is hidden by the dashboard filter")
     return actions.create_session(body.cwd, body.platform)
 
 
-@app.post("/api/windows/{pid}/prompt")
-def api_window_prompt(pid: int, body: PromptBody) -> dict:
+@app.post("/api/windows/{key}/prompt")
+def api_window_prompt(key: str, body: PromptBody) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/prompt", body.model_dump())
     _require_window(pid)
     # Stamp the send time before the keystrokes: send_prompt types, verifies the
     # composer and verifies the submit, which takes long enough that Claude's own
@@ -407,14 +590,17 @@ def api_window_prompt(pid: int, body: PromptBody) -> dict:
     return r
 
 
-@app.post("/api/windows/{pid}/clear")
-def api_window_clear(pid: int) -> dict:
+@app.post("/api/windows/{key}/clear")
+def api_window_clear(key: str) -> dict:
     """Send /clear and blank the card's pre-clear preview.
 
     Both Claude and Codex have /clear. Claude starts a fresh transcript so its
     card empties on its own, but Codex's /clear leaves the rollout JSONL intact —
     so we also stamp a per-pid clear time that hides older rollout events from the
     card and timeline (see codex.mark_cleared)."""
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/clear")
     _require_window(pid)
     sent_at = time.time()
     r = actions.send_prompt(pid, "/clear")
@@ -425,26 +611,35 @@ def api_window_clear(pid: int) -> dict:
 
 
 class ModelBody(BaseModel):
-    model: str  # a /model dialog alias, e.g. "opus" | "fable"
+    model: str = ""   # Claude: a /model dialog alias ("opus" | "fable"); Codex: a model name
+    effort: str = ""  # Codex only: low | medium | high | xhigh
 
 
-@app.post("/api/windows/{pid}/model")
-def api_window_model(pid: int, body: ModelBody) -> dict:
-    """Switch this session's model for the running session only.
+@app.post("/api/windows/{key}/model")
+def api_window_model(key: str, body: ModelBody) -> dict:
+    """Switch this session's model (Claude: for the running session only).
 
     Not a plain `/model <alias>` prompt: that form also saves the pick as the
     user's default for new sessions. actions.switch_model drives the dialog and
-    commits with "s" instead (see its docstring)."""
+    commits with "s" instead (see its docstring). A Codex card goes through its
+    two-step picker with `model` and/or `effort`; that picker has no session-only
+    scope and also rewrites ~/.codex/config.toml."""
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/model", body.model_dump())
     _require_window(pid)
-    return actions.switch_model(pid, body.model)
+    return actions.switch_model(pid, body.model, body.effort)
 
 
 class PermissionBody(BaseModel):
     choice: str  # approve | approve_always | deny
 
 
-@app.post("/api/windows/{pid}/permission")
-def api_window_permission(pid: int, body: PermissionBody) -> dict:
+@app.post("/api/windows/{key}/permission")
+def api_window_permission(key: str, body: PermissionBody) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/permission", body.model_dump())
     _require_window(pid)
     return actions.respond_permission(pid, body.choice)
 
@@ -453,26 +648,38 @@ class MenuKeysBody(BaseModel):
     keys: list[str]  # e.g. ["2"], ["Enter"], ["Escape"]
 
 
-@app.post("/api/windows/{pid}/keys")
-def api_window_keys(pid: int, body: MenuKeysBody) -> dict:
+@app.post("/api/windows/{key}/keys")
+def api_window_keys(key: str, body: MenuKeysBody) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/keys", body.model_dump())
     _require_window(pid)
     return actions.send_menu_keys(pid, body.keys)
 
 
-@app.post("/api/windows/{pid}/fork")
-def api_fork(pid: int) -> dict:
+@app.post("/api/windows/{key}/fork")
+def api_fork(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/fork")
     _require_window(pid)
     return actions.fork_session(pid)
 
 
-@app.post("/api/windows/{pid}/export")
-def api_export(pid: int) -> dict:
+@app.post("/api/windows/{key}/export")
+def api_export(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/export")
     _require_window(pid)
     return actions.export_to_feishu(pid)
 
 
-@app.post("/api/windows/{pid}/close")
-def api_close(pid: int) -> dict:
+@app.post("/api/windows/{key}/close")
+def api_close(key: str) -> dict:
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/close")
     _require_window(pid)
     return actions.close_session(pid)
 
@@ -481,11 +688,14 @@ class BtwDismissBody(BaseModel):
     id: int  # btwlog entry id (w["btw"].id on the card)
 
 
-@app.post("/api/windows/{pid}/btw/dismiss")
-def api_btw_dismiss(pid: int, body: BtwDismissBody) -> dict:
+@app.post("/api/windows/{key}/btw/dismiss")
+def api_btw_dismiss(key: str, body: BtwDismissBody) -> dict:
     """Hide the card's archived /btw aside. Card-state only: the aside stays in
     the archive and the timeline (that's history), it just stops occupying the
     card."""
+    host, pid = _split(key)
+    if host:
+        return peers.forward(host, "POST", f"/api/windows/{pid}/btw/dismiss", body.model_dump())
     w = _require_window(pid)
     sid = getattr(w, "session_id", None)
     if not sid:
@@ -539,6 +749,7 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
                 "plan_history": transcripts.extract_plan_history(fp),
                 # What the session was for, still worth reading in the archive.
                 "goal": transcripts.session_goal(fp),
+                "loop": transcripts.session_loop(fp),
             }
     # Codex transcripts
     from core.codex import CODEX_SESSIONS_DIR

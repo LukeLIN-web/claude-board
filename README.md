@@ -21,7 +21,9 @@ cd claude-board && bash run.sh
 ```
 
 The first run creates a venv and installs dependencies automatically — nothing to
-set up. Change the port with `CLAUDE_FLEET_PORT=9000 bash run.sh`.
+set up. Change the port with `CLAUDE_FLEET_PORT=9000 bash run.sh`. Detached mode
+is supervised and restarts the board automatically if it exits. Use
+`bash run.sh status`, `bash run.sh restart`, or `bash run.sh stop` to manage it.
 
 ## What it solves
 
@@ -170,6 +172,120 @@ a lookup, not a heuristic.
 > drop an executable `~/.claude/focus-tty.sh` taking a `<tty>` arg; it takes
 > precedence over the bundled default.
 
+### Remote access
+
+The server binds loopback only. Two ways to reach it from a phone, differing in
+*where the login lives*.
+
+> **The login is load-bearing, whichever you pick.**
+> `POST /api/windows/<pid>/keys` types into a tmux pane, so an unprotected
+> tunnel is a public shell on a hostname that gets scanned. Both scripts below
+> refuse to publish a board they cannot prove is protected.
+
+**A fixed domain, login at the edge** — [`scripts/tunnel.sh`](scripts/tunnel.sh)
+publishes on a reserved [ngrok](https://ngrok.com) domain behind a Google
+sign-in:
+
+```console
+$ scripts/tunnel.sh start          # also: stop | status
+[tunnel] up -> https://<your-domain>.ngrok-free.dev (Google sign-in required)
+```
+
+Set `FLEET_TUNNEL_DOMAIN` / `FLEET_TUNNEL_ALLOWED_EMAILS` in `.env.local`, and
+store the authtoken with `ngrok config add-authtoken` — none of it belongs in
+the repo. The script generates the ngrok traffic policy itself and refuses to
+start without one. It takes two rules: a Google sign-in *and* an allow-list
+check, or every Google account on earth would qualify.
+
+**A free random URL, login in the app** — [`scripts/cf-tunnel.sh`](scripts/cf-tunnel.sh)
+uses a [Cloudflare](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
+quick tunnel, which needs no account and no domain:
+
+```console
+$ scripts/cf-tunnel.sh start       # also: stop | status | url
+[cf-tunnel] up -> https://<random-words>.trycloudflare.com (password required)
+```
+
+A quick tunnel has no edge policy at all, so here the gate is the app's own
+password ([`core/auth.py`](core/auth.py)): set `FLEET_AUTH_PASSWORD` in
+`.env.local` and restart the board. The script *probes* the running server and
+refuses to publish unless an anonymous request is actually rejected — it does
+not just read the variable, because `run.sh` runs uvicorn detached and a
+password added after startup is set in your shell and absent in the process.
+The URL is random and changes on every start; `cf-tunnel.sh url` reprints it.
+
+The two are independent. The password gate works behind either tunnel, or
+behind none — it is on whenever `FLEET_AUTH_PASSWORD` is set, and off (loopback
+use only) when it is not.
+
+> **There is no exemption for loopback**, deliberately: tunnel daemons connect
+> to `127.0.0.1`, so every remote request looks local, and "trust local
+> requests" would be a public bypass. Whoever is sitting at the machine logs in
+> too.
+
+Scripted access differs between the two. Under ngrok's OAuth the API is
+browser-only — `curl` against `/api/*` gets a redirect to Google. The password
+gate instead accepts `Authorization: Bearer $FLEET_API_TOKEN` if you set one:
+
+```console
+$ curl -H "Authorization: Bearer $FLEET_API_TOKEN" http://127.0.0.1:7879/api/windows
+```
+
+### Several machines, one page
+
+Two laptops, two Claude accounts, one dashboard. Each machine runs its own board
+over its own `~/.claude` and its own tmux; the machine with the tunnel
+aggregates, so the URL you already use shows every machine's cards in one grid,
+each tagged with its machine's label, and every button on a card still acts on
+the machine that card lives on. (The label is `CLAUDE_FLEET_LABEL`, or the last
+octet of that machine's IP if you don't set one.)
+
+```
+                    ┌── board on A ────┐  reads ~/.claude on A, drives A's tmux
+  public URL ──────▶│  aggregates      │
+                    └────────┬─────────┘
+                             │ ssh -L 7880:127.0.0.1:7879
+                    ┌────────▼─────────┐
+                    │  board on B      │  reads ~/.claude on B, drives B's tmux
+                    └──────────────────┘
+```
+
+**Why not just read the other machine's `~/.claude` over the shared mount?**
+Because a card is alive when `/proc/<pid>` exists *on this host* — a remote pid
+is either missing or, worse, some unrelated local process — the UI keys cards by
+pid, so two hosts collide, and every action is a tmux call on the local machine.
+The sessions would render and none of them would be real. So each host keeps its
+own board, and cards are addressed by a host-qualified key (`b:1234`) that the
+routes use to decide *run it here* or *forward it there*.
+
+On the aggregating host, in `.env.local.<hostname>` (a per-host file `run.sh`
+layers on top of the shared `.env.local`):
+
+```bash
+FLEET_PEERS=b=http://127.0.0.1:7880
+FLEET_PEER_TUNNELS="7880:hostb:7879"   # <local port>:<ssh host>:<peer's port>
+```
+
+```console
+$ scripts/peer-tunnel.sh start     # also: stop | status
+[peer-tunnel] 7880:hostb:7879 — up
+$ ./run.sh                         # restart so the board reads FLEET_PEERS
+```
+
+The peer is reached on loopback, not on its LAN address: every board binds
+`127.0.0.1` because it can type into tmux panes, and an ssh forward gives the
+aggregator a local port to poll while the peer stays exactly as unreachable as
+before. The password gate applies to that hop too — `FLEET_API_TOKEN` from the
+shared `.env.local` is what gets through it.
+
+Peer cards come from a background poll (2s), never from a fetch in the request
+path, so a wedged peer costs its own cards going stale — they dim after 10s and
+disappear after two minutes — and nothing else. The header grows one chip per
+machine: click to see just that machine, and a peer whose board stopped
+answering turns red and says why on hover. **Spawn** grows a machine picker, and
+the directory list follows it. Search / History / Skills / Memory still show the
+aggregating host only.
+
 ## Architecture
 
 Single-file frontend (Alpine.js + Tailwind via CDN — no npm). The Python backend
@@ -188,6 +304,7 @@ core/
   codex.py            Codex session parsing + live-session discovery (/proc + fd)
   search.py           cross-platform ripgrep search
   actions.py          focus / fork / close / export / spawn / send-prompt
+  peers.py            multi-host: poll peer boards, forward card actions
   tmux.py             tmux backend: spawn window + inject prompt (Linux)
   history.py          unified index + full-text rg search
   skills.py           skill directory scan

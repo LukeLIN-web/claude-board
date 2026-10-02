@@ -16,7 +16,7 @@ cd claude-board && bash run.sh
 # 浏览器打开 http://127.0.0.1:7878
 ```
 
-首次运行自动建 venv 装依赖，不用管。换端口：`CLAUDE_FLEET_PORT=9000 bash run.sh`。
+首次运行自动建 venv 装依赖，不用管。换端口：`CLAUDE_FLEET_PORT=9000 bash run.sh`。默认的后台模式有 supervisor，board 退出后会自动重启。可用 `bash run.sh status` / `restart` / `stop` 管理。
 
 ## 解决什么问题
 
@@ -136,6 +136,108 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 > tab → 切过去）。想换别的终端 / 窗口管理器，放一个可执行的 `~/.claude/focus-tty.sh`（接收一个
 > `<tty>` 参数）即可，它优先于自带默认。
 
+### 远程访问
+
+server 只监听 loopback。从手机打开面板有两条路，区别在于**那层登录挡在哪里**。
+
+> **无论选哪条，那层登录都是承重的。**
+> `POST /api/windows/<pid>/keys` 会往 tmux pane 里敲键，所以不设防的隧道就是在一个
+> 会被扫描的域名上开了个公网 shell。下面两个脚本都拒绝发布一个它无法证明是设防的面板。
+
+**固定域名，登录挡在边缘** —— [`scripts/tunnel.sh`](scripts/tunnel.sh) 发布到一个
+固定的 [ngrok](https://ngrok.com) 域名上，前面是 Google 登录：
+
+```console
+$ scripts/tunnel.sh start          # 还有：stop | status
+[tunnel] up -> https://<your-domain>.ngrok-free.dev (Google sign-in required)
+```
+
+域名和放行的邮箱写在 `.env.local` 的 `FLEET_TUNNEL_DOMAIN` /
+`FLEET_TUNNEL_ALLOWED_EMAILS`，authtoken 用 `ngrok config add-authtoken` 存到
+ngrok 自己的配置里——这些都不该进仓库。脚本自己生成 traffic policy，没有 policy 就
+拒绝启动。两条规则缺一不可：先要 Google 登录，再查白名单，否则全世界任何一个 Google
+账号都算数。
+
+**免费随机域名，登录挡在应用里** —— [`scripts/cf-tunnel.sh`](scripts/cf-tunnel.sh)
+用 [Cloudflare](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
+quick tunnel，不需要账号，也不需要域名：
+
+```console
+$ scripts/cf-tunnel.sh start       # 还有：stop | status | url
+[cf-tunnel] up -> https://<random-words>.trycloudflare.com (password required)
+```
+
+quick tunnel 在边缘没有任何策略可言，所以这里的门是应用自己的密码
+（[`core/auth.py`](core/auth.py)）：在 `.env.local` 里设 `FLEET_AUTH_PASSWORD`，然后
+重启面板。脚本会**实际探测**跑着的 server，匿名请求确实被挡下来了才肯发布——它不是去读
+那个环境变量，因为 `run.sh` 是 detached 起 uvicorn 的，启动之后才加的密码只存在于你的
+shell 里，那个正在服务的进程根本不知道。URL 是随机的、每次启动都变，`cf-tunnel.sh url`
+可以再打印一遍。
+
+两条路互不依赖。密码门在哪种隧道后面都能用，不开隧道也能用——设了
+`FLEET_AUTH_PASSWORD` 就是开，没设就是关（只适合 loopback 自用）。
+
+> **代码里没有任何对 loopback 的放行**，这是故意的：隧道进程是连 `127.0.0.1` 的，所以
+> 每个远端请求看起来都像本地请求，"信任本地请求"就是一把公开的万能钥匙。坐在这台机器前
+> 面的人也一样要登录。
+
+脚本访问 API 这一点上两者不同。ngrok 的 OAuth 之后 API 只能在浏览器里用——`curl` 打
+`/api/*` 会被重定向到 Google。密码门则接受 `Authorization: Bearer $FLEET_API_TOKEN`
+（如果你设了这个变量）：
+
+```console
+$ curl -H "Authorization: Bearer $FLEET_API_TOKEN" http://127.0.0.1:7879/api/windows
+```
+
+### 多台机器，一个页面
+
+两台机器、两个 Claude 账号、一个面板。每台机器各跑一份 board，各读自己的
+`~/.claude`、各驱动自己的 tmux；开着隧道的那台负责聚合——你原来那个 URL 就会
+在同一个网格里显示所有机器的卡片，每张带上它所属机器的标签，卡片上的每个按钮
+仍然作用在这张卡片真正所在的那台机器上。（标签取 `CLAUDE_FLEET_LABEL`，没设的话
+就是那台机器 IP 的最后一段。）
+
+```
+                    ┌── A 上的 board ──┐  读 A 的 ~/.claude，驱动 A 的 tmux
+  公网 URL ────────▶│  聚合            │
+                    └────────┬─────────┘
+                             │ ssh -L 7880:127.0.0.1:7879
+                    ┌────────▼─────────┐
+                    │  B 上的 board    │  读 B 的 ~/.claude，驱动 B 的 tmux
+                    └──────────────────┘
+```
+
+**为什么不直接从共享挂载去读另一台的 `~/.claude`?** 因为一张卡片"活着"的依据是
+*本机*的 `/proc/<pid>` 存在——远端的 pid 要么查不到，更糟的是撞上一个毫不相干的
+本地进程;前端用 pid 当卡片的 key,两台机器必然冲突;而所有操作都是本机的 tmux
+调用。会话能画出来,但没有一个是真的。所以每台机器各留一份 board,卡片改用带
+主机前缀的 key(`b:1234`)寻址,路由据此决定*在本地执行*还是*转发过去*。
+
+在负责聚合的那台机器上，写进 `.env.local.<hostname>`（`run.sh` 会在共享的
+`.env.local` 之上再叠加这个按主机名区分的文件）：
+
+```bash
+FLEET_PEERS=b=http://127.0.0.1:7880
+FLEET_PEER_TUNNELS="7880:hostb:7879"   # <本地端口>:<ssh 主机>:<对端端口>
+```
+
+```console
+$ scripts/peer-tunnel.sh start     # 还有：stop | status
+[peer-tunnel] 7880:hostb:7879 — up
+$ ./run.sh                         # 重启一次，board 才会读到 FLEET_PEERS
+```
+
+对端是通过 loopback 访问的，而不是它的局域网地址：board 能往 tmux pane 里打字，
+所以每份 board 都只绑 `127.0.0.1`；ssh 转发给聚合方一个本地端口去轮询，对端在
+网络上依旧和以前一样不可达。密码门同样管着这一跳——共享 `.env.local` 里的
+`FLEET_API_TOKEN` 就是穿过它的凭据。
+
+对端卡片来自后台轮询（2s），不会在请求路径里发起网络调用，所以一个卡住的 peer
+只会让它自己的卡片变旧——10 秒后变暗，两分钟后消失——不会拖住别的东西。顶栏会
+多出每台机器一个的 chip：点击只看那台机器，board 不再应答的 peer 会变红、悬停
+说明原因。**Spawn** 会多一个机器选择器，目录列表跟着它走。搜索 / History /
+Skills / Memory 目前仍然只显示聚合机本身的数据。
+
 ## 架构
 
 单文件前端（Alpine.js + Tailwind CDN，不需要 npm）。Python 后端从不写入 `~/.claude/` 和 `~/.codex/` 中存储的 harness 数据——这些数据保持只读。它**默认只读**：少数显式的、用户触发的操作（fork、close，以及 Linux 上基于 tmux 的新建会话 / 单条 prompt 注入，包括 Clear/Commit/Review 这几个 prompt 快捷按钮）作用于运行中的会话，而非存储的数据。
@@ -149,6 +251,7 @@ core/
   codex.py            Codex session 解析 + 实时 session 发现（/proc + fd）
   search.py           ripgrep 跨平台搜索
   actions.py          focus / fork / close / export / 新建 / 发 prompt
+  peers.py            多机：轮询对端 board、转发卡片操作
   tmux.py             tmux 后端：新建窗口 + 注入 prompt（Linux）
   history.py          统一索引 + 全文 rg 搜索
   skills.py           skill 目录扫描

@@ -10,6 +10,7 @@ from typing import Iterable, Optional
 
 from .textcap import (
     GOAL_CHARS,
+    LOOP_CHARS,
     META_CHARS,
     MESSAGE_CHARS,
     TOOL_ARG_CHARS,
@@ -30,8 +31,13 @@ _RECAP_HINT_RE = re.compile(r"\s*\(\s*disable recaps in /config\s*\)\s*$")
 # a background task reporting back; `<local-command-stdout>` is a slash command's
 # own output echoed into the turn.
 _INJECTED_ENVELOPES = ("<task-notification>", "<local-command-stdout>")
+# A paste is logged wrapped in `<pasted_content id="c5b9">…</pasted_content id="c5b9">`.
+# The id is a per-paste random tag the person never sees in the composer, so it
+# has no business on the board row or in a copy of it.
+_PASTE_TAG_RE = re.compile(r'</?pasted_content\b[^>]*>\n?')
 _TN_STATUS_RE = re.compile(r"<status>\s*(.*?)\s*</status>", re.DOTALL)
 _TN_SUMMARY_RE = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
+_TN_EVENT_RE = re.compile(r"<event>\s*(.*?)\s*</event>", re.DOTALL)
 
 
 def is_injected_user_row(d: dict) -> bool:
@@ -72,10 +78,17 @@ def _clean_task_notification(text: str) -> str:
         return text
     status = _TN_STATUS_RE.search(text)
     summary = _TN_SUMMARY_RE.search(text)
-    if not status and not summary:
+    event = _TN_EVENT_RE.search(text)
+    if not status and not summary and not event:
         return text
     head = f"后台任务 {status.group(1)}" if status else "后台任务"
-    return f"{head}：{summary.group(1)}" if summary else head
+    body = summary.group(1) if summary else ""
+    if event:
+        # A Monitor's summary is the standing description of what it watches —
+        # byte-identical on every firing. What actually changed is in `<event>`,
+        # so dropping it left a column of rows that all read the same.
+        body = f"{body} — {event.group(1)}" if body else event.group(1)
+    return f"{head}：{body}" if body else head
 
 
 def _clean_command_text(text: str) -> str:
@@ -94,9 +107,22 @@ def _clean_command_text(text: str) -> str:
     return f"{name} {args}".strip()
 
 
+def _strip_paste_envelope(text: str) -> str:
+    """The text of a paste without the `<pasted_content id=…>` tags around it.
+
+    Both tags carry the same id, and the closing one repeats it, so a plain
+    `</pasted_content>` match would leave half of them behind. Each tag sits on
+    a line of its own, so the line break after it goes with it — otherwise a
+    paste in the middle of typed text keeps a blank line where each tag was.
+    """
+    if "<pasted_content" not in text:
+        return text
+    return _PASTE_TAG_RE.sub("", text).strip()
+
+
 def clean_user_text(text: str) -> str:
     """A user row's envelope reduced to what it actually says."""
-    return _clean_task_notification(_clean_command_text(text))
+    return _strip_paste_envelope(_clean_task_notification(_clean_command_text(text)))
 
 
 @dataclass
@@ -269,6 +295,23 @@ def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
     return out
 
 
+def _queued_prompt_text(value) -> str:
+    """A queued prompt as text, whatever shape the CLI logged it in.
+
+    Usually a plain string. A prompt with pasted images is logged as content
+    blocks instead, and this used to go straight to `.strip()` — one
+    AttributeError that took `timeline()` down for the whole session, so any card
+    ever sent a screenshot showed an empty transcript. Keep the text blocks; the
+    image bytes have no place on a row capped at a couple hundred chars.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(b.get("text") or "" for b in value
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
 def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     """A prompt typed while the session was busy, as the user row it never got.
 
@@ -291,7 +334,7 @@ def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     a = d.get("attachment") or {}
     if a.get("type") != "queued_command":
         return []
-    text = a.get("prompt") or ""
+    text = _queued_prompt_text(a.get("prompt"))
     if not text.strip():
         return []
     extra = {"queued": True}
@@ -402,6 +445,164 @@ def session_goal(path: str | Path) -> Optional[dict]:
     return goal
 
 
+_CRON_STEP_RE = re.compile(r"^\*/(\d+)$")
+_CRON_LIST_RE = re.compile(r"^\d+(?:,\d+)*$")
+
+
+def _cron_every(field: str, period: int) -> Optional[int]:
+    """The gap between one cron field's firings, or None if they aren't even.
+
+    Two spellings mean the same cadence. `*/30` is the obvious one; `7,37` is
+    what a model writes to spread a fleet's loops across the hour instead of
+    firing them all on the same minute, and it is still every 30 minutes. A list
+    only counts when it wraps evenly too: `0,10` fires twice an hour, fifty
+    minutes apart, and has no single cadence worth printing.
+    """
+    m = _CRON_STEP_RE.match(field)
+    if m:
+        step = int(m.group(1))
+        return step if 0 < step < period else None
+    if not _CRON_LIST_RE.match(field):
+        return None
+    vals = sorted({int(v) for v in field.split(",")})
+    if len(vals) < 2 or vals[-1] >= period:
+        return None
+    gaps = {b - a for a, b in zip(vals, vals[1:])}
+    gaps.add(period - vals[-1] + vals[0])
+    return gaps.pop() if len(gaps) == 1 else None
+
+
+def _cron_cadence(expr: str) -> str:
+    """A cron expression as the cadence it was set for, e.g. "每 30 分钟".
+
+    Only the shapes `/loop` emits are read. Anything else is handed back as the
+    expression itself: an unparsed cadence reads as unparsed, while a guessed one
+    reads as fact and would sit pinned above the timeline being wrong.
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return expr
+    minute, hour, dom, mon, dow = parts
+    if (mon, dow) != ("*", "*"):
+        return expr
+    if dom == "*" and hour == "*":
+        n = _cron_every(minute, 60)
+        return f"每 {n} 分钟" if n else expr
+    if dom == "*" and minute.isdigit():
+        n = _cron_every(hour, 24)
+        if n:
+            return f"每 {n} 小时"
+        if hour.isdigit():
+            return f"每天 {int(hour):02d}:{int(minute):02d}"
+        return expr
+    m = _CRON_STEP_RE.match(dom)
+    if m and minute.isdigit() and hour.isdigit():
+        return f"每 {m.group(1)} 天"
+    return expr
+
+
+def _delay_cadence(seconds) -> Optional[str]:
+    """A ScheduleWakeup delay as a cadence. The tool clamps to one hour, so
+    minutes is the only unit this ever has to reach for."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    return f"自定节奏 · 约 {max(1, round(s / 60))} 分钟" if s > 0 else None
+
+
+# `/loop` hands the next firing its own invocation back, so a self-paced loop's
+# stored prompt still carries the slash command it re-enters through.
+_LOOP_SELF_PREFIX_RE = re.compile(r"^\s*/loop\s+", re.IGNORECASE)
+# What `/loop` stores when nobody typed a task: the runtime swaps the real
+# instructions in at fire time, so the sentinel itself says nothing to a reader.
+_LOOP_SENTINELS = ("<<autonomous-loop-dynamic>>", "<<autonomous-loop>>")
+# A `/loop` invocation, matched on the envelope rather than on the unwrapped
+# text. `_clean_command_text` renders it as "loop 30 mins, …", which is
+# indistinguishable from prose opening the same way — and "loop through the
+# files and fix each" is a sentence, not a schedule. Only the slash command (or
+# the Skill call a model makes instead) starts a loop, so only those count.
+_LOOP_CMD_RE = re.compile(r"<command-name>\s*/?loop\s*</command-name>", re.IGNORECASE)
+
+
+def _loop_task_text(prompt: str) -> str:
+    """A stored wakeup prompt as the task, minus the `/loop` wrapper."""
+    text = _LOOP_SELF_PREFIX_RE.sub("", prompt).strip()
+    return "自主循环" if text in _LOOP_SENTINELS else text
+
+
+def session_loop(path: str | Path) -> Optional[dict]:
+    """The prompt this session keeps re-running, as {text, ts, source, cadence}.
+
+    Like a goal, a loop is set once and then buried — except it goes on acting on
+    the session long after the row that started it scrolled away, which is what
+    makes an unpinned one confusing: turns keep arriving that nobody just asked
+    for. Three sources, last one in the file wins, since the file is in the order
+    the loop was actually set up:
+
+      - `cron`: a recurring `CronCreate`, the fixed-interval mode. The best
+        source there is — the schedule and the prompt are the ones registered,
+        not the ones asked for, and those differ (`/loop 30 mins …` registers
+        `7,37 * * * *` and drops the interval from the prompt).
+      - `wakeup`: a `ScheduleWakeup`, the self-paced mode. Re-armed every tick,
+        so the stamp tracks the most recent arming rather than the first.
+      - `prompt`: a `/loop` invocation, typed or made through the Skill tool.
+        Covers the gap between asking for a loop and the model scheduling one —
+        and the case where it never did, which is why this source carries no
+        cadence to claim.
+
+    A stopped loop returns None rather than a stale banner: `CronDelete` ends a
+    cron, `ScheduleWakeup(stop=True)` ends a self-paced one, and either way
+    there is nothing left to pin.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    loop: Optional[dict] = None
+
+    def offer(text: str, ts: str, source: str, cadence: Optional[str]) -> None:
+        nonlocal loop
+        text = text.strip()
+        if not text:
+            return
+        loop = {"text": cap_text(text, LOOP_CHARS), "ts": ts,
+                "source": source, "cadence": cadence}
+
+    for d in _iter_lines(p):
+        if d.get("type") == "assistant":
+            ts = d.get("timestamp", "")
+            for c in ((d.get("message") or {}).get("content") or []):
+                if not isinstance(c, dict) or c.get("type") != "tool_use":
+                    continue
+                name, inp = c.get("name", ""), (c.get("input") or {})
+                if name == "Skill" and str(inp.get("skill", "")).lstrip("/") == "loop":
+                    offer(str(inp.get("args") or ""), ts, "prompt", None)
+                elif name == "CronDelete":
+                    loop = None
+                elif name == "CronCreate" and inp.get("recurring"):
+                    offer(str(inp.get("prompt") or ""), ts, "cron",
+                          _cron_cadence(str(inp.get("cron") or "")))
+                elif name == "ScheduleWakeup":
+                    if inp.get("stop"):
+                        loop = None
+                    else:
+                        offer(_loop_task_text(str(inp.get("prompt") or "")), ts,
+                              "wakeup", _delay_cadence(inp.get("delaySeconds")))
+            continue
+        # A `/loop` someone typed. Read off the raw row: the envelope is the
+        # only thing that distinguishes the command from a sentence about loops.
+        if d.get("type") != "user" or is_injected_user_row(d):
+            continue
+        raw = (d.get("message") or {}).get("content")
+        if isinstance(raw, list):
+            raw = "".join(b.get("text", "") for b in raw
+                          if isinstance(b, dict) and b.get("type") == "text")
+        if isinstance(raw, str) and _LOOP_CMD_RE.search(raw):
+            args = _CMD_ARGS_RE.search(raw)
+            offer(args.group(1) if args else "", d.get("timestamp", ""), "prompt", None)
+    return loop
+
+
 def _normalize(d: dict) -> list[TurnEvent]:
     t = d.get("type")
     msg = d.get("message") or {}
@@ -491,6 +692,77 @@ def _model_change_events(raw: list[dict]) -> dict[int, TurnEvent]:
     return out
 
 
+def _pending_notice_events(raw: list[dict]) -> dict[int, TurnEvent]:
+    """Notifications sitting in Claude's queue undelivered, as timeline rows.
+
+    An idle session does not wake for a background task. The CLI writes a
+    `queue-operation`/`enqueue` row the moment a Monitor fires and then leaves it
+    there — nothing drains the queue until a turn starts, which in practice means
+    until someone types. A session left alone banks every event and delivers the
+    lot in one burst stamped with the *delivery* time: seen here, thirteen 15-min
+    Monitor events fired between 05:21 and 08:21, and all thirteen landed at
+    08:23:43, a quarter second after a typed "好了吗". Three hours of a card
+    showing nothing, then thirteen rows at once.
+
+    The enqueue row carries the whole notification and the real firing time, so
+    the news was on disk all along and only the delivery was late. These are the
+    ones still waiting, placed where they fired; each drops out again the moment
+    it lands, so the timeline never shows one twice.
+
+    Matching is by queue position, not by text. A `remove` row names what it
+    took, but the `dequeue` spelling a newer CLI writes carries no content at all
+    — and all thirteen were identical anyway. The queue is FIFO, so every enqueue
+    is tracked, typed prompts included: skip those and the positions drift.
+
+    Only what `raw` holds can be reconciled. An enqueue that fell off the head of
+    the tail is invisible either way, and a removal whose enqueue fell off finds
+    nothing to retire — both leave the row out rather than inventing one.
+    """
+    queued: list[tuple[int, str]] = []  # (row index, raw content), oldest first
+
+    def retire_exact(text: str) -> bool:
+        for n, (_, content) in enumerate(queued):
+            if content == text:
+                queued.pop(n)
+                return True
+        return False
+
+    for i, d in enumerate(raw):
+        t = d.get("type")
+        if t == "queue-operation":
+            content = d.get("content")
+            content = content if isinstance(content, str) else ""
+            if d.get("operation") == "enqueue":
+                queued.append((i, content))
+            elif not (content and retire_exact(content)) and queued:
+                queued.pop(0)
+        elif t == "attachment":
+            # Claude pulled it off the queue mid-turn. On CLI versions that log
+            # no removal row this attachment is the only trace, so it counts —
+            # but by text only: the FIFO pop above already covers the rest, and
+            # doing it twice would retire a notification still waiting.
+            a = d.get("attachment") or {}
+            if a.get("type") == "queued_command":
+                retire_exact(_queued_prompt_text(a.get("prompt")))
+        elif t == "user" and is_injected_user_row(d):
+            content = (d.get("message") or {}).get("content")
+            if isinstance(content, str):
+                retire_exact(content)
+
+    out: dict[int, TurnEvent] = {}
+    for i, content in queued:
+        # A typed prompt waiting in the same queue is the dashboard's own
+        # "Queued" panel's business, and it already has one.
+        if not content.lstrip().startswith("<task-notification>"):
+            continue
+        out[i] = TurnEvent(
+            raw[i].get("timestamp", ""), "user_text",
+            cap_text(clean_user_text(content), META_CHARS),
+            None, "user", {"meta": True, "pending": True},
+        )
+    return out
+
+
 def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     """Return ≤ limit most recent flattened turn events for a transcript."""
     p = Path(path)
@@ -499,10 +771,13 @@ def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     # Read more lines than needed because one jsonl row can expand into several events.
     raw = _tail_lines(p, max(limit * 2, 100))
     switches = _model_change_events(raw)
+    pending = _pending_notice_events(raw)
     events: list[TurnEvent] = []
     for i, d in enumerate(raw):
         if i in switches:
             events.append(switches[i])
+        if i in pending:
+            events.append(pending[i])
         events.extend(_normalize(d))
     return [e.__dict__ for e in events[-limit:]]
 
@@ -752,38 +1027,110 @@ def extract_memory_ops(path: str | Path) -> list[dict]:
     return ops
 
 
+# The two task-notification fields the ledger below keys on (status and summary
+# are already parsed above, for rendering the row). <task-id> is the only field
+# every row for a task carries — the final "finished" notification can omit
+# <tool-use-id> — so it is the identity; <tool-use-id> joins a notification back
+# to the launch that started the work.
+_TN_TASK_ID_RE = re.compile(r"<task-id>\s*(.*?)\s*</task-id>", re.DOTALL)
+_TN_TOOL_USE_RE = re.compile(r"<tool-use-id>\s*(.*?)\s*</tool-use-id>", re.DOTALL)
+
+
+def _async_launch_kind(name: str, inp: dict) -> str:
+    """Which kind of async work this tool call starts, or "" if it starts none."""
+    if name == "Agent":
+        return "agent"
+    if name == "Bash" and inp.get("run_in_background"):
+        return "bash_bg"
+    if name == "Monitor" and inp.get("persistent"):
+        return "monitor"
+    return ""
+
+
 def extract_background_tasks(path: str | Path) -> list[dict]:
-    """Extract ACTIVE (unresolved) background Bash/Monitor tasks."""
+    """Async work this session started and has not finished with, as
+    [{type, description, command, state, ts}].
+
+    `state` is "running" while the work is still going, and "undelivered" once it
+    has reported completion that the session has not picked up — the work is
+    done and its answer is sitting in a queue nobody is draining. That gap is the
+    one a person has to close, and it looks exactly like a session still working.
+
+    Not "a tool_use with no tool_result": every async launch gets its tool_result
+    back *at launch* ("Async agent launched successfully", "Command running in
+    background"), so that test matched nothing on any transcript and this list
+    was always empty. What actually tracks the work is the notification ledger —
+    the task reports completion in a `queue-operation` row, and the session takes
+    delivery in a `remove` row or in a user row carrying the same <task-id>.
+    """
     p = Path(path)
     if not p.exists():
         return []
-    bg_by_id: dict[str, dict] = {}
-    resolved_ids: set[str] = set()
+    launched: dict[str, dict] = {}   # tool_use_id -> {type, description, command}
+    notified: dict[str, dict] = {}   # task_id -> {tool_use_id, summary, ts}
+    delivered: set[str] = set()      # task_ids the session has taken
     for d in _iter_lines(p):
-        if d.get("type") == "assistant":
+        t = d.get("type")
+        if t == "assistant":
             for c in ((d.get("message") or {}).get("content") or []):
                 if not isinstance(c, dict) or c.get("type") != "tool_use":
                     continue
-                name = c.get("name", "")
                 inp = c.get("input") or {}
-                tid = c.get("id", "")
-                if name == "Bash" and inp.get("run_in_background") and tid:
-                    bg_by_id[tid] = {
-                        "type": "bash_bg",
+                kind = _async_launch_kind(c.get("name", ""), inp)
+                if kind and c.get("id"):
+                    launched[c["id"]] = {
+                        "type": kind,
                         "description": (inp.get("description") or "")[:200],
-                        "command": (inp.get("command") or "")[:200],
+                        "command": (inp.get("command") or inp.get("prompt") or "")[:200],
                     }
-                elif name == "Monitor" and inp.get("persistent") and tid:
-                    bg_by_id[tid] = {
-                        "type": "monitor",
-                        "description": (inp.get("description") or "")[:200],
-                        "command": (inp.get("command") or "")[:200],
-                    }
-        elif d.get("type") == "user":
-            for c in ((d.get("message") or {}).get("content") or []):
-                if isinstance(c, dict) and c.get("type") == "tool_result":
-                    resolved_ids.add(c.get("tool_use_id", ""))
-    return [t for tid, t in bg_by_id.items() if tid not in resolved_ids]
+        elif t == "queue-operation":
+            body = d.get("content") or ""
+            op = d.get("operation")
+            if op == "dequeue":
+                # Carries no content, so it cannot be attributed. It appears
+                # alongside real deliveries, so read it as one: a missed stall is
+                # quieter than a card that cries stall at every flush.
+                delivered.update(notified)
+                continue
+            hit = _TN_TASK_ID_RE.search(body)
+            if not hit:
+                continue
+            task_id = hit.group(1)
+            if op != "enqueue":
+                delivered.add(task_id)
+                continue
+            status = _TN_STATUS_RE.search(body)
+            if not status or status.group(1) != "completed":
+                continue  # a progress event, not the task finishing
+            summary = _TN_SUMMARY_RE.search(body)
+            entry = notified.setdefault(
+                task_id,
+                {"tool_use_id": "", "ts": _parse_ts(d.get("timestamp", "")),
+                 "summary": summary.group(1) if summary else ""},
+            )
+            tool_use = _TN_TOOL_USE_RE.search(body)
+            if tool_use and not entry["tool_use_id"]:
+                entry["tool_use_id"] = tool_use.group(1)
+        elif t == "user" and not d.get("isSidechain"):
+            body = json.dumps((d.get("message") or {}).get("content"), ensure_ascii=False)
+            hit = _TN_TASK_ID_RE.search(body)
+            if hit:
+                delivered.add(hit.group(1))
+
+    out: list[dict] = []
+    settled: set[str] = set()  # tool_use_ids whose completion has been delivered
+    for task_id, n in notified.items():
+        if task_id in delivered:
+            settled.add(n["tool_use_id"])
+            continue
+        info = launched.get(n["tool_use_id"]) or {
+            "type": "task", "description": n["summary"][:200], "command": ""}
+        out.append({**info, "state": "undelivered", "ts": n["ts"]})
+        settled.add(n["tool_use_id"])
+    for tool_use_id, info in launched.items():
+        if tool_use_id not in settled:
+            out.append({**info, "state": "running", "ts": 0.0})
+    return out
 
 
 def extract_plan_history(path: str | Path) -> list[dict]:
