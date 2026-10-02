@@ -496,9 +496,6 @@ def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
     if idx == -1:
         return False
     region = cap[idx:]
-    if marker == OMH_COMPOSER:
-        # The box borders sit between wrapped rows and would split the needle.
-        region = _composer_text(cap, marker) or ""
     if _BTW_OVERLAY_FOOTER in region:
         return False
     squeezed = "".join(region.split())
@@ -533,32 +530,12 @@ _CLEAR_KEYS = ("End", "C-u", "BSpace")
 _CHROME_CHARS = set("─│╭╮╰╯▔ ")
 
 
-# omh draws its composer as a box with no prompt glyph: the top border opens
-# with "╭──" and carries the status line, wrapped rows sit between │ borders,
-# and the last row is typed on the bottom border itself:
-#
-#   ╭── π  ┤ ⬢ claude-opus-5 ┤ ~/project ┤ ◫ 25K ┤──────────────
-#   │  word000 word001 … word018                                │
-#   ╰─ word019 word020                                         ─╯
-#
-# So "╭──" is its marker, and everything below the last one is the composer.
-OMH_COMPOSER = "╭──"
-
-
-def _composer_text(cap_text: str, marker: str = "❯") -> Optional[str]:
+def _composer_text(cap_text: str) -> Optional[str]:
     """What is sitting in the composer: the last ❯/› marker line (after the
     marker) plus wrapped continuation lines, stopping at the chrome below it
     (rule / box border / blank / the ⏵⏵ status line). None when no marker is
-    on screen — there is no composer to read. An omh `marker` reads its box
-    instead (see OMH_COMPOSER)."""
+    on screen — there is no composer to read."""
     lines = cap_text.splitlines()
-    if marker == OMH_COMPOSER:
-        top = next((i for i in range(len(lines) - 1, -1, -1) if marker in lines[i]), None)
-        if top is None:
-            return None
-        chrome = "".join(_CHROME_CHARS)
-        rows = [ln.strip(chrome) for ln in lines[top + 1:]]
-        return "\n".join(r for r in rows if r).strip()
     last = None
     for i, ln in enumerate(lines):
         if "❯" in ln or "›" in ln:
@@ -575,7 +552,7 @@ def _composer_text(cap_text: str, marker: str = "❯") -> Optional[str]:
     return "\n".join(p.strip() for p in parts).strip()
 
 
-def _clear_composer(pane: str, marker: str = "❯") -> None:
+def _clear_composer(pane: str) -> None:
     """Empty `pane`'s composer before a retry / after giving up on a send.
 
     Claude's composer removes at most one visual LINE per clearing press (see
@@ -590,7 +567,7 @@ def _clear_composer(pane: str, marker: str = "❯") -> None:
     prev = None
     for _ in range(_CLEAR_VERIFY_TRIES):
         cap = capture_pane(pane)
-        content = _composer_text(cap.get("text", ""), marker) if cap.get("ok") else None
+        content = _composer_text(cap.get("text", "")) if cap.get("ok") else None
         if content == "":
             return
         if content is None or content == prev:
@@ -669,7 +646,7 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
         # next Clear submitted the literal text "/clear/clear" — which Claude
         # answers as prose ("type /clear on its own line") instead of clearing,
         # leaving the session unclearable from the board for good.
-        _clear_composer(pane, marker)
+        _clear_composer(pane)
         literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
@@ -684,7 +661,7 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
                  else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
                     f"needle={needle!r} frame={frame!r}")
-    _clear_composer(pane, marker)  # wipe the buffered text on wake
+    _clear_composer(pane)  # wipe the buffered text on wake
     _send_debug(f"landed pane={pane} gave up after "
                 f"{len(_LANDED_VERIFY_WAITS)} attempts")
     return False

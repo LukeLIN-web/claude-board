@@ -426,8 +426,7 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
 
     `platform` selects the CLI: "claude" (default) launches Claude Code with
     permission prompts skipped; "codex" launches the Codex TUI in `--yolo` mode
-    so the fleet can drive it without per-action approval prompts; "omh" launches
-    oh-my-humanize, whose default approval mode already auto-approves every tool.
+    so the fleet can drive it without per-action approval prompts.
     """
     if not cwd or not cwd.strip():
         return {"ok": False, "error": "cwd is required"}
@@ -436,8 +435,6 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         return {"ok": False, "error": f"not a directory: {resolved}"}
     if platform == "codex":
         return tmux.new_window(resolved, ["codex", "--yolo"])
-    if platform == "omh":
-        return tmux.new_window(resolved, ["omh"])
     r = tmux.new_window(resolved)
     # First spawn into a directory raises Claude's folder-trust prompt, which no
     # digit answers — leaving the new card stuck on a dialog the spawner isn't
@@ -1428,7 +1425,7 @@ def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
 # and both copies pour into the composer when the TUI wakes (seen live on a
 # fresh spawn — boot takes seconds on this class of shared-filesystem host,
 # past the whole landed-verify window). So never type until a composer marker
-# (❯ Claude / › Codex / tmux.OMH_COMPOSER omh) is actually on screen.
+# (❯ Claude / › Codex) is actually on screen.
 _COMPOSER_READY_TIMEOUT = 15.0
 _COMPOSER_READY_POLL = 0.5
 
@@ -1456,8 +1453,8 @@ def _rewind_panel_open(text: str) -> bool:
     return _REWIND_FOOTER in lines[-1] or lines[-1] == _REWIND_CURRENT_ROW
 
 
-def _wait_composer_ready(pane: str, markers: tuple[str, ...] = ("❯", "›")) -> bool:
-    """Block until `pane` shows one of `markers`, dismissing a Rewind panel if
+def _wait_composer_ready(pane: str) -> bool:
+    """Block until `pane` shows a composer marker, dismissing a Rewind panel if
     that's what is covering it. False when the composer never appears — the
     caller must then refuse to type rather than feed keystrokes to a pane that
     will eat or double them. Fails open when the pane can't be captured (the
@@ -1470,7 +1467,7 @@ def _wait_composer_ready(pane: str, markers: tuple[str, ...] = ("❯", "›")) -
         text = cap.get("text", "")
         if _rewind_panel_open(text):
             tmux.send_keys(pane, "Escape")
-        elif any(m in text for m in markers):
+        elif "❯" in text or "›" in text:
             return True
         if time.time() >= deadline:
             return False
@@ -1598,7 +1595,6 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # own ❯ cursor, fooling _wait_composer_ready below. Esc it away first,
     # remembering what we cleared so the outcome can name it (and warn when
     # closing a live menu meant denying a pending permission prompt).
-    platform = getattr(w, "platform", "claude")
     blocker = _clear_blocker(pane)
     if blocker and not blocker["cleared"]:
         return {"ok": False,
@@ -1607,8 +1603,7 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # Refuse to type until the composer is actually on screen: a booting TUI
     # eats or doubles the prompt, and a Rewind panel (which the wait dismisses
     # itself) eats it outright.
-    ready_markers = (tmux.OMH_COMPOSER,) if platform == "omh" else ("❯", "›")
-    if not _wait_composer_ready(pane, ready_markers):
+    if not _wait_composer_ready(pane):
         return {"ok": False,
                 "error": "composer not on screen — TUI still starting or a "
                          "full-screen dialog is covering it; prompt not sent"}
@@ -1620,16 +1615,12 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # shows a phantom "Queued"). For Claude, verify the text actually landed
     # before pressing Enter and that the composer emptied after, re-sending
     # whichever half a busy re-render dropped.
-    if platform == "codex":
+    is_codex = getattr(w, "platform", "claude") == "codex"
+    if is_codex:
         settle = tmux.codex_enter_settle(len(collapsed))
         res = tmux.send_text(
             pane, collapsed, settle_before_enter=settle, verify_submit=True,
             marker="›",
-        )
-    elif platform == "omh":
-        res = tmux.send_text(
-            pane, collapsed, verify_landed=True, verify_submit=True,
-            marker=tmux.OMH_COMPOSER,
         )
     else:
         res = tmux.send_text(

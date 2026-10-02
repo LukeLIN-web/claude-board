@@ -297,7 +297,7 @@ class Window:
     transcript_path: Optional[str]
     alive: bool
     hidden: bool          # internal `.slock` agent sub-session, shown at page bottom
-    platform: str = "claude"   # "claude" | "codex" | "omh" — which CLI owns this window
+    platform: str = "claude"   # "claude" | "codex" — which CLI owns this window
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -617,12 +617,12 @@ def find_window(pid: int) -> Optional[Window]:
     for w in list_claude_proc_windows(set(), set()):
         if w.pid == pid:
             return w
-    # Live Codex and omh sessions aren't backed by ~/.claude/sessions files;
-    # they're discovered from running processes. Late import to avoid a circular
-    # dependency (both import HOME_BASE from this module).
+    # Live Codex sessions aren't backed by ~/.claude/sessions files; they're
+    # discovered from running processes. Late import to avoid a circular
+    # dependency (codex imports HOME_BASE from this module).
     try:
-        from . import codex, omh
-        for w in codex.list_codex_windows() + omh.list_omh_windows():
+        from . import codex
+        for w in codex.list_codex_windows():
             if w.pid == pid:
                 return w
     except Exception:

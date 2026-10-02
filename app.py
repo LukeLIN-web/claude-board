@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, history, memory, omh, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, auth, btwcapture, btwlog, codex, history, memory, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -126,13 +126,10 @@ def _local_snapshot() -> dict:
     # shape than Claude's, so they can't go through the loop below). Shell-process
     # counts are platform-agnostic, so we fold their pids into the single ps walk.
     codex_windows = codex.codex_window_dicts()
-    omh_windows = omh.omh_window_dicts()
     shell_counts = sessions.shell_descendant_counts(
-        [w["pid"] for w in snap["windows"] + codex_windows + omh_windows
+        [w["pid"] for w in snap["windows"] + codex_windows
          if isinstance(w.get("pid"), int)]
     )
-    for ow in omh_windows:
-        ow["shell_proc_count"] = shell_counts.get(ow.get("pid"), 0)
     for cw in codex_windows:
         cw["shell_proc_count"] = shell_counts.get(cw.get("pid"), 0)
         # Codex's status line names the model + effort the session is on right
@@ -256,10 +253,10 @@ def _local_snapshot() -> dict:
             # never looks dead while it works (nothing is archived yet).
             w["btw"] = {"question": pending_q, "answer": "", "pending": True}
     _prune_banner_models({w.get("pid") for w in snap["windows"]})
-    # Merge live Codex and omh windows in, then address every card. `key` — not pid — is
+    # Merge live Codex windows in, then address every card. `key` — not pid — is
     # what the UI and the action routes carry: once a peer host's cards sit in
     # the same list, pids alone collide (see core/peers.py).
-    snap["windows"].extend(codex_windows + omh_windows)
+    snap["windows"].extend(codex_windows)
     label = peers.local_label()
     for w in snap["windows"]:
         w["host"] = label
@@ -452,20 +449,6 @@ def api_timeline(key: str, limit: int = 2000) -> dict:
             "loop": None,
             "menu": None,
         }
-    if w.platform == "omh":
-        return {
-            "pid": pid,
-            "session_id": w.session_id,
-            "project_name": w.project_name,
-            "platform": "omh",
-            "events": omh.omh_timeline(tp, limit=limit) if tp else [],
-            "skills_used": [],
-            "memory_ops": [],
-            "plan_history": [],
-            "goal": None,
-            "loop": None,
-            "menu": None,
-        }
     events = transcripts.timeline(tp, limit=limit) if tp else []
     # Merge in /btw asides — they live only in the fleet's archive (never the
     # transcript). Re-sort by timestamp so they interleave with real turns;
@@ -551,7 +534,7 @@ def api_focus(key: str) -> dict:
 
 class CreateBody(BaseModel):
     cwd: str
-    platform: str = "claude"  # "claude" | "codex" | "omh"
+    platform: str = "claude"  # "claude" | "codex"
     # Which board runs the spawn. Empty (or this host's own label) means here;
     # a configured peer label spawns on that machine, in that machine's paths.
     host: str = ""
@@ -596,17 +579,15 @@ def api_window_clear(key: str) -> dict:
     Both Claude and Codex have /clear. Claude starts a fresh transcript so its
     card empties on its own, but Codex's /clear leaves the rollout JSONL intact —
     so we also stamp a per-pid clear time that hides older rollout events from the
-    card and timeline (see codex.mark_cleared). omh calls it /new, and like
-    Claude it moves the terminal to a fresh session file."""
+    card and timeline (see codex.mark_cleared)."""
     host, pid = _split(key)
     if host:
         return peers.forward(host, "POST", f"/api/windows/{pid}/clear")
-    w = _require_window(pid)
-    cmd = "/new" if w.platform == "omh" else "/clear"
+    _require_window(pid)
     sent_at = time.time()
-    r = actions.send_prompt(pid, cmd)
+    r = actions.send_prompt(pid, "/clear")
     if r.get("ok"):
-        promptqueue.record_sent(pid, cmd, ts=sent_at)
+        promptqueue.record_sent(pid, "/clear", ts=sent_at)
         codex.mark_cleared(pid)
     return r
 

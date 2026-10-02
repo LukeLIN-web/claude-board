@@ -99,10 +99,6 @@
                   class="flex-1 text-xs px-2 py-1 rounded border transition"
                   :class="spawnPlatform === 'codex' ? 'border-green-400 text-green-700 bg-green-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
             Codex</button>
-          <button @click="spawnPlatform = 'omh'"
-                  class="flex-1 text-xs px-2 py-1 rounded border transition"
-                  :class="spawnPlatform === 'omh' ? 'border-violet-400 text-violet-700 bg-violet-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
-            omh</button>
         </div>
         <template x-if="hosts.length > 1">
           <div>
@@ -115,7 +111,7 @@
           </div>
         </template>
         <label class="text-xs text-gray-500">Spawn
-          <code x-text="spawnPlatform === 'codex' ? 'codex --yolo' : spawnPlatform"></code> in a directory
+          <code x-text="spawnPlatform === 'codex' ? 'codex --yolo' : 'claude'"></code> in a directory
           <span x-show="hosts.length > 1" class="text-gray-400">on <span x-text="spawnHost"></span></span></label>
         <select x-model="spawnCwdSelect" class="border rounded px-2 py-1 text-sm bg-white">
           <option value="">— recent directory —</option>
@@ -324,8 +320,8 @@
             <span class="inline-block w-3 h-3 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
             <span class="font-semibold text-sm truncate" x-text="w.name || w.first_input || w.project_name"></span>
             <span class="text-[10px] text-white px-1.5 rounded-full shrink-0 font-medium"
-                  :class="w.platform === 'codex' ? 'bg-green-500' : w.platform === 'omh' ? 'bg-violet-500' : 'bg-blue-500'"
-                  x-text="w.platform === 'codex' || w.platform === 'omh' ? w.platform : 'cc'"></span>
+                  :class="w.platform === 'codex' ? 'bg-green-500' : 'bg-blue-500'"
+                  x-text="w.platform === 'codex' ? 'codex' : 'cc'"></span>
             <span class="text-[10px] px-1.5 rounded-full text-white shrink-0" :class="'triage-' + w.triage"
                   x-text="w.triage"></span>
             <span x-show="hosts.length > 1"
@@ -434,14 +430,14 @@
                   class="text-xs px-2 py-1 rounded border transition"
                   :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
             Focus</button>
-          <button x-show="tmuxAvailable && w.platform !== 'codex' && w.platform !== 'omh'" @click="sendReview(w.key)" :disabled="!!promptSending[w.key]"
+          <button x-show="tmuxAvailable && w.platform !== 'codex'" @click="sendReview(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /humanize:ask-codex review to this session">
             Review</button>
           <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.key)"
                   class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
             Close</button>
-          <button x-show="w.platform !== 'codex' && w.platform !== 'omh'" @click="forkWindow(w.key)"
+          <button x-show="w.platform !== 'codex'" @click="forkWindow(w.key)"
                   class="text-xs border border-green-200 text-green-600 px-2 py-1 rounded hover:bg-green-50 transition">
             Fork</button>
           <button x-show="false" @click="exportWindow(w.key)"
@@ -449,7 +445,7 @@
             Export</button>
           <button x-show="tmuxAvailable" @click="sendClear(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
-                  :title="w.platform === 'omh' ? 'Send /new to this session' : 'Send /clear to this session'">
+                  title="Send /clear to this session">
             Clear</button>
           <button x-show="tmuxAvailable" @click="sendCommit(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
@@ -464,7 +460,7 @@
                (model, then reasoning effort — modelOptions offers both as
                groups, a pick of one keeps the other), which also rewrites
                ~/.codex/config.toml, so modelTitle says so. -->
-          <select x-show="tmuxAvailable && w.platform !== 'omh'"
+          <select x-show="tmuxAvailable"
                   @change="switchModel(w, $event.target.value); $event.target.value = ''"
                   :disabled="!!promptSending[w.key]"
                   class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded bg-white hover:bg-purple-50 transition disabled:opacity-50 disabled:cursor-wait"
@@ -526,7 +522,6 @@
         <span x-text="timelineData?.project_name || timelineData?.project_slug || ''"></span>
         <span class="text-xs text-gray-400 font-normal" x-text="'session:' + (timelineData?.session_id || '').slice(0,8)"></span>
         <span x-show="timelineData?.platform === 'codex'" class="text-[10px] bg-green-500 text-white px-1.5 rounded">codex</span>
-        <span x-show="timelineData?.platform === 'omh'" class="text-[10px] bg-violet-500 text-white px-1.5 rounded">omh</span>
       </h2>
       <div class="flex items-center gap-2">
         <!-- Assistant font-size adjuster -->
@@ -1090,7 +1085,7 @@ function fleet() {
     memorySessions: {},
     tmuxAvailable: false,
     showSpawn: false,
-    spawnPlatform: 'claude',   // 'claude' | 'codex' | 'omh'
+    spawnPlatform: 'claude',   // 'claude' | 'codex'
     spawnCwd: '',
     spawnCwdSelect: '',
     spawning: false,
@@ -1491,7 +1486,7 @@ function fleet() {
         const d = await this.apiPost('/api/windows/create',
                                      { cwd, platform: this.spawnPlatform, host: this.spawnHost });
         if (d.ok) {
-          this.toast('Spawned ' + this.spawnPlatform + ' in ' + cwd
+          this.toast('Spawned ' + (this.spawnPlatform === 'codex' ? 'codex' : 'claude') + ' in ' + cwd
                      + (this.hosts.length > 1 ? ' on ' + this.spawnHost : ''));
           this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = '';
         } else {
