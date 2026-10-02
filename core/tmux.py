@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 _TIMEOUT = 10
 # Availability is probed at most once per this many seconds so the 2s dashboard
@@ -152,14 +152,16 @@ def _resolve_cli(name: str) -> Optional[str]:
     return None
 
 
-def _run(*args: str) -> dict:
-    """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise."""
+def _run(*args: str, input: Optional[str] = None) -> dict:
+    """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise.
+    `input` is fed to tmux's stdin (for `load-buffer -`); otherwise stdin is closed."""
+    stdin = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
     try:
         cp = subprocess.run(
             ["tmux", *_socket_args(), *args],
             capture_output=True, text=True, timeout=_TIMEOUT,
             env=_spawn_env(),
-            stdin=subprocess.DEVNULL,
+            **stdin,
         )
     except FileNotFoundError:
         return {"ok": False, "rc": None, "stdout": "", "stderr": "", "error": "tmux not found on PATH"}
@@ -730,3 +732,103 @@ def send_text(
             if _composer_has_tail(pane, text, marker):
                 return {"ok": False, "error": "prompt still unsent after retries"}
     return {"ok": True}
+
+
+# A bracketed paste lands in hmz's composer in ~0.06s whatever its length. The
+# length-scaled wait is for a TUI that hasn't turned bracketed paste on, where
+# tmux delivers the paste as plain keystrokes and hmz re-renders per key (850
+# chars of CJK took 1s that way, 1700 took 2.4s). Polled, so a quick landing
+# costs nothing; nothing is resent meanwhile.
+_CONFIRMED_LANDED_BASE = 3.0
+_CONFIRMED_LANDED_PER_KCHAR = 3.0
+_CONFIRMED_LANDED_MAX = 12.0
+_CONFIRMED_POLL = 0.1
+# After each Enter, how long to look for the TUI's own record of the line before
+# deciding the Enter didn't take.
+_CONFIRMED_TOOK_WAIT = 3.0
+
+
+def _shown_above_composer(pane: str, text: str, marker: str = "❯") -> bool:
+    """True if the tail of `text` is on screen above an empty composer: the
+    line was submitted and echoed into the transcript."""
+    needle = "".join(text.split())[-24:]
+    cap = capture_pane(pane).get("text", "")
+    idx = cap.rfind(marker)
+    if not needle or idx == -1 or _composer_text(cap):
+        return False
+    return needle in "".join(cap[:idx].split())
+
+
+def _paste(pane: str, text: str) -> dict:
+    """Paste `text` into `pane` as one bracketed paste.
+
+    Through a uniquely named buffer (buffers are server-wide, and two sends can
+    overlap), loaded from stdin rather than argv, and deleted by the paste. -p
+    brackets it when the app has asked for bracketed paste, so the app takes it
+    as one Paste rather than a key per character; -r keeps a newline a newline
+    instead of tmux's default CR, which an app without bracketed paste would
+    read as Enter."""
+    name = f"fleet-send-{os.getpid()}-{time.monotonic_ns()}"
+    loaded = _run("load-buffer", "-b", name, "-", input=text)
+    if not loaded["ok"]:
+        return loaded
+    pasted = _run("paste-buffer", "-p", "-r", "-d", "-b", name, "-t", pane)
+    if not pasted["ok"]:
+        _run("delete-buffer", "-b", name)
+    return pasted
+
+
+def send_text_confirmed(
+    pane: str,
+    text: str,
+    took: Callable[[], bool],
+    marker: str = "❯",
+) -> dict:
+    """Paste `text` into `pane` once, Enter, and succeed only when `took()` says
+    the TUI actually took the line.
+
+    For hmz, where _send_until_landed + verify_submit lose prompts and report
+    them sent (seen live: a 621-char prompt, ok returned, nothing ran). Typed a
+    key at a time, a long prompt takes hmz seconds to ingest, and hmz resolves
+    bound keys — Backspace, Ctrl-U, End — on its app pump AHEAD of the
+    characters still queued at its editor. So the first 0.15s landed check
+    missed, the clear-and-retype fired mid-ingest, the clear keys jumped the
+    queue, the two copies and the clears interleaved, and the Enter sent an
+    editor that ended up empty — which hmz ignores, and which an "is our tail
+    gone from the composer" check reads as a submit.
+
+    So the text goes in as one paste (see _paste), once, never resent, and is
+    given as long as its length could need to land; and after Enter an emptied
+    composer counts for nothing — only `took()`, the caller's positive evidence,
+    does. Enter is resent only while the text still sits in the composer.
+    """
+    _clear_composer(pane)
+    pasted = _paste(pane, text)
+    if not pasted["ok"]:
+        return {"ok": False, "error": pasted["error"]}
+    wait = min(_CONFIRMED_LANDED_BASE + len(text) / 1000.0 * _CONFIRMED_LANDED_PER_KCHAR,
+               _CONFIRMED_LANDED_MAX)
+    deadline = time.time() + wait
+    while not _composer_has_tail(pane, text, marker):
+        if time.time() >= deadline:
+            _clear_composer(pane)
+            _send_debug(f"confirmed pane={pane} never landed in {wait:.1f}s")
+            return {"ok": False, "error": "prompt text never landed in composer"}
+        time.sleep(_CONFIRMED_POLL)
+    for _ in range(_SUBMIT_VERIFY_RETRIES):
+        enter = _run("send-keys", "-t", pane, "Enter")
+        if not enter["ok"]:
+            return {"ok": False, "error": enter["error"]}
+        until = time.time() + _CONFIRMED_TOOK_WAIT
+        while time.time() < until:
+            time.sleep(_CONFIRMED_POLL)
+            if took():
+                return {"ok": True}
+        if not _composer_has_tail(pane, text, marker):
+            break  # the composer let go of it and nothing took it; Enter won't help
+    stranded = _composer_has_tail(pane, text, marker)
+    _send_debug(f"confirmed pane={pane} not taken, stranded={stranded}")
+    if stranded:
+        return {"ok": False, "error": "prompt still unsent after retries"}
+    return {"ok": False,
+            "error": "the composer emptied but the prompt was never taken — not sent"}

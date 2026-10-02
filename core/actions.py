@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import tmux
+from . import hmz, tmux
 from .sessions import CLAUDE_HOME, find_window, uninterruptible_wrappers
 from .transcripts import timeline, extract_plan_history, extract_skills_used, extract_memory_ops
 
@@ -1618,14 +1618,21 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # shows a phantom "Queued"). For Claude, verify the text actually landed
     # before pressing Enter and that the composer emptied after, re-sending
     # whichever half a busy re-render dropped.
-    is_codex = getattr(w, "platform", "claude") == "codex"
-    if is_codex:
+    platform = getattr(w, "platform", "claude")
+    if platform == "codex":
         settle = tmux.codex_enter_settle(len(collapsed))
         res = tmux.send_text(
             pane, collapsed, settle_before_enter=settle, verify_submit=True,
             marker="›",
         )
-    else:  # Claude, and hmz, whose composer is the same ❯ between two rules
+    elif platform == "hmz":
+        # Same ❯ composer as Claude, but Claude's clear-and-retype races hmz's
+        # slow per-key intake and loses the prompt while reporting it sent; this
+        # path pastes once and waits for hmz's own record of the line.
+        res = tmux.send_text_confirmed(
+            pane, collapsed, hmz.prompt_taken(pid, w.cwd, collapsed, pane),
+        )
+    else:
         res = tmux.send_text(
             pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
         )

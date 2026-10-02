@@ -729,6 +729,9 @@
       <pre class="text-xs text-gray-700 max-h-48 overflow-y-auto whitespace-pre-wrap bg-gray-50 rounded p-2"
            x-text="memoryDetail?.content || '(loading...)'"></pre>
     </div>
+    <!-- Why the list below is empty, when the backend knows (an hmz with no run yet). -->
+    <div x-show="timelineData?.note" class="mb-3 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-600"
+         x-text="timelineData?.note || ''"></div>
     <div class="space-y-2 max-h-[32rem] overflow-y-auto" x-ref="eventsList">
       <!-- Only the newest `timelineWindow` events are rendered; older ones load
            on demand so a 1000-event session doesn't re-render in full on every poll. -->

@@ -11,6 +11,9 @@ opened), `called` / `returned` (a flow it called), and `ended` (`how`: done,
 failed or stopped). <workspace> is the cwd with every non-alphanumeric character
 turned into "-", and the TUI reopens on the newest run of its directory — so the
 card reads that one: begun and not ended means a flow is running.
+
+~/.humanize is $HUMANIZE_HOME when the hmz was started with one, as hmz's own
+`home()` has it.
 """
 from __future__ import annotations
 
@@ -18,13 +21,19 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
+from . import tmux
 from .codex import _classify_codex, _proc_start_ms, _proc_table
 from .sessions import HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive, get_tty
 from .textcap import MESSAGE_CHARS, cap_text
 
-EPICS_DIR = HOME_BASE / ".humanize" / "epics"
+HMZ_HOME = HOME_BASE / ".humanize"
+
+# What the timeline says for an hmz that hasn't run anything yet: there is no
+# epic to read until the first line is submitted in it.
+NO_RUN_NOTE = ("这个 hmz 还没开始 run，没有可显示的内容。在它的输入框里提交一行后才会有："
+               "普通的一行交给当前 flow（状态栏上 ◉ 后面那个），`$<flow> <任务>` 启动指定的 flow。")
 
 # Commands that are not the interface: `hmz exec` runs a flow headless, and
 # `hmz internal …` is the sandbox / credential plumbing under every turn.
@@ -41,9 +50,23 @@ def _is_interactive_hmz(args: str) -> bool:
     return False
 
 
-def _latest_epic(cwd: str) -> Optional[Path]:
+def _home(pid: int) -> Path:
+    """Where hmz `pid` keeps its runs and its history."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        env = []
+    for kv in env:
+        if kv.startswith(b"HUMANIZE_HOME="):
+            v = kv.split(b"=", 1)[1].decode(errors="replace")
+            if v:
+                return Path(v)
+    return HMZ_HOME
+
+
+def _latest_epic(cwd: str, home: Optional[Path] = None) -> Optional[Path]:
     """epic.jsonl of the newest run in `cwd`, or None before the first one."""
-    runs = EPICS_DIR / _PLAIN.sub("-", cwd)
+    runs = (home or HMZ_HOME) / "epics" / _PLAIN.sub("-", cwd)
     try:
         names = sorted(n for n in os.listdir(runs) if (runs / n / "epic.jsonl").is_file())
     except OSError:
@@ -115,7 +138,7 @@ def list_hmz_windows() -> list[Window]:
         if not _cwd_visible(cwd):
             continue
         started_at = _proc_start_ms(pid)
-        epic = _latest_epic(cwd)
+        epic = _latest_epic(cwd, _home(pid))
         status, updated_at, session_id = "idle", started_at, f"hmz-{pid}"
         if epic:
             events = _events(epic)
@@ -176,6 +199,53 @@ def hmz_window_dicts() -> list[dict]:
         })
         out.append(d)
     return out
+
+
+def _said(path: Path, start: int = 0) -> list[tuple[str, str]]:
+    """(workdir, text) of each line in hmz's history.jsonl from byte `start` on."""
+    out: list[tuple[str, str]] = []
+    try:
+        with path.open("rb") as f:
+            f.seek(start)
+            data = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in data.splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(d, dict) and isinstance(d.get("text"), str):
+            out.append((str(d.get("workdir") or ""), d["text"]))
+    return out
+
+
+def _squeeze(s: str) -> str:
+    return "".join(s.split())
+
+
+def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]:
+    """A check that hmz `pid` took `text`, set up before it is pasted.
+
+    An emptied composer proves nothing with hmz (see tmux.send_text_confirmed).
+    What does: hmz writes every line it takes — a task, a word put into a
+    running flow, a command — to <home>/history.jsonl before acting on it. It
+    skips the line it was last given, though, so a repeat of that falls back to
+    the screen: the line echoed above an emptied composer.
+    """
+    path = _home(pid) / "history.jsonl"
+    try:
+        mark = path.stat().st_size
+    except OSError:
+        mark = 0
+    want = _squeeze(text)
+    said = _said(path)
+    # hmz's "last given" is the newest line typed in this directory, or the
+    # newest anywhere when nothing was ever typed here.
+    here = [t for where, t in said if where == cwd] or [t for _, t in said]
+    if here and _squeeze(here[-1]) == want:
+        return lambda: tmux._shown_above_composer(pane, text)
+    return lambda: any(_squeeze(t) == want for _, t in _said(path, mark))
 
 
 def hmz_timeline(path: str | Path, limit: int = 60) -> list[dict]:

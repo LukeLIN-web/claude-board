@@ -459,6 +459,7 @@ def api_timeline(key: str, limit: int = 2000) -> dict:
             "project_name": w.project_name,
             "platform": "hmz",
             "events": hmz.hmz_timeline(tp, limit=limit) if tp else [],
+            "note": None if tp else hmz.NO_RUN_NOTE,
             "skills_used": [],
             "memory_ops": [],
             "plan_history": [],

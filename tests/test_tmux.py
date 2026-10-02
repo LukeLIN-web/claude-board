@@ -810,6 +810,131 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
 
 
+class SendTextConfirmedTests(unittest.TestCase):
+    """send_text_confirmed (hmz) pastes once, waits out a slow intake, and
+    succeeds only on the caller's evidence that the line was taken."""
+
+    def setUp(self):
+        tmux._clear_caches()
+        self.now = [1000.0]
+        self.calls = []
+        self.inputs = []
+
+    def _run(self, *extra):
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            self.inputs.append(kw.get("input"))
+            return FakeProc(returncode=0)
+        sleep = lambda s: self.now.__setitem__(0, self.now[0] + s)
+        return [mock.patch.object(tmux.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(tmux.time, "sleep", side_effect=sleep),
+                mock.patch.object(tmux.time, "time", side_effect=lambda: self.now[0]),
+                mock.patch.object(tmux, "_clear_composer"), *extra]
+
+    def _send(self, landed, took, text="hello"):
+        patches = self._run(mock.patch.object(tmux, "_composer_has_tail", side_effect=landed))
+        for p in patches:
+            p.start()
+        try:
+            return tmux.send_text_confirmed("%5", text, took)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def _literals(self):
+        return [c for c in self.calls if "paste-buffer" in c or "-l" in c]
+
+    def _enters(self):
+        return [c for c in self.calls if c[-1] == "Enter"]
+
+    def test_text_goes_in_as_one_bracketed_paste(self):
+        # Typed a key at a time, 1700 chars took hmz 2.4s to ingest; pasted, 0.06s.
+        r = self._send(lambda *a: True, took=lambda: True, text="split the todo")
+        self.assertTrue(r["ok"])
+        load = next(c for c in self.calls if "load-buffer" in c)
+        paste = next(c for c in self.calls if "paste-buffer" in c)
+        self.assertEqual(self.inputs[self.calls.index(load)], "split the todo")
+        name = load[load.index("-b") + 1]
+        self.assertEqual(paste[paste.index("-b") + 1], name)
+        for flag in ("-p", "-r", "-d"):
+            self.assertIn(flag, paste)
+        self.assertEqual(paste[paste.index("-t") + 1], "%5")
+        self.assertFalse(any("-l" in c for c in self.calls))  # no per-key typing
+
+    def test_a_failed_paste_leaves_no_buffer_and_no_enter(self):
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return FakeProc(returncode=1 if "paste-buffer" in argv else 0, stderr="no pane")
+        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(tmux, "_clear_composer"):
+            r = tmux.send_text_confirmed("%5", "hello", lambda: True)
+        self.assertFalse(r["ok"])
+        self.assertTrue(any("delete-buffer" in c for c in self.calls))
+        self.assertEqual(self._enters(), [])
+
+    def test_slow_intake_is_waited_out_not_retyped(self):
+        # Regression: a 0.15s check missed hmz still ingesting, and the clear +
+        # retype raced the first copy into an empty editor.
+        landed = iter([False] * 5 + [True])
+        r = self._send(lambda *a: next(landed), took=lambda: True)
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(self._literals()), 1)
+        self.assertEqual(len(self._enters()), 1)
+
+    def test_emptied_composer_without_evidence_is_a_failure(self):
+        # The live loss: Enter, the composer reads empty, hmz never took it.
+        tail = iter([True, False, False])
+        r = self._send(lambda *a: next(tail), took=lambda: False)
+        self.assertFalse(r["ok"])
+        self.assertIn("never taken", r["error"])
+        self.assertEqual(len(self._enters()), 1)  # an Enter more wouldn't help
+
+    def test_stranded_text_gets_enter_again(self):
+        polls = round(tmux._CONFIRMED_TOOK_WAIT / tmux._CONFIRMED_POLL)  # one Enter's full wait
+        took = iter([False] * polls + [True])
+        r = self._send(lambda *a: True, took=lambda: next(took))
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(self._enters()), 2)
+
+    def test_never_landed_presses_no_enter(self):
+        r = self._send(lambda *a: False, took=lambda: True)
+        self.assertFalse(r["ok"])
+        self.assertIn("never landed", r["error"])
+        self.assertEqual(self._enters(), [])
+        self.assertEqual(len(self._literals()), 1)
+
+    def test_landing_wait_grows_with_length_and_is_capped(self):
+        for n, wait in ((10, 3.03), (1000, 6.0), (100000, tmux._CONFIRMED_LANDED_MAX)):
+            self.now, self.calls = [1000.0], []
+            self._send(lambda *a: False, took=lambda: True, text="x" * n)
+            self.assertAlmostEqual(self.now[0] - 1000.0, wait, delta=tmux._CONFIRMED_POLL)
+
+
+class ShownAboveComposerTests(unittest.TestCase):
+    PANE = ("\n".join([
+        "split the todo across workers",
+        "── assistant",
+        "● assistant is working",
+        "─" * 40,
+        "❯ ",
+        "─" * 40,
+        "  ◉ chat · /home/u/proj",
+    ]))
+
+    def _shown(self, screen, text="split the todo across workers"):
+        with mock.patch.object(tmux, "capture_pane", return_value={"ok": True, "text": screen}):
+            return tmux._shown_above_composer("%1", text)
+
+    def test_echo_above_an_empty_composer(self):
+        self.assertTrue(self._shown(self.PANE))
+
+    def test_text_still_in_the_composer_is_not_an_echo(self):
+        self.assertFalse(self._shown(self.PANE.replace("❯ ", "❯ split the todo across workers")))
+
+    def test_absent(self):
+        self.assertFalse(self._shown(self.PANE, text="something else entirely"))
+
+
 class ComposerHasTailTests(unittest.TestCase):
     """_composer_has_tail anchors on the DRIVEN platform's composer marker only —
     Claude's `❯` by default, Codex's `›` when passed. The other TUI's glyph is

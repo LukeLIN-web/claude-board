@@ -4,6 +4,7 @@ processes, finding the newest run of a directory, and reading a run's epic.
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from core import hmz
@@ -44,15 +45,15 @@ class TestDetection(unittest.TestCase):
 class TestEpics(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.orig = hmz.EPICS_DIR
-        hmz.EPICS_DIR = Path(self.tmp.name)
+        self.orig = hmz.HMZ_HOME
+        hmz.HMZ_HOME = Path(self.tmp.name)
 
     def tearDown(self):
-        hmz.EPICS_DIR = self.orig
+        hmz.HMZ_HOME = self.orig
         self.tmp.cleanup()
 
     def _run(self, cwd_slug, name, events):
-        d = Path(self.tmp.name) / cwd_slug / name
+        d = Path(self.tmp.name) / "epics" / cwd_slug / name
         d.mkdir(parents=True)
         (d / "epic.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
         return d / "epic.jsonl"
@@ -65,6 +66,93 @@ class TestEpics(unittest.TestCase):
 
     def test_dir_without_runs(self):
         self.assertIsNone(hmz._latest_epic("/home/u/never.ran"))
+
+    def test_humanize_home_of_the_process(self):
+        # An hmz started with HUMANIZE_HOME keeps its runs there, not in ~/.humanize.
+        other = Path(self.tmp.name) / "elsewhere"
+        d = other / "epics" / "-home-u-x" / "20261002T000000.000Z-cccccc"
+        d.mkdir(parents=True)
+        (d / "epic.jsonl").write_text(json.dumps(RUN[0]) + "\n")
+        self.assertIsNone(hmz._latest_epic("/home/u/x"))
+        self.assertEqual(hmz._latest_epic("/home/u/x", other), d / "epic.jsonl")
+
+
+class TestPromptTaken(unittest.TestCase):
+    """A send to hmz succeeds on hmz's own record of the line, never on an
+    emptied composer."""
+
+    CWD = "/home/u/proj"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.history = Path(self.tmp.name) / "history.jsonl"
+        home = mock.patch.object(hmz, "_home", return_value=Path(self.tmp.name))
+        home.start()
+        self.addCleanup(home.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _say(self, text, workdir=CWD):
+        with self.history.open("a") as f:
+            f.write(json.dumps({"at": "2026-10-02T20:43:25Z", "workdir": workdir,
+                                "text": text}) + "\n")
+
+    def test_taken_once_hmz_writes_the_line_down(self):
+        self._say("an earlier task")
+        taken = hmz.prompt_taken(1, self.CWD, "split   the\ntodo", "%1")
+        self.assertFalse(taken())
+        self._say("split the todo")  # whitespace differs only
+        self.assertTrue(taken())
+
+    def test_lines_from_before_the_send_do_not_count(self):
+        self._say("split the todo")
+        self._say("something else")
+        taken = hmz.prompt_taken(1, self.CWD, "split the todo", "%1")
+        self.assertFalse(taken())
+
+    def test_no_history_yet(self):
+        taken = hmz.prompt_taken(1, self.CWD, "first ever", "%1")
+        self.assertFalse(taken())
+        self._say("first ever")
+        self.assertTrue(taken())
+
+    def test_repeat_of_the_last_line_falls_back_to_the_screen(self):
+        # hmz doesn't write a repeat of the line it was last given, so the
+        # history can't confirm it; the echo above the composer has to.
+        self._say("again", workdir="/elsewhere")
+        self._say("again")
+        taken = hmz.prompt_taken(1, self.CWD, "again", "%1")
+        with mock.patch.object(hmz.tmux, "_shown_above_composer",
+                               return_value=True) as shown:
+            self.assertTrue(taken())
+        shown.assert_called_once_with("%1", "again")
+
+
+class TestNoRunNote(unittest.TestCase):
+    def _window(self, transcript_path):
+        return hmz.Window(pid=7, session_id="hmz-7", cwd="/home/u/proj", project_name="proj",
+                          project_slug="-home-u-proj", name=None, status="idle",
+                          waiting_for=None, started_at=0, updated_at=0, version="",
+                          tty="/dev/pts/1", transcript_path=transcript_path, alive=True,
+                          hidden=False, platform="hmz")
+
+    def test_timeline_says_why_it_is_empty(self):
+        import app
+        with mock.patch.object(app.sessions, "find_window", return_value=self._window(None)):
+            r = app.api_timeline("7")
+        self.assertEqual(r["events"], [])
+        self.assertEqual(r["note"], hmz.NO_RUN_NOTE)
+
+    def test_no_note_once_a_run_exists(self):
+        import app
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            f.write("".join(json.dumps(e) + "\n" for e in RUN))
+        self.addCleanup(Path(f.name).unlink)
+        with mock.patch.object(app.sessions, "find_window", return_value=self._window(f.name)):
+            r = app.api_timeline("7")
+        self.assertIsNone(r["note"])
+        self.assertEqual(r["events"][0]["kind"], "user_text")
 
 
 class TestRun(unittest.TestCase):
