@@ -713,7 +713,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertEqual(len(literals), 1)  # text sent once
         # Landing first try still costs one clear: the composer is emptied
         # before the text is typed, never after it lands.
-        cc.assert_called_once_with("%5")
+        cc.assert_called_once_with("%5", "❯")
 
     def test_composer_is_cleared_before_the_first_keystroke(self):
         # Regression: the clear used to run only on RETRIES, so whatever a
@@ -732,7 +732,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer",
-                                  side_effect=lambda p: order.append("clear")), \
+                                  side_effect=lambda p, m: order.append("clear")), \
                 mock.patch.object(tmux, "_composer_has_tail",
                                   side_effect=[True, False]):  # landed, then submitted
             r = tmux.send_text("%5", "/clear", verify_landed=True)
@@ -754,7 +754,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertEqual(len(literals), 2)  # initial + one resend
         # Every attempt clears first, so neither a leftover from an earlier send
         # nor a partial paste can concatenate into a corrupted prompt.
-        self.assertEqual(cc.call_args_list, [mock.call("%5")] * 2)
+        self.assertEqual(cc.call_args_list, [mock.call("%5", "❯")] * 2)
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
