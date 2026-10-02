@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -118,8 +119,11 @@ def _venv_unset_prefix() -> list[str]:
 # Where a user-installed CLI lives when the board's own PATH cannot see it.
 # `claude` and `codex` install into ~/.local/bin — an entry a login shell adds
 # to PATH and a bare environment does not, so a board brought up by a
-# supervisor restart, a systemd unit or a cron line never has it.
-_CLI_FALLBACK_DIRS = ("~/.local/bin", "/usr/local/bin")
+# supervisor restart, a systemd unit or a cron line never has it. `hmz` is a pip
+# entry point, so it lands in the conda base's bin — added to PATH by `conda
+# init` in .bashrc, which a bare environment never sources either.
+_CLI_FALLBACK_DIRS = ("~/.local/bin", "/usr/local/bin",
+                      "~/miniconda3/bin", "~/anaconda3/bin", "~/miniforge3/bin")
 
 
 def _resolve_cli(name: str) -> Optional[str]:
@@ -343,10 +347,13 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     # (see _resolve_cli). Refusing here beats spawning a window that dies 127.
     exe = _resolve_cli(cmd[0])
     if exe is None:
+        # Name the host: a peer's spawn error shows up on the aggregating
+        # board's page, where "the board" would read as the wrong machine.
         return {"ok": False,
-                "error": f"{cmd[0]} not found on the board's PATH or in "
-                         f"{', '.join(_CLI_FALLBACK_DIRS)} — restart the board "
-                         f"from a shell that can run {cmd[0]}"}
+                "error": f"{cmd[0]} not found on {socket.gethostname()}: not on "
+                         f"its board's PATH or in {', '.join(_CLI_FALLBACK_DIRS)} "
+                         f"— install it there, or restart that board from a "
+                         f"shell that can run {cmd[0]}"}
     # Force-unset the board's venv markers on the pane command itself so a stale
     # tmux server can't re-inject VIRTUAL_ENV into the spawned session.
     cmd = [*_venv_unset_prefix(), exe, *cmd[1:]]

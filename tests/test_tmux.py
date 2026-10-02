@@ -437,6 +437,15 @@ class ResolveCliTests(unittest.TestCase):
                                lambda path, mode: path == "/home/u/.local/bin/claude"):
             self.assertEqual(tmux._resolve_cli("claude"), "/home/u/.local/bin/claude")
 
+    def test_falls_back_to_conda_base_when_path_is_bare(self):
+        # hmz is a pip entry point in the conda base, which only .bashrc's
+        # `conda init` block puts on PATH.
+        with mock.patch.dict("os.environ", {"HOME": "/home/u"}), \
+             mock.patch.object(tmux.shutil, "which", return_value=None), \
+             mock.patch.object(tmux.os, "access",
+                               lambda path, mode: path == "/home/u/miniconda3/bin/hmz"):
+            self.assertEqual(tmux._resolve_cli("hmz"), "/home/u/miniconda3/bin/hmz")
+
     def test_returns_none_when_nothing_on_disk_matches(self):
         with mock.patch.object(tmux.shutil, "which", return_value=None), \
              mock.patch.object(tmux.os, "access", return_value=False):
