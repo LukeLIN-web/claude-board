@@ -426,7 +426,8 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
 
     `platform` selects the CLI: "claude" (default) launches Claude Code with
     permission prompts skipped; "codex" launches the Codex TUI in `--yolo` mode
-    so the fleet can drive it without per-action approval prompts.
+    so the fleet can drive it without per-action approval prompts; "hmz" opens
+    the humanize interface, whose flows run every agent with approvals bypassed.
     """
     if not cwd or not cwd.strip():
         return {"ok": False, "error": "cwd is required"}
@@ -435,6 +436,8 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         return {"ok": False, "error": f"not a directory: {resolved}"}
     if platform == "codex":
         return tmux.new_window(resolved, ["codex", "--yolo"])
+    if platform == "hmz":
+        return tmux.new_window(resolved, ["hmz"])
     r = tmux.new_window(resolved)
     # First spawn into a directory raises Claude's folder-trust prompt, which no
     # digit answers — leaving the new card stuck on a dialog the spawner isn't
@@ -1622,7 +1625,7 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
             pane, collapsed, settle_before_enter=settle, verify_submit=True,
             marker="›",
         )
-    else:
+    else:  # Claude, and hmz, whose composer is the same ❯ between two rules
         res = tmux.send_text(
             pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
         )
