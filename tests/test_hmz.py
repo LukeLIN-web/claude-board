@@ -1,7 +1,9 @@
 """Tests for humanize (hmz) cards: telling the interface from hmz's headless
-processes, finding the newest run of a directory, and reading a run's epic.
+processes, finding the newest run of a directory, and reading a run's epic and
+the sessions it keeps.
 """
 import json
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -178,6 +180,111 @@ class TestRun(unittest.TestCase):
                          ["user_text", "assistant_text", "assistant_text", "assistant_text"])
         self.assertTrue(ev[0]["text"].startswith("$commander_delegate split todo.md"))
         self.assertEqual(ev[-1]["text"], "run ended: done")
+
+
+def _jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+class TestKeptSessions(unittest.TestCase):
+    """What the agents said lives in the sessions the run keeps beside its epic,
+    under sessions/<cli>/ laid out as that CLI lays out its home."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        run = Path(self.tmp.name) / "20261002T000000.000Z-a1b2c3"
+        self.run = run
+        self.epic = _jsonl(run / "epic.jsonl", [
+            {"event": "began", "at": "2026-10-02T00:00:00.000Z", "flow": "rlar",
+             "task": "fix   the bug"},
+            # Written once the session's first turn is done, so after it.
+            {"event": "opened", "at": "2026-10-02T00:00:05.000Z", "agent": "writer",
+             "backend": "claude", "session": "c1", "where": "sessions/claude"},
+            {"event": "called", "at": "2026-10-02T00:00:06.000Z", "flow": "review",
+             "epic": "epic.review_d4e5f6.jsonl"},
+            {"event": "opened", "at": "2026-10-02T00:00:09.000Z", "agent": "writer",
+             "backend": "claude", "session": "c2", "parent": "c1", "where": "sessions/claude"},
+            {"event": "opened", "at": "2026-10-02T00:00:10.000Z", "agent": "scout",
+             "backend": "grok", "session": "g1", "where": "sessions/grok"},
+        ])
+        # The called flow writes its own record, and the session it opened is there.
+        _jsonl(run / "epic.review_d4e5f6.jsonl", [
+            {"event": "began", "at": "2026-10-02T00:00:06.000Z", "flow": "review"},
+            {"event": "opened", "at": "2026-10-02T00:00:08.000Z", "agent": "reviewer",
+             "backend": "codex", "session": "x9", "where": "sessions/codex"},
+        ])
+        first = [
+            {"type": "user", "timestamp": "2026-10-02T00:00:01.000Z",
+             "message": {"role": "user", "content": "fix the bug"}},
+            {"type": "assistant", "timestamp": "2026-10-02T00:00:04.000Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "fixed it"}]}},
+        ]
+        claude = run / "sessions" / "claude" / "projects" / "-home-u-proj"
+        self.writer_log = _jsonl(claude / "c1.jsonl", first)
+        # A fork opens on a copy of the conversation it was cut from.
+        _jsonl(claude / "c2.jsonl", first + [
+            {"type": "user", "timestamp": "2026-10-02T00:00:08.500Z",
+             "message": {"role": "user", "content": "address the review"}},
+        ])
+        _jsonl(run / "sessions" / "codex" / "sessions" / "2026" / "10" / "02"
+               / "rollout-2026-10-02T00-00-07-x9.jsonl", [
+            {"type": "event_msg", "timestamp": "2026-10-02T00:00:07.000Z",
+             "payload": {"type": "user_message", "message": "review the diff"}},
+            {"type": "response_item", "timestamp": "2026-10-02T00:00:07.500Z",
+             "payload": {"type": "message",
+                         "content": [{"type": "output_text", "text": "one nit"}]}},
+        ])
+
+    def test_every_session_of_the_run_in_order(self):
+        ev = hmz.hmz_timeline(self.epic)
+        self.assertEqual(
+            [(e["extra"].get("agent"), e["text"]) for e in ev],
+            [(None, "$rlar fix   the bug"),
+             # The task handed to the first agent word for word is not shown twice.
+             ("writer", "fixed it"),
+             (None, "called flow review"),
+             ("reviewer", "review the diff"),
+             ("reviewer", "one nit"),
+             # The fork's copy of c1 is shown once, its own turn after it.
+             ("writer", "address the review"),
+             # No log the board can read: the run's own line is all there is.
+             ("scout", "scout opened a grok session")])
+
+    def test_session_kept_in_the_cli_home(self):
+        # A session that stayed where its CLI keeps it: `where` is the whole path.
+        home = Path(self.tmp.name) / "dot-claude"
+        _jsonl(home / "projects" / "-x" / "h1.jsonl", [
+            {"type": "assistant", "timestamp": "2026-10-02T00:00:11.000Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "from home"}]}},
+        ])
+        opened = {"agent": "w", "backend": "claude", "session": "h1", "where": str(home)}
+        self.assertEqual(hmz._logs(self.epic, opened), [home / "projects" / "-x" / "h1.jsonl"])
+
+    def test_activity_is_read_off_the_session_logs(self):
+        # A long turn writes its session's log, not the epic.
+        for p in self.run.rglob("*.jsonl"):
+            os.utime(p, (1_000, 1_000))
+        os.utime(self.writer_log, (5_000, 5_000))
+        self.assertEqual(hmz._last_logged(self.epic), 5_000_000)
+
+    def test_current_task_follows_the_session_written_last(self):
+        events = hmz._events(self.epic)
+        for p in self.run.rglob("*.jsonl"):
+            os.utime(p, (1_000, 1_000))
+        codex_log = next(self.run.rglob("rollout-*.jsonl"))
+        os.utime(codex_log, (2_000, 2_000))
+        self.assertEqual(hmz._current_task(events, self.epic), "rlar · reviewer: one nit")
+        # The writer resumes its session for the next round: no new `opened` line.
+        os.utime(self.writer_log, (3_000, 3_000))
+        self.assertEqual(hmz._current_task(events, self.epic), "rlar · writer: fixed it")
+
+    def test_current_task_without_logs_is_the_last_opened(self):
+        events = [e for e in hmz._events(self.epic) if e.get("event") != "opened"]
+        events.append({"event": "opened", "agent": "scout", "backend": "grok", "session": "g1"})
+        self.assertEqual(hmz._current_task(events), "rlar · scout")
 
 
 if __name__ == "__main__":

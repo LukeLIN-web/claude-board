@@ -767,6 +767,10 @@
              }">
           <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
             <span x-text="fmtTimeET(ev.ts)" :title="ev.ts || ''"></span>
+            <!-- Which of an hmz run's agents this turn is from. -->
+            <template x-if="ev.extra?.agent">
+              <span class="text-violet-600 font-medium" x-text="'@' + ev.extra.agent"></span>
+            </template>
             <template x-if="ev.extra?.source==='btw'">
               <span class="text-teal-600 font-medium">💬 btw</span>
             </template>
