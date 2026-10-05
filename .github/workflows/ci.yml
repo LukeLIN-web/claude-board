@@ -6,6 +6,8 @@ name: CI
 #   smoke  bash scripts/smoke.sh
 # GitHub-hosted runners: this repository is public, so they cost no minutes, and a
 # self-hosted runner on a public repository would run any fork's pull request.
+# Pinned to ubuntu-24.04 rather than ubuntu-latest, which moves to Ubuntu 26 on
+# 2026-10-19: a new image is a change of its own, made here when it is wanted.
 
 on:
   push:
@@ -25,12 +27,12 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Install ruff
@@ -45,17 +47,17 @@ jobs:
         run: python scripts/secrets-audit.py
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         # The oldest Python pyproject.toml admits, and the one the board's venv runs.
         python: ["3.10", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -67,12 +69,12 @@ jobs:
         run: python -m pytest -ra
 
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
