@@ -760,7 +760,7 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
             continue
         f = proj_dir / f"{session_id}.jsonl"
         if f.exists():
-            if not sessions.slug_visible(proj_dir.name):
+            if not sessions.transcript_visible(f):
                 raise HTTPException(404, "session not found")
             fp = str(f)
             events = transcripts.timeline(fp, limit=limit)

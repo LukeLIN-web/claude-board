@@ -77,6 +77,39 @@ class CreateRouteVisibilityTests(unittest.TestCase):
         m.assert_not_called()
 
 
+class HistoryTimelineVisibilityTests(unittest.TestCase):
+    """The archive timeline obeys the cwd allowlist on the transcript's own cwd:
+    projects/-shared-ws-proj-evil reads, by its slug, as inside /shared/ws/proj."""
+
+    def setUp(self):
+        import json, tempfile
+        from pathlib import Path
+        self.root = Path(tempfile.mkdtemp())
+        d = self.root / "-shared-ws-proj-evil"
+        d.mkdir()
+        (d / "sid1.jsonl").write_text(json.dumps(
+            {"type": "user", "cwd": "/shared/ws/proj-evil", "timestamp": "2026-09-08T20:40:00Z",
+             "message": {"content": "secret plans"}}) + "\n")
+        env = mock.patch.dict("os.environ", {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj",
+                                             "CLAUDE_FLEET_CWD_EXCLUDE": ""})
+        env.start()
+        appmod.sessions._reload_cwd_filters()
+        self.addCleanup(lambda: (env.stop(), appmod.sessions._reload_cwd_filters()))
+        p = mock.patch.object(appmod.sessions, "PROJECTS_DIR", self.root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_sibling_outside_the_allowlist_is_not_served(self):
+        import fastapi
+        with self.assertRaises(fastapi.HTTPException) as cm:
+            appmod.api_history_timeline("sid1")
+        self.assertEqual(cm.exception.status_code, 404)
+
+
 class PromptRouteTests(unittest.TestCase):
     def test_dispatches_to_send_prompt(self):
         # The route now guards on a visible window before sending.

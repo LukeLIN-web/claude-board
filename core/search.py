@@ -181,9 +181,10 @@ def search(query: str, limit: int = 60) -> list[dict]:
 
         p = Path(path)
         # Hide hits from projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/
-        # EXCLUDE. Claude transcripts live under projects/<cwd-slug>/; codex
-        # sessions aren't cwd-addressable, so they're left untouched.
-        if _detect_platform(p) == "claude" and not sessions.slug_visible(_project_slug_from_file(p)):
+        # EXCLUDE, judged on the cwd the transcript records (its projects/<slug>
+        # name is lossy); codex sessions aren't cwd-addressable, so they're left
+        # untouched.
+        if _detect_platform(p) == "claude" and not sessions.transcript_visible(p):
             continue
         raw = _read_line(p, line_no) or (text_info.get("text") or "")
         try:

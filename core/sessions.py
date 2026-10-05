@@ -74,7 +74,9 @@ _reload_cwd_filters()
 
 def _under(cwd: str, prefix: str) -> bool:
     cwd_n = os.path.normpath(cwd)
-    return cwd_n == prefix or cwd_n.startswith(prefix + os.sep)
+    # rstrip: the root prefix "/" already ends in the separator, and "//" would
+    # match nothing — CLAUDE_FLEET_CWD_INCLUDE=/ hid every session.
+    return cwd_n == prefix or cwd_n.startswith(prefix.rstrip(os.sep) + os.sep)
 
 
 def _cwd_visible(cwd: str) -> bool:
@@ -87,20 +89,64 @@ def _cwd_visible(cwd: str) -> bool:
 
 
 def _slug_under(slug: str, prefix_slug: str) -> bool:
-    return slug == prefix_slug or slug.startswith(prefix_slug + "-")
+    return slug == prefix_slug or slug.startswith(prefix_slug.rstrip("-") + "-")
 
 
 def slug_visible(slug: str) -> bool:
     """Same filter as `_cwd_visible`, but for a `projects/<slug>` dir name.
 
-    The slug is a lossy encoding of the cwd (/ _ . all become -), so this can
-    over-match in rare cases (e.g. `a/b` vs `a_b`); good enough for hiding
-    search hits from filtered projects."""
+    The slug is a lossy encoding of the cwd (/ _ . all become -), so this
+    over-matches — not only `a/b` vs `a_b`, but every sibling whose name extends
+    an included dir with "-": `proj` lets `proj-evil` through. Prefer
+    `transcript_visible` wherever there is a transcript to read."""
     if _CWD_EXCLUDE_SLUGS and any(_slug_under(slug, p) for p in _CWD_EXCLUDE_SLUGS):
         return False
     if _CWD_INCLUDE_SLUGS and not any(_slug_under(slug, p) for p in _CWD_INCLUDE_SLUGS):
         return False
     return True
+
+
+# transcript path -> the cwd its rows record. A transcript never changes
+# directory, so a hit is kept for good; a file with no cwd row yet is re-read.
+_TRANSCRIPT_CWD: dict[str, str] = {}
+
+
+def _transcript_cwd(path: Path) -> str:
+    """The cwd a Claude transcript was written from, "" if no row names one yet."""
+    key = str(path)
+    if key in _TRANSCRIPT_CWD:
+        return _TRANSCRIPT_CWD[key]
+    cwd = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(200), f):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                c = d.get("cwd") if isinstance(d, dict) else None
+                if isinstance(c, str) and c:
+                    cwd = c
+                    break
+    except OSError:
+        return ""
+    if cwd:
+        _TRANSCRIPT_CWD[key] = cwd
+    return cwd
+
+
+def transcript_visible(path: str | Path) -> bool:
+    """Whether a Claude transcript's session passes the machine-local filter.
+
+    Decided on the cwd the transcript records, so it is exactly `_cwd_visible`:
+    the slug of its projects/ dir cannot tell /w/proj-evil from /w/proj/evil,
+    and an allowlist read off the slug served /w/proj-evil's whole timeline.
+    The slug is only the fallback for a file whose rows name no cwd yet."""
+    if not (_CWD_INCLUDE or _CWD_EXCLUDE):
+        return True
+    p = Path(path)
+    cwd = _transcript_cwd(p)
+    return _cwd_visible(cwd) if cwd else slug_visible(p.parent.name)
 
 
 def _pid_alive(pid: int) -> bool:
