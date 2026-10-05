@@ -17,7 +17,7 @@ a glance.
 ```bash
 git clone https://github.com/LukeLIN-web/claude-board
 cd claude-board && bash run.sh
-# open http://127.0.0.1:7878 in your browser
+# open http://127.0.0.1:7879 in your browser
 ```
 
 The first run creates a venv and installs dependencies automatically — nothing to
@@ -207,10 +207,11 @@ $ scripts/cf-tunnel.sh start       # also: stop | status | url
 
 A quick tunnel has no edge policy at all, so here the gate is the app's own
 password ([`core/auth.py`](core/auth.py)): set `FLEET_AUTH_PASSWORD` in
-`.env.local` and restart the board. The script *probes* the running server and
-refuses to publish unless an anonymous request is actually rejected — it does
-not just read the variable, because `run.sh` runs uvicorn detached and a
-password added after startup is set in your shell and absent in the process.
+`.env.local` and restart the board (`bash run.sh restart`). The script
+*probes* the running server and refuses to publish unless an anonymous request
+is actually rejected — it does not just read the variable, because `run.sh`
+runs uvicorn detached and a password added after startup is set in your shell
+and absent in the process.
 The URL is random and changes on every start; `cf-tunnel.sh url` reprints it.
 
 The two are independent. The password gate works behind either tunnel, or
@@ -268,7 +269,7 @@ FLEET_PEER_TUNNELS="7880:hostb:7879"   # <local port>:<ssh host>:<peer's port>
 ```console
 $ scripts/peer-tunnel.sh start     # also: stop | status
 [peer-tunnel] 7880:hostb:7879 — up
-$ ./run.sh                         # restart so the board reads FLEET_PEERS
+$ ./run.sh restart                 # so the board reads FLEET_PEERS
 ```
 
 The peer is reached on loopback, not on its LAN address: every board binds

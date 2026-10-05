@@ -13,7 +13,7 @@
 ```bash
 git clone https://github.com/LukeLIN-web/claude-board
 cd claude-board && bash run.sh
-# 浏览器打开 http://127.0.0.1:7878
+# 浏览器打开 http://127.0.0.1:7879
 ```
 
 首次运行自动建 venv 装依赖，不用管。换端口：`CLAUDE_FLEET_PORT=9000 bash run.sh`。默认的后台模式有 supervisor，board 退出后会自动重启。可用 `bash run.sh status` / `restart` / `stop` 管理。
@@ -168,7 +168,7 @@ $ scripts/cf-tunnel.sh start       # 还有：stop | status | url
 
 quick tunnel 在边缘没有任何策略可言，所以这里的门是应用自己的密码
 （[`core/auth.py`](core/auth.py)）：在 `.env.local` 里设 `FLEET_AUTH_PASSWORD`，然后
-重启面板。脚本会**实际探测**跑着的 server，匿名请求确实被挡下来了才肯发布——它不是去读
+重启面板（`bash run.sh restart`）。脚本会**实际探测**跑着的 server，匿名请求确实被挡下来了才肯发布——它不是去读
 那个环境变量，因为 `run.sh` 是 detached 起 uvicorn 的，启动之后才加的密码只存在于你的
 shell 里，那个正在服务的进程根本不知道。URL 是随机的、每次启动都变，`cf-tunnel.sh url`
 可以再打印一遍。
@@ -223,7 +223,7 @@ FLEET_PEER_TUNNELS="7880:hostb:7879"   # <本地端口>:<ssh 主机>:<对端端�
 ```console
 $ scripts/peer-tunnel.sh start     # 还有：stop | status
 [peer-tunnel] 7880:hostb:7879 — up
-$ ./run.sh                         # 重启一次，board 才会读到 FLEET_PEERS
+$ ./run.sh restart                 # 重启一次，board 才会读到 FLEET_PEERS
 ```
 
 对端是通过 loopback 访问的，而不是它的局域网地址：board 能往 tmux pane 里打字，

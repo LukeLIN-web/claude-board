@@ -7,7 +7,7 @@ user data. Point the dashboard at it with CLAUDE_FLEET_HOME:
 
     python3 fixtures/seed.py                 # populate fixtures/demo-home
     CLAUDE_FLEET_HOME=fixtures/demo-home bash run.sh
-    # open http://127.0.0.1:7878
+    # open http://127.0.0.1:7879
 
 The live "cards" require alive PIDs, so this spawns a few detached `sleep`
 processes and records them in fixtures/demo-home/.demo-pids. Clean up with:

@@ -157,7 +157,7 @@ down)
     ;;
 ungated)
     echo "error: the board on 127.0.0.1:$PORT answered an anonymous request with HTTP 200 — it has no password gate." >&2
-    echo "       Set FLEET_AUTH_PASSWORD in .env.local and RESTART the board (./run.sh), then retry." >&2
+    echo "       Set FLEET_AUTH_PASSWORD in .env.local and RESTART the board (./run.sh restart), then retry." >&2
     echo "       A restart is the part that is easy to miss: run.sh runs uvicorn detached, so" >&2
     echo "       editing .env.local does nothing to the process already serving this port." >&2
     exit 5
