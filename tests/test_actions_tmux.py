@@ -20,6 +20,16 @@ _CARD = _fake_window("/dev/pts/3")
 
 # An idle Claude pane: an empty composer over its status line.
 _LIVE_TEXT = "❯ \n⏵⏵ bypass permissions on"
+# An idle Codex pane: its composer's placeholder over its status line.
+_CODEX_LIVE_TEXT = "› Ask Codex to do anything\n  gpt-6-astra high · /tmp/proj\n"
+# Claude's task list, drawn BELOW its composer; every blocked task carries a `›`.
+_CLAUDE_TASKS = (
+    "  3 tasks (0 done, 1 in progress, 2 open)\n"
+    "  ◼ task1: New pool mining + eligibility + dedup\n"
+    "  ◻ task2: Render spec v5 › blocked by #1\n"
+    "  ◻ task3: Objective function › blocked by #2\n"
+)
+_CLAUDE_EMPTY_OVER_TASKS = "────────────\n❯ \n────────────\n" + _CLAUDE_TASKS
 
 
 def _screens(*texts, then=None):
@@ -177,7 +187,7 @@ class SendPromptTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
     def test_codex_window_gets_settle_before_enter(self):
-        with _pane(window=_fake_window("/dev/pts/3", platform="codex")) as p:
+        with _pane(_CODEX_LIVE_TEXT, window=_fake_window("/dev/pts/3", platform="codex")) as p:
             r = actions.send_prompt(1234, "hello")
         # Codex gets a length-scaled settle, its submit-verify anchored on
         # Codex's `›` composer marker.
@@ -419,6 +429,21 @@ class SendPromptReadinessTests(unittest.TestCase):
         p.send_text.assert_called_once()
         self.assertTrue(r["ok"])
 
+    def test_a_task_line_is_not_a_claude_composer(self):
+        # Codex's glyph on a Claude pane is a task line, not a place to type.
+        r, p = self._send(self._BOOTING + _CLAUDE_TASKS)
+        p.send_text.assert_not_called()
+        self.assertFalse(r["ok"])
+        self.assertIn("composer", r["error"])
+
+    def test_codex_pane_waits_for_its_own_composer(self):
+        codex = _fake_window("/dev/pts/3", platform="codex")
+        with _pane(CODEX_BANNER_BOX, CODEX_BANNER_BOX, _CODEX_LIVE_TEXT, window=codex) as p:
+            r = actions.send_prompt(1234, "hello")
+        self.assertTrue(r["ok"])
+        self.assertEqual(p.capture_pane.call_count, 3)  # banner twice, then the composer
+        self.assertEqual(p.send_text.call_args.kwargs["marker"], "›")
+
 
 def _fail_send(after_text):
     """send_prompt on a pane whose composer looks clean until the send, which
@@ -527,6 +552,14 @@ class SendFailureDiagnosisTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
         self.assertIn("some other draft", r["error"])
+
+    def test_task_list_below_an_empty_composer_is_not_other_text(self):
+        # Each blocked task carries a `›` (Codex's composer glyph); read as the
+        # composer, the empty one was reported holding "blocked by #2".
+        r, _ = _fail_send(_CLAUDE_EMPTY_OVER_TASKS)
+        self.assertFalse(r["ok"])
+        self.assertIn("stayed empty", r["error"])
+        self.assertNotIn("other text", r["error"])
 
 
 class SendMenuKeysOverlayTests(unittest.TestCase):

@@ -312,9 +312,10 @@ _TRUST_WAIT = 6.0          # seconds to wait for the dialog to close after Enter
 _TRUST_POLL = 0.2
 
 
-def _has_composer(text: str) -> bool:
-    """Whether a composer marker (❯ Claude / › Codex) is anywhere on screen."""
-    return "❯" in text or "›" in text
+def _has_composer(text: str, marker: str) -> bool:
+    """Whether the composer marker of the CLI on screen — `marker`, see
+    tmux.COMPOSER_MARKERS — is anywhere in `text`."""
+    return marker in text
 
 
 def _wait_pane(pane: str, pred, timeout: float, poll: float) -> Optional[str]:
@@ -429,6 +430,7 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
     """
     if not pane_id:
         return {"answered": False, "waited": 0.0, "reason": "no pane"}
+    marker = tmux.composer_marker("claude")  # only Claude launches raise this prompt
     waited = 0.0
     for _ in range(max(1, attempts)):
         cap = tmux.capture_pane(pane_id)
@@ -440,7 +442,7 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
             r = answer_trust_prompt(pane_id)
             return {"answered": bool(r.get("answered")), "waited": round(waited, 2),
                     "reason": "" if r.get("ok") else r.get("error", "")}
-        if not _trust_prompt_painting(text) and _has_composer(text):
+        if not _trust_prompt_painting(text) and _has_composer(text, marker):
             return {"answered": False, "waited": round(waited, 2), "reason": "already trusted"}
         time.sleep(interval)
         waited += interval
@@ -1244,8 +1246,8 @@ def _archive_open_aside(pane: str, session_id: Optional[str],
 # retry's clearing keys sit inert in the same buffer as the text they were meant to clear,
 # and both copies pour into the composer when the TUI wakes (seen live on a
 # fresh spawn — boot takes seconds on this class of shared-filesystem host,
-# past the whole landed-verify window). So never type until a composer marker
-# (❯ Claude / › Codex) is actually on screen.
+# past the whole landed-verify window). So never type until the CLI's own
+# composer marker (tmux.COMPOSER_MARKERS) is actually on screen.
 _COMPOSER_READY_TIMEOUT = 15.0
 _COMPOSER_READY_POLL = 0.5
 
@@ -1273,8 +1275,8 @@ def _rewind_panel_open(text: str) -> bool:
     return _REWIND_FOOTER in lines[-1] or lines[-1] == _REWIND_CURRENT_ROW
 
 
-def _wait_composer_ready(pane: str) -> bool:
-    """Block until `pane` shows a composer marker, dismissing a Rewind panel if
+def _wait_composer_ready(pane: str, marker: str) -> bool:
+    """Block until `pane` shows its composer `marker`, dismissing a Rewind panel if
     that's what is covering it. False when the composer never appears — the
     caller must then refuse to type rather than feed keystrokes to a pane that
     will eat or double them. Fails open when the pane can't be captured (the
@@ -1287,7 +1289,7 @@ def _wait_composer_ready(pane: str) -> bool:
         text = cap.get("text", "")
         if _rewind_panel_open(text):
             tmux.send_keys(pane, "Escape")
-        elif _has_composer(text):
+        elif _has_composer(text, marker):
             return True
         if time.time() >= deadline:
             return False
@@ -1321,13 +1323,14 @@ def _diagnose_blocker(text: str) -> Optional[dict]:
     return None
 
 
-def _unlanded_error(text: str) -> str:
-    """Specific error for a landed-verify failure with no classifiable blocker.
+def _unlanded_error(text: str, marker: str) -> str:
+    """Specific error for a landed-verify failure with no classifiable blocker,
+    read off the composer `marker` opens.
 
     Three distinct failure shapes used to collapse into the same generic
     "prompt text never landed in composer"; telling them apart from the message
     alone is what makes the card actionable without shelling into tmux."""
-    content = tmux._composer_text(text)
+    content = tmux._composer_text(text, marker)
     if content is None:
         return ("prompt text never landed: no composer marker on screen — the "
                 "TUI is still starting, mid-redraw, or a full-screen view "
@@ -1335,7 +1338,7 @@ def _unlanded_error(text: str) -> str:
     if content:
         snippet = content if len(content) <= 60 else content[:57] + "…"
         return ("prompt text never landed: the composer holds other text "
-                f"({snippet!r}) — an unrecognized overlay drawing its own ❯ "
+                f"({snippet!r}) — an unrecognized overlay drawing its own {marker} "
                 "cursor, or someone is typing in this pane")
     tail = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
     return ("prompt text never landed: the composer stayed empty — the pane "
@@ -1422,10 +1425,13 @@ def _send_prompt_inner(pid: int, w, pane: str, text: str) -> dict:
         return {"ok": False,
                 "error": f"send blocked: {blocker['label']} is still open on "
                          "this pane — press Esc on the card, then resend."}
+    # Every composer read from here on — ready, landed, sent, what went wrong —
+    # anchors on this CLI's own glyph (see tmux.COMPOSER_MARKERS).
+    marker = tmux.composer_marker(w.platform)
     # Refuse to type until the composer is actually on screen: a booting TUI
     # eats or doubles the prompt, and a Rewind panel (which the wait dismisses
     # itself) eats it outright.
-    if not _wait_composer_ready(pane):
+    if not _wait_composer_ready(pane, marker):
         return {"ok": False,
                 "error": "composer not on screen — TUI still starting or a "
                          "full-screen dialog is covering it; prompt not sent"}
@@ -1439,18 +1445,18 @@ def _send_prompt_inner(pid: int, w, pane: str, text: str) -> dict:
     # whichever half a busy re-render dropped.
     if w.platform == "codex":
         settle = tmux.codex_enter_settle(len(collapsed))
-        res = tmux.send_text(pane, collapsed, settle_before_enter=settle, marker="›")
+        res = tmux.send_text(pane, collapsed, settle_before_enter=settle, marker=marker)
     elif w.platform == "hmz":
         # Same ❯ composer as Claude, but Claude's clear-and-retype races hmz's
         # slow per-key intake and loses the prompt while reporting it sent; this
         # path pastes once and waits for hmz's own record of the line — and for
         # whatever hmz then says on screen instead of running it.
         res = tmux.send_text_confirmed(
-            pane, collapsed, hmz.prompt_taken(pid, w.cwd, collapsed, pane),
+            pane, collapsed, hmz.prompt_taken(pid, w.cwd, collapsed, pane), marker,
             refused=lambda: hmz.refusal(pane, collapsed),
         )
     else:
-        res = tmux.send_text(pane, collapsed, verify_landed=True, marker="❯")
+        res = tmux.send_text(pane, collapsed, verify_landed=True, marker=marker)
     # Reactive diagnosis: if the prompt still didn't land, a blocker may have
     # (re)surfaced between the clear above and the send — name it instead of the
     # generic "never landed in composer". With no classifiable blocker, still
@@ -1465,7 +1471,7 @@ def _send_prompt_inner(pid: int, w, pane: str, text: str) -> dict:
                         "error": f"send blocked: {b['label']} is open on this "
                                  "pane — press Esc on the card, then resend."}
             if res.get("reason") == "unlanded":
-                return {"ok": False, "error": _unlanded_error(cap["text"])}
+                return {"ok": False, "error": _unlanded_error(cap["text"], marker)}
         return res
     # Delivered. If we had to auto-close a blocker to get here, say so.
     if blocker:

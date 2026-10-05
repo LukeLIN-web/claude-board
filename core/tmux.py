@@ -507,25 +507,40 @@ def _needle(text: str) -> str:
     return "".join(text.split())[-24:]
 
 
-def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
+# The glyph each CLI opens its composer line with, by Window.platform. hmz's
+# composer is Claude's shape. Every read of a composer — has our text landed,
+# is it empty, what is in it — anchors on the DRIVEN CLI's glyph and that one
+# only, so every one of them takes it as an argument rather than guessing: the
+# other CLI's glyph turns up as ordinary content. Claude draws `›` in its task
+# list (" › blocked by #N"), which it puts BELOW the composer; a reader taking
+# the last of either glyph as the composer read an empty Claude composer as
+# holding "blocked by #N", cleared it blind on every landed-verify attempt, and
+# blamed a failed send on "other text" that was never there.
+COMPOSER_MARKERS = {"claude": "❯", "codex": "›", "hmz": "❯"}
+
+
+def composer_marker(platform: str) -> str:
+    """The composer glyph of `platform`'s CLI. Anything not named is driven
+    down Claude's send path, so it is read with Claude's glyph too."""
+    return COMPOSER_MARKERS.get(platform, COMPOSER_MARKERS["claude"])
+
+
+def _composer_has_tail(pane: str, text: str, marker: str) -> bool:
     """_tail_in over a fresh capture of `pane`."""
     return _tail_in(capture_pane(pane).get("text", ""), text, marker)
 
 
-def _tail_in(cap: str, text: str, marker: str = "❯") -> bool:
+def _tail_in(cap: str, text: str, marker: str) -> bool:
     """True if a distinctive tail of `text` still sits in the composer of the
     captured screen `cap`, stranded and awaiting a submit Enter.
 
-    The composer is the region after the last prompt marker — `marker` is the
-    DRIVEN platform's composer glyph (`❯` for Claude, `›` for Codex), and only
-    that one is searched. The other TUI's glyph is ordinary content here: Claude
-    renders `›` as the " › blocked by #N" task-list separator, which the todo
-    summary draws BELOW the composer — searching for both markers would anchor
-    on that trailing `›`, look past the real composer, and wrongly report a
-    landed prompt as "never landed". A submitted prompt is echoed as a turn ABOVE
-    the marker (same glyph, hence "last") and leaves the composer empty (a dim
-    ghost suggestion, never our text). Whitespace is squeezed on both sides so
-    the needle survives the composer's soft-wrapping and indentation.
+    The composer is the region after the last `marker` (see COMPOSER_MARKERS:
+    anchored on a Claude task line's `›` instead, the region starts below the
+    real composer and a landed prompt reads as "never landed"). A submitted
+    prompt is echoed as a turn ABOVE the marker (same glyph, hence "last") and
+    leaves the composer empty (a dim ghost suggestion, never our text).
+    Whitespace is squeezed on both sides so the needle survives the composer's
+    soft-wrapping and indentation.
 
     Exception: a /btw aside keeps its command text on the composer line for as
     long as its answer overlay is open, so the overlay footer in the region
@@ -577,20 +592,21 @@ _CLEAR_KEYS = ("End", "C-u", "BSpace")
 _CHROME_CHARS = set("─│╭╮╰╯▔ ")
 
 
-def _composer_text(cap_text: str) -> Optional[str]:
-    """What is sitting in the composer: the last ❯/› marker line (after the
+def _composer_text(cap_text: str, marker: str) -> Optional[str]:
+    """What is sitting in the composer: the last `marker` line (after the
     marker) plus wrapped continuation lines, stopping at the chrome below it
     (rule / box border / blank / the ⏵⏵ status line). None when no marker is
-    on screen — there is no composer to read."""
+    on screen — there is no composer to read. `marker` is the driven CLI's
+    glyph alone (see COMPOSER_MARKERS)."""
     lines = cap_text.splitlines()
     last = None
     for i, ln in enumerate(lines):
-        if "❯" in ln or "›" in ln:
+        if marker in ln:
             last = i
     if last is None:
         return None
     head = lines[last]
-    parts = [head[max(head.rfind("❯"), head.rfind("›")) + 1:].strip("│")]
+    parts = [head[head.rfind(marker) + 1:].strip("│")]
     for ln in lines[last + 1:]:
         s = ln.strip()
         if not s or set(s) <= _CHROME_CHARS or s.startswith("⏵⏵"):
@@ -599,8 +615,9 @@ def _composer_text(cap_text: str) -> Optional[str]:
     return "\n".join(p.strip() for p in parts).strip()
 
 
-def _clear_composer(pane: str) -> None:
-    """Empty `pane`'s composer before a retry / after giving up on a send.
+def _clear_composer(pane: str, marker: str) -> None:
+    """Empty `pane`'s composer — the one `marker` opens — before a retry /
+    after giving up on a send.
 
     Claude's composer removes at most one visual LINE per clearing press (see
     _CLEAR_KEYS), so a single press leaves most of a partial paste in place —
@@ -614,7 +631,7 @@ def _clear_composer(pane: str) -> None:
     prev = None
     for _ in range(_CLEAR_VERIFY_TRIES):
         cap = capture_pane(pane)
-        content = _composer_text(cap.get("text", "")) if cap.get("ok") else None
+        content = _composer_text(cap.get("text", ""), marker) if cap.get("ok") else None
         if content == "":
             return
         if content is None or content == prev:
@@ -668,7 +685,7 @@ def _send_literal(pane: str, text: str) -> dict:
     return {"ok": True} if r["ok"] else {"ok": False, "error": r["error"]}
 
 
-def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
+def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
     A busy pane can drop the injected keystrokes during a re-render, so the text
@@ -698,7 +715,7 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
         # next Clear submitted the literal text "/clear/clear" — which Claude
         # answers as prose ("type /clear on its own line") instead of clearing,
         # leaving the session unclearable from the board for good.
-        _clear_composer(pane)
+        _clear_composer(pane, marker)
         literal = _send_literal(pane, text)
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
@@ -715,7 +732,7 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
                  else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
                     f"needle={_needle(text)!r} frame={frame!r}")
-    _clear_composer(pane)  # wipe the buffered text on wake
+    _clear_composer(pane, marker)  # wipe the buffered text on wake
     _send_debug(f"landed pane={pane} gave up after "
                 f"{len(_LANDED_VERIFY_WAITS)} attempts")
     return False
@@ -726,9 +743,13 @@ def send_text(
     text: str,
     settle_before_enter: float = 0.0,
     verify_landed: bool = False,
-    marker: str = "❯",
+    *,
+    marker: str,
 ) -> dict:
     """Send `text` literally into `pane`, then a separate Enter to submit it.
+
+    `marker` is the composer glyph of the CLI in `pane` (composer_marker); every
+    check below reads the composer it opens.
 
     `settle_before_enter` pauses between the pasted text and the Enter. Some TUIs
     (Codex always; Claude when a slash-command popup is open) coalesce a rapid
@@ -793,13 +814,13 @@ _CONFIRMED_TOOK_WAIT = 3.0
 _CONFIRMED_REFUSAL_WAIT = 1.5
 
 
-def _shown_above_composer(pane: str, text: str, marker: str = "❯") -> bool:
-    """True if the tail of `text` is on screen above an empty composer: the
-    line was submitted and echoed into the transcript."""
+def _shown_above_composer(pane: str, text: str, marker: str) -> bool:
+    """True if the tail of `text` is on screen above an empty composer — the
+    one `marker` opens: the line was submitted and echoed into the transcript."""
     needle = _needle(text)
     cap = capture_pane(pane).get("text", "")
     idx = cap.rfind(marker)
-    if not needle or idx == -1 or _composer_text(cap):
+    if not needle or idx == -1 or _composer_text(cap, marker):
         return False
     return needle in "".join(cap[:idx].split())
 
@@ -827,7 +848,7 @@ def send_text_confirmed(
     pane: str,
     text: str,
     took: Callable[[], bool],
-    marker: str = "❯",
+    marker: str,
     refused: Optional[Callable[[], str]] = None,
 ) -> dict:
     """Paste `text` into `pane` once, Enter, and succeed only when `took()` says
@@ -849,7 +870,7 @@ def send_text_confirmed(
     composer counts for nothing — only `took()`, the caller's positive evidence,
     does. Enter is resent only while the text still sits in the composer.
     """
-    _clear_composer(pane)
+    _clear_composer(pane, marker)
     pasted = _paste(pane, text)
     if not pasted["ok"]:
         return {"ok": False, "error": pasted["error"]}
@@ -858,7 +879,7 @@ def send_text_confirmed(
     deadline = time.time() + wait
     while not _composer_has_tail(pane, text, marker):
         if time.time() >= deadline:
-            _clear_composer(pane)
+            _clear_composer(pane, marker)
             _send_debug(f"confirmed pane={pane} never landed in {wait:.1f}s")
             return {"ok": False, "error": "prompt text never landed in composer",
                     "reason": "unlanded"}

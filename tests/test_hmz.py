@@ -144,7 +144,7 @@ class TestPromptTaken(_HmzHomeTest):
         with mock.patch.object(hmz.tmux, "_shown_above_composer",
                                return_value=True) as shown:
             self.assertTrue(taken())
-        shown.assert_called_once_with("%1", "again")
+        shown.assert_called_once_with("%1", "again", "❯")
 
 
 class TestRefusal(unittest.TestCase):

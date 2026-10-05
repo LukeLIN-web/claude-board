@@ -768,6 +768,10 @@ def _squeeze(s: str) -> str:
     return "".join(s.split())
 
 
+# The glyph hmz's composer line opens with (see tmux.COMPOSER_MARKERS).
+_COMPOSER = tmux.composer_marker("hmz")
+
+
 def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]:
     """A check that hmz `pid` took `text`, set up before it is pasted.
 
@@ -788,7 +792,7 @@ def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]
     # newest anywhere when nothing was ever typed here.
     here = [d["text"] for d in said if d["workdir"] == cwd] or [d["text"] for d in said]
     if here and _squeeze(here[-1]) == want:
-        return lambda: tmux._shown_above_composer(pane, text)
+        return lambda: tmux._shown_above_composer(pane, text, _COMPOSER)
     return lambda: any(_squeeze(d["text"]) == want for d in _history(path, mark))
 
 
@@ -807,7 +811,7 @@ def refusal(pane: str, text: str) -> str:
     """
     lines = tmux.capture_pane(pane).get("text", "").splitlines()
     composer = next((i for i in range(len(lines) - 1, -1, -1)
-                     if lines[i].lstrip().startswith("❯")), -1)
+                     if lines[i].lstrip().startswith(_COMPOSER)), -1)
     needle = _squeeze(text)[-24:]
     if composer < 0 or not needle:
         return ""

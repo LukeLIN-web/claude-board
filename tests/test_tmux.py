@@ -448,7 +448,7 @@ class SendTextTests(unittest.TestCase):
     def test_sends_literal_then_separate_enter(self):
         calls = []
         with _patch_run(_recorder(calls)):
-            r = tmux.send_text("%5", "hello world")
+            r = tmux.send_text("%5", "hello world", marker="❯")
         self.assertTrue(r["ok"])
         self.assertEqual(
             calls[0],
@@ -459,14 +459,14 @@ class SendTextTests(unittest.TestCase):
     def test_literal_failure_short_circuits_before_enter(self):
         calls = []
         with _patch_run(_recorder(calls, returncode=1, stderr="bad pane")):
-            r = tmux.send_text("%5", "hi")
+            r = tmux.send_text("%5", "hi", marker="❯")
         self.assertFalse(r["ok"])
         self.assertEqual(len(calls), 1)  # Enter never sent
 
     def test_slash_prefix_settles_before_enter(self):
         calls = []
         with _patch_run(_recorder(calls)):
-            r = tmux.send_text("%5", "/research-pipeline")
+            r = tmux.send_text("%5", "/research-pipeline", marker="❯")
         self.assertTrue(r["ok"])
         self.assertEqual(self.sleeps[0], tmux._SLASH_SETTLE)
         self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
@@ -474,7 +474,7 @@ class SendTextTests(unittest.TestCase):
     def test_settle_before_enter_pauses_plain_text(self):
         calls = []
         with _patch_run(_recorder(calls)):
-            r = tmux.send_text("%5", "hello", settle_before_enter=tmux._CODEX_ENTER_SETTLE)
+            r = tmux.send_text("%5", "hello", settle_before_enter=tmux._CODEX_ENTER_SETTLE, marker="❯")
         self.assertTrue(r["ok"])
         # The settle before Enter, then the submit-verify's wait after it.
         self.assertEqual(self.sleeps, [tmux._CODEX_ENTER_SETTLE, tmux._SUBMIT_VERIFY_WAIT])
@@ -483,13 +483,13 @@ class SendTextTests(unittest.TestCase):
     def test_slash_settle_wins_when_longer_than_caller_settle(self):
         # A slash prompt with a smaller caller settle still waits the slash time.
         with _patch_run(_recorder([])):
-            r = tmux.send_text("%5", "/foo", settle_before_enter=0.1)
+            r = tmux.send_text("%5", "/foo", settle_before_enter=0.1, marker="❯")
         self.assertTrue(r["ok"])
         self.assertEqual(self.sleeps[0], tmux._SLASH_SETTLE)
 
     def test_plain_text_does_not_settle_before_enter(self):
         with _patch_run(_recorder([])):
-            r = tmux.send_text("%5", "research-pipeline")
+            r = tmux.send_text("%5", "research-pipeline", marker="❯")
         self.assertTrue(r["ok"])
         self.assertEqual(self.sleeps, [tmux._SUBMIT_VERIFY_WAIT])  # only the post-Enter check
 
@@ -500,7 +500,7 @@ class SendTextTests(unittest.TestCase):
             return FakeProc(returncode=0)
 
         with _patch_run(fake_run):
-            r = tmux.send_text("%5", "hi")
+            r = tmux.send_text("%5", "hi", marker="❯")
         self.assertFalse(r["ok"])
         self.assertIn("enter failed", r["error"])
 
@@ -543,7 +543,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=False):
-            r = tmux.send_text("%5", "hello")
+            r = tmux.send_text("%5", "hello", marker="❯")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submit Enter only, no resend
@@ -555,7 +555,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail",
                                   side_effect=lambda *a: next(states)):
-            r = tmux.send_text("%5", "hello")
+            r = tmux.send_text("%5", "hello", marker="❯")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 2)  # initial submit + one resend
@@ -565,7 +565,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=True):
-            r = tmux.send_text("%5", "hello")
+            r = tmux.send_text("%5", "hello", marker="❯")
         self.assertFalse(r["ok"])
         self.assertIn("unsent", r["error"])
 
@@ -579,7 +579,7 @@ class SendTextVerifySubmitTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail",
                                   side_effect=lambda *a: next(states)):
-            r = tmux.send_text("%5", "/clear")
+            r = tmux.send_text("%5", "/clear", marker="❯")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 2)  # initial submit + one resend
@@ -606,15 +606,54 @@ class SendTextVerifySubmitTests(unittest.TestCase):
 
         with _patch_run(fake_run), \
                 mock.patch.object(tmux.time, "sleep"):
-            r = tmux.send_text("%5", "/btw hello, just reply ok")
+            r = tmux.send_text("%5", "/btw hello, just reply ok", marker="❯")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submit Enter only — overlay untouched
 
 
+# Claude's task list, which it draws BELOW the composer: every blocked task
+# carries a `›`, Codex's composer glyph.
+_CLAUDE_TASK_LIST = (
+    "  10 tasks (0 done, 1 in progress, 9 open)\n"
+    "  ◼ task1: New pool mining + eligibility + dedup\n"
+    "  ◻ task2: Render spec v5 › blocked by #1\n"
+    "  ◻ task3: Objective function › blocked by #2\n"
+)
+
+
+def _claude_pane_with_tasks(composer=""):
+    """A Claude pane holding `composer` in its composer, task list below."""
+    return f"────────────\n❯ {composer}\n────────────\n" + _CLAUDE_TASK_LIST
+
+
 class SendTextVerifyLandedTests(unittest.TestCase):
     """verify_landed confirms the literal text reached the composer before Enter,
     re-sending it (clearing the composer first) when a busy-pane re-render dropped it."""
+
+    def test_empty_composer_over_a_task_list_is_not_cleared_blind(self):
+        # Read with Codex's glyph too, the empty composer "held" the last task
+        # line's "blocked by #2": no clearing press could empty that, so every
+        # landed-verify attempt ended in the blind fallback — forty clearing
+        # presses into a composer that held nothing.
+        typed = [""]
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "capture-pane" in argv:
+                return FakeProc(stdout=_claude_pane_with_tasks(typed[0]))
+            if "-l" in argv:
+                typed[0] = argv[-1]
+            elif argv[-1] == "Enter":
+                typed[0] = ""
+            return FakeProc()
+
+        with _patch_run(fake_run), \
+                mock.patch.object(tmux.time, "sleep"):
+            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
+        self.assertTrue(r["ok"])
+        self.assertEqual(ClearComposerTests._presses(calls), [])
 
     def test_no_resend_when_text_lands_first_try(self):
         calls = []
@@ -623,13 +662,13 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
-            r = tmux.send_text("%5", "hello", verify_landed=True)
+            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 1)  # text sent once
         # Landing first try still costs one clear: the composer is emptied
         # before the text is typed, never after it lands.
-        cc.assert_called_once_with("%5")
+        cc.assert_called_once_with("%5", "❯")
 
     def test_composer_is_cleared_before_the_first_keystroke(self):
         # Regression: the clear used to run only on RETRIES, so whatever a
@@ -648,10 +687,10 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         with _patch_run(fake_run), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer",
-                                  side_effect=lambda p: order.append("clear")), \
+                                  side_effect=lambda *a: order.append("clear")), \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
-            r = tmux.send_text("%5", "/clear", verify_landed=True)
+            r = tmux.send_text("%5", "/clear", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
         # The clear precedes the very first keystroke, not just the resends.
         self.assertEqual(order[:2], ["clear", "type"])
@@ -664,13 +703,13 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=lambda *a: next(landed)):
-            r = tmux.send_text("%5", "hello", verify_landed=True)
+            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 2)  # initial + one resend
         # Every attempt clears first, so neither a leftover from an earlier send
         # nor a partial paste can concatenate into a corrupted prompt.
-        self.assertEqual(cc.call_args_list, [mock.call("%5")] * 2)
+        self.assertEqual(cc.call_args_list, [mock.call("%5", "❯")] * 2)
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
@@ -678,7 +717,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_tail_in", return_value=False):
-            r = tmux.send_text("%5", "hello", verify_landed=True)
+            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
         # Never press Enter on a prompt that never made it into the composer.
@@ -698,7 +737,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         with _patch_run(_recorder([])), \
                 mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append), \
                 mock.patch.object(tmux, "_tail_in", return_value=False):
-            r = tmux.send_text("%5", "hello", verify_landed=True)
+            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertFalse(r["ok"])
         self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
         self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
@@ -711,7 +750,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
-            r = tmux.send_text("%5", "hello", verify_landed=True)
+            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
@@ -742,7 +781,7 @@ class SendTextConfirmedTests(unittest.TestCase):
         for p in patches:
             p.start()
         try:
-            return tmux.send_text_confirmed("%5", text, took, refused=refused)
+            return tmux.send_text_confirmed("%5", text, took, "❯", refused=refused)
         finally:
             for p in reversed(patches):
                 p.stop()
@@ -773,7 +812,7 @@ class SendTextConfirmedTests(unittest.TestCase):
             return FakeProc(returncode=1 if "paste-buffer" in argv else 0, stderr="no pane")
         with _patch_run(fake_run), \
                 mock.patch.object(tmux, "_clear_composer"):
-            r = tmux.send_text_confirmed("%5", "hello", lambda: True)
+            r = tmux.send_text_confirmed("%5", "hello", lambda: True, "❯")
         self.assertFalse(r["ok"])
         self.assertTrue(any("delete-buffer" in c for c in self.calls))
         self.assertEqual(self._enters(), [])
@@ -843,7 +882,7 @@ class ShownAboveComposerTests(unittest.TestCase):
 
     def _shown(self, screen, text="split the todo across workers"):
         with mock.patch.object(tmux, "capture_pane", return_value={"ok": True, "text": screen}):
-            return tmux._shown_above_composer("%1", text)
+            return tmux._shown_above_composer("%1", text, "❯")
 
     def test_echo_above_an_empty_composer(self):
         self.assertTrue(self._shown(self.PANE))
@@ -992,7 +1031,7 @@ class ComposerTextTests(unittest.TestCase):
             "────────────\n"
             "  ⏵⏵ bypass permissions on\n"
         )
-        self.assertEqual(tmux._composer_text(cap), "")
+        self.assertEqual(tmux._composer_text(cap, "❯"), "")
 
     def test_wrapped_content_is_joined_across_lines(self):
         cap = (
@@ -1002,17 +1041,28 @@ class ComposerTextTests(unittest.TestCase):
             "────────────\n"
             "  ⏵⏵ bypass permissions on\n"
         )
-        text = tmux._composer_text(cap)
+        text = tmux._composer_text(cap, "❯")
         self.assertIn("ABC", text)
         self.assertIn("6789012345678901234567890123456789", text)
 
     def test_status_line_without_rule_is_not_content(self):
         # Minimal layouts draw the status line directly under the marker line.
         cap = "❯ \n⏵⏵ bypass permissions on\n"
-        self.assertEqual(tmux._composer_text(cap), "")
+        self.assertEqual(tmux._composer_text(cap, "❯"), "")
 
     def test_no_marker_returns_none(self):
-        self.assertIsNone(tmux._composer_text("(base) user@host:~$ \n"))
+        self.assertIsNone(tmux._composer_text("(base) user@host:~$ \n", "❯"))
+
+    def test_task_list_below_an_empty_claude_composer_is_not_its_text(self):
+        self.assertEqual(tmux._composer_text(_claude_pane_with_tasks(), "❯"), "")
+
+    def test_codex_composer_is_read_on_its_own_marker(self):
+        cap = (
+            "────────────\n"
+            "› run the benchmark suite\n"
+            "────────────\n"
+        )
+        self.assertEqual(tmux._composer_text(cap, "›"), "run the benchmark suite")
 
 
 class ClearComposerTests(unittest.TestCase):
@@ -1037,7 +1087,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
-            tmux._clear_composer("%5")
+            tmux._clear_composer("%5", "❯")
         self.assertEqual(tmux._CLEAR_KEYS, ("End", "C-u", "BSpace"))
         sends = [c for c in calls if "send-keys" in c]
         self.assertEqual(len(sends), 1)
@@ -1054,17 +1104,20 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
-            tmux._clear_composer("%5")
+            tmux._clear_composer("%5", "❯")
         self.assertEqual(len(self._presses(calls)), 2)  # one per non-empty read, none once empty
 
     def test_already_empty_composer_sends_nothing(self):
-        calls = []
-        with _patch_run(_recorder(calls)), \
-                mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "capture_pane",
-                                  return_value={"ok": True, "text": "❯ \n────────────\n"}):
-            tmux._clear_composer("%5")
-        self.assertEqual(self._presses(calls), [])
+        for name, screen in (("bare", "❯ \n────────────\n"),
+                             ("task list below", _claude_pane_with_tasks())):
+            with self.subTest(name):
+                calls = []
+                with _patch_run(_recorder(calls)), \
+                        mock.patch.object(tmux.time, "sleep"), \
+                        mock.patch.object(tmux, "capture_pane",
+                                          return_value={"ok": True, "text": screen}):
+                    tmux._clear_composer("%5", "❯")
+                self.assertEqual(self._presses(calls), [])
 
     def test_stalled_pane_falls_back_to_blind_presses(self):
         # A stalled TUI never redraws: the same screen comes back after a press
@@ -1075,7 +1128,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ stuck text\n────────────\n"}):
-            tmux._clear_composer("%5")
+            tmux._clear_composer("%5", "❯")
         self.assertGreaterEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
 
     def test_capture_failure_falls_back_to_blind_presses(self):
@@ -1083,7 +1136,7 @@ class ClearComposerTests(unittest.TestCase):
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane", return_value={"ok": False}):
-            tmux._clear_composer("%5")
+            tmux._clear_composer("%5", "❯")
         self.assertEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
 
 
@@ -1156,7 +1209,7 @@ class TrailingSemicolonEscapeTests(unittest.TestCase):
         calls = []
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"):
-            r = tmux.send_text("%5", "do the thing;")
+            r = tmux.send_text("%5", "do the thing;", marker="❯")
         self.assertTrue(r["ok"])
         (literal,) = self._literal_calls(calls)
         self.assertEqual(literal[-1], "do the thing\\;")
@@ -1172,7 +1225,7 @@ class TrailingSemicolonEscapeTests(unittest.TestCase):
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_tail_in", side_effect=fake_tail):
-            r = tmux.send_text("%5", "goal 2. 重跑(钉死);", verify_landed=True)
+            r = tmux.send_text("%5", "goal 2. 重跑(钉死);", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
         (literal,) = self._literal_calls(calls)
         self.assertEqual(literal[-1], "goal 2. 重跑(钉死)\\;")
