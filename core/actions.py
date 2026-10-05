@@ -1,4 +1,4 @@
-"""Side-effectful actions: focus, fork, export, close, spawn, send-prompt."""
+"""Side-effectful actions: focus, fork, close, spawn, send-prompt."""
 from __future__ import annotations
 
 import os
@@ -13,7 +13,6 @@ from typing import Optional
 
 from . import hmz, tmux
 from .sessions import CLAUDE_HOME, find_window, uninterruptible_wrappers
-from .transcripts import timeline, extract_plan_history, extract_skills_used, extract_memory_ops
 
 # Upper bound on an injected single-line prompt (after newline collapse).
 _MAX_PROMPT_CHARS = 8000
@@ -94,30 +93,18 @@ end tell
 '''
 
 
-def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
-    """Open `claude <claude_args>` in a new window, cwd-anchored.
+def _open_cli_window(cli: str, cwd: str, args: list[str]) -> dict:
+    """Open `<cli> <args>` in a new window, cwd-anchored.
 
     Prefers the tmux backend (Linux/headless); falls back to a new iTerm2 window
     via AppleScript on macOS. Returns a structured dict and never raises. If
     neither backend is available, returns a clear actionable error rather than
     the opaque `[Errno 2] No such file or directory: 'osascript'`.
-
-    Resume/fork (the callers below) always launch with
-    `--dangerously-skip-permissions`, matching fresh spawns (create_session ->
-    tmux.new_window's default). The fleet drives these sessions unattended, so
-    a per-action approval prompt would otherwise wedge a resumed /goal loop.
     """
-    if "--dangerously-skip-permissions" not in claude_args:
-        claude_args = ["--dangerously-skip-permissions", *claude_args]
     if tmux.available():
-        r = tmux.new_window(cwd, ["claude", *claude_args])
+        r = tmux.new_window(cwd, [cli, *args])
         if r["ok"]:
-            # A resume/fork into a never-opened directory hits the folder-trust
-            # prompt before it gets anywhere near the resume picker the caller
-            # goes on to answer, so clear it first (see confirm_trust_prompt).
-            trust = confirm_trust_prompt(r.get("pane_id"))
-            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"),
-                    "backend": "tmux", "trust": trust}
+            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
         return {"ok": False, "error": r["error"], "backend": "tmux"}
 
     if not shutil.which("osascript"):
@@ -127,8 +114,8 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
                      "or run on macOS with iTerm2 (osascript not found)",
         }
 
-    args_str = " ".join(shlex.quote(a) for a in claude_args)
-    inner = f"cd {shlex.quote(cwd)} && claude {args_str}"
+    args_str = " ".join(shlex.quote(a) for a in args)
+    inner = f"cd {shlex.quote(cwd)} && {cli} {args_str}"
     quoted_for_applescript = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
     script = _FORK_APPLESCRIPT_ITERM.format(cmd=quoted_for_applescript)
     try:
@@ -147,38 +134,23 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
     }
 
 
-def open_codex_window(cwd: str, codex_args: list[str]) -> dict:
-    """Open `codex <codex_args>` in a new window, cwd-anchored (tmux/iTerm2).
+def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
+    """Open `claude <claude_args>` in a new window (see _open_cli_window).
 
-    Mirrors open_claude_window but launches the Codex CLI; used to fork/resume a
-    Codex session into a fresh window.
+    Resume/fork (the callers below) always launch with
+    `--dangerously-skip-permissions`, matching fresh spawns (create_session ->
+    tmux.new_window's default). The fleet drives these sessions unattended, so
+    a per-action approval prompt would otherwise wedge a resumed /goal loop.
     """
-    if tmux.available():
-        r = tmux.new_window(cwd, ["codex", *codex_args])
-        if r["ok"]:
-            return {"ok": True, "cwd": cwd, "pane_id": r.get("pane_id"), "backend": "tmux"}
-        return {"ok": False, "error": r["error"], "backend": "tmux"}
-
-    if not shutil.which("osascript"):
-        return {
-            "ok": False,
-            "error": "no terminal backend: start a tmux server (Linux) "
-                     "or run on macOS with iTerm2 (osascript not found)",
-        }
-
-    args_str = " ".join(shlex.quote(a) for a in codex_args)
-    inner = f"cd {shlex.quote(cwd)} && codex {args_str}"
-    quoted_for_applescript = '"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"'
-    script = _FORK_APPLESCRIPT_ITERM.format(cmd=quoted_for_applescript)
-    try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": proc.returncode == 0, "cwd": cwd, "backend": "iterm",
-            "stdout": proc.stdout, "stderr": proc.stderr}
+    if "--dangerously-skip-permissions" not in claude_args:
+        claude_args = ["--dangerously-skip-permissions", *claude_args]
+    r = _open_cli_window("claude", cwd, claude_args)
+    if r["ok"] and r["backend"] == "tmux":
+        # A resume/fork into a never-opened directory hits the folder-trust
+        # prompt before it gets anywhere near the resume picker the caller
+        # goes on to answer, so clear it first (see confirm_trust_prompt).
+        r["trust"] = confirm_trust_prompt(r.get("pane_id"))
+    return r
 
 
 # Both lines are present only on Claude's "resume from summary?" picker, shown
@@ -261,128 +233,12 @@ def fork_session(pid: int) -> dict:
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
 
-    if getattr(w, "platform", "claude") == "codex":
-        r = open_codex_window(w.cwd, ["resume", w.session_id])
+    if w.platform == "codex":
+        r = _open_cli_window("codex", w.cwd, ["resume", w.session_id])
     else:
         r = open_claude_window(w.cwd, ["--resume", w.session_id, "--fork-session"])
     r.setdefault("session_id", w.session_id)
     return r
-
-
-def _render_session_markdown(pid: int, limit: int = 80) -> Optional[tuple[str, str]]:
-    w = find_window(pid)
-    if not w or not w.transcript_path:
-        return None
-    events = timeline(w.transcript_path, limit=limit)
-    title = w.name or w.project_name or f"session-{w.session_id[:8]}"
-    plan_hist = extract_plan_history(w.transcript_path)
-    skills = extract_skills_used(w.transcript_path)
-    mem_ops = extract_memory_ops(w.transcript_path)
-
-    lines: list[str] = [
-        f"# {title}",
-        "",
-        f"- project: `{w.cwd}`",
-        f"- session: `{w.session_id}`",
-        f"- pid: {w.pid} · status: {w.status} · version: {w.version}",
-        f"- transcript: `{w.transcript_path}`",
-    ]
-    if skills:
-        lines.append(f"- skills: {', '.join(skills)}")
-    if mem_ops:
-        ops_str = ", ".join(f"{'↓' if m['operation']=='read' else '↑'}{m['name']}" for m in mem_ops)
-        lines.append(f"- memory: {ops_str}")
-    lines.append("")
-
-    if plan_hist:
-        lines.append("## Plan 历史")
-        lines.append("")
-        for ph in plan_hist:
-            ts = (ph.get("ts") or "")[:19]
-            lines.append(f"### {ph['version_label']} — {ts} ({ph['plan_file']})")
-            lines.append("")
-            if ph["operation"] == "write" and ph.get("content"):
-                lines.append("```")
-                lines.append(ph["content"][:5000])
-                lines.append("```")
-            elif ph["operation"] == "edit" and ph.get("diff"):
-                lines.append("```diff")
-                lines.append(f"- {ph['diff']['old'][:1000]}")
-                lines.append(f"+ {ph['diff']['new'][:1000]}")
-                lines.append("```")
-            lines.append("")
-
-    lines.append("## 时间线")
-    lines.append("")
-    for ev in events:
-        ts = (ev.get("ts") or "")[:19]
-        kind = ev["kind"]
-        if kind == "user_text":
-            lines.append(f"### 👤 user `{ts}`")
-            lines.append("")
-            lines.append(ev["text"])
-            lines.append("")
-        elif kind == "assistant_text":
-            lines.append(f"### 🤖 assistant `{ts}`")
-            lines.append("")
-            lines.append(ev["text"])
-            lines.append("")
-        elif kind == "tool_use":
-            extras = ", ".join(f"{k}={v!r}" for k, v in ev.get("extra", {}).items())
-            lines.append(f"- 🔧 `{ev['tool']}({extras})` `{ts}`")
-        elif kind == "tool_result":
-            snippet = (ev.get("text") or "").replace("\n", " ")[:120]
-            lines.append(f"  - ↳ result: `{snippet}…`")
-    return title, "\n".join(lines)
-
-
-_EXPORT_MD = Path("/tmp/fleet-export.md")
-
-
-def export_to_feishu(pid: int) -> dict:
-    """Render session markdown and create a Feishu doc via lark-fnlp."""
-    rendered = _render_session_markdown(pid)
-    if not rendered:
-        return {"ok": False, "error": "no session"}
-    title, md = rendered
-
-    _EXPORT_MD.write_text(md, encoding="utf-8")
-
-    quoted_title = shlex.quote(title)
-    cmd = (
-        f"source ~/.zshrc 2>/dev/null; "
-        f"cd /tmp && lark-fnlp docs +create "
-        f"--title {quoted_title} "
-        f"--markdown @./fleet-export.md "
-        f"--as bot"
-    )
-    try:
-        proc = subprocess.run(
-            ["zsh", "-c", cmd],
-            capture_output=True, text=True, timeout=60,
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    finally:
-        _EXPORT_MD.unlink(missing_ok=True)
-
-    doc_url = None
-    if proc.returncode == 0:
-        import json as _json
-        try:
-            result = _json.loads(proc.stdout)
-            doc_url = result.get("data", {}).get("doc_url")
-        except Exception:
-            pass
-
-    return {
-        "ok": proc.returncode == 0,
-        "title": title,
-        "doc_url": doc_url,
-        "stdout": proc.stdout.strip()[-2000:],
-        "stderr": proc.stderr.strip()[-2000:],
-        "rc": proc.returncode,
-    }
 
 
 def close_session(pid: int) -> dict:
@@ -456,6 +312,35 @@ _TRUST_WAIT = 6.0          # seconds to wait for the dialog to close after Enter
 _TRUST_POLL = 0.2
 
 
+def _has_composer(text: str) -> bool:
+    """Whether a composer marker (❯ Claude / › Codex) is anywhere on screen."""
+    return "❯" in text or "›" in text
+
+
+def _wait_pane(pane: str, pred, timeout: float, poll: float) -> Optional[str]:
+    """Re-capture `pane` every `poll` seconds until `pred(text)` holds and return
+    that text — None once `timeout` passes first. A failed capture reads as ""."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        text = tmux.capture_pane(pane).get("text", "")
+        if pred(text):
+            return text
+        time.sleep(poll)
+    return None
+
+
+def _escape_until(pane: str, is_closed, tries: int, settle: float) -> None:
+    """Press Escape on `pane` — at most `tries` times, `settle` seconds apart —
+    until a fresh capture, read before each press, satisfies `is_closed(text)`.
+    A capture that fails ends it too: no more keys into a pane we can't read."""
+    for _ in range(tries):
+        cap = tmux.capture_pane(pane)
+        if not cap.get("ok") or is_closed(cap.get("text", "")):
+            return
+        tmux.send_keys(pane, "Escape")
+        time.sleep(settle)
+
+
 def trust_prompt_up(text: str) -> bool:
     """Whether a captured pane currently shows the folder-trust prompt."""
     return all(m in text for m in _TRUST_MARKERS)
@@ -506,12 +391,10 @@ def answer_trust_prompt(pane: str) -> dict:
     r = tmux.send_keys(pane, "Enter")
     if not r.get("ok"):
         return r
-    deadline = time.time() + _TRUST_WAIT
-    while time.time() < deadline:
-        cap = tmux.capture_pane(pane)
-        if cap.get("ok") and not trust_prompt_up(cap["text"]):
-            return {"ok": True, "answered": True, "label": _TRUST_YES}
-        time.sleep(_TRUST_POLL)
+    # An unreadable pane ("") is not a closed dialog.
+    if _wait_pane(pane, lambda t: bool(t) and not trust_prompt_up(t),
+                  _TRUST_WAIT, _TRUST_POLL) is not None:
+        return {"ok": True, "answered": True, "label": _TRUST_YES}
     return {"ok": False, "error": "the trust prompt did not close"}
 
 
@@ -557,7 +440,7 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
             r = answer_trust_prompt(pane_id)
             return {"answered": bool(r.get("answered")), "waited": round(waited, 2),
                     "reason": "" if r.get("ok") else r.get("error", "")}
-        if not _trust_prompt_painting(text) and ("❯" in text or "›" in text):
+        if not _trust_prompt_painting(text) and _has_composer(text):
             return {"answered": False, "waited": round(waited, 2), "reason": "already trusted"}
         time.sleep(interval)
         waited += interval
@@ -578,6 +461,19 @@ _PERM_KEYS = {
 }
 
 
+def _pane_of(w, pid: int) -> tuple[Optional[str], Optional[dict]]:
+    """(pane, None) for the tmux pane window `w` — find_window(pid) — runs in,
+    or (None, an error result) saying why there is none to drive."""
+    if not w:
+        return None, {"ok": False, "error": f"no window pid={pid}"}
+    if not w.tty:
+        return None, {"ok": False, "error": "no tty for this session"}
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return None, {"ok": False, "error": "session not in a tmux pane"}
+    return pane, None
+
+
 def respond_permission(pid: int, choice: str) -> dict:
     """Answer the dialog in `pid`'s tmux pane.
 
@@ -591,14 +487,9 @@ def respond_permission(pid: int, choice: str) -> dict:
     keys = _PERM_KEYS.get(choice)
     if keys is None:
         return {"ok": False, "error": f"unknown choice '{choice}' (expected: {', '.join(_PERM_KEYS)})"}
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-    if not w.tty:
-        return {"ok": False, "error": "no tty for this session"}
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return {"ok": False, "error": "session not in a tmux pane"}
+    pane, err = _pane_of(find_window(pid), pid)
+    if err:
+        return err
     if choice in ("approve", "approve_always"):
         cap = tmux.capture_pane(pane)
         if cap.get("ok") and trust_prompt_up(cap["text"]):
@@ -634,14 +525,30 @@ def _is_tabbar(line: str) -> bool:
     return "Submit" in line and "✔" in line and ("←" in line or "→" in line)
 
 
+# What marks a live answerable menu, as (parse mode, phrases that must all be
+# present), in the order parse_pane_menu prefers them when several are found.
+_MENU_MARKERS = (
+    ("question", ("to select", "navigate")),       # AskUserQuestion picker footer
+    ("permission", ("Do you want to proceed",)),
+    ("review", ("Ready to submit your answers",)),  # multiSelect review screen (no footer)
+    # Startup "resume from summary vs full" picker — a different footer than
+    # the tool-permission menus. "Enter to confirm" marks a choice awaiting an
+    # answer (informational overlays say "Esc to dismiss", not confirm).
+    ("confirm", ("Enter to confirm",)),
+)
+
+# Footer / instruction chrome around a menu's options: each marker's lead
+# phrase, plus the hints drawn beside them.
+_MENU_HINTS = tuple(phrases[0] for _, phrases in _MENU_MARKERS) + (
+    "Ready to submit", "Esc to cancel", "Tab to amend", "ctrl+e to explain",
+    "Enter to set", "to use this session", "↑/↓",
+)
+
+
 def _is_menu_hint(line: str) -> bool:
     """Footer / instruction chrome that must not bleed into an option's detail
     text when collecting the wrapped lines under a numbered option."""
-    return any(s in line for s in (
-        "to select", "Esc to cancel", "Enter to confirm", "Tab to amend",
-        "ctrl+e to explain", "Do you want to proceed", "Ready to submit",
-        "Enter to set", "to use this session", "↑/↓",
-    ))
+    return any(s in line for s in _MENU_HINTS)
 
 
 # Top-left / bottom-left corners of a box-drawn panel (square or rounded).
@@ -697,56 +604,39 @@ def parse_pane_menu(text: str) -> Optional[dict]:
     if not text:
         return None
     lines = _strip_side_preview(text.split("\n"))
-    footer_idx = None
+    # Line of each marker's last match — the current picker is the lowest.
+    last: dict[str, int] = {}
     for i, ln in enumerate(lines):
-        if "to select" in ln and "navigate" in ln:
-            footer_idx = i  # last match wins — the current picker is the lowest
-    proceed_idx = None
-    for i, ln in enumerate(lines):
-        if "Do you want to proceed" in ln:
-            proceed_idx = i
-    review_idx = None
-    for i, ln in enumerate(lines):
-        if "Ready to submit your answers" in ln:
-            review_idx = i
-    confirm_idx = None
-    for i, ln in enumerate(lines):
-        if "Enter to confirm" in ln:  # startup "resume from summary?" picker
-            confirm_idx = i
-
-    if footer_idx is not None:
-        mode = "question"
-    elif proceed_idx is not None:
-        mode = "permission"
-    elif review_idx is not None:
-        mode = "review"
-    elif confirm_idx is not None:
-        mode = "confirm"
-    else:
+        for m, phrases in _MENU_MARKERS:
+            if all(p in ln for p in phrases):
+                last[m] = i
+    mode = next((m for m, _ in _MENU_MARKERS if m in last), None)
+    if mode is None:
         return None
+    idx = last[mode]
 
     if mode == "question":
         # Anchor to the current question: the last tab header above the footer,
         # so older pickers' options sitting in scrollback aren't merged in.
         header_idx = None
-        for i in range(footer_idx):
+        for i in range(idx):
             if any(mk in lines[i] for mk in _HEADER_MARKS):
                 header_idx = i
         lo = (header_idx + 1) if header_idx is not None else 0
-        hi = footer_idx
+        hi = idx
     elif mode == "permission":
-        header_idx = proceed_idx
-        lo, hi = proceed_idx + 1, len(lines)
+        header_idx = idx
+        lo, hi = idx + 1, len(lines)
     elif mode == "confirm":  # startup picker; options sit above the footer
         # Anchor the prompt to the divider rule just above the options so the
         # transcript text scrolled in above it isn't swept into the prompt.
-        header_idx = next((i for i in range(confirm_idx - 1, -1, -1)
+        header_idx = next((i for i in range(idx - 1, -1, -1)
                            if _HRULE_RE.match(lines[i])), None)
-        lo, hi = (header_idx + 1 if header_idx is not None else 0), confirm_idx
+        lo, hi = (header_idx + 1 if header_idx is not None else 0), idx
     else:  # review — multiSelect confirmation ("1. Submit answers / 2. Cancel")
-        header_idx = next((i for i in range(review_idx + 1)
-                           if "Review your answers" in lines[i]), review_idx)
-        lo, hi = review_idx, len(lines)
+        header_idx = next((i for i in range(idx + 1)
+                           if "Review your answers" in lines[i]), idx)
+        lo, hi = idx, len(lines)
 
     opt_lines: list[tuple[int, int, str]] = []  # (line_idx, num, label)
     for i in range(lo, hi):
@@ -810,7 +700,7 @@ def parse_pane_menu(text: str) -> Optional[dict]:
         options.append(opt)
 
     if mode == "permission":
-        prompt = lines[proceed_idx].replace("\xa0", " ").strip()
+        prompt = lines[idx].replace("\xa0", " ").strip()
     else:
         start = header_idx if header_idx is not None else 0
         parts = []
@@ -833,16 +723,10 @@ def parse_pane_menu(text: str) -> Optional[dict]:
 
 
 def _menu_markers_present(text: str) -> bool:
-    """Whether a captured viewport shows a live answerable menu."""
-    return (
-        ("to select" in text and "navigate" in text)
-        or ("Do you want to proceed" in text)
-        or ("Ready to submit your answers" in text)  # multiSelect review screen (no footer)
-        # Startup "resume from summary vs full" picker — a different footer than
-        # the tool-permission menus. "Enter to confirm" marks a choice awaiting
-        # an answer (informational overlays say "Esc to dismiss", not confirm).
-        or ("Enter to confirm" in text)
-    )
+    """Whether a captured viewport shows a live answerable menu. Matched over the
+    whole viewport — a marker's phrases need not share a line, unlike in
+    parse_pane_menu."""
+    return any(all(p in text for p in phrases) for _, phrases in _MENU_MARKERS)
 
 
 def pane_dialog(tty: Optional[str]) -> Optional[dict]:
@@ -859,22 +743,10 @@ def pane_dialog(tty: Optional[str]) -> Optional[dict]:
     None (no tty / no pane / failed capture) means "can't verify", and callers
     should keep trusting the registry.
     """
-    if not tty:
+    text = tmux.capture_tty(tty)
+    if text is None:
         return None
-    pane = tmux.pane_for_tty(tty)
-    if pane is None:
-        return None
-    cap = tmux.capture_pane(pane)
-    if not cap["ok"]:
-        return None
-    return {"menu": _menu_markers_present(cap["text"]),
-            "trust": trust_prompt_up(cap["text"])}
-
-
-def pane_menu_active(tty: Optional[str]) -> Optional[bool]:
-    """Whether `tty`'s pane currently shows an answerable menu; None if unknowable."""
-    d = pane_dialog(tty)
-    return None if d is None else d["menu"]
+    return {"menu": _menu_markers_present(text), "trust": trust_prompt_up(text)}
 
 
 def get_pane_menu(pid: int) -> Optional[dict]:
@@ -884,11 +756,8 @@ def get_pane_menu(pid: int) -> Optional[dict]:
     (an answered picker left in scrollback must not be reported), then a
     scrollback capture recovers options that scrolled above the fold.
     """
-    w = find_window(pid)
-    if not w or not w.tty:
-        return None
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
+    pane, err = _pane_of(find_window(pid), pid)
+    if err:
         return None
     visible = tmux.capture_pane(pane)
     if not visible["ok"]:
@@ -940,18 +809,9 @@ def parse_pane_queue(text: str) -> list[str]:
     return items
 
 
-def get_pane_queue(pid: int) -> list[str]:
-    """Queued-message texts scraped live from `pid`'s pane (empty on any miss)."""
-    w = find_window(pid)
-    if not w or not w.tty:
-        return []
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return []
-    cap = tmux.capture_pane(pane)
-    if not cap["ok"]:
-        return []
-    return parse_pane_queue(cap["text"])
+def get_pane_queue(tty: Optional[str]) -> list[str]:
+    """Queued-message texts scraped live from `tty`'s pane (empty on any miss)."""
+    return parse_pane_queue(tmux.capture_tty(tty) or "")
 
 
 def parse_btw_overlay(text: str) -> Optional[dict]:
@@ -1070,20 +930,14 @@ def parse_btw_pending(text: str) -> Optional[str]:
     return _overlay_question(lines[q_idx])
 
 
-def get_btw_state(pid: int) -> Optional[dict]:
-    """One-capture view of the /btw overlay on `pid`'s pane:
+def get_btw_state(pane: str) -> Optional[dict]:
+    """One-capture view of the /btw overlay on `pane`:
     {"settled": {question, answer}} while a finished answer is up,
     {"pending": question} while the answer is still generating, else None.
 
     The overlay covers the visible pane, so a plain capture (no scrollback, which
     would pull in stale pre-overlay content) is what we want. None on any miss.
     """
-    w = find_window(pid)
-    if not w or not w.tty:
-        return None
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return None
     cap = tmux.capture_pane(pane)
     if not cap["ok"]:
         return None
@@ -1094,9 +948,9 @@ def get_btw_state(pid: int) -> Optional[dict]:
     return {"pending": q} if q is not None else None
 
 
-def get_btw_answer(pid: int) -> Optional[dict]:
-    """The settled /btw overlay on `pid`'s pane as {question, answer}, or None."""
-    state = get_btw_state(pid)
+def get_btw_answer(pane: str) -> Optional[dict]:
+    """The settled /btw overlay on `pane` as {question, answer}, or None."""
+    state = get_btw_state(pane)
     return state["settled"] if state and "settled" in state else None
 
 
@@ -1174,21 +1028,15 @@ def _stitch_btw(acc: list[str], window: list[str]) -> Optional[list[str]]:
     return None
 
 
-def capture_full_btw_answer(pid: int) -> Optional[dict]:
-    """The *complete* /btw aside on `pid`'s pane, scrolling the overlay to recover
-    an answer taller than the visible window. None if no settled overlay is up.
+def capture_full_btw_answer(pane: str) -> Optional[dict]:
+    """The *complete* /btw aside on `pane`, scrolling the overlay to recover an
+    answer taller than the visible window. None if no settled overlay is up.
 
     Injects ↓ keys into the live pane, so callers must gate this (see
     core.btwcapture): only run it for a not-yet-archived aside, off the hot path.
     Returns None rather than a guess when the pane is repainting too hard to read
     a trustworthy frame (see _stable_btw_regions).
     """
-    w = find_window(pid)
-    if not w or not w.tty:
-        return None
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return None
     frame = _stable_btw_regions(pane)
     if frame is None or frame is _BTW_FRAME_UNSTABLE:
         return None  # no settled overlay, or an unreadable pane — no keystrokes
@@ -1309,26 +1157,16 @@ def send_menu_keys(pid: int, keys: list[str]) -> dict:
     if bad:
         return {"ok": False, "error": f"disallowed keys: {', '.join(bad)}"}
     w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-    if not w.tty:
-        return {"ok": False, "error": "no tty for this session"}
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return {"ok": False, "error": "session not in a tmux pane"}
+    pane, err = _pane_of(w, pid)
+    if err:
+        return err
     # The dashboard's Esc button lands here. If a settled /btw overlay is up,
     # this Escape closes it — and the answer exists nowhere else — so archive it
     # first. A still-answering aside is NOT waited for: the user is interrupting,
     # and delaying their Escape would be worse than losing the aside they chose
     # to kill.
     if "Escape" in keys:
-        sid = getattr(w, "session_id", None)
-        if sid:
-            cap = tmux.capture_pane(pane)
-            text = cap.get("text", "") if cap.get("ok") else ""
-            if _btw_regions(text):
-                from . import btwcapture  # lazy: btwcapture imports this module
-                btwcapture.capture_sync(pid, sid)
+        _archive_open_aside(pane, w.session_id, settle_wait=0)
     result = tmux.send_keys(pane, *keys)
     # A bare Esc is an interrupt. If the send landed but the turn is wedged on an
     # uninterruptible (D-state) child, the keystroke can't reach it — escalate by
@@ -1364,12 +1202,8 @@ def _dismiss_answer_overlay(pane: str) -> None:
     composer instead of being eaten. Best-effort and self-limiting: only presses
     Escape while the overlay is actually detected (never on a clean/busy pane),
     and gives up quietly if capture fails or it won't clear."""
-    for _ in range(_OVERLAY_DISMISS_TRIES):
-        cap = tmux.capture_pane(pane)
-        if not cap.get("ok") or not _answer_overlay_open(cap.get("text", "")):
-            return
-        tmux.send_keys(pane, "Escape")
-        time.sleep(_OVERLAY_DISMISS_SETTLE)
+    _escape_until(pane, lambda t: not _answer_overlay_open(t),
+                  _OVERLAY_DISMISS_TRIES, _OVERLAY_DISMISS_SETTLE)
 
 
 # An aside's answer exists ONLY in its overlay — dismissing an un-archived one
@@ -1379,17 +1213,18 @@ _ASIDE_SETTLE_WAIT = 10.0   # max seconds to wait for "Answering…" to finish
 _ASIDE_SETTLE_POLL = 0.4
 
 
-def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
+def _archive_open_aside(pane: str, session_id: Optional[str],
+                        settle_wait: float = _ASIDE_SETTLE_WAIT) -> None:
     """Latch the /btw aside on `pane` to the archive before it gets dismissed.
 
-    If the answer is still generating, wait (bounded) for it to settle — an
-    Escape now would kill the answer with no way to ever recover it. Quietly a
-    no-op when there is no overlay, no session id, or the answer never settles
-    in time (the caller proceeds to dismiss regardless; a bounded loss beats an
-    unbounded stall of the prompt the user is trying to send)."""
+    If the answer is still generating, wait (up to `settle_wait`) for it to
+    settle — an Escape now would kill the answer with no way to ever recover it.
+    Quietly a no-op when there is no overlay, no session id, or the answer never
+    settles in time (the caller proceeds to dismiss regardless; a bounded loss
+    beats an unbounded stall of the prompt the user is trying to send)."""
     if not session_id:
         return
-    deadline = time.time() + _ASIDE_SETTLE_WAIT
+    deadline = time.time() + settle_wait
     while True:
         cap = tmux.capture_pane(pane)
         text = cap.get("text", "") if cap.get("ok") else ""
@@ -1401,7 +1236,7 @@ def _archive_open_aside(pane: str, pid: int, session_id: Optional[str]) -> None:
             return
         time.sleep(_ASIDE_SETTLE_POLL)
     from . import btwcapture  # lazy: btwcapture imports this module
-    btwcapture.capture_sync(pid, session_id)
+    btwcapture.capture_sync(pane, session_id)
 
 
 # A prompt injected before the TUI paints its composer is lost or, worse,
@@ -1452,7 +1287,7 @@ def _wait_composer_ready(pane: str) -> bool:
         text = cap.get("text", "")
         if _rewind_panel_open(text):
             tmux.send_keys(pane, "Escape")
-        elif "❯" in text or "›" in text:
+        elif _has_composer(text):
             return True
         if time.time() >= deadline:
             return False
@@ -1492,11 +1327,11 @@ def _unlanded_error(text: str) -> str:
     Three distinct failure shapes used to collapse into the same generic
     "prompt text never landed in composer"; telling them apart from the message
     alone is what makes the card actionable without shelling into tmux."""
-    if "❯" not in text and "›" not in text:
+    content = tmux._composer_text(text)
+    if content is None:
         return ("prompt text never landed: no composer marker on screen — the "
                 "TUI is still starting, mid-redraw, or a full-screen view "
                 "replaced the prompt")
-    content = tmux._composer_text(text) or ""
     if content:
         snippet = content if len(content) <= 60 else content[:57] + "…"
         return ("prompt text never landed: the composer holds other text "
@@ -1536,22 +1371,24 @@ def _clear_blocker(pane: str) -> Optional[dict]:
 
 def send_prompt(pid: int, text: str) -> dict:
     """Inject a single-line prompt into the tmux pane that owns `pid`'s session."""
-    r = _send_prompt_inner(pid, text)
+    w = find_window(pid)
+    pane, err = _pane_of(w, pid)
+    return _send_prompt_to(pid, w, pane, text, err)
+
+
+def _send_prompt_to(pid: int, w, pane: Optional[str], text: str,
+                    err: Optional[dict] = None) -> dict:
+    """send_prompt into `pid`'s already-resolved window `w` and its `pane` — or,
+    with `err`, the reason they couldn't be resolved. Every failure is traced to
+    the send-debug log."""
+    r = err or _send_prompt_inner(pid, w, pane, text)
     if not r.get("ok"):
         tmux._send_debug(f"send pid={pid} len={len(text or '')} "
                          f"tail={(text or '')[-60:]!r} FAILED: {r.get('error')!r}")
     return r
 
 
-def _send_prompt_inner(pid: int, text: str) -> dict:
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-    if not w.tty:
-        return {"ok": False, "error": "no tty for this session"}
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return {"ok": False, "error": "session not in a tmux pane"}
+def _send_prompt_inner(pid: int, w, pane: str, text: str) -> dict:
     # If the TUI exited or was suspended (Ctrl-Z, crash), the pane's foreground
     # process is its parent shell: the injected text echoes at the shell prompt
     # — where a stale composer marker in the scrollback can fool the landed
@@ -1573,7 +1410,7 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # A /btw aside from a prior send may still be open over the pane; archive it
     # (its answer lives nowhere else), then clear it so this prompt isn't
     # swallowed by the overlay.
-    _archive_open_aside(pane, pid, getattr(w, "session_id", None))
+    _archive_open_aside(pane, w.session_id)
     _dismiss_answer_overlay(pane)
     # A cancellable overlay (/model dialog, permission/choice menu, Rewind panel)
     # can sit over the composer and eat the injected prompt — and some draw their
@@ -1600,14 +1437,10 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     # shows a phantom "Queued"). For Claude, verify the text actually landed
     # before pressing Enter and that the composer emptied after, re-sending
     # whichever half a busy re-render dropped.
-    platform = getattr(w, "platform", "claude")
-    if platform == "codex":
+    if w.platform == "codex":
         settle = tmux.codex_enter_settle(len(collapsed))
-        res = tmux.send_text(
-            pane, collapsed, settle_before_enter=settle, verify_submit=True,
-            marker="›",
-        )
-    elif platform == "hmz":
+        res = tmux.send_text(pane, collapsed, settle_before_enter=settle, marker="›")
+    elif w.platform == "hmz":
         # Same ❯ composer as Claude, but Claude's clear-and-retype races hmz's
         # slow per-key intake and loses the prompt while reporting it sent; this
         # path pastes once and waits for hmz's own record of the line — and for
@@ -1617,9 +1450,7 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
             refused=lambda: hmz.refusal(pane, collapsed),
         )
     else:
-        res = tmux.send_text(
-            pane, collapsed, verify_landed=True, verify_submit=True, marker="❯",
-        )
+        res = tmux.send_text(pane, collapsed, verify_landed=True, marker="❯")
     # Reactive diagnosis: if the prompt still didn't land, a blocker may have
     # (re)surfaced between the clear above and the send — name it instead of the
     # generic "never landed in composer". With no classifiable blocker, still
@@ -1633,7 +1464,7 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
                 return {"ok": False,
                         "error": f"send blocked: {b['label']} is open on this "
                                  "pane — press Esc on the card, then resend."}
-            if res.get("error") == "prompt text never landed in composer":
+            if res.get("reason") == "unlanded":
                 return {"ok": False, "error": _unlanded_error(cap["text"])}
         return res
     # Delivered. If we had to auto-close a blocker to get here, say so.
@@ -1718,15 +1549,7 @@ def pane_model(tty: Optional[str]) -> str:
     a banner scrolled out of reach. Every one of those means "nothing to claim",
     not "no model", so callers must leave the readout as they found it.
     """
-    if not tty:
-        return ""
-    pane = tmux.pane_for_tty(tty)
-    if pane is None:
-        return ""
-    cap = tmux.capture_pane(pane, scrollback=_BANNER_SCROLLBACK)
-    if not cap["ok"]:
-        return ""
-    return banner_model(cap["text"])
+    return banner_model(tmux.capture_tty(tty, scrollback=_BANNER_SCROLLBACK) or "")
 
 
 # Claude's /model dialog. Its footer is the marker that the dialog is up, and it
@@ -1767,6 +1590,33 @@ _MODEL_ESCAPES = 3         # enough to back out of confirm -> picker -> prompt
 _MODEL_WALK_MAX = 24       # hard stop for the survey lap; the list is far shorter
 
 
+# The ✔ the /model dialog puts after the session's current model.
+_MODEL_TICK_RE = re.compile(r"✔$")
+
+
+def _picker_rows(text: str, row_re: re.Pattern, tag_re: re.Pattern
+                 ) -> tuple[list[tuple[int, str]], int, int]:
+    """Rows of a numbered picker (Claude's /model dialog, Codex's pickers):
+    [(row number, name)], the highlighted row — the one whose `row_re` match
+    carries the "cur" group — and the row tagged "(current)", 0 for either when
+    absent. A name is the row's text up to the gap before its blurb, minus what
+    `tag_re` matches: tags mark the row, not the model."""
+    rows: list[tuple[int, str]] = []
+    cursor = current = 0
+    for line in text.splitlines():
+        m = row_re.match(line)
+        if not m:
+            continue
+        n = int(m.group("n"))
+        head = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
+        if "(current)" in head:
+            current = n
+        rows.append((n, tag_re.sub("", head).strip()))
+        if m.group("cur"):
+            cursor = n
+    return rows, cursor, current
+
+
 def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
     """Parse the /model dialog: [(row number, model name)], plus the number of the
     highlighted row (0 if no row carries the cursor).
@@ -1774,17 +1624,7 @@ def _model_dialog_rows(text: str) -> tuple[list[tuple[int, str]], int]:
     Only the rows Claude currently has on screen — see _survey_model_rows for why
     that is rarely the whole list. The ✔ on the session's current model is
     stripped: it marks the row, not the model."""
-    rows: list[tuple[int, str]] = []
-    cursor = 0
-    for line in text.splitlines():
-        m = _MODEL_ROW_RE.match(line)
-        if not m:
-            continue
-        n = int(m.group("n"))
-        name = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
-        rows.append((n, name.removesuffix("✔").strip()))
-        if m.group("cur"):
-            cursor = n
+    rows, cursor, _ = _picker_rows(text, _MODEL_ROW_RE, _MODEL_TICK_RE)
     return rows, cursor
 
 
@@ -1801,11 +1641,7 @@ def _model_dialogs_closed(text: str) -> bool:
 
 def _escape_model_dialogs(pane: str) -> None:
     """Leave the session at a prompt, not parked on a modal — from either dialog."""
-    for _ in range(_MODEL_ESCAPES):
-        if _model_dialogs_closed(tmux.capture_pane(pane).get("text", "")):
-            return
-        tmux.send_keys(pane, "Escape")
-        time.sleep(_MODEL_KEY_SETTLE)
+    _escape_until(pane, _model_dialogs_closed, _MODEL_ESCAPES, _MODEL_KEY_SETTLE)
 
 
 def _step_cursor_onto(pane: str, target: int, rows: int, read_cursor) -> bool:
@@ -1904,15 +1740,7 @@ def codex_pane_model(tty: Optional[str]) -> str:
 
     "" whenever that can't be read — same contract as pane_model: nothing to
     claim, not "no model"."""
-    if not tty:
-        return ""
-    pane = tmux.pane_for_tty(tty)
-    if pane is None:
-        return ""
-    cap = tmux.capture_pane(pane)
-    if not cap["ok"]:
-        return ""
-    return codex_status_model(cap["text"])
+    return codex_status_model(tmux.capture_tty(tty) or "")
 
 
 # Codex's /model is two pickers in a row — the model list, then the reasoning
@@ -1937,26 +1765,6 @@ _CODEX_MODEL_NAME_RE = re.compile(r"^[a-z][\w.-]*$")
 _CODEX_EFFORTS = {"low": "low", "medium": "medium", "high": "high", "xhigh": "extra high"}
 
 
-def _codex_picker_rows(text: str) -> tuple[list[tuple[int, str]], int, int]:
-    """Rows of a Codex picker: [(row number, name)], the highlighted row, and the
-    row tagged (current) — 0 for either when absent. Tags are stripped from the
-    names: they mark the row, not the model."""
-    rows: list[tuple[int, str]] = []
-    cursor = current = 0
-    for line in text.splitlines():
-        m = _CODEX_ROW_RE.match(line)
-        if not m:
-            continue
-        n = int(m.group("n"))
-        head = _MODEL_NAME_GAP_RE.split(m.group("rest"))[0]
-        if "(current)" in head:
-            current = n
-        rows.append((n, _CODEX_TAG_RE.sub("", head).strip()))
-        if m.group("cur"):
-            cursor = n
-    return rows, cursor, current
-
-
 def _codex_picker(text: str, head: str) -> Optional[tuple[list[tuple[int, str]], int, int]]:
     """The picker headed `head` if it is on the pane, else None. Only the lines
     under the header are read: numbered rows of anything drawn above it (the
@@ -1965,7 +1773,7 @@ def _codex_picker(text: str, head: str) -> Optional[tuple[list[tuple[int, str]],
     idx = next((i for i in range(len(lines) - 1, -1, -1) if head in lines[i]), -1)
     if idx < 0:
         return None
-    return _codex_picker_rows("\n".join(lines[idx + 1:]))
+    return _picker_rows("\n".join(lines[idx + 1:]), _CODEX_ROW_RE, _CODEX_TAG_RE)
 
 
 def _codex_pickers_closed(text: str) -> bool:
@@ -1974,11 +1782,7 @@ def _codex_pickers_closed(text: str) -> bool:
 
 def _escape_codex_pickers(pane: str) -> None:
     """Leave the session at its composer, not parked in a picker."""
-    for _ in range(_MODEL_ESCAPES):
-        if _codex_pickers_closed(tmux.capture_pane(pane).get("text", "")):
-            return
-        tmux.send_keys(pane, "Escape")
-        time.sleep(_MODEL_KEY_SETTLE)
+    _escape_until(pane, _codex_pickers_closed, _MODEL_ESCAPES, _MODEL_KEY_SETTLE)
 
 
 def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
@@ -1986,14 +1790,8 @@ def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
     `wanted` — or, with `wanted` empty, on the row tagged current — and press
     Enter. {"ok": True, "name": <row name>}, or an error with the pickers backed
     out of so the session is left at its composer."""
-    text = ""
-    deadline = time.time() + _MODEL_DIALOG_WAIT
-    while time.time() < deadline:
-        text = tmux.capture_pane(pane).get("text", "")
-        if head in text:
-            break
-        time.sleep(_MODEL_DIALOG_POLL)
-    else:
+    text = _wait_pane(pane, lambda t: head in t, _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL)
+    if text is None:
         _escape_codex_pickers(pane)
         return {"ok": False, "error": f"the Codex {what} picker never opened"}
     rows, cursor, current = _codex_picker(text, head)
@@ -2030,13 +1828,11 @@ def _switch_codex_model(pid: int, w, model: str, effort: str) -> dict:
                 "error": f"unknown reasoning effort '{effort}' (one of {', '.join(_CODEX_EFFORTS)})"}
     if not model and not effort:
         return {"ok": False, "error": "nothing to switch: give a model, an effort, or both"}
-    if not w.tty:
-        return {"ok": False, "error": "no tty for this session"}
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return {"ok": False, "error": "session not in a tmux pane"}
+    pane, err = _pane_of(w, pid)
+    if err:
+        return err
 
-    r = send_prompt(pid, "/model")
+    r = _send_prompt_to(pid, w, pane, "/model")
     if not r.get("ok"):
         return r
     picked = _codex_pick(pane, _CODEX_MODEL_PICKER_HEAD, model, "model")
@@ -2048,11 +1844,8 @@ def _switch_codex_model(pid: int, w, model: str, effort: str) -> dict:
         return picked
     effort_name = picked["name"].lower()
 
-    deadline = time.time() + _MODEL_DIALOG_WAIT
-    while time.time() < deadline:
-        if _codex_pickers_closed(tmux.capture_pane(pane).get("text", "")):
-            return {"ok": True, "model": f"{model_name} {effort_name}"}
-        time.sleep(_MODEL_DIALOG_POLL)
+    if _wait_pane(pane, _codex_pickers_closed, _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL) is not None:
+        return {"ok": True, "model": f"{model_name} {effort_name}"}
     _escape_codex_pickers(pane)
     return {"ok": False, "error": "the Codex /model picker did not close after confirming"}
 
@@ -2089,29 +1882,21 @@ def switch_model(pid: int, alias: str, effort: str = "") -> dict:
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
-    if getattr(w, "platform", "claude") == "codex":
+    if w.platform == "codex":
         return _switch_codex_model(pid, w, alias, effort)
     alias = (alias or "").strip().lower()
     if not alias.isalnum():
         return {"ok": False, "error": f"invalid model alias '{alias}'"}
-    if not w.tty:
-        return {"ok": False, "error": "no tty for this session"}
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return {"ok": False, "error": "session not in a tmux pane"}
+    pane, err = _pane_of(w, pid)
+    if err:
+        return err
 
-    r = send_prompt(pid, "/model")
+    r = _send_prompt_to(pid, w, pane, "/model")
     if not r.get("ok"):
         return r
 
-    text = ""
-    deadline = time.time() + _MODEL_DIALOG_WAIT
-    while time.time() < deadline:
-        text = tmux.capture_pane(pane).get("text", "")
-        if _MODEL_DIALOG_FOOTER in text:
-            break
-        time.sleep(_MODEL_DIALOG_POLL)
-    else:
+    if _wait_pane(pane, lambda t: _MODEL_DIALOG_FOOTER in t,
+                  _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL) is None:
         return {"ok": False, "error": "the /model dialog never opened"}
 
     rows = _survey_model_rows(pane)
@@ -2135,18 +1920,13 @@ def switch_model(pid: int, alias: str, effort: str = "") -> dict:
     tmux.send_keys(pane, "s")
 
     # "s" either commits (both dialogs gone) or raises the confirm dialog.
-    yes_row = 0
-    deadline = time.time() + _MODEL_DIALOG_WAIT
-    while time.time() < deadline:
-        text = tmux.capture_pane(pane).get("text", "")
-        yes_row = _model_confirm_yes_row(text)
-        if yes_row or _model_dialogs_closed(text):
-            break
-        time.sleep(_MODEL_DIALOG_POLL)
-    else:
+    text = _wait_pane(pane, lambda t: _model_confirm_yes_row(t) or _model_dialogs_closed(t),
+                      _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL)
+    if text is None:
         _escape_model_dialogs(pane)
         return {"ok": False, "error": "the /model dialog did not close after pressing s"}
 
+    yes_row = _model_confirm_yes_row(text)
     if not yes_row:
         return {"ok": True, "model": picked}
 
@@ -2157,10 +1937,7 @@ def switch_model(pid: int, alias: str, effort: str = "") -> dict:
         return {"ok": False, "error": f"could not confirm the switch to {alias}"}
 
     tmux.send_keys(pane, "Enter")
-    deadline = time.time() + _MODEL_DIALOG_WAIT
-    while time.time() < deadline:
-        if _model_dialogs_closed(tmux.capture_pane(pane).get("text", "")):
-            return {"ok": True, "model": picked}
-        time.sleep(_MODEL_DIALOG_POLL)
+    if _wait_pane(pane, _model_dialogs_closed, _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL) is not None:
+        return {"ok": True, "model": picked}
     _escape_model_dialogs(pane)
     return {"ok": False, "error": f"the confirm dialog did not close after confirming {alias}"}

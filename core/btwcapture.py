@@ -23,49 +23,58 @@ latch it before pressing Escape rather than hoping a poll got there first.
 from __future__ import annotations
 
 import threading
-import time
 
-from . import actions, btwlog
+from . import actions, btwlog, tmux
 
-_lock = threading.Lock()
-_inflight: set[str] = set()  # session_ids with a scroll-stitch currently running
+_lock = threading.Lock()  # guards _session_locks
+# session_id -> held for as long as a scroll-stitch of that session's pane runs
+_session_locks: dict[str, threading.Lock] = {}
 
 # How long capture_sync will wait out a background stitch already running for
 # the same session before giving up (it archives on completion anyway).
 _SYNC_INFLIGHT_WAIT = 15.0
-_SYNC_INFLIGHT_POLL = 0.2
 
 
-def maybe_capture(pid: int, session_id: str) -> str | None:
-    """Capture the full /btw answer for `pid` if a new (not-yet-archived) settled
-    aside is on the pane. Non-blocking: the actual scroll-stitch runs on a daemon
+def _session_lock(session_id: str) -> threading.Lock:
+    with _lock:
+        return _session_locks.setdefault(session_id, threading.Lock())
+
+
+def _archived(session_id: str, slice_ov: dict) -> bool:
+    return btwlog.has_slice(session_id, slice_ov["question"], slice_ov["answer"])
+
+
+def maybe_capture(tty: str, session_id: str) -> str | None:
+    """Capture the full /btw answer on `tty`'s pane if a new (not-yet-archived)
+    settled aside is up. Non-blocking: the actual scroll-stitch runs on a daemon
     thread. Best-effort — any failure leaves whatever is already archived intact.
 
     Returns the question of an aside whose answer is STILL GENERATING (for the
     card's live "answering…" indicator — nothing to archive yet), else None."""
     if not session_id:
         return None
+    pane = tmux.pane_for_tty(tty)
+    if pane is None:
+        return None
     try:
-        state = actions.get_btw_state(pid)  # cheap, no key injection
+        state = actions.get_btw_state(pane)  # cheap, no key injection
     except Exception:
         return None
     if not state:
         return None
     if "pending" in state:
         return state["pending"]
-    slice_ov = state["settled"]
-    if btwlog.has_slice(session_id, slice_ov["question"], slice_ov["answer"]):
+    if _archived(session_id, state["settled"]):
         return None  # already fully archived — don't re-scroll the overlay
-    with _lock:
-        if session_id in _inflight:
-            return None  # a stitch for this session is already running
-        _inflight.add(session_id)
-    threading.Thread(target=_worker, args=(pid, session_id), daemon=True).start()
+    lock = _session_lock(session_id)
+    if not lock.acquire(blocking=False):
+        return None  # a stitch for this session is already running
+    threading.Thread(target=_stitch, args=(lock, pane, session_id), daemon=True).start()
     return None
 
 
-def capture_sync(pid: int, session_id: str) -> None:
-    """Archive the settled aside on `pid`'s pane NOW, blocking until latched.
+def capture_sync(pane: str, session_id: str) -> None:
+    """Archive the settled aside on `pane` NOW, blocking until latched.
 
     For pane-mutating callers about to dismiss the overlay. If a background
     stitch for this session is already scrolling, wait for it instead of racing
@@ -75,42 +84,33 @@ def capture_sync(pid: int, session_id: str) -> None:
     if not session_id:
         return
     try:
-        slice_ov = actions.get_btw_answer(pid)
+        slice_ov = actions.get_btw_answer(pane)
     except Exception:
         return
-    if not slice_ov:
+    if not slice_ov or _archived(session_id, slice_ov):
         return
-    deadline = time.time() + _SYNC_INFLIGHT_WAIT
-    while True:
-        if btwlog.has_slice(session_id, slice_ov["question"], slice_ov["answer"]):
-            return  # archived (possibly by the stitch we were waiting out)
-        with _lock:
-            if session_id not in _inflight:
-                _inflight.add(session_id)
-                break
-        if time.time() >= deadline:
-            return  # a stuck stitch owns the pane — don't pile on
-        time.sleep(_SYNC_INFLIGHT_POLL)
+    lock = _session_lock(session_id)
+    if not lock.acquire(timeout=_SYNC_INFLIGHT_WAIT):
+        return  # a stuck stitch owns the pane — don't pile on
+    if _archived(session_id, slice_ov):
+        lock.release()
+        return  # archived by the stitch we were waiting out
+    _stitch(lock, pane, session_id, fallback=slice_ov)
+
+
+def _stitch(lock: threading.Lock, pane: str, session_id: str,
+            fallback: dict | None = None) -> None:
+    """Scroll-stitch the aside on `pane` and archive it, then release `lock` —
+    the session's, which the caller acquired. A failed stitch archives
+    `fallback` instead when given; otherwise whatever is already archived
+    stands."""
     try:
-        full = None
         try:
-            full = actions.capture_full_btw_answer(pid)
+            full = actions.capture_full_btw_answer(pane)
         except Exception:
-            pass
-        got = full or slice_ov
-        btwlog.record(session_id, got["question"], got["answer"])
+            full = None  # a scrape/scroll failure degrades to the fallback
+        got = full or fallback
+        if got:
+            btwlog.record(session_id, got["question"], got["answer"])
     finally:
-        with _lock:
-            _inflight.discard(session_id)
-
-
-def _worker(pid: int, session_id: str) -> None:
-    try:
-        full = actions.capture_full_btw_answer(pid)
-        if full:
-            btwlog.record(session_id, full["question"], full["answer"])
-    except Exception:
-        pass  # scrape/scroll failure degrades to the already-latched top slice
-    finally:
-        with _lock:
-            _inflight.discard(session_id)
+        lock.release()

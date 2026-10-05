@@ -109,7 +109,6 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 | Resume | `claude --resume <sid>`，继续原 session（在历史列表里）|
 | Review | 向 session 发送 `/humanize:ask-codex review`（Linux + tmux）|
 | Close | SIGTERM——每张卡片都有 |
-| Export | 导出对话文档（带 timeline + plan 历史 + skill/memory 摘要）|
 
 **Codex** 卡片上，平台无关的操作（Close、发 prompt、Esc、Commit）照常工作；Claude 专属的（Fork、Review、Clear、快速批准 permission）会隐藏，因为它们依赖 Claude 的斜杠命令或 `claude` 二进制。
 
@@ -250,7 +249,7 @@ core/
   patrol.py           triage 分类引擎
   codex.py            Codex session 解析 + 实时 session 发现（/proc + fd）
   search.py           ripgrep 跨平台搜索
-  actions.py          focus / fork / close / export / 新建 / 发 prompt
+  actions.py          focus / fork / close / 新建 / 发 prompt
   peers.py            多机：轮询对端 board、转发卡片操作
   tmux.py             tmux 后端：新建窗口 + 注入 prompt（Linux）
   history.py          统一索引 + 全文 rg 搜索

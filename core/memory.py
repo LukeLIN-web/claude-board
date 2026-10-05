@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Optional
 
 from .sessions import PROJECTS_DIR
@@ -23,11 +24,25 @@ def _parse_frontmatter(text: str) -> dict:
             val = val.strip()
             if key == "metadata":
                 continue
-            if key == "type" and not result.get("type"):
-                result["type"] = val
-            else:
-                result[key] = val
+            result[key] = val
     return result
+
+
+def split_frontmatter(text: str) -> tuple[dict, str]:
+    """(frontmatter fields, body) of a memory file. The body is what follows the
+    closing `---`; a file without one is all body."""
+    body_start = text.find("\n---", 3)
+    body = text[body_start + 4:].strip() if body_start > 0 else text
+    return _parse_frontmatter(text), body
+
+
+def find_memory(name: str) -> Optional[Path]:
+    """The memory file `name` (its file stem), in the first project that has one."""
+    for proj_dir in PROJECTS_DIR.iterdir():
+        f = proj_dir / "memory" / f"{name}.md"
+        if f.exists():
+            return f
+    return None
 
 
 def list_memories(project_slug: Optional[str] = None) -> dict:
@@ -59,9 +74,7 @@ def list_memories(project_slug: Optional[str] = None) -> dict:
                 text = f.read_text(errors="replace")
             except Exception:
                 continue
-            fm = _parse_frontmatter(text)
-            body_start = text.find("\n---", 3)
-            body = text[body_start + 4:].strip() if body_start > 0 else text
+            fm, body = split_frontmatter(text)
             memories.append({
                 "name": fm.get("name", f.stem),
                 "file_stem": f.stem,

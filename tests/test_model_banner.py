@@ -93,7 +93,3 @@ class PaneModelTests(unittest.TestCase):
              mock.patch.object(actions.tmux, "capture_pane",
                                return_value={"ok": False, "error": "no pane", "text": ""}):
             self.assertEqual(actions.pane_model("/dev/pts/3"), "")
-
-
-if __name__ == "__main__":
-    unittest.main()

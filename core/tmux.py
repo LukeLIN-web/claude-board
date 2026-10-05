@@ -20,10 +20,18 @@ _TIMEOUT = 10
 _AVAILABLE_TTL = 5.0
 _available_cache: dict = {}
 
+# pane_for_tty runs for every card on every poll (more for a card the snapshot
+# looks at closely), and each lookup used to fork `list-panes -a`. A pane's tty
+# never changes, so the tty→pane map is reused for this long; a miss always
+# re-lists, so a pane spawned since the last listing is never reported missing.
+_PANE_MAP_TTL = 1.0
+_pane_map_cache: dict = {}
+
 
 def _clear_caches() -> None:
     """Reset memoized state (used by tests and on explicit refresh)."""
     _available_cache.clear()
+    _pane_map_cache.clear()
 
 
 # When the board server is itself launched from inside a Claude session, its
@@ -209,9 +217,8 @@ def _norm_tty(tty: str) -> str:
 
 
 def list_panes() -> list[dict]:
-    """All panes across all sessions as dicts: pane_id, tty, session, path."""
-    fmt = "#{pane_id}\t#{pane_tty}\t#{session_name}\t#{pane_current_path}"
-    r = _run("list-panes", "-a", "-F", fmt)
+    """All panes across all sessions as dicts: pane_id, tty."""
+    r = _run("list-panes", "-a", "-F", "#{pane_id}\t#{pane_tty}")
     if not r["ok"]:
         return []
     panes: list[dict] = []
@@ -219,10 +226,9 @@ def list_panes() -> list[dict]:
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) < 4:
+        if len(parts) < 2:
             continue
-        pane_id, tty, session, path = parts[0], parts[1], parts[2], parts[3]
-        panes.append({"pane_id": pane_id, "tty": tty, "session": session, "path": path})
+        panes.append({"pane_id": parts[0], "tty": parts[1]})
     return panes
 
 
@@ -231,21 +237,38 @@ def pane_for_tty(tty: str) -> Optional[str]:
     target = _norm_tty(tty)
     if not target:
         return None
+    listed_at, panes = _pane_map_cache.get("map", (float("-inf"), {}))
+    if time.monotonic() - listed_at < _PANE_MAP_TTL and target in panes:
+        return panes[target]
+    now = time.monotonic()
+    panes = {}
     for pane in list_panes():
-        if _norm_tty(pane["tty"]) == target:
-            return pane["pane_id"]
-    return None
+        panes.setdefault(_norm_tty(pane["tty"]), pane["pane_id"])
+    _pane_map_cache["map"] = (now, panes)
+    return panes.get(target)
+
+
+def capture_tty(tty: Optional[str], scrollback: int = 0) -> Optional[str]:
+    """Text of the pane running on `tty` (see capture_pane), or None when there
+    is no such pane or it can't be captured."""
+    pane = pane_for_tty(tty)
+    if pane is None:
+        return None
+    cap = capture_pane(pane, scrollback=scrollback)
+    return cap["text"] if cap["ok"] else None
+
+
+def _display(pane: str, fmt: str) -> Optional[str]:
+    """`fmt` expanded by tmux for `pane` (display-message), or None when tmux
+    can't answer or the expansion is empty."""
+    r = _run("display-message", "-p", "-t", pane, fmt)
+    return (r["stdout"].strip() or None) if r["ok"] else None
 
 
 def pane_current_command(pane: str) -> Optional[str]:
     """Name of the pane's foreground process (tmux #{pane_current_command}), or
     None when it can't be resolved. Best-effort — callers must fail open."""
-    if not pane:
-        return None
-    r = _run("display-message", "-p", "-t", pane, "#{pane_current_command}")
-    if not r["ok"]:
-        return None
-    return r["stdout"].strip() or None
+    return _display(pane, "#{pane_current_command}") if pane else None
 
 
 def pane_alive(pane: str) -> bool:
@@ -270,8 +293,7 @@ def exit_copy_mode(pane: str) -> None:
     text is silently eaten and never reaches the TUI's composer. Best-effort:
     a failed probe is treated as "not in mode" and nothing is sent.
     """
-    r = _run("display-message", "-p", "-t", pane, "#{pane_in_mode}")
-    if r["ok"] and r["stdout"].strip() == "1":
+    if _display(pane, "#{pane_in_mode}") == "1":
         _run("send-keys", "-t", pane, "-X", "cancel")
 
 
@@ -279,11 +301,7 @@ def pane_target(pane: str) -> Optional[str]:
     """Human-addressable target ("session:window.pane") for a pane id, or None."""
     if not pane:
         return None
-    r = _run("display-message", "-p", "-t", pane,
-             "#{session_name}:#{window_index}.#{pane_index}")
-    if not r["ok"]:
-        return None
-    return r["stdout"].strip() or None
+    return _display(pane, "#{session_name}:#{window_index}.#{pane_index}")
 
 
 def _session_names() -> list[str]:
@@ -371,6 +389,9 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
         # never comes (the dashboard's "Spawning…" hang on a host with no tmux
         # server). Starting the server in its own call lets it daemonize and
         # close those fds first; the subsequent new-session then only attaches.
+        # A new server numbers its panes from %0 again, so a tty→pane map read
+        # off the old one could name a live pane of the new one — drop it.
+        _pane_map_cache.clear()
         _run("start-server")
         r = _run("new-session", "-d", "-s", target["target"],
                  "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
@@ -480,9 +501,20 @@ _BTW_OVERLAY_FOOTER = "Esc to close"
 _PASTED_PLACEHOLDER_RE = re.compile(r"\[Pastedtext#\d+[^\]]*\]")
 
 
+def _needle(text: str) -> str:
+    """The distinctive tail of `text` the landed/submitted checks look for,
+    whitespace-squeezed so it survives the composer's soft-wrapping."""
+    return "".join(text.split())[-24:]
+
+
 def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
-    """True if a distinctive tail of `text` still sits in `pane`'s composer,
-    stranded and awaiting a submit Enter.
+    """_tail_in over a fresh capture of `pane`."""
+    return _tail_in(capture_pane(pane).get("text", ""), text, marker)
+
+
+def _tail_in(cap: str, text: str, marker: str = "❯") -> bool:
+    """True if a distinctive tail of `text` still sits in the composer of the
+    captured screen `cap`, stranded and awaiting a submit Enter.
 
     The composer is the region after the last prompt marker — `marker` is the
     DRIVEN platform's composer glyph (`❯` for Claude, `›` for Codex), and only
@@ -504,10 +536,9 @@ def _composer_has_tail(pane: str, text: str, marker: str = "❯") -> bool:
     there (line-discipline echo at a bash prompt), and matching that echo would
     make send_text press Enter and EXECUTE the prompt as a shell command.
     """
-    needle = "".join(text.split())[-24:]
+    needle = _needle(text)
     if not needle:
         return False
-    cap = capture_pane(pane).get("text", "")
     idx = cap.rfind(marker)
     if idx == -1:
         return False
@@ -589,10 +620,10 @@ def _clear_composer(pane: str) -> None:
         if content is None or content == prev:
             break  # unreadable or no progress — go blind
         prev = content
-        _run("send-keys", "-t", pane, *_CLEAR_KEYS)
+        send_keys(pane, *_CLEAR_KEYS)
         time.sleep(_CLEAR_POLL)
     for _ in range(_CLEAR_BLIND_PRESSES):
-        _run("send-keys", "-t", pane, *_CLEAR_KEYS)
+        send_keys(pane, *_CLEAR_KEYS)
 
 
 # Post-mortem trace for the send path: landed-verify attempts append what the
@@ -631,6 +662,12 @@ def _literal_key_arg(text: str) -> str:
     return text[:-1] + "\\;" if text.endswith(";") else text
 
 
+def _send_literal(pane: str, text: str) -> dict:
+    """Type `text` into `pane` as literal characters, not key names: {ok[, error]}."""
+    r = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
+    return {"ok": True} if r["ok"] else {"ok": False, "error": r["error"]}
+
+
 def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
@@ -650,7 +687,6 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
     wipes the late-landing text, so "never landed" stays truthful and the
     stranded prompt can't concatenate into the next send.
     """
-    needle = "".join(text.split())[-24:]
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         # Clear before every attempt, the FIRST one included. Whatever is in the
         # composer when we arrive takes the lead and our text lands appended to
@@ -663,20 +699,22 @@ def _send_until_landed(pane: str, text: str, marker: str = "❯") -> bool:
         # answers as prose ("type /clear on its own line") instead of clearing,
         # leaving the session unclearable from the board for good.
         _clear_composer(pane)
-        literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
+        literal = _send_literal(pane, text)
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
                         f"send-keys FAILED: {literal.get('error')!r}")
             return False
         time.sleep(wait)
-        if _composer_has_tail(pane, text, marker):
-            return True
+        # One capture, both judged and logged: a miss records the very frame it
+        # was decided on, not a later one the pane has since redrawn.
         cap = capture_pane(pane).get("text", "")
+        if _tail_in(cap, text, marker):
+            return True
         idx = cap.rfind(marker)
         frame = ("".join(cap[idx:].split())[:200] if idx != -1
                  else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
-                    f"needle={needle!r} frame={frame!r}")
+                    f"needle={_needle(text)!r} frame={frame!r}")
     _clear_composer(pane)  # wipe the buffered text on wake
     _send_debug(f"landed pane={pane} gave up after "
                 f"{len(_LANDED_VERIFY_WAITS)} attempts")
@@ -687,7 +725,6 @@ def send_text(
     pane: str,
     text: str,
     settle_before_enter: float = 0.0,
-    verify_submit: bool = False,
     verify_landed: bool = False,
     marker: str = "❯",
 ) -> dict:
@@ -703,41 +740,39 @@ def send_text(
     `verify_landed` (Claude) confirms the literal text actually reached the
     composer before Enter, re-sending it if a busy-pane re-render dropped the
     keystrokes — otherwise the Enter submits an empty line and the prompt is
-    lost. `verify_submit` (Codex) confirms the composer actually emptied after
-    Enter and resends Enter a couple of times if the prompt is still sitting
-    there, so an under-tuned settle can't silently strand a prompt. Slash prompts
-    verify submit unconditionally: even after the settle, Claude's popup can
-    consume the Enter selecting the highlighted completion, leaving the command
-    (e.g. "/clear") in the composer unsubmitted — the resent Enter then submits
-    it for real.
+    lost. After Enter, the composer is checked to have actually emptied, and
+    Enter resent a couple of times while the prompt is still sitting there, so an
+    under-tuned settle (Codex) can't silently strand a prompt — and so can't
+    Claude's slash popup, which even after the settle can consume the Enter
+    selecting the highlighted completion, leaving the command (e.g. "/clear") in
+    the composer unsubmitted; the resent Enter then submits it for real.
     """
     if verify_landed:
         if not _send_until_landed(pane, text, marker):
-            return {"ok": False, "error": "prompt text never landed in composer"}
+            return {"ok": False, "error": "prompt text never landed in composer",
+                    "reason": "unlanded"}
     else:
-        literal = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
+        literal = _send_literal(pane, text)
         if not literal["ok"]:
-            return {"ok": False, "error": literal["error"]}
-    is_slash = text.lstrip().startswith("/")
+            return literal
     delay = settle_before_enter
-    if is_slash:
+    if text.lstrip().startswith("/"):
         delay = max(delay, _SLASH_SETTLE)
     if delay > 0:
         time.sleep(delay)
-    enter = _run("send-keys", "-t", pane, "Enter")
+    enter = send_keys(pane, "Enter")
     if not enter["ok"]:
-        return {"ok": False, "error": enter["error"]}
-    if verify_submit or is_slash:
-        for _ in range(_SUBMIT_VERIFY_RETRIES):
-            time.sleep(_SUBMIT_VERIFY_WAIT)
-            if not _composer_has_tail(pane, text, marker):
-                break
-            resent = _run("send-keys", "-t", pane, "Enter")
-            if not resent["ok"]:
-                return {"ok": False, "error": resent["error"]}
-        else:
-            if _composer_has_tail(pane, text, marker):
-                return {"ok": False, "error": "prompt still unsent after retries"}
+        return enter
+    for _ in range(_SUBMIT_VERIFY_RETRIES):
+        time.sleep(_SUBMIT_VERIFY_WAIT)
+        if not _composer_has_tail(pane, text, marker):
+            break
+        resent = send_keys(pane, "Enter")
+        if not resent["ok"]:
+            return resent
+    else:
+        if _composer_has_tail(pane, text, marker):
+            return {"ok": False, "error": "prompt still unsent after retries"}
     return {"ok": True}
 
 
@@ -761,7 +796,7 @@ _CONFIRMED_REFUSAL_WAIT = 1.5
 def _shown_above_composer(pane: str, text: str, marker: str = "❯") -> bool:
     """True if the tail of `text` is on screen above an empty composer: the
     line was submitted and echoed into the transcript."""
-    needle = "".join(text.split())[-24:]
+    needle = _needle(text)
     cap = capture_pane(pane).get("text", "")
     idx = cap.rfind(marker)
     if not needle or idx == -1 or _composer_text(cap):
@@ -799,7 +834,7 @@ def send_text_confirmed(
     the TUI actually took the line — and, given `refused`, didn't then answer it
     with a refusal (what `refused()` returns) instead of acting on it.
 
-    For hmz, where _send_until_landed + verify_submit lose prompts and report
+    For hmz, where _send_until_landed + submit-verify lose prompts and report
     them sent (seen live: a 621-char prompt, ok returned, nothing ran). Typed a
     key at a time, a long prompt takes hmz seconds to ingest, and hmz resolves
     bound keys — Backspace, Ctrl-U, End — on its app pump AHEAD of the
@@ -825,12 +860,13 @@ def send_text_confirmed(
         if time.time() >= deadline:
             _clear_composer(pane)
             _send_debug(f"confirmed pane={pane} never landed in {wait:.1f}s")
-            return {"ok": False, "error": "prompt text never landed in composer"}
+            return {"ok": False, "error": "prompt text never landed in composer",
+                    "reason": "unlanded"}
         time.sleep(_CONFIRMED_POLL)
     for _ in range(_SUBMIT_VERIFY_RETRIES):
-        enter = _run("send-keys", "-t", pane, "Enter")
+        enter = send_keys(pane, "Enter")
         if not enter["ok"]:
-            return {"ok": False, "error": enter["error"]}
+            return enter
         until = time.time() + _CONFIRMED_TOOK_WAIT
         while time.time() < until:
             time.sleep(_CONFIRMED_POLL)

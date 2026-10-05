@@ -1,43 +1,95 @@
 """Tests for the tmux-backed wrappers in core/actions.py (create_session, send_prompt)."""
 import contextlib
 import os
+import signal
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
 
-from core import actions
+from core import actions, btwcapture
 
 
 def _fake_window(tty, platform="claude", session_id=None):
     return types.SimpleNamespace(tty=tty, platform=platform, session_id=session_id)
 
 
-def _preflight_ok(foreground="node"):
-    """A pane that's ready to be typed into.
+# The card most tests drive: a Claude session on /dev/pts/3 with no session id.
+_CARD = _fake_window("/dev/pts/3")
 
-    Before it types, `send_prompt` inspects the pane: what's in the foreground,
-    whether it's in copy mode, whether a /btw aside or a cancellable dialog is
-    covering the composer, and whether the composer has drawn yet. None of that
-    is stubbed by a `send_text` mock, so tests that only mocked the send were
-    running the whole inspection against this machine's real tmux server —
-    failing on an unrelated pane, or blocking for 15s in the composer wait.
+# An idle Claude pane: an empty composer over its status line.
+_LIVE_TEXT = "❯ \n⏵⏵ bypass permissions on"
 
-    Pass foreground=None to leave `pane_current_command` alone for tests that
-    drive it themselves.
+
+def _screens(*texts, then=None):
+    """A capture_pane stand-in showing `texts` one capture at a time, then `then`
+    — the last of `texts` unless given — on every capture after."""
+    seq = list(texts)
+    rest = texts[-1] if then is None else then
+
+    def capture(*_a, **_k):
+        return {"ok": True, "text": seq.pop(0) if seq else rest}
+    return capture
+
+
+class _Clock:
+    """A time.time that moves only when time.sleep is called. Mocking sleep alone
+    leaves a deadline loop spinning on the wall clock until its budget runs out;
+    on this clock the loop polls its whole budget at once."""
+
+    def __init__(self):
+        self.now = time.time()
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@contextlib.contextmanager
+def _pane(*screens, then=None, window=_CARD, pane="%5", foreground="node"):
+    """A tmux pane for the code under test to drive, with nothing reaching a real
+    tmux server or process table.
+
+    pid 1234 resolves to `window` (find_window; None for no window) and that to
+    `pane` (pane_for_tty; None for no pane). capture_pane shows `screens` in turn
+    (see _screens; an idle composer when none are given), send_keys and send_text
+    succeed, pane_current_command reports `foreground` and exit_copy_mode
+    succeeds. Before it types, send_prompt inspects all of these — what's in the
+    foreground, copy mode, a /btw aside or dialog covering the composer, whether
+    the composer has drawn — so tests that only mocked the send ran that whole
+    inspection against this machine's real tmux server. The card's process tree
+    holds no uninterruptible Bash wrapper, so a bare Esc never escalates to a
+    SIGKILL of a real process. Time runs on a _Clock.
+
+    Yields the mocks by name; `sent` lists the keys of each send_keys call. A test
+    whose pane reacts to keys sets the mocks' side_effect itself.
     """
-    stack = contextlib.ExitStack()
-    if foreground is not None:
-        stack.enter_context(mock.patch.object(
-            actions.tmux, "pane_current_command", return_value=foreground))
-    stack.enter_context(mock.patch.object(
-        actions.tmux, "exit_copy_mode", return_value={"ok": True}))
-    stack.enter_context(mock.patch.object(actions, "_archive_open_aside"))
-    stack.enter_context(mock.patch.object(actions, "_dismiss_answer_overlay"))
-    stack.enter_context(mock.patch.object(actions, "_clear_blocker", return_value=None))
-    stack.enter_context(mock.patch.object(
-        actions, "_wait_composer_ready", return_value=True))
-    return stack
+    if not screens and then is None:
+        screens = (_LIVE_TEXT,)
+    clock = _Clock()
+    sent = []
+
+    def send_keys(_pane, *keys):
+        sent.append(keys)
+        return {"ok": True}
+
+    with mock.patch.object(actions, "find_window", return_value=window), \
+         mock.patch.object(actions, "uninterruptible_wrappers", return_value=[]) as uw, \
+         mock.patch.object(actions.tmux, "pane_for_tty", return_value=pane) as pf, \
+         mock.patch.object(actions.tmux, "pane_current_command", return_value=foreground), \
+         mock.patch.object(actions.tmux, "exit_copy_mode", return_value={"ok": True}) as ecm, \
+         mock.patch.object(actions.tmux, "capture_pane",
+                           side_effect=_screens(*screens, then=then)) as cp, \
+         mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys) as sk, \
+         mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
+         mock.patch.object(actions.time, "sleep", side_effect=clock.sleep) as sl, \
+         mock.patch.object(actions.time, "time", side_effect=clock.time):
+        yield types.SimpleNamespace(
+            sent=sent, pane_for_tty=pf, exit_copy_mode=ecm, capture_pane=cp,
+            send_keys=sk, send_text=st, sleep=sl, wrappers=uw)
 
 
 class CreateSessionTests(unittest.TestCase):
@@ -114,120 +166,88 @@ class CreateSessionTests(unittest.TestCase):
 
 class SendPromptTests(unittest.TestCase):
     def test_happy_path_resolves_pane_and_sends(self):
-        with _preflight_ok(), \
-             mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5") as pf, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
+        with _pane() as p:
             r = actions.send_prompt(1234, "hello")
-        pf.assert_called_once_with("/dev/pts/3")
+        p.pane_for_tty.assert_called_once_with("/dev/pts/3")
         # Claude's busy pane can drop the injected keystrokes, so verify the text
-        # lands before Enter and that the composer empties after — anchored on
-        # Claude's `❯` composer marker, never Codex's `›` (a task-list separator
-        # here).
-        st.assert_called_once_with(
-            "%5", "hello", verify_landed=True, verify_submit=True, marker="❯",
-        )
+        # lands before Enter (send_text itself checks the composer empties after)
+        # — anchored on Claude's `❯` composer marker, never Codex's `›` (a
+        # task-list separator here).
+        p.send_text.assert_called_once_with("%5", "hello", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
 
     def test_codex_window_gets_settle_before_enter(self):
-        with _preflight_ok(), \
-             mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/3", platform="codex")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
+        with _pane(window=_fake_window("/dev/pts/3", platform="codex")) as p:
             r = actions.send_prompt(1234, "hello")
-        # Codex gets a length-scaled settle and submit-verification, anchored on
+        # Codex gets a length-scaled settle, its submit-verify anchored on
         # Codex's `›` composer marker.
-        st.assert_called_once_with(
+        p.send_text.assert_called_once_with(
             "%5", "hello",
             settle_before_enter=actions.tmux.codex_enter_settle(len("hello")),
-            verify_submit=True, marker="›",
+            marker="›",
         )
         self.assertTrue(r["ok"])
 
     def test_newlines_collapsed_to_spaces(self):
-        with _preflight_ok(), \
-             mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
+        with _pane() as p:
             actions.send_prompt(1234, "line1\nline2\nline3")
-        self.assertEqual(st.call_args[0][1], "line1 line2 line3")
+        self.assertEqual(p.send_text.call_args[0][1], "line1 line2 line3")
 
     def test_shell_foreground_refuses_to_send(self):
         # If the TUI exited or was suspended, the pane's foreground process is
         # its parent shell — injected text would echo at the shell prompt and
         # the submit Enter would EXECUTE the prompt as a shell command.
         for shell in ("bash", "zsh", "-fish"):
-            with mock.patch.object(actions, "find_window",
-                                   return_value=_fake_window("/dev/pts/3")), \
-                 mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-                 mock.patch.object(actions.tmux, "pane_current_command",
-                                   return_value=shell), \
-                 mock.patch.object(actions.tmux, "send_text") as st:
-                r = actions.send_prompt(1234, "hello")
-            self.assertFalse(r["ok"], shell)
-            self.assertIn("shell", r["error"])
-            st.assert_not_called()
+            with self.subTest(shell):
+                with _pane(foreground=shell) as p:
+                    r = actions.send_prompt(1234, "hello")
+                self.assertFalse(r["ok"])
+                self.assertIn("shell", r["error"])
+                p.send_text.assert_not_called()
 
     def test_unknown_foreground_command_still_sends(self):
         # The lookup is best-effort: an unrecognized or unresolvable foreground
         # command (node, claude, "") must not block the send.
         for cmd in ("claude", "node", "", None):
-            with _preflight_ok(foreground=None), \
-                 mock.patch.object(actions, "find_window",
-                                   return_value=_fake_window("/dev/pts/3")), \
-                 mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-                 mock.patch.object(actions.tmux, "pane_current_command",
-                                   return_value=cmd), \
-                 mock.patch.object(actions.tmux, "send_text",
-                                   return_value={"ok": True}) as st:
-                r = actions.send_prompt(1234, "hello")
-            self.assertTrue(r["ok"], repr(cmd))
-            st.assert_called_once()
+            with self.subTest(cmd):
+                with _pane(foreground=cmd) as p:
+                    r = actions.send_prompt(1234, "hello")
+                self.assertTrue(r["ok"])
+                p.send_text.assert_called_once()
 
     def test_no_pane_returns_explicit_error(self):
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value=None), \
-             mock.patch.object(actions.tmux, "send_text") as st:
+        with _pane(pane=None) as p:
             r = actions.send_prompt(1234, "hello")
         self.assertFalse(r["ok"])
         self.assertEqual(r["error"], "session not in a tmux pane")
-        st.assert_not_called()
+        p.send_text.assert_not_called()
 
     def test_missing_window_returns_error(self):
-        with mock.patch.object(actions, "find_window", return_value=None), \
-             mock.patch.object(actions.tmux, "send_text") as st:
+        with _pane(window=None) as p:
             r = actions.send_prompt(1234, "hello")
         self.assertFalse(r["ok"])
-        st.assert_not_called()
+        p.send_text.assert_not_called()
 
     def test_empty_text_rejected_before_send(self):
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "send_text") as st:
+        with _pane() as p:
             r = actions.send_prompt(1234, "   \n  ")
         self.assertFalse(r["ok"])
-        st.assert_not_called()
+        p.send_text.assert_not_called()
 
     def test_oversized_text_rejected_before_send(self):
         big = "a" * 8001
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "send_text") as st:
+        with _pane() as p:
             r = actions.send_prompt(1234, big)
         self.assertFalse(r["ok"])
         self.assertIn("8000", r["error"])
-        st.assert_not_called()
+        p.send_text.assert_not_called()
 
     def test_max_length_accepted(self):
         ok_text = "a" * 8000
-        with _preflight_ok(), \
-             mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
+        with _pane() as p:
             r = actions.send_prompt(1234, ok_text)
         self.assertTrue(r["ok"])
-        st.assert_called_once()
+        p.send_text.assert_called_once()
 
     # A settled /btw answer overlay left on the pane: ▔ border + "Esc to close".
     _BTW_OVERLAY = (
@@ -236,38 +256,6 @@ class SendPromptTests(unittest.TestCase):
         "      2 plus 2 is 4.\n\n"
         "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\n"
     )
-    _CLEAN_PANE = "❯ \n⏵⏵ bypass permissions on"
-
-    def test_open_btw_overlay_is_dismissed_before_send(self):
-        # An open /btw overlay is modal: a prompt pasted while it's up is eaten.
-        # send_prompt must Escape it (then re-check it cleared) before the paste.
-        caps = [{"ok": True, "text": self._BTW_OVERLAY},
-                {"ok": True, "text": self._CLEAN_PANE}]
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
-             mock.patch.object(actions.time, "sleep"):
-            r = actions.send_prompt(1234, "hello")
-        sk.assert_any_call("%5", "Escape")
-        st.assert_called_once()
-        self.assertTrue(r["ok"])
-
-    def test_no_escape_when_composer_is_clean(self):
-        # No overlay -> never touch Escape (it would interrupt a working session).
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st:
-            r = actions.send_prompt(1234, "hello")
-        sk.assert_not_called()
-        st.assert_called_once()
-        self.assertTrue(r["ok"])
-
     # The same aside mid-generation: footer lacks "c to copy" (not settled).
     _BTW_ANSWERING = (
         "▔" * 60 + "\n\n"
@@ -292,80 +280,52 @@ class SendPromptTests(unittest.TestCase):
         "  Esc to close\n"
     )
 
-    def test_borderless_overlay_is_dismissed_before_send(self):
-        # Current builds draw no ▔ border. Missing the overlay here means the
+    def test_open_btw_overlay_is_dismissed_before_send(self):
+        # An open /btw overlay is modal: a prompt pasted while it's up is eaten.
+        # send_prompt must Escape it (then re-check it cleared) before the paste.
+        # Current builds draw no ▔ border. Missing the overlay there means the
         # pasted prompt is eaten by the overlay's key handling, which destroys
         # the aside AND silently loses the prompt (seen live: both /btw answers
         # and the follow-up prompt vanished).
-        caps = [{"ok": True, "text": self._BTW_OVERLAY_BORDERLESS},
-                {"ok": True, "text": self._CLEAN_PANE}]
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
-             mock.patch.object(actions.time, "sleep"):
-            r = actions.send_prompt(1234, "hello")
-        sk.assert_any_call("%5", "Escape")
-        st.assert_called_once()
-        self.assertTrue(r["ok"])
+        for name, overlay in (("bordered", self._BTW_OVERLAY),
+                              ("borderless", self._BTW_OVERLAY_BORDERLESS)):
+            with self.subTest(name):
+                with _pane(overlay, _LIVE_TEXT) as p:
+                    r = actions.send_prompt(1234, "hello")
+                p.send_keys.assert_any_call("%5", "Escape")
+                p.send_text.assert_called_once()
+                self.assertTrue(r["ok"])
 
-    def test_borderless_answering_aside_is_waited_out_and_archived(self):
-        from core import btwcapture
-        caps = [{"ok": True, "text": self._BTW_ANSWERING_BORDERLESS},  # archive: generating
-                {"ok": True, "text": self._BTW_OVERLAY_BORDERLESS},    # archive: settled -> latch
-                {"ok": True, "text": self._BTW_OVERLAY_BORDERLESS},    # dismiss: present -> Esc
-                {"ok": True, "text": self._CLEAN_PANE}]                # dismiss: cleared
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/3", session_id="sessX")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}), \
-             mock.patch.object(actions.time, "sleep"), \
-             mock.patch.object(btwcapture, "capture_sync") as cs:
+    def test_no_escape_when_composer_is_clean(self):
+        # No overlay -> never touch Escape (it would interrupt a working session).
+        with _pane(_LIVE_TEXT) as p:
             r = actions.send_prompt(1234, "hello")
-        cs.assert_called_once_with(1234, "sessX")
-        sk.assert_any_call("%5", "Escape")
+        p.send_keys.assert_not_called()
+        p.send_text.assert_called_once()
         self.assertTrue(r["ok"])
 
     def test_answering_aside_is_waited_out_and_archived_before_dismiss(self):
         # The aside's answer exists only in the overlay. send_prompt must wait
         # (bounded) for it to settle and archive it BEFORE the dismiss-Escape
         # destroys it — otherwise the answer is unrecoverable.
-        from core import btwcapture
-        caps = [{"ok": True, "text": self._BTW_ANSWERING},   # archive: still generating
-                {"ok": True, "text": self._BTW_OVERLAY},     # archive: settled -> latch
-                {"ok": True, "text": self._BTW_OVERLAY},     # dismiss: overlay present -> Esc
-                {"ok": True, "text": self._CLEAN_PANE}]      # dismiss: cleared
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/3", session_id="sessX")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}), \
-             mock.patch.object(actions.time, "sleep"), \
-             mock.patch.object(btwcapture, "capture_sync") as cs:
-            r = actions.send_prompt(1234, "hello")
-        cs.assert_called_once_with(1234, "sessX")
-        sk.assert_any_call("%5", "Escape")
-        self.assertTrue(r["ok"])
+        for name, answering, settled in (
+                ("bordered", self._BTW_ANSWERING, self._BTW_OVERLAY),
+                ("borderless", self._BTW_ANSWERING_BORDERLESS, self._BTW_OVERLAY_BORDERLESS)):
+            with self.subTest(name):
+                with _pane(answering,   # archive: still generating
+                           settled,     # archive: settled -> latch
+                           settled,     # dismiss: overlay present -> Esc
+                           _LIVE_TEXT,  # dismiss: cleared
+                           window=_fake_window("/dev/pts/3", session_id="sessX")) as p, \
+                     mock.patch.object(btwcapture, "capture_sync") as cs:
+                    r = actions.send_prompt(1234, "hello")
+                cs.assert_called_once_with("%5", "sessX")
+                p.send_keys.assert_any_call("%5", "Escape")
+                self.assertTrue(r["ok"])
 
     def test_no_archive_without_session_id(self):
         # Windows without a session id (e.g. codex) have no /btw archive to feed.
-        from core import btwcapture
-        caps = [{"ok": True, "text": self._BTW_OVERLAY},
-                {"ok": True, "text": self._CLEAN_PANE}]
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=lambda *a, **k: caps.pop(0) if caps else {"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}), \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}), \
-             mock.patch.object(actions.time, "sleep"), \
+        with _pane(self._BTW_OVERLAY, _LIVE_TEXT), \
              mock.patch.object(btwcapture, "capture_sync") as cs:
             r = actions.send_prompt(1234, "hello")
         cs.assert_not_called()
@@ -387,7 +347,7 @@ class SendPromptReadinessTests(unittest.TestCase):
         "▝▜█████▛▘  Fable 5 · Claude Max\n"
         "  ▘▘ ▝▝    /shared/ws/proj\n"
     )
-    _READY = _BOOTING + "❯ \n⏵⏵ bypass permissions on"
+    _READY = _BOOTING + _LIVE_TEXT
     # The Rewind panel replacing the composer (lifted from a live wedged pane).
     _REWIND = _BOOTING + "  Rewind\n\n  Nothing to rewind to yet.\n\n  Esc to cancel\n"
     # Same panel in a session WITH checkpoints (lifted live): it draws its own
@@ -401,51 +361,6 @@ class SendPromptReadinessTests(unittest.TestCase):
         "  ❯ (current)\n\n"
         "  Enter to continue · Esc to cancel\n"
     )
-
-    def _send(self, caps, text="hello"):
-        seq = list(caps)
-        last = seq[-1]
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "exit_copy_mode") as ecm, \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               side_effect=lambda *a, **k: {"ok": True, "text": seq.pop(0) if seq else last}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
-             mock.patch.object(actions.time, "sleep"), \
-             mock.patch.object(actions, "_COMPOSER_READY_TIMEOUT", 0.2), \
-             mock.patch.object(actions, "_COMPOSER_READY_POLL", 0.0):
-            r = actions.send_prompt(1234, text)
-        return r, sk, st, ecm
-
-    def test_booting_pane_waits_for_composer_then_sends(self):
-        # dismiss-overlay probe sees the booting pane, then the readiness loop
-        # sees it once more before the composer paints.
-        r, sk, st, _ = self._send([self._BOOTING, self._BOOTING, self._READY])
-        st.assert_called_once()
-        sk.assert_not_called()
-        self.assertTrue(r["ok"])
-
-    def test_composer_never_ready_fails_without_typing(self):
-        r, _, st, _ = self._send([self._BOOTING])
-        st.assert_not_called()
-        self.assertFalse(r["ok"])
-        self.assertIn("composer", r["error"])
-
-    def test_rewind_panel_is_escaped_then_send_proceeds(self):
-        r, sk, st, _ = self._send([self._REWIND, self._REWIND, self._READY])
-        sk.assert_any_call("%5", "Escape")
-        st.assert_called_once()
-        self.assertTrue(r["ok"])
-
-    def test_rewind_panel_with_checkpoints_is_escaped_despite_its_own_cursor(self):
-        # The ❯ cursor row inside the panel must not read as a ready composer.
-        r, sk, st, _ = self._send(
-            [self._REWIND_HISTORY, self._REWIND_HISTORY, self._READY])
-        sk.assert_any_call("%5", "Escape")
-        st.assert_called_once()
-        self.assertTrue(r["ok"])
-
     # Newer builds (seen live on v2.1.216, fixtures/rewind_panel_no_footer.txt)
     # draw NO footer while the panel cursor sits on "(current)": nothing to
     # restore means no "Enter to continue · Esc to cancel" line, so the cursor
@@ -461,24 +376,61 @@ class SendPromptReadinessTests(unittest.TestCase):
         "  ❯ (current)\n\n\n"
     )
 
-    def test_footerless_rewind_panel_is_escaped_then_send_proceeds(self):
-        r, sk, st, _ = self._send(
-            [self._REWIND_NO_FOOTER, self._REWIND_NO_FOOTER, self._READY])
-        sk.assert_any_call("%5", "Escape")
-        st.assert_called_once()
+    def _send(self, *screens):
+        with _pane(*screens) as p:
+            r = actions.send_prompt(1234, "hello")
+        return r, p
+
+    def test_booting_pane_waits_for_composer_then_sends(self):
+        # dismiss-overlay probe sees the booting pane, then the readiness loop
+        # sees it once more before the composer paints.
+        r, p = self._send(self._BOOTING, self._BOOTING, self._READY)
+        p.send_text.assert_called_once()
+        p.send_keys.assert_not_called()
         self.assertTrue(r["ok"])
 
+    def test_composer_never_ready_fails_without_typing(self):
+        r, p = self._send(self._BOOTING)
+        p.send_text.assert_not_called()
+        self.assertFalse(r["ok"])
+        self.assertIn("composer", r["error"])
+
+    def test_rewind_panel_is_escaped_then_send_proceeds(self):
+        # With checkpoints, the ❯ cursor row inside the panel must not read as a
+        # ready composer; without a footer, the panel is still the panel.
+        for name, panel in (("empty", self._REWIND),
+                            ("with checkpoints", self._REWIND_HISTORY),
+                            ("no footer", self._REWIND_NO_FOOTER)):
+            with self.subTest(name):
+                r, p = self._send(panel, panel, self._READY)
+                p.send_keys.assert_any_call("%5", "Escape")
+                p.send_text.assert_called_once()
+                self.assertTrue(r["ok"])
+
     def test_copy_mode_is_cancelled_before_typing(self):
-        r, _, st, ecm = self._send([self._READY])
-        ecm.assert_called_once_with("%5")
-        st.assert_called_once()
+        r, p = self._send(self._READY)
+        p.exit_copy_mode.assert_called_once_with("%5")
+        p.send_text.assert_called_once()
         self.assertTrue(r["ok"])
 
     def test_ready_pane_sends_without_waiting_or_keys(self):
-        r, sk, st, _ = self._send([self._READY])
-        sk.assert_not_called()
-        st.assert_called_once()
+        r, p = self._send(self._READY)
+        p.send_keys.assert_not_called()
+        p.send_text.assert_called_once()
         self.assertTrue(r["ok"])
+
+
+def _fail_send(after_text):
+    """send_prompt on a pane whose composer looks clean until the send, which
+    doesn't land; `after_text` is on the pane by the time the failure is
+    diagnosed. Returns the result and the send_text mock."""
+    with _pane() as p:
+        p.capture_pane.side_effect = lambda *a, **k: {
+            "ok": True, "text": after_text if p.send_text.called else _LIVE_TEXT}
+        p.send_text.return_value = {"ok": False, "reason": "unlanded",
+                                    "error": "prompt text never landed in composer"}
+        r = actions.send_prompt(1234, "hello")
+    return r, p.send_text
 
 
 class SendPromptBlockerTests(unittest.TestCase):
@@ -499,34 +451,17 @@ class SendPromptBlockerTests(unittest.TestCase):
         "  ❯ 1. Yes\n"
         "    2. No\n"
     )
-    _CLEAN = SendPromptTests._CLEAN_PANE
 
-    def _send_with_blocker(self, blocker_text, clears=True, text="hello"):
+    def _send_with_blocker(self, blocker_text, clears=True):
         """Drive send_prompt with `blocker_text` on the pane. When `clears`, the
         pane goes clean once an Escape is delivered (a dialog that dismisses); when
         not, it stays blocked no matter how many Escapes land."""
-        state = {"escaped": False}
-
-        def cap(*a, **k):
-            clean = clears and state["escaped"]
-            return {"ok": True, "text": self._CLEAN if clean else blocker_text}
-
-        def keys(pane, *ks):
-            if ks and ks[0] == "Escape":
-                state["escaped"] = True
-            return {"ok": True}
-
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "exit_copy_mode"), \
-             mock.patch.object(actions.tmux, "capture_pane", side_effect=cap), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=keys) as sk, \
-             mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
-             mock.patch.object(actions.time, "sleep"), \
-             mock.patch.object(actions, "_COMPOSER_READY_TIMEOUT", 0.2), \
-             mock.patch.object(actions, "_COMPOSER_READY_POLL", 0.0):
-            r = actions.send_prompt(1234, text)
-        return r, sk, st
+        with _pane() as p:
+            p.capture_pane.side_effect = lambda *a, **k: {
+                "ok": True,
+                "text": _LIVE_TEXT if clears and ("Escape",) in p.sent else blocker_text}
+            r = actions.send_prompt(1234, "hello")
+        return r, p.send_keys, p.send_text
 
     def test_model_dialog_is_escaped_then_send_delivers_with_note(self):
         r, sk, st = self._send_with_blocker(self._MODEL_DIALOG)
@@ -556,24 +491,7 @@ class SendPromptBlockerTests(unittest.TestCase):
         # Composer looks clear, so the send is attempted, but it doesn't land and
         # a dialog is on screen by the time we re-capture — name it, don't report
         # the generic "never landed".
-        state = {"sent": False}
-
-        def cap(*a, **k):
-            return {"ok": True,
-                    "text": self._MODEL_DIALOG if state["sent"] else self._CLEAN}
-
-        def stext(*a, **k):
-            state["sent"] = True
-            return {"ok": False, "error": "prompt text never landed in composer"}
-
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "exit_copy_mode"), \
-             mock.patch.object(actions.tmux, "capture_pane", side_effect=cap), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}), \
-             mock.patch.object(actions.tmux, "send_text", side_effect=stext) as st, \
-             mock.patch.object(actions.time, "sleep"):
-            r = actions.send_prompt(1234, "hello")
+        r, st = _fail_send(self._MODEL_DIALOG)
         st.assert_called_once()
         self.assertFalse(r["ok"])
         self.assertIn("/model dialog", r["error"])
@@ -586,52 +504,26 @@ class SendFailureDiagnosisTests(unittest.TestCase):
     an unrecognized overlay used to collapse into the same generic
     "prompt text never landed in composer"."""
 
-    _CLEAN = SendPromptTests._CLEAN_PANE
-    _BOOTING = SendPromptReadinessTests._BOOTING
-    _REWIND_NO_FOOTER = SendPromptReadinessTests._REWIND_NO_FOOTER
-
-    def _fail_send(self, after_text):
-        """Composer looks clean pre-send; the send doesn't land; `after_text` is
-        on the pane by the time the failure is diagnosed."""
-        state = {"sent": False}
-
-        def cap(*a, **k):
-            return {"ok": True,
-                    "text": after_text if state["sent"] else self._CLEAN}
-
-        def stext(*a, **k):
-            state["sent"] = True
-            return {"ok": False, "error": "prompt text never landed in composer"}
-
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/3")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "exit_copy_mode"), \
-             mock.patch.object(actions.tmux, "capture_pane", side_effect=cap), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}), \
-             mock.patch.object(actions.tmux, "send_text", side_effect=stext), \
-             mock.patch.object(actions.time, "sleep"):
-            return actions.send_prompt(1234, "hello")
-
     def test_footerless_rewind_panel_is_named_not_generic(self):
-        r = self._fail_send(self._REWIND_NO_FOOTER)
+        r, _ = _fail_send(SendPromptReadinessTests._REWIND_NO_FOOTER)
         self.assertFalse(r["ok"])
         self.assertIn("Rewind panel", r["error"])
         self.assertNotIn("never landed", r["error"])
 
     def test_no_composer_marker_is_reported_as_such(self):
-        r = self._fail_send(self._BOOTING)
+        r, _ = _fail_send(SendPromptReadinessTests._BOOTING)
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
         self.assertIn("no composer marker", r["error"])
 
     def test_empty_composer_reports_dropped_keystrokes(self):
-        r = self._fail_send(self._CLEAN)
+        r, _ = _fail_send(_LIVE_TEXT)
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
         self.assertIn("empty", r["error"])
 
     def test_composer_holding_other_text_is_quoted(self):
-        r = self._fail_send("❯ some other draft\n⏵⏵ bypass permissions on")
+        r, _ = _fail_send("❯ some other draft\n⏵⏵ bypass permissions on")
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
         self.assertIn("some other draft", r["error"])
@@ -643,23 +535,16 @@ class SendMenuKeysOverlayTests(unittest.TestCase):
 
     _BTW_OVERLAY = SendPromptTests._BTW_OVERLAY
     _BTW_ANSWERING = SendPromptTests._BTW_ANSWERING
-    _CLEAN_PANE = SendPromptTests._CLEAN_PANE
 
-    def _run(self, keys, pane_text, session_id="sessX"):
-        from core import btwcapture
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/3", session_id=session_id)), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": pane_text}), \
-             mock.patch.object(actions.tmux, "send_keys", return_value={"ok": True}) as sk, \
+    def _run(self, keys, pane_text):
+        with _pane(pane_text, window=_fake_window("/dev/pts/3", session_id="sessX")) as p, \
              mock.patch.object(btwcapture, "capture_sync") as cs:
             r = actions.send_menu_keys(1234, keys)
-        return r, sk, cs
+        return r, p.send_keys, cs
 
     def test_escape_archives_settled_overlay_first(self):
         r, sk, cs = self._run(["Escape"], self._BTW_OVERLAY)
-        cs.assert_called_once_with(1234, "sessX")
+        cs.assert_called_once_with("%5", "sessX")
         sk.assert_called_once_with("%5", "Escape")
         self.assertTrue(r["ok"])
 
@@ -682,64 +567,54 @@ class SendMenuKeysInterruptEscalationTests(unittest.TestCase):
     """A bare Esc that Claude Code's own interrupt can't honour (turn wedged on a
     D-state child) escalates to a SIGKILL of the Bash-tool wrapper."""
 
-    _CLEAN_PANE = SendPromptTests._CLEAN_PANE
-
     def _run(self, keys, wrappers, send_ok=True):
         """`wrappers` is a list of returns for successive uninterruptible_wrappers
         calls (the pre-check, then the post-settle re-check)."""
-        import signal
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/3", session_id="s")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%5"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": self._CLEAN_PANE}), \
-             mock.patch.object(actions.tmux, "send_keys",
-                               return_value={"ok": send_ok}) as sk, \
-             mock.patch.object(actions, "uninterruptible_wrappers",
-                               side_effect=wrappers) as uw, \
-             mock.patch.object(actions.time, "sleep") as sleep, \
+        with _pane(window=_fake_window("/dev/pts/3", session_id="s")) as p, \
              mock.patch.object(actions.os, "kill") as kill:
+            p.wrappers.side_effect = wrappers
+            p.send_keys.side_effect = lambda *a: {"ok": send_ok}
             r = actions.send_menu_keys(1234, keys)
-        return r, sk, uw, sleep, kill, signal
+        return r, p, kill
 
     def test_wedged_wrapper_is_force_killed(self):
-        r, sk, uw, sleep, kill, signal = self._run(["Escape"], [[200], [200]])
-        sk.assert_called_once_with("%5", "Escape")   # graceful Esc still sent first
-        sleep.assert_called_once()                   # gave the graceful path a beat
+        r, p, kill = self._run(["Escape"], [[200], [200]])
+        p.send_keys.assert_called_once_with("%5", "Escape")  # graceful Esc still sent first
+        p.sleep.assert_called_once()                         # gave the graceful path a beat
         kill.assert_called_once_with(200, signal.SIGKILL)
         self.assertTrue(r["escalated"])
         self.assertEqual(r["killed_wrappers"], [200])
 
     def test_no_dwrapper_never_escalates_and_stays_fast(self):
-        r, sk, uw, sleep, kill, _ = self._run(["Escape"], [[]])
-        sk.assert_called_once_with("%5", "Escape")
-        sleep.assert_not_called()                    # no settle in the common case
+        r, p, kill = self._run(["Escape"], [[]])
+        p.send_keys.assert_called_once_with("%5", "Escape")
+        p.sleep.assert_not_called()                          # no settle in the common case
         kill.assert_not_called()
         self.assertNotIn("escalated", r)
         self.assertTrue(r["ok"])
 
     def test_graceful_interrupt_clearing_after_settle_kills_nothing(self):
         # Pre-check sees the wedge; after the settle it's gone (graceful Esc won).
-        r, sk, uw, sleep, kill, _ = self._run(["Escape"], [[200], []])
-        sleep.assert_called_once()
+        r, p, kill = self._run(["Escape"], [[200], []])
+        p.sleep.assert_called_once()
         kill.assert_not_called()
         self.assertNotIn("escalated", r)
 
     def test_non_escape_key_never_escalates(self):
-        r, sk, uw, sleep, kill, _ = self._run(["1"], [[200], [200]])
-        uw.assert_not_called()
+        r, p, kill = self._run(["1"], [[200], [200]])
+        p.wrappers.assert_not_called()
         kill.assert_not_called()
         self.assertNotIn("escalated", r)
 
     def test_escape_combined_with_other_keys_is_not_an_interrupt(self):
         # Only a bare ["Escape"] is the interrupt button; combos are picker nav.
-        r, sk, uw, sleep, kill, _ = self._run(["1", "Escape"], [[200], [200]])
-        uw.assert_not_called()
+        r, p, kill = self._run(["1", "Escape"], [[200], [200]])
+        p.wrappers.assert_not_called()
         kill.assert_not_called()
 
     def test_failed_send_skips_escalation(self):
-        r, sk, uw, sleep, kill, _ = self._run(["Escape"], [[200], [200]], send_ok=False)
-        uw.assert_not_called()
+        r, p, kill = self._run(["Escape"], [[200], [200]], send_ok=False)
+        p.wrappers.assert_not_called()
         kill.assert_not_called()
         self.assertFalse(r["ok"])
 
@@ -751,58 +626,34 @@ _PICKER_TEXT = (
     "    3. Don't ask me again\n"
     "  Enter to confirm · Esc to cancel"
 )
-_LIVE_TEXT = "❯ \n⏵⏵ bypass permissions on"
 
 
 class ConfirmResumePickerTests(unittest.TestCase):
     """Auto-answering Claude's 'resume from summary?' picker for fleet resumes."""
 
-    def test_digit_then_enter_confirms_and_reports(self):
-        # Picker is up at first; still up after the digit (digit only selects);
-        # gone after Enter. Expect choice "2" then Enter, and confirmed=True.
-        caps = [_PICKER_TEXT, _PICKER_TEXT, _LIVE_TEXT]
-
-        def fake_capture(pane, **kw):
-            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
-
-        sent = []
-        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=lambda p, *k: sent.append(k)), \
-             mock.patch.object(actions.time, "sleep"):
-            r = actions.confirm_resume_picker("%0")
-        self.assertTrue(r["confirmed"])
-        self.assertEqual(sent, [("2",), ("Enter",)])
-
-    def test_no_enter_leak_when_digit_already_dismissed(self):
-        # Some builds confirm on the digit alone: the picker is gone right after
-        # "2", so Enter must NOT be sent (it would land in the live session).
-        caps = [_PICKER_TEXT, _LIVE_TEXT]
-
-        def fake_capture(pane, **kw):
-            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
-
-        sent = []
-        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=lambda p, *k: sent.append(k)), \
-             mock.patch.object(actions.time, "sleep"):
-            r = actions.confirm_resume_picker("%0")
-        self.assertTrue(r["confirmed"])
-        self.assertEqual(sent, [("2",)])
+    def test_digit_confirms_and_enter_follows_only_while_the_picker_is_up(self):
+        for name, screens, keys in (
+                # Picker is up at first; still up after the digit (digit only
+                # selects); gone after Enter. Expect choice "2" then Enter.
+                ("digit selects", [_PICKER_TEXT, _PICKER_TEXT, _LIVE_TEXT],
+                 [("2",), ("Enter",)]),
+                # Some builds confirm on the digit alone: the picker is gone right
+                # after "2", so Enter must NOT be sent (it would land in the live
+                # session).
+                ("digit confirms", [_PICKER_TEXT, _LIVE_TEXT], [("2",)])):
+            with self.subTest(name):
+                with _pane(*screens) as p:
+                    r = actions.confirm_resume_picker("%0")
+                self.assertTrue(r["confirmed"])
+                self.assertEqual(p.sent, keys)
 
     def test_no_picker_sends_nothing(self):
         # A small session resumes straight to a live prompt: never send keys.
-        with mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": _LIVE_TEXT}), \
-             mock.patch.object(actions.tmux, "send_keys") as sk, \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(_LIVE_TEXT) as p:
             r = actions.confirm_resume_picker("%0", attempts=2)
         self.assertFalse(r["confirmed"])
         self.assertEqual(r["reason"], "no picker")
-        sk.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
+        p.send_keys.assert_not_called()
 
 
 class ParsePaneMenuTests(unittest.TestCase):
@@ -949,8 +800,17 @@ class ParsePaneMenuTests(unittest.TestCase):
         self.assertIsNone(actions.parse_pane_menu(""))
 
 
+def _pane_dialog(text, pane="%9", ok=True):
+    """pane_dialog for a card whose pane (`pane`; None for no pane) captures as
+    `text` (`ok`=False: the capture failed)."""
+    with mock.patch.object(actions.tmux, "pane_for_tty", return_value=pane), \
+         mock.patch.object(actions.tmux, "capture_pane",
+                           return_value={"ok": ok, "text": text}):
+        return actions.pane_dialog("/dev/pts/9")
+
+
 class PaneMenuActiveTests(unittest.TestCase):
-    """pane_menu_active: pane-level ground truth for whether a session's
+    """pane_dialog's `menu`: pane-level ground truth for whether a session's
     "waiting / dialog open" registry status is actionable. Claude writes
     waitingFor="dialog open" for ANY overlay — including the /goal panel,
     which has nothing to answer — so the dashboard must verify the pane."""
@@ -982,10 +842,8 @@ class PaneMenuActiveTests(unittest.TestCase):
     )
 
     def _run(self, text, pane="%9", ok=True):
-        with mock.patch.object(actions.tmux, "pane_for_tty", return_value=pane), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": ok, "text": text}):
-            return actions.pane_menu_active("/dev/pts/9")
+        d = _pane_dialog(text, pane, ok)
+        return d and d["menu"]
 
     def test_goal_overlay_is_not_an_active_menu(self):
         self.assertIs(self._run(self.GOAL_OVERLAY), False)
@@ -1000,7 +858,7 @@ class PaneMenuActiveTests(unittest.TestCase):
         self.assertIs(self._run(self.RESUME_PICKER), True)
 
     def test_no_tty_is_unknown(self):
-        self.assertIsNone(actions.pane_menu_active(None))
+        self.assertIsNone(actions.pane_dialog(None))
 
     def test_no_pane_is_unknown(self):
         self.assertIsNone(self._run(self.GOAL_OVERLAY, pane=None))
@@ -1178,12 +1036,10 @@ class SwitchModelTests(unittest.TestCase):
                         state["screen"] = "closed"
             return {"ok": True}
 
-        with mock.patch.object(actions, "find_window", return_value=_fake_window("/dev/pts/9")), \
-             mock.patch.object(actions, "send_prompt", return_value={"ok": True}), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
-             mock.patch.object(actions.tmux, "capture_pane", side_effect=capture), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys), \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(window=_fake_window("/dev/pts/9"), pane="%1") as p, \
+             mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}):
+            p.capture_pane.side_effect = capture
+            p.send_keys.side_effect = send_keys
             r = actions.switch_model(1234, alias)
         return r, sent, state
 
@@ -1262,10 +1118,9 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(sent[-3:], ["s", "Down", "Enter"])
 
     def test_confirm_that_never_closes_escapes_out_of_both_dialogs(self):
-        # time.sleep is mocked out, so shorten the wait or the give-up path spins
-        # for the full real-time deadline.
-        with mock.patch.object(actions, "_MODEL_DIALOG_WAIT", 0.05):
-            r, sent, state = self._drive("fable", confirm=True, confirm_sticks=True)
+        # The give-up path waits out the whole _MODEL_DIALOG_WAIT — on _pane's
+        # clock, which only moves when the code sleeps.
+        r, sent, state = self._drive("fable", confirm=True, confirm_sticks=True)
         self.assertFalse(r["ok"])
         self.assertIn("confirm", r["error"].lower())
         # One Escape only backs out to the picker — the session is left on an open
@@ -1411,20 +1266,17 @@ class SwitchCodexModelTests(unittest.TestCase):
                     state["screen"] = {"effort": "model"}.get(state["screen"], "closed")
             return {"ok": True}
 
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/9", platform="codex")), \
-             mock.patch.object(actions, "send_prompt", return_value={"ok": True}) as sp, \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
-             mock.patch.object(actions.tmux, "capture_pane", side_effect=capture), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys), \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(window=_fake_window("/dev/pts/9", platform="codex"), pane="%1") as p, \
+             mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}) as sp:
+            p.capture_pane.side_effect = capture
+            p.send_keys.side_effect = send_keys
             r = actions.switch_model(1234, model, effort)
         return r, sent, state, sp
 
     def test_model_and_effort(self):
         r, sent, state, sp = self._drive("gpt-5.6-sol", "high")
         self.assertTrue(r["ok"], r)
-        sp.assert_called_once_with(1234, "/model")
+        sp.assert_called_once_with(1234, mock.ANY, "%1", "/model")
         self.assertEqual(state["picks"], [("model", 2), ("effort", 3)])
         self.assertEqual(r["model"], "gpt-5.6-sol high")
         self.assertEqual(state["screen"], "closed")
@@ -1469,8 +1321,7 @@ class SwitchCodexModelTests(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_picker_that_never_closes_is_a_failure_and_escapes_out(self):
-        with mock.patch.object(actions, "_MODEL_DIALOG_WAIT", 0.05):
-            r, _, state, _ = self._drive("gpt-6-astra", "high", close_sticks=True)
+        r, _, state, _ = self._drive("gpt-6-astra", "high", close_sticks=True)
         self.assertFalse(r["ok"])
         self.assertIn("did not close", r["error"])
         self.assertEqual(state["screen"], "closed")
@@ -1495,14 +1346,6 @@ _TRUST_PROMPT = (
 # The same dialog after one Down: the cursor has moved onto the Yes row.
 _TRUST_PROMPT_ON_YES = _TRUST_PROMPT.replace(
     " \u276f No, exit\n   Yes", "   No, exit\n \u276f Yes")
-
-
-def _keys_recorder(sent):
-    """A send_keys stub that records the keys and answers like the real one."""
-    def fake(pane, *keys):
-        sent.append(keys)
-        return {"ok": True}
-    return fake
 
 
 class TrustPromptTests(unittest.TestCase):
@@ -1538,64 +1381,42 @@ class TrustPromptTests(unittest.TestCase):
 
     def test_steps_onto_yes_then_confirms(self):
         # Cursor on No, then on Yes after the Down, then the dialog is gone.
-        caps = [_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT]
-
-        def fake_capture(pane, **kw):
-            return {"ok": True, "text": caps.pop(0) if caps else _LIVE_TEXT}
-
-        sent = []
-        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT) as p:
             r = actions.answer_trust_prompt("%0")
         self.assertTrue(r["ok"])
         self.assertTrue(r["answered"])
-        self.assertEqual(sent, [("Down",), ("Enter",)])
+        self.assertEqual(p.sent, [("Down",), ("Enter",)])
 
     def test_never_confirms_a_cursor_it_could_not_move(self):
         # A dialog whose cursor never reaches Yes must be left alone: Enter here
         # would commit "No, exit" and kill the session.
-        with mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": _TRUST_PROMPT}), \
-             mock.patch.object(actions.tmux, "send_keys") as sk, \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(_TRUST_PROMPT) as p:
             r = actions.answer_trust_prompt("%0")
         self.assertFalse(r["ok"])
-        self.assertNotIn(("Enter",), [c.args[1:] for c in sk.call_args_list])
+        self.assertNotIn(("Enter",), p.sent)
 
     def test_unreadable_pane_sends_nothing(self):
-        with mock.patch.object(actions.tmux, "capture_pane", return_value={"ok": False}), \
-             mock.patch.object(actions.tmux, "send_keys") as sk, \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane() as p:
+            p.capture_pane.side_effect = lambda *a, **k: {"ok": False}
             r = actions.answer_trust_prompt("%0")
         self.assertFalse(r["ok"])
-        sk.assert_not_called()
+        p.send_keys.assert_not_called()
 
     def test_already_answered_prompt_is_a_no_op(self):
-        with mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": _LIVE_TEXT}), \
-             mock.patch.object(actions.tmux, "send_keys") as sk, \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(_LIVE_TEXT) as p:
             r = actions.answer_trust_prompt("%0")
         self.assertTrue(r["ok"])
         self.assertFalse(r["answered"])
-        sk.assert_not_called()
+        p.send_keys.assert_not_called()
 
 
 class RespondPermissionRoutingTests(unittest.TestCase):
     """Which dialog is on screen decides how "approve" is delivered."""
 
     def _respond(self, pane_text, choice="approve"):
-        sent = []
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window("/dev/pts/9")), \
-             mock.patch.object(actions.tmux, "pane_for_tty", return_value="%0"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": pane_text}), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
-             mock.patch.object(actions.time, "sleep"):
+        with _pane(pane_text, window=_fake_window("/dev/pts/9"), pane="%0") as p:
             r = actions.respond_permission(100, choice)
-        return r, sent
+        return r, p.sent
 
     def test_numbered_permission_still_gets_the_digit(self):
         r, sent = self._respond("Do you want to proceed?\n\u276f 1. Yes\n  2. No")
@@ -1617,25 +1438,17 @@ class RespondPermissionRoutingTests(unittest.TestCase):
 
 
 class PaneDialogTests(unittest.TestCase):
-    """One capture, both facts the snapshot needs about an open dialog."""
-
-    def _run(self, text):
-        with mock.patch.object(actions.tmux, "pane_for_tty", return_value="%9"), \
-             mock.patch.object(actions.tmux, "capture_pane",
-                               return_value={"ok": True, "text": text}):
-            return actions.pane_dialog("/dev/pts/9")
+    """One capture, both facts the snapshot needs about an open dialog. (No tty,
+    no pane and a failed capture are PaneMenuActiveTests'.)"""
 
     def test_trust_prompt_is_a_menu_and_names_itself(self):
-        self.assertEqual(self._run(_TRUST_PROMPT), {"menu": True, "trust": True})
+        self.assertEqual(_pane_dialog(_TRUST_PROMPT), {"menu": True, "trust": True})
 
     def test_other_picker_is_a_menu_but_not_trust(self):
-        self.assertEqual(self._run(_PICKER_TEXT), {"menu": True, "trust": False})
+        self.assertEqual(_pane_dialog(_PICKER_TEXT), {"menu": True, "trust": False})
 
     def test_live_pane_has_no_dialog(self):
-        self.assertEqual(self._run(_LIVE_TEXT), {"menu": False, "trust": False})
-
-    def test_unreadable_pane_is_unknown(self):
-        self.assertIsNone(actions.pane_dialog(None))
+        self.assertEqual(_pane_dialog(_LIVE_TEXT), {"menu": False, "trust": False})
 
 
 class ConfirmTrustPromptTests(unittest.TestCase):
@@ -1647,16 +1460,8 @@ class ConfirmTrustPromptTests(unittest.TestCase):
     """
 
     def _run(self, caps, default=_LIVE_TEXT, **kw):
-        seq = list(caps)
-
-        def fake_capture(pane, **_kw):
-            return {"ok": True, "text": seq.pop(0) if seq else default}
-
-        sent = []
-        with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
-             mock.patch.object(actions.tmux, "send_keys", side_effect=_keys_recorder(sent)), \
-             mock.patch.object(actions.time, "sleep"):
-            return actions.confirm_trust_prompt("%0", **kw), sent
+        with _pane(*caps, then=default) as p:
+            return actions.confirm_trust_prompt("%0", **kw), p.sent
 
     def test_answers_the_prompt_once_it_paints(self):
         # Two empty polls while Claude boots, then the dialog: cursor on "No,
@@ -1682,11 +1487,11 @@ class ConfirmTrustPromptTests(unittest.TestCase):
 
         # Cursor already on Yes, and the dialog clears once the key lands — so
         # the run ends at the Enter instead of sitting out the confirm wait.
-        seq = [_TRUST_PROMPT_ON_YES, _TRUST_PROMPT_ON_YES]
+        screens = _screens(_TRUST_PROMPT_ON_YES, _TRUST_PROMPT_ON_YES, then=_LIVE_TEXT)
 
-        def fake_capture(pane, **_kw):
+        def fake_capture(pane, **kw):
             order.append("capture")
-            return {"ok": True, "text": seq.pop(0) if seq else _LIVE_TEXT}
+            return screens(pane, **kw)
 
         with mock.patch.object(actions.tmux, "capture_pane", side_effect=fake_capture), \
              mock.patch.object(actions.tmux, "send_keys",

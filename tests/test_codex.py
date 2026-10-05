@@ -8,12 +8,12 @@ carrying `input_text`. The latter shape is also reused for synthetic injections
 """
 import json
 import os
-import tempfile
 import time
 import unittest
-from pathlib import Path
+from unittest import mock
 
-from core import codex
+from core import codex, transcripts
+from tests.helpers import scratch_dir, write_jsonl
 
 
 # A minimal rollout mirroring the on-disk event ordering of a real session:
@@ -42,53 +42,30 @@ ASSISTANT_REPLY = "我会按代码审查处理…"
 
 
 def _write_rollout(lines):
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
-    for d in lines:
-        tmp.write(json.dumps(d, ensure_ascii=False) + "\n")
-    tmp.close()
-    return Path(tmp.name)
+    # As Codex writes it: non-ASCII text as raw UTF-8, not \u escapes.
+    return write_jsonl(lines, ensure_ascii=False)
 
 
 class TestExtractFirstUserInput(unittest.TestCase):
     def setUp(self):
         self.path = _write_rollout(ROLLOUT_LINES)
 
-    def tearDown(self):
-        self.path.unlink(missing_ok=True)
-
     def test_returns_real_user_prompt_not_assistant_reply(self):
+        # Equal to the typed prompt, so also not the synthetic
+        # <environment_context> turn logged ahead of it.
         self.assertEqual(codex._extract_first_user_input(self.path), REAL_PROMPT)
-
-    def test_skips_synthetic_environment_context(self):
-        out = codex._extract_first_user_input(self.path)
-        self.assertNotIn("environment_context", out)
 
     def test_falls_back_to_assistant_when_no_user_text(self):
         no_user = [l for l in ROLLOUT_LINES
                    if not (l["type"] == "event_msg" and l["payload"].get("type") == "user_message")
                    and not (l["type"] == "response_item" and l["payload"].get("role") == "user")]
-        p = _write_rollout(no_user)
-        try:
-            self.assertEqual(codex._extract_first_user_input(p), ASSISTANT_REPLY)
-        finally:
-            p.unlink(missing_ok=True)
+        self.assertEqual(codex._extract_first_user_input(_write_rollout(no_user)),
+                         ASSISTANT_REPLY)
 
 
 class TestCodexTimeline(unittest.TestCase):
-    def setUp(self):
-        self.path = _write_rollout(ROLLOUT_LINES)
-
-    def tearDown(self):
-        self.path.unlink(missing_ok=True)
-
-    def test_timeline_includes_user_prompt(self):
-        evs = codex.codex_timeline(self.path)
-        user_texts = [e["text"] for e in evs if e["kind"] == "user_text"]
-        self.assertIn(REAL_PROMPT, user_texts)
-
     def test_timeline_user_prompt_not_duplicated(self):
-        evs = codex.codex_timeline(self.path)
+        evs = codex.codex_timeline(_write_rollout(ROLLOUT_LINES))
         user_texts = [e["text"] for e in evs if e["kind"] == "user_text"]
         self.assertEqual(user_texts.count(REAL_PROMPT), 1)
 
@@ -134,9 +111,6 @@ class TestThreadItemRollout(unittest.TestCase):
     def setUp(self):
         self.path = _write_rollout(ITEM_ROLLOUT_LINES)
 
-    def tearDown(self):
-        self.path.unlink(missing_ok=True)
-
     def test_first_input_is_the_typed_prompt_not_the_agents_md_preamble(self):
         self.assertEqual(codex._extract_first_user_input(self.path), REAL_PROMPT)
 
@@ -159,24 +133,17 @@ class TestThreadItemRollout(unittest.TestCase):
         both = list(ITEM_ROLLOUT_LINES)
         both.insert(5, {"type": "event_msg", "payload": {
             "type": "user_message", "message": REAL_PROMPT, "images": []}})
-        p = _write_rollout(both)
-        try:
-            user_texts = [e["text"] for e in codex.codex_timeline(p)
-                          if e["kind"] == "user_text"]
-            self.assertEqual(user_texts, [REAL_PROMPT])
-        finally:
-            p.unlink(missing_ok=True)
+        user_texts = [e["text"] for e in codex.codex_timeline(_write_rollout(both))
+                      if e["kind"] == "user_text"]
+        self.assertEqual(user_texts, [REAL_PROMPT])
 
     def test_pending_custom_tool_call_reads_as_busy(self):
         # Rollout ends on an issued `exec` with no output yet, and was last
         # written long enough ago that the mtime shortcut can't answer.
-        pending = ITEM_ROLLOUT_LINES[:-2]
-        p = _write_rollout(pending)
-        try:
-            self.assertEqual(
-                codex._infer_codex_status(p, mtime=time.time() - 600), "busy")
-        finally:
-            p.unlink(missing_ok=True)
+        p = _write_rollout(ITEM_ROLLOUT_LINES[:-2])
+        self.assertEqual(
+            codex._infer_codex_status(codex._read_tail_events(p),
+                                      mtime=time.time() - 600), "busy")
 
     def test_goal_injection_with_attributes_is_not_a_prompt(self):
         injected = [l for l in ITEM_ROLLOUT_LINES
@@ -185,11 +152,8 @@ class TestThreadItemRollout(unittest.TestCase):
         injected[3] = {"type": "response_item", "payload": {
             "type": "message", "role": "user", "content": [{"type": "input_text",
                 "text": '<codex_internal_context source="goal">\nContinue.\n</codex_internal_context>'}]}}
-        p = _write_rollout(injected)
-        try:
-            self.assertEqual(codex._extract_first_user_input(p), ASSISTANT_REPLY)
-        finally:
-            p.unlink(missing_ok=True)
+        self.assertEqual(codex._extract_first_user_input(_write_rollout(injected)),
+                         ASSISTANT_REPLY)
 
 
 # A rollout straddling a /clear: an old prompt+reply, then a new prompt+reply.
@@ -206,7 +170,7 @@ CLEAR_ROLLOUT = [
      "payload": {"type": "message", "role": "assistant",
                  "content": [{"type": "output_text", "text": "NEW assistant reply"}]}},
 ]
-CLEAR_CUTOFF_MS = codex._parse_iso_ms("2026-06-11T11:00:00Z")  # between old and new
+CLEAR_CUTOFF_MS = int(transcripts._parse_ts("2026-06-11T11:00:00Z") * 1000)  # between old and new
 
 
 class TestClearHidesPreClearEvents(unittest.TestCase):
@@ -217,7 +181,6 @@ class TestClearHidesPreClearEvents(unittest.TestCase):
         self.path = _write_rollout(CLEAR_ROLLOUT)
 
     def tearDown(self):
-        self.path.unlink(missing_ok=True)
         codex._cleared_at_ms.clear()
 
     def test_first_input_skips_pre_clear_prompt(self):
@@ -239,7 +202,8 @@ class TestClearHidesPreClearEvents(unittest.TestCase):
 
     def test_last_assistant_text_skips_pre_clear(self):
         self.assertEqual(
-            codex._last_assistant_text(self.path, since_ms=CLEAR_CUTOFF_MS),
+            codex._last_assistant_text(codex._read_tail_events(self.path),
+                                       since_ms=CLEAR_CUTOFF_MS),
             "NEW assistant reply")
 
     def test_unparseable_timestamp_is_not_hidden(self):
@@ -262,8 +226,7 @@ class TestRolloutFdSelection(unittest.TestCase):
     """
 
     def _fake_fd_dir(self, marker: str, *, frozen_newer: bool):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        tmp = scratch_dir()
         sessions = tmp / marker.lstrip("/")
         sessions.mkdir(parents=True)
         frozen = sessions / "rollout-2026-06-14T16-48-38-019ec889.jsonl"
@@ -292,8 +255,7 @@ class TestRolloutFdSelection(unittest.TestCase):
         self.assertEqual(codex._newest_rollout_in_fd_dir(fd_dir, marker), frozen)
 
     def test_no_rollout_fds_returns_none(self):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        tmp = scratch_dir()
         fd_dir = tmp / "fd"
         fd_dir.mkdir()
         other = tmp / "some.log"
@@ -322,11 +284,7 @@ class TestLastTurnError(unittest.TestCase):
     latest turn outcome; a later successful turn clears it."""
 
     def _err_of(self, lines, since_ms=0):
-        p = _write_rollout(lines)
-        try:
-            return codex._last_turn_error(p, since_ms)
-        finally:
-            p.unlink(missing_ok=True)
+        return codex._last_turn_error(codex._read_tail_events(_write_rollout(lines)), since_ms)
 
     def test_surfaces_latest_turn_error_message(self):
         out = self._err_of([_task_complete("2026-07-26T19:36:10Z", _MODEL_ERR)])
@@ -344,7 +302,7 @@ class TestLastTurnError(unittest.TestCase):
         self.assertIsNone(self._err_of(ROLLOUT_LINES))
 
     def test_pre_clear_error_is_hidden(self):
-        cutoff = codex._parse_iso_ms("2026-07-26T19:38:00Z")
+        cutoff = int(transcripts._parse_ts("2026-07-26T19:38:00Z") * 1000)
         out = self._err_of([_task_complete("2026-07-26T19:36:10Z", _MODEL_ERR)],
                            since_ms=cutoff)
         self.assertIsNone(out)
@@ -376,14 +334,13 @@ class TestSubagentRolloutIsNotTheCard(unittest.TestCase):
                 "payload": payload}
 
     def _fd_dir(self, *, subagent_newer=True, include_user=True):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        tmp = scratch_dir()
         sessions = tmp / "codex-sessions"
         sessions.mkdir(parents=True)
         user = sessions / "rollout-2026-07-30T20-56-35-019fb651.jsonl"
         sub = sessions / "rollout-2026-07-31T11-30-40-019fb971.jsonl"
-        user.write_text(json.dumps(self._meta("019fb651")) + "\n")
-        sub.write_text(json.dumps(self._meta("019fb971", parent="019fb651")) + "\n")
+        write_jsonl([self._meta("019fb651")], user)
+        write_jsonl([self._meta("019fb971", parent="019fb651")], sub)
         os.utime(user, (1000, 1000) if subagent_newer else (2000, 2000))
         os.utime(sub, (2000, 2000) if subagent_newer else (1000, 1000))
         fd_dir = tmp / "fd"
@@ -413,15 +370,34 @@ class TestSubagentRolloutIsNotTheCard(unittest.TestCase):
         self.assertTrue(codex._is_subagent_rollout(sub))
 
     def test_unreadable_meta_is_treated_as_user_thread(self):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
-        p = tmp / "rollout-2026-07-31T00-00-00-deadbeef.jsonl"
+        p = scratch_dir() / "rollout-2026-07-31T00-00-00-deadbeef.jsonl"
         p.write_text("not json\n")
         self.assertFalse(codex._is_subagent_rollout(str(p)))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestRolloutsParsedOncePerChange(unittest.TestCase):
+    """History lists every rollout every 30s; one that hasn't changed is not
+    read again, and one that has gone is forgotten."""
+
+    def test_list_codex_sessions_reuses_unchanged_rollouts(self):
+        root = scratch_dir()
+        self.addCleanup(codex._clear_caches)
+        a, b = root / "rollout-a.jsonl", root / "rollout-b.jsonl"
+        for f in (a, b):
+            write_jsonl(ROLLOUT_LINES, f)
+        with mock.patch.object(codex, "CODEX_SESSIONS_DIR", root), \
+                mock.patch.object(codex, "_scan_activity",
+                                  wraps=codex._scan_activity) as scan:
+            self.assertEqual(len(codex.list_codex_sessions()), 2)
+            self.assertEqual(len(codex.list_codex_sessions()), 2)
+            self.assertEqual(scan.call_count, 2)
+            with a.open("a") as f:
+                f.write(json.dumps({"type": "turn_context", "payload": {"model": "m"}}) + "\n")
+            b.unlink()
+            (s,) = codex.list_codex_sessions()
+            self.assertEqual((s["transcript_path"], s["model"]), (str(a), "m"))
+            self.assertEqual(scan.call_count, 3)
+        self.assertEqual(list(codex._session_cache), [a])
 
 
 class TestTurnContextModel(unittest.TestCase):
@@ -429,20 +405,12 @@ class TestTurnContextModel(unittest.TestCase):
     last one wins, since /model rewrites both mid-session."""
 
     def test_last_turn_context_wins(self):
-        path = _write_rollout(ROLLOUT_LINES + [
+        act = codex.extract_codex_session_activity(_write_rollout(ROLLOUT_LINES + [
             {"type": "turn_context", "payload": {"model": "gpt-6-astra", "effort": "medium"}},
             {"type": "turn_context", "payload": {"model": "gpt-5.6-sol", "effort": "high"}},
-        ])
-        try:
-            act = codex.extract_codex_session_activity(path)
-        finally:
-            path.unlink(missing_ok=True)
+        ]))
         self.assertEqual((act["model"], act["effort"]), ("gpt-5.6-sol", "high"))
 
     def test_no_turn_context_means_blank(self):
-        path = _write_rollout(ROLLOUT_LINES)
-        try:
-            act = codex.extract_codex_session_activity(path)
-        finally:
-            path.unlink(missing_ok=True)
+        act = codex.extract_codex_session_activity(_write_rollout(ROLLOUT_LINES))
         self.assertEqual((act["model"], act["effort"]), ("", ""))

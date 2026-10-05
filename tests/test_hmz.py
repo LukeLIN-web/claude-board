@@ -4,12 +4,11 @@ the sessions it keeps.
 """
 import json
 import os
-import tempfile
 import unittest
 from unittest import mock
-from pathlib import Path
 
 from core import hmz
+from tests.helpers import make_window, scratch_dir, write_jsonl
 
 # Copied from `ps` while a flow ran: the interface, the headless run, and the
 # sandbox plumbing under one of its turns.
@@ -30,6 +29,13 @@ RUN = [
 ENDED = RUN + [{"event": "ended", "at": "2026-10-02T01:10:00.000Z", "how": "done"}]
 
 
+def _window(**over):
+    """An hmz card running in /home/u/proj, with no run yet unless given one."""
+    return make_window(**{"pid": 7, "session_id": "hmz-7", "cwd": "/home/u/proj",
+                          "project_slug": "-home-u-proj", "tty": "/dev/pts/1",
+                          "platform": "hmz", **over})
+
+
 class TestDetection(unittest.TestCase):
     def test_interface(self):
         self.assertTrue(hmz._is_interactive_hmz(TUI))
@@ -46,19 +52,13 @@ class TestDetection(unittest.TestCase):
 
 class TestEpics(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.orig = hmz.HMZ_HOME
-        hmz.HMZ_HOME = Path(self.tmp.name)
-
-    def tearDown(self):
-        hmz.HMZ_HOME = self.orig
-        self.tmp.cleanup()
+        self.base = scratch_dir()
+        home = mock.patch.object(hmz, "HMZ_HOME", self.base)
+        home.start()
+        self.addCleanup(home.stop)
 
     def _run(self, cwd_slug, name, events):
-        d = Path(self.tmp.name) / "epics" / cwd_slug / name
-        d.mkdir(parents=True)
-        (d / "epic.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-        return d / "epic.jsonl"
+        return write_jsonl(events, self.base / "epics" / cwd_slug / name / "epic.jsonl")
 
     def test_newest_run_of_the_directory(self):
         self._run("-home-u-tmp-hmz-aot", "20261001T090000.000Z-aaaaaa", ENDED)
@@ -71,7 +71,7 @@ class TestEpics(unittest.TestCase):
 
     def test_home_before_and_after_the_rename(self):
         # hmz moved ~/.humanize to ~/.hmz; one from before the move keeps the old name.
-        base = Path(self.tmp.name)
+        base = self.base
         with mock.patch.object(hmz, "HMZ_HOME", base / ".hmz"), \
                 mock.patch.object(hmz, "HMZ_HOME_WAS", base / ".humanize"):
             (base / ".humanize").mkdir()
@@ -84,29 +84,32 @@ class TestEpics(unittest.TestCase):
 
     def test_humanize_home_of_the_process(self):
         # An hmz started with HUMANIZE_HOME keeps its runs there, not in ~/.humanize.
-        other = Path(self.tmp.name) / "elsewhere"
-        d = other / "epics" / "-home-u-x" / "20261002T000000.000Z-cccccc"
-        d.mkdir(parents=True)
-        (d / "epic.jsonl").write_text(json.dumps(RUN[0]) + "\n")
+        other = self.base / "elsewhere"
+        epic = write_jsonl(RUN[:1], other / "epics" / "-home-u-x"
+                           / "20261002T000000.000Z-cccccc" / "epic.jsonl")
         self.assertIsNone(hmz._latest_epic("/home/u/x"))
-        self.assertEqual(hmz._latest_epic("/home/u/x", other), d / "epic.jsonl")
+        self.assertEqual(hmz._latest_epic("/home/u/x", other), epic)
 
 
-class TestPromptTaken(unittest.TestCase):
+class _HmzHomeTest(unittest.TestCase):
+    """hmz's home (where its history.jsonl lives) is a fresh, empty directory."""
+
+    def setUp(self):
+        self.home = scratch_dir()
+        home = mock.patch.object(hmz, "_home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+
+
+class TestPromptTaken(_HmzHomeTest):
     """A send to hmz succeeds on hmz's own record of the line, never on an
     emptied composer."""
 
     CWD = "/home/u/proj"
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.history = Path(self.tmp.name) / "history.jsonl"
-        home = mock.patch.object(hmz, "_home", return_value=Path(self.tmp.name))
-        home.start()
-        self.addCleanup(home.stop)
-
-    def tearDown(self):
-        self.tmp.cleanup()
+        super().setUp()
+        self.history = self.home / "history.jsonl"
 
     def _say(self, text, workdir=CWD):
         with self.history.open("a") as f:
@@ -221,8 +224,7 @@ class TestMenu(unittest.TestCase):
     ])
 
     def _menu(self, screen, status="idle"):
-        w = TestNoRunNote._window(None)
-        w.status = status
+        w = _window(status=status)
         with mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
                 mock.patch.object(hmz.tmux, "capture_pane",
                                   return_value={"ok": True, "text": screen}):
@@ -242,8 +244,8 @@ class TestMenu(unittest.TestCase):
         self.assertEqual(self._menu(self.SETUP, status="busy"), "")
 
     def test_the_card_says_where_it_waits(self):
-        w = TestNoRunNote._window(None)
-        with mock.patch.object(hmz, "list_hmz_windows", return_value=[w]), \
+        w = _window()
+        with mock.patch.object(hmz, "_discover", return_value=[(w, [], None, None)]), \
                 mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
                 mock.patch.object(hmz.tmux, "capture_pane",
                                   return_value={"ok": True, "text": self.SETUP}):
@@ -253,9 +255,9 @@ class TestMenu(unittest.TestCase):
 
     def test_the_timeline_says_so(self):
         import app
-        w = TestNoRunNote._window(None)
+        w = _window()
         with mock.patch.object(app.sessions, "find_window", return_value=w), \
-                mock.patch.object(hmz, "_home", return_value=Path(tempfile.gettempdir()) / "no-hmz"), \
+                mock.patch.object(hmz, "_home", return_value=scratch_dir() / "no-hmz"), \
                 mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
                 mock.patch.object(hmz.tmux, "capture_pane",
                                   return_value={"ok": True, "text": self.SETUP}):
@@ -263,19 +265,15 @@ class TestMenu(unittest.TestCase):
         self.assertEqual(r["note"], hmz.MENU_NOTE.format("parallel_flame_chase"))
 
 
-class TestTyped(unittest.TestCase):
+class TestTyped(_HmzHomeTest):
     """The lines typed into one hmz, read off the history it shares with every
     other hmz of its home."""
 
     CWD = "/home/u/robot"
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        home = mock.patch.object(hmz, "_home", return_value=Path(self.tmp.name))
-        home.start()
-        self.addCleanup(home.stop)
-        _jsonl(Path(self.tmp.name) / "history.jsonl", [
+        super().setUp()
+        write_jsonl(path=self.home / "history.jsonl", rows=[
             {"at": "2026-10-02T20:51:06Z", "workdir": self.CWD, "text": "before it started"},
             {"at": "2026-10-05T00:34:40Z", "workdir": "/home/u/other", "text": "another hmz"},
             {"at": "2026-10-05T00:34:42.806383Z", "workdir": self.CWD,
@@ -293,34 +291,26 @@ class TestTyped(unittest.TestCase):
                          [("user_text", "$parallel_flame_chase do it")])
 
     def test_a_line_the_run_shows_is_not_repeated(self):
-        epic = _jsonl(Path(self.tmp.name) / "run" / "epic.jsonl", [
+        epic = write_jsonl([
             {"event": "began", "at": "2026-10-05T00:35:00Z", "flow": "rlar", "task": "fix  it"},
-        ])
+        ], self.home / "run" / "epic.jsonl")
         typed = [{"at": "2026-10-05T00:34:42Z", "workdir": self.CWD, "text": "$nosuch x"},
                  {"at": "2026-10-05T00:34:59Z", "workdir": self.CWD, "text": "$rlar fix it"}]
         self.assertEqual([e["text"] for e in hmz.hmz_timeline(epic, typed=typed)],
                          ["$nosuch x", "$rlar fix  it"])
 
 
-class TestNoRunNote(unittest.TestCase):
+class TestNoRunNote(_HmzHomeTest):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        home = mock.patch.object(hmz, "_home", return_value=Path(self.tmp.name))
-        home.start()
-        self.addCleanup(home.stop)
-
-    @staticmethod
-    def _window(transcript_path):
-        return hmz.Window(pid=7, session_id="hmz-7", cwd="/home/u/proj", project_name="proj",
-                          project_slug="-home-u-proj", name=None, status="idle",
-                          waiting_for=None, started_at=0, updated_at=0, version="",
-                          tty="/dev/pts/1", transcript_path=transcript_path, alive=True,
-                          hidden=False, platform="hmz")
+        super().setUp()
+        # The timeline looks for a setup menu on the card's pane; there is none.
+        pane = mock.patch.object(hmz.tmux, "pane_for_tty", return_value=None)
+        pane.start()
+        self.addCleanup(pane.stop)
 
     def test_timeline_says_why_it_is_empty(self):
         import app
-        with mock.patch.object(app.sessions, "find_window", return_value=self._window(None)):
+        with mock.patch.object(app.sessions, "find_window", return_value=_window()):
             r = app.api_timeline("7")
         self.assertEqual(r["events"], [])
         self.assertEqual(r["note"], hmz.NO_RUN_NOTE)
@@ -329,19 +319,17 @@ class TestNoRunNote(unittest.TestCase):
         # The live miss: hmz took `$parallel_flame_chase …`, had no such flow,
         # and the card said nothing had been typed.
         import app
-        _jsonl(Path(self.tmp.name) / "history.jsonl", [
-            {"at": "2026-10-05T00:34:42Z", "workdir": "/home/u/proj", "text": "$nosuch x"}])
-        with mock.patch.object(app.sessions, "find_window", return_value=self._window(None)):
+        write_jsonl([{"at": "2026-10-05T00:34:42Z", "workdir": "/home/u/proj", "text": "$nosuch x"}],
+                    self.home / "history.jsonl")
+        with mock.patch.object(app.sessions, "find_window", return_value=_window()):
             r = app.api_timeline("7")
         self.assertEqual([e["text"] for e in r["events"]], ["$nosuch x"])
         self.assertEqual(r["note"], hmz.TYPED_NO_RUN_NOTE)
 
     def test_no_note_once_a_run_exists(self):
         import app
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-            f.write("".join(json.dumps(e) + "\n" for e in RUN))
-        self.addCleanup(Path(f.name).unlink)
-        with mock.patch.object(app.sessions, "find_window", return_value=self._window(f.name)):
+        epic = str(write_jsonl(RUN))
+        with mock.patch.object(app.sessions, "find_window", return_value=_window(transcript_path=epic)):
             r = app.api_timeline("7")
         self.assertIsNone(r["note"])
         self.assertEqual(r["events"][0]["kind"], "user_text")
@@ -353,29 +341,18 @@ class TestRun(unittest.TestCase):
         self.assertEqual(hmz._ended(ENDED)["how"], "done")
 
     def test_current_task(self):
-        self.assertEqual(hmz._current_task(RUN), "commander_delegate · worker")
-        self.assertEqual(hmz._current_task(ENDED), "commander_delegate done")
+        self.assertEqual(hmz._current_task(RUN, RUN[-1], None), "commander_delegate · worker")
+        self.assertEqual(hmz._current_task(ENDED, ENDED[-2], None), "commander_delegate done")
 
     def test_models_are_deduplicated(self):
         self.assertEqual(hmz._models(hmz._began(RUN)), "claude/claude-opus-5-5")
 
     def test_timeline(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-            f.write("".join(json.dumps(e) + "\n" for e in ENDED))
-        try:
-            ev = hmz.hmz_timeline(f.name)
-        finally:
-            Path(f.name).unlink()
+        ev = hmz.hmz_timeline(str(write_jsonl(ENDED)))
         self.assertEqual([e["kind"] for e in ev],
                          ["user_text", "assistant_text", "assistant_text", "assistant_text"])
         self.assertTrue(ev[0]["text"].startswith("$commander_delegate split todo.md"))
         self.assertEqual(ev[-1]["text"], "run ended: done")
-
-
-def _jsonl(path, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    return path
 
 
 class TestKeptSessions(unittest.TestCase):
@@ -383,11 +360,10 @@ class TestKeptSessions(unittest.TestCase):
     under sessions/<cli>/ laid out as that CLI lays out its home."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        run = Path(self.tmp.name) / "20261002T000000.000Z-a1b2c3"
+        self.base = scratch_dir()
+        run = self.base / "20261002T000000.000Z-a1b2c3"
         self.run = run
-        self.epic = _jsonl(run / "epic.jsonl", [
+        self.epic = write_jsonl(path=run / "epic.jsonl", rows=[
             {"event": "began", "at": "2026-10-02T00:00:00.000Z", "flow": "rlar",
              "task": "fix   the bug"},
             # Written once the session's first turn is done, so after it.
@@ -401,7 +377,7 @@ class TestKeptSessions(unittest.TestCase):
              "backend": "grok", "session": "g1", "where": "sessions/grok"},
         ])
         # The called flow writes its own record, and the session it opened is there.
-        _jsonl(run / "epic.review_d4e5f6.jsonl", [
+        write_jsonl(path=run / "epic.review_d4e5f6.jsonl", rows=[
             {"event": "began", "at": "2026-10-02T00:00:06.000Z", "flow": "review"},
             {"event": "opened", "at": "2026-10-02T00:00:08.000Z", "agent": "reviewer",
              "backend": "codex", "session": "x9", "where": "sessions/codex"},
@@ -413,14 +389,14 @@ class TestKeptSessions(unittest.TestCase):
              "message": {"role": "assistant", "content": [{"type": "text", "text": "fixed it"}]}},
         ]
         claude = run / "sessions" / "claude" / "projects" / "-home-u-proj"
-        self.writer_log = _jsonl(claude / "c1.jsonl", first)
+        self.writer_log = write_jsonl(first, claude / "c1.jsonl")
         # A fork opens on a copy of the conversation it was cut from.
-        _jsonl(claude / "c2.jsonl", first + [
+        write_jsonl(path=claude / "c2.jsonl", rows=first + [
             {"type": "user", "timestamp": "2026-10-02T00:00:08.500Z",
              "message": {"role": "user", "content": "address the review"}},
         ])
-        _jsonl(run / "sessions" / "codex" / "sessions" / "2026" / "10" / "02"
-               / "rollout-2026-10-02T00-00-07-x9.jsonl", [
+        write_jsonl(path=run / "sessions" / "codex" / "sessions" / "2026" / "10" / "02"
+                    / "rollout-2026-10-02T00-00-07-x9.jsonl", rows=[
             {"type": "event_msg", "timestamp": "2026-10-02T00:00:07.000Z",
              "payload": {"type": "user_message", "message": "review the diff"}},
             {"type": "response_item", "timestamp": "2026-10-02T00:00:07.500Z",
@@ -445,8 +421,8 @@ class TestKeptSessions(unittest.TestCase):
 
     def test_session_kept_in_the_cli_home(self):
         # A session that stayed where its CLI keeps it: `where` is the whole path.
-        home = Path(self.tmp.name) / "dot-claude"
-        _jsonl(home / "projects" / "-x" / "h1.jsonl", [
+        home = self.base / "dot-claude"
+        write_jsonl(path=home / "projects" / "-x" / "h1.jsonl", rows=[
             {"type": "assistant", "timestamp": "2026-10-02T00:00:11.000Z",
              "message": {"role": "assistant", "content": [{"type": "text", "text": "from home"}]}},
         ])
@@ -458,7 +434,7 @@ class TestKeptSessions(unittest.TestCase):
         for p in self.run.rglob("*.jsonl"):
             os.utime(p, (1_000, 1_000))
         os.utime(self.writer_log, (5_000, 5_000))
-        self.assertEqual(hmz._last_logged(self.epic), 5_000_000)
+        self.assertEqual(hmz._activity(self.epic)[0], 5_000_000)
 
     def test_current_task_follows_the_session_written_last(self):
         events = hmz._events(self.epic)
@@ -466,15 +442,18 @@ class TestKeptSessions(unittest.TestCase):
             os.utime(p, (1_000, 1_000))
         codex_log = next(self.run.rglob("rollout-*.jsonl"))
         os.utime(codex_log, (2_000, 2_000))
-        self.assertEqual(hmz._current_task(events, self.epic), "rlar · reviewer: one nit")
+        self.assertEqual(hmz._current_task(events, *hmz._activity(self.epic)[1:]),
+                         "rlar · reviewer: one nit")
         # The writer resumes its session for the next round: no new `opened` line.
         os.utime(self.writer_log, (3_000, 3_000))
-        self.assertEqual(hmz._current_task(events, self.epic), "rlar · writer: fixed it")
+        self.assertEqual(hmz._current_task(events, *hmz._activity(self.epic)[1:]),
+                         "rlar · writer: fixed it")
 
     def test_current_task_without_logs_is_the_last_opened(self):
-        events = [e for e in hmz._events(self.epic) if e.get("event") != "opened"]
-        events.append({"event": "opened", "agent": "scout", "backend": "grok", "session": "g1"})
-        self.assertEqual(hmz._current_task(events), "rlar · scout")
+        import shutil
+        shutil.rmtree(self.run / "sessions")
+        events = hmz._events(self.epic)
+        self.assertEqual(hmz._current_task(events, *hmz._activity(self.epic)[1:]), "rlar · scout")
 
 
 PRICES = {"models": {
@@ -501,12 +480,10 @@ class TestSpending(unittest.TestCase):
     the price list while it runs, hmz's own total once it has ended."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name)
+        self.home = scratch_dir()
         (self.home / "prices.json").write_text(json.dumps(PRICES))
         self.run = self.home / "epics" / "-p" / "20261002T000000.000Z-a1b2c3"
-        self.epic = _jsonl(self.run / "epic.jsonl", [
+        self.epic = write_jsonl(path=self.run / "epic.jsonl", rows=[
             {"event": "began", "at": "2026-10-02T00:00:00.000Z", "flow": "rlar", "task": "fix",
              "budget": {"duration": "PT15H", "cost": 150.0, "output_tokens": None, "graceful": True}},
             {"event": "opened", "at": "2026-10-02T00:00:05.000Z", "agent": "writer",
@@ -516,18 +493,18 @@ class TestSpending(unittest.TestCase):
         ])
         first = _claude_turn("1", "claude-opus-5-5", input_tokens=2, output_tokens=300,
                              cache_read_input_tokens=10_000, cache_creation_input_tokens=5_000)
-        self.claude_log = _jsonl(self.run / "sessions/claude/projects/-p/c1.jsonl", [
+        self.claude_log = write_jsonl(path=self.run / "sessions/claude/projects/-p/c1.jsonl", rows=[
             # A message is a line per content block, each carrying the whole message's usage.
             first, first,
             _claude_turn("2", "claude-opus-5-5", input_tokens=100, output_tokens=700),
         ])
-        self.codex_log = _jsonl(
-            self.run / "sessions/codex/sessions/2026/10/02/rollout-2026-10-02T00-00-07-x9.jsonl", [
-                {"type": "turn_context", "payload": {"model": "gpt-6-astra", "cwd": "/p"}},
-                # Running totals, the last of which is the session's; input includes the cached part.
-                _codex_count(input_tokens=1_000, cached_input_tokens=600, output_tokens=50),
-                _codex_count(input_tokens=3_000, cached_input_tokens=2_000, output_tokens=200),
-            ])
+        self.codex_log = write_jsonl(path=self.run / "sessions/codex/sessions/2026/10/02"
+                                     / "rollout-2026-10-02T00-00-07-x9.jsonl", rows=[
+            {"type": "turn_context", "payload": {"model": "gpt-6-astra", "cwd": "/p"}},
+            # Running totals, the last of which is the session's; input includes the cached part.
+            _codex_count(input_tokens=1_000, cached_input_tokens=600, output_tokens=50),
+            _codex_count(input_tokens=3_000, cached_input_tokens=2_000, output_tokens=200),
+        ])
         self.began = hmz.transcripts._parse_ts("2026-10-02T00:00:00.000Z")
 
     def _spending(self, events=None, now=None):
@@ -587,14 +564,14 @@ class TestSpending(unittest.TestCase):
             f.write('{"type": "assistant", "message": {"id": "msg_4", "usage": {"output_tok')  # mid-write
         self.assertEqual(self._spending()["tokens"]["output"], before + 5)
         # Rewritten shorter — a fresh session under the old name — it is read over.
-        _jsonl(self.claude_log, [_claude_turn("9", "claude-opus-5-5", output_tokens=1)])
+        write_jsonl([_claude_turn("9", "claude-opus-5-5", output_tokens=1)], self.claude_log)
         self.assertEqual(self._spending()["tokens"]["output"], 201)
 
     def test_a_sub_agents_tokens_are_the_runs(self):
         # A sub-agent Claude starts logs under its session; the timeline leaves
         # it out, the bill takes it in, as hmz's own does.
-        _jsonl(self.run / "sessions/claude/projects/-p/c1/subagents/agent-7.jsonl", [
-            {**_claude_turn("7", "claude-opus-5-5", output_tokens=40), "isSidechain": True}])
+        write_jsonl([{**_claude_turn("7", "claude-opus-5-5", output_tokens=40), "isSidechain": True}],
+                    self.run / "sessions/claude/projects/-p/c1/subagents/agent-7.jsonl")
         self.assertEqual(self._spending()["tokens"]["output"], 1_240)
         self.assertEqual(len(hmz._logs(self.epic, hmz._opened(self.epic)[0])), 1)
         self.assertNotIn("40", [e["text"] for e in hmz.hmz_timeline(self.epic)])
@@ -644,22 +621,16 @@ class TestSpending(unittest.TestCase):
                          ["8", "12.7k", "2.40M"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSessionsNotYetOpened(unittest.TestCase):
     """hmz writes a session's `opened` line once its first turn has landed. Until
     then its log under the run's own session directory names it, and the
     engine's journal says whose it is."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name)
+        self.home = scratch_dir()
         (self.home / "prices.json").write_text(json.dumps(PRICES))
         self.run = self.home / "epics" / "-p" / "20261005T013920.331Z-3196f3"
-        self.epic = _jsonl(self.run / "epic.jsonl", [
+        self.epic = write_jsonl(path=self.run / "epic.jsonl", rows=[
             {"event": "began", "at": "2026-10-05T01:39:20.331Z", "flow": "parallel_flame_chase",
              "task": "lift", "budget": {"duration": "PT15H", "cost": 150.0,
                                         "output_tokens": None, "graceful": True}},
@@ -670,7 +641,7 @@ class TestSessionsNotYetOpened(unittest.TestCase):
              "epic": "epic.parallel_flame_chase-lane_turn_5dbd4d.jsonl"},
         ])
         # The plan's session: its one turn landed, so it is written down.
-        _jsonl(self.run / "epic.parallel_flame_chase-plan_1c830f.jsonl", [
+        write_jsonl(path=self.run / "epic.parallel_flame_chase-plan_1c830f.jsonl", rows=[
             {"event": "began", "at": "2026-10-05T01:39:22.429Z", "flow": "parallel_flame_chase:plan"},
             {"event": "opened", "at": "2026-10-05T01:41:03.167Z", "agent": "coordinator",
              "backend": "claude", "session": "0056c5ba-0692-40cf-98e2-bb016be18722",
@@ -678,12 +649,12 @@ class TestSessionsNotYetOpened(unittest.TestCase):
             {"event": "ended", "at": "2026-10-05T01:41:03.169Z", "how": "done"},
         ])
         # The lane's: an hour into its first turn, nothing but `began` on its record.
-        _jsonl(self.run / "epic.parallel_flame_chase-lane_turn_5dbd4d.jsonl", [
+        write_jsonl(path=self.run / "epic.parallel_flame_chase-lane_turn_5dbd4d.jsonl", rows=[
             {"event": "began", "at": "2026-10-05T01:41:03.628Z",
              "flow": "parallel_flame_chase:lane_turn"},
         ])
         # The engine's journal named both as their CLI announced the id, seconds in.
-        self.journal = _jsonl(self.run / "resume.jsonl", [
+        self.journal = write_jsonl(path=self.run / "resume.jsonl", rows=[
             {"t": "journal", "v": 1},
             {"t": "session", "id": 2, "role": "coordinator", "harness": "claude",
              "model": "claude-opus-5-5", "session": "0056c5ba-0692-40cf-98e2-bb016be18722"},
@@ -691,12 +662,13 @@ class TestSessionsNotYetOpened(unittest.TestCase):
              "model": "claude-opus-5-5", "session": "3eb6cb8d-3c12-499f-b67c-54515abd8495"},
         ])
         projects = self.run / "sessions" / "claude" / "projects"
-        _jsonl(projects / "-planning" / "0056c5ba-0692-40cf-98e2-bb016be18722.jsonl", [
+        write_jsonl(path=projects / "-planning" / "0056c5ba-0692-40cf-98e2-bb016be18722.jsonl", rows=[
             {"type": "user", "timestamp": "2026-10-05T01:39:23.603Z",
              "message": {"role": "user", "content": "plan it"}},
             _claude_turn("p", "claude-opus-5-5", input_tokens=12, output_tokens=1_000),
         ])
-        self.lane_log = _jsonl(projects / "-lane-2" / "3eb6cb8d-3c12-499f-b67c-54515abd8495.jsonl", [
+        self.lane_log = write_jsonl(path=projects / "-lane-2"
+                                    / "3eb6cb8d-3c12-499f-b67c-54515abd8495.jsonl", rows=[
             # Claude's first lines are its queue's, stamped before the turn itself.
             {"type": "queue-operation", "operation": "enqueue",
              "timestamp": "2026-10-05T01:41:04.766Z", "sessionId": "3eb6cb8d"},
@@ -732,8 +704,9 @@ class TestSessionsNotYetOpened(unittest.TestCase):
         self.assertEqual(self._spending()["output_tokens"], 41_000)
 
     def test_its_subagents_are_billed_too(self):
-        _jsonl(self.lane_log.parent / "3eb6cb8d-3c12-499f-b67c-54515abd8495" / "subagents"
-               / "agent-a1.jsonl", [_claude_turn("sub", "claude-opus-5-5", output_tokens=1_000)])
+        write_jsonl([_claude_turn("sub", "claude-opus-5-5", output_tokens=1_000)],
+                    self.lane_log.parent / "3eb6cb8d-3c12-499f-b67c-54515abd8495" / "subagents"
+                    / "agent-a1.jsonl")
         self.assertEqual(self._spending()["output_tokens"], 42_000)
 
     def test_a_codex_session_is_named_by_its_rollout(self):
@@ -741,8 +714,8 @@ class TestSessionsNotYetOpened(unittest.TestCase):
         with self.journal.open("a") as f:
             f.write(json.dumps({"t": "session", "id": 5, "role": "reviewer", "harness": "codex",
                                 "model": "gpt-6-astra", "session": ident}) + "\n")
-        _jsonl(self.run / "sessions" / "codex" / "sessions" / "2026" / "10" / "05"
-               / f"rollout-2026-10-05T01-41-05-{ident}.jsonl", [
+        write_jsonl(path=self.run / "sessions" / "codex" / "sessions" / "2026" / "10" / "05"
+                    / f"rollout-2026-10-05T01-41-05-{ident}.jsonl", rows=[
             {"type": "session_meta", "timestamp": "2026-10-05T01:41:05.000Z", "payload": {"id": ident}},
             {"type": "turn_context", "payload": {"model": "gpt-6-astra", "cwd": "/p"}},
             _codex_count(input_tokens=1_000, cached_input_tokens=0, output_tokens=200),
@@ -756,8 +729,9 @@ class TestSessionsNotYetOpened(unittest.TestCase):
         for p in self.run.rglob("*.jsonl"):
             os.utime(p, (1_000, 1_000))
         os.utime(self.lane_log, (5_000, 5_000))
-        self.assertEqual(hmz._last_logged(self.epic), 5_000_000)
-        self.assertTrue(hmz._current_task(hmz._events(self.epic), self.epic)
+        newest, at_work, log = hmz._activity(self.epic)
+        self.assertEqual(newest, 5_000_000)
+        self.assertTrue(hmz._current_task(hmz._events(self.epic), at_work, log)
                         .startswith("parallel_flame_chase · actor"))
 
     def test_the_timeline_shows_what_the_lane_was_told(self):

@@ -11,28 +11,26 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
+from . import patrol, transcripts
 from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
 from .sessions import (
     HOME_BASE,
+    Proc,
     Window,
     _cwd_to_project_slug,
+    _exe_index,
     _pid_alive,
-    get_tty,
+    _proc_start_ms,
+    proc_table,
 )
 
 CODEX_HOME = HOME_BASE / ".codex"
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 
-# Idle thresholds for live-card triage, mirroring core.patrol.
-_IDLE_THRESHOLD = 300       # 5 min — past this an idle session reads as "done"
-_CLOSEABLE_THRESHOLD = 3600  # 1 hour — past this it's safe to suggest closing
 # A rollout written within this window means the agent is actively producing
 # output right now, regardless of what the last parsed event type was.
 _BUSY_MTIME_WINDOW = 5.0
@@ -129,47 +127,13 @@ def _before_clear(ts: str, since_ms: int) -> bool:
     """
     if since_ms <= 0:
         return False
-    t = _parse_iso_ms(ts)
+    t = transcripts._parse_ts(ts) * 1000
     return 0 < t < since_ms
 
 
-@dataclass
-class CodexSession:
-    session_id: str
-    project: str
-    project_name: str
-    first_input: str
-    first_ts: str
-    last_ts: str
-    transcript_path: str
-    transcript_size: int
-    transcript_mtime: int
-    cli_version: str
-    model_provider: str
-    model: str = ""
-    skills_used: list = field(default_factory=list)
-    memory_ops: list = field(default_factory=list)
-    skill_breakdown: dict = field(default_factory=dict)
-
-    def to_history_dict(self) -> dict:
-        return {
-            "session_id": self.session_id,
-            "project": self.project,
-            "project_name": self.project_name,
-            "first_input": self.first_input,
-            "input_count": 0,
-            "first_ts": self.first_ts,
-            "last_ts": self.last_ts,
-            "transcript_path": self.transcript_path,
-            "transcript_size": self.transcript_size,
-            "transcript_mtime": self.transcript_mtime,
-            "is_alive": False,
-            "platform": "codex",
-            "model": self.model,
-            "skills_used": self.skills_used,
-            "memory_ops": self.memory_ops,
-            "skill_breakdown": self.skill_breakdown,
-        }
+def _records(path: Path) -> Iterator[dict]:
+    """A rollout's lines, parsed; one that isn't a JSON object is skipped."""
+    return (d for d in transcripts._iter_lines(path) if isinstance(d, dict))
 
 
 def _parse_session_meta(path: Path) -> Optional[dict]:
@@ -196,52 +160,65 @@ def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
     """
     fallback = ""
     try:
-        with path.open() as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if _before_clear(d.get("timestamp", ""), since_ms):
-                    continue
-                t = d.get("type")
-                payload = d.get("payload") or {}
+        for d in _records(path):
+            if _before_clear(d.get("timestamp", ""), since_ms):
+                continue
+            t = d.get("type")
+            payload = d.get("payload") or {}
 
-                if t == "event_msg":
-                    ptype = payload.get("type")
-                    if ptype == "user_message":
-                        msg = (payload.get("message") or "").strip()
-                        if msg:
-                            return msg[:300]
-                    if ptype == "item_completed":
-                        msg = _typed_item_text(payload)
-                        if msg:
-                            return msg[:300]
+            if t == "event_msg":
+                ptype = payload.get("type")
+                if ptype == "user_message":
+                    msg = (payload.get("message") or "").strip()
+                    if msg:
+                        return msg[:300]
+                if ptype == "item_completed":
+                    msg = _typed_item_text(payload)
+                    if msg:
+                        return msg[:300]
 
-                if t == "response_item" and payload.get("type") == "message":
-                    if payload.get("role") == "user":
-                        typed = _typed_user_parts(payload)
-                        if typed:
-                            return "\n".join(typed)[:300]
+            if t == "response_item" and payload.get("type") == "message":
+                if payload.get("role") == "user":
+                    typed = _typed_user_parts(payload)
+                    if typed:
+                        return "\n".join(typed)[:300]
+                    continue
+                for c in (payload.get("content") or []):
+                    if not isinstance(c, dict):
                         continue
-                    for c in (payload.get("content") or []):
-                        if not isinstance(c, dict):
-                            continue
-                        if c.get("type") == "output_text" and not fallback:
-                            txt = (c.get("text") or "").strip()
-                            if txt:
-                                fallback = txt[:300]
+                    if c.get("type") == "output_text" and not fallback:
+                        txt = (c.get("text") or "").strip()
+                        if txt:
+                            fallback = txt[:300]
     except Exception:
         pass
     return fallback
 
 
+# Parsed rollouts, kept while the file is unchanged — path → ((st_mtime_ns,
+# st_size), result). A live card asks for its activity every 2s tick, and the
+# history index (rebuilt every 30s) lists every rollout: re-reading ~1k of them
+# (~900 MB) for it took seconds each time.
+_activity_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+_session_cache: dict[Path, tuple[tuple[int, int], Optional[dict]]] = {}
+
+
+def _clear_caches() -> None:
+    """Forget every parsed rollout (tests / explicit refresh)."""
+    _activity_cache.clear()
+    _session_cache.clear()
+
+
 def extract_codex_session_activity(path: Path | str) -> dict:
     """Codex has no file I/O tools — everything goes through exec_command.
     We must scan the command strings for skill/memory file references.
+    Read again only once the rollout changes; the result is shared, so callers
+    must not change it.
     """
     p = Path(path)
-    if not p.exists():
+    try:
+        st = p.stat()
+    except OSError:
         return {
             "skills_used": [], "memory_ops": [], "model": "", "effort": "",
             "skill_breakdown": {
@@ -249,7 +226,14 @@ def extract_codex_session_activity(path: Path | str) -> dict:
                 "per_skill_writes": {}, "per_skill_bash_refs": {},
             },
         }
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _activity_cache.get(str(p))
+    if hit is None or hit[0] != key:
+        hit = _activity_cache[str(p)] = (key, _scan_activity(p))
+    return hit[1]
 
+
+def _scan_activity(p: Path) -> dict:
     bash_refs: dict[str, int] = {}
     skill_reads: dict[str, int] = {}
     skill_writes: dict[str, int] = {}
@@ -259,66 +243,61 @@ def extract_codex_session_activity(path: Path | str) -> dict:
     effort = ""
 
     try:
-        with p.open() as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                t = d.get("type", "")
-                payload = d.get("payload") or {}
+        for d in _records(p):
+            t = d.get("type", "")
+            payload = d.get("payload") or {}
 
-                if t == "turn_context":
-                    m = payload.get("model", "")
-                    if m:
-                        model = m
-                    e = payload.get("effort", "")
-                    if e:
-                        effort = e
+            if t == "turn_context":
+                m = payload.get("model", "")
+                if m:
+                    model = m
+                e = payload.get("effort", "")
+                if e:
+                    effort = e
 
-                if t != "response_item":
-                    continue
-                if payload.get("type") != "function_call":
-                    continue
-                name = payload.get("name", "")
-                if name != "exec_command":
-                    continue
+            if t != "response_item":
+                continue
+            if payload.get("type") != "function_call":
+                continue
+            name = payload.get("name", "")
+            if name != "exec_command":
+                continue
 
-                args_str = payload.get("arguments", "")
-                try:
-                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
-                except Exception:
-                    args = {}
-                cmd = str(args.get("cmd", "") or args.get("command", ""))
-                workdir = str(args.get("workdir", ""))
-                # Codex sets workdir to skill dir, then runs cmd inside it.
-                # Need to scan both for skill references.
-                haystack = cmd + " " + workdir
-                if not haystack.strip():
+            args_str = payload.get("arguments", "")
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except Exception:
+                args = {}
+            cmd = str(args.get("cmd", "") or args.get("command", ""))
+            workdir = str(args.get("workdir", ""))
+            # Codex sets workdir to skill dir, then runs cmd inside it.
+            # Need to scan both for skill references.
+            haystack = cmd + " " + workdir
+            if not haystack.strip():
+                continue
+
+            # Skill path mentions (in cmd OR workdir)
+            skill_matches = set(_SKILL_PATH_RE.findall(haystack))
+            if skill_matches:
+                write_kw = any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir"))
+                for sk in skill_matches:
+                    bash_refs[sk] = bash_refs.get(sk, 0) + 1
+                    if write_kw:
+                        skill_writes[sk] = skill_writes.get(sk, 0) + 1
+                    else:
+                        skill_reads[sk] = skill_reads.get(sk, 0) + 1
+
+            # Memory path mentions
+            mem_matches = _MEMORY_PATH_RE.findall(haystack)
+            for mem_name in set(mem_matches):
+                if mem_name == "MEMORY":
                     continue
-
-                # Skill path mentions (in cmd OR workdir)
-                skill_matches = set(_SKILL_PATH_RE.findall(haystack))
-                if skill_matches:
-                    write_kw = any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir"))
-                    for sk in skill_matches:
-                        bash_refs[sk] = bash_refs.get(sk, 0) + 1
-                        if write_kw:
-                            skill_writes[sk] = skill_writes.get(sk, 0) + 1
-                        else:
-                            skill_reads[sk] = skill_reads.get(sk, 0) + 1
-
-                # Memory path mentions
-                mem_matches = _MEMORY_PATH_RE.findall(haystack)
-                for mem_name in set(mem_matches):
-                    if mem_name == "MEMORY":
-                        continue
-                    write_kw = any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<"))
-                    op = "write" if write_kw else "read"
-                    key = (mem_name, op)
-                    if key not in memory_ops_seen:
-                        memory_ops_seen.add(key)
-                        memory_ops.append({"name": mem_name, "operation": op})
+                write_kw = any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<"))
+                op = "write" if write_kw else "read"
+                key = (mem_name, op)
+                if key not in memory_ops_seen:
+                    memory_ops_seen.add(key)
+                    memory_ops.append({"name": mem_name, "operation": op})
     except Exception:
         pass
 
@@ -337,39 +316,59 @@ def extract_codex_session_activity(path: Path | str) -> dict:
     }
 
 
-def list_codex_sessions() -> list[CodexSession]:
+def list_codex_sessions() -> list[dict]:
+    """Every rollout under ~/.codex/sessions as history.HistorySession fields,
+    newest first. Each is parsed once per change (see _session_cache); the dicts
+    are shared, so callers must not change them."""
     if not CODEX_SESSIONS_DIR.exists():
         return []
-    sessions: list[CodexSession] = []
+    sessions: list[dict] = []
+    seen: set[Path] = set()
     for f in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
-        meta = _parse_session_meta(f)
-        if not meta:
-            continue
         try:
             st = f.stat()
         except Exception:
             continue
-        cwd = meta.get("cwd", "")
-        activity = extract_codex_session_activity(f)
-        sessions.append(CodexSession(
-            session_id=meta.get("id", f.stem),
-            project=cwd,
-            project_name=cwd.rsplit("/", 1)[-1] if cwd else f.stem,
-            first_input=_extract_first_user_input(f),
-            first_ts=meta.get("timestamp", ""),
-            last_ts=meta.get("timestamp", ""),
-            transcript_path=str(f),
-            transcript_size=st.st_size,
-            transcript_mtime=int(st.st_mtime * 1000),
-            cli_version=meta.get("cli_version", ""),
-            model_provider=meta.get("model_provider", ""),
-            model=activity["model"],
-            skills_used=activity["skills_used"],
-            memory_ops=activity["memory_ops"],
-            skill_breakdown=activity["skill_breakdown"],
-        ))
-    sessions.sort(key=lambda s: s.transcript_mtime, reverse=True)
+        seen.add(f)
+        key = (st.st_mtime_ns, st.st_size)
+        hit = _session_cache.get(f)
+        if hit is None or hit[0] != key:
+            hit = _session_cache[f] = (key, _codex_session(f, st))
+        if hit[1]:
+            sessions.append(hit[1])
+    # list() first: history requests can run this on two threads at once.
+    for gone in [f for f in list(_session_cache) if f not in seen]:
+        _session_cache.pop(gone, None)
+    sessions.sort(key=lambda s: s["transcript_mtime"], reverse=True)
     return sessions
+
+
+def _codex_session(f: Path, st: os.stat_result) -> Optional[dict]:
+    """The rollout `f` (as stat'd in `st`) as history.HistorySession fields; None
+    when its first line isn't session_meta."""
+    meta = _parse_session_meta(f)
+    if not meta:
+        return None
+    cwd = meta.get("cwd", "")
+    activity = _scan_activity(f)
+    return {
+        "session_id": meta.get("id", f.stem),
+        "project": cwd,
+        "project_name": cwd.rsplit("/", 1)[-1] if cwd else f.stem,
+        "first_input": _extract_first_user_input(f),
+        "input_count": 0,
+        "first_ts": meta.get("timestamp", ""),
+        "last_ts": meta.get("timestamp", ""),
+        "transcript_path": str(f),
+        "transcript_size": st.st_size,
+        "transcript_mtime": int(st.st_mtime * 1000),
+        "is_alive": False,
+        "platform": "codex",
+        "model": activity["model"],
+        "skills_used": activity["skills_used"],
+        "memory_ops": activity["memory_ops"],
+        "skill_breakdown": activity["skill_breakdown"],
+    }
 
 
 def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list[dict]:
@@ -383,76 +382,71 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list
         return []
     events: list[dict] = []
     try:
-        with p.open() as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                t = d.get("type")
-                ts = d.get("timestamp", "")
-                if _before_clear(ts, since_ms):
-                    continue
-                payload = d.get("payload") or {}
+        for d in _records(p):
+            t = d.get("type")
+            ts = d.get("timestamp", "")
+            if _before_clear(ts, since_ms):
+                continue
+            payload = d.get("payload") or {}
 
-                if t == "event_msg":
-                    # The user's typed prompt is logged as a `user_message`
-                    # event with the text in `message` — or, on newer Codex, as
-                    # an `item_completed` event carrying a UserMessage item.
-                    # (role=user response_item turns mix in synthetic injections,
-                    # so they are never the source of a user row.)
-                    text = ""
-                    if payload.get("type") == "user_message":
-                        text = (payload.get("message") or "").strip()
-                    elif payload.get("type") == "item_completed":
-                        text = _typed_item_text(payload)
-                    if text:
-                        text = cap_text(text, MESSAGE_CHARS)
-                        # A rollout speaks one of the two shapes, never both. If
-                        # a future build emits both, the copies land back to back
-                        # (only the ignored role=user record sits between them) —
-                        # so drop a prompt that repeats the row just written.
-                        prev = events[-1] if events else None
-                        if not (prev and prev["kind"] == "user_text"
-                                and prev["text"] == text):
-                            events.append({
-                                "ts": ts, "kind": "user_text",
-                                "text": text, "tool": None,
-                                "role": "user", "extra": {},
-                            })
+            if t == "event_msg":
+                # The user's typed prompt is logged as a `user_message`
+                # event with the text in `message` — or, on newer Codex, as
+                # an `item_completed` event carrying a UserMessage item.
+                # (role=user response_item turns mix in synthetic injections,
+                # so they are never the source of a user row.)
+                text = ""
+                if payload.get("type") == "user_message":
+                    text = (payload.get("message") or "").strip()
+                elif payload.get("type") == "item_completed":
+                    text = _typed_item_text(payload)
+                if text:
+                    text = cap_text(text, MESSAGE_CHARS)
+                    # A rollout speaks one of the two shapes, never both. If
+                    # a future build emits both, the copies land back to back
+                    # (only the ignored role=user record sits between them) —
+                    # so drop a prompt that repeats the row just written.
+                    prev = events[-1] if events else None
+                    if not (prev and prev["kind"] == "user_text"
+                            and prev["text"] == text):
+                        events.append({
+                            "ts": ts, "kind": "user_text",
+                            "text": text, "tool": None,
+                            "role": "user", "extra": {},
+                        })
 
-                elif t == "response_item":
-                    item_type = payload.get("type", "")
-                    if item_type in ("function_call", "custom_tool_call"):
-                        # A custom tool call is a freeform one — newer Codex runs
-                        # every shell command through `exec`, whose call body is
-                        # a JS snippet in `input` rather than JSON `arguments`.
-                        args = payload.get("arguments")
-                        if item_type == "custom_tool_call":
-                            args = payload.get("input")
-                        events.append({
-                            "ts": ts, "kind": "tool_use",
-                            "text": "", "tool": payload.get("name", "function"),
-                            "role": "assistant",
-                            "extra": {"arguments": cap_text(args, TOOL_ARG_CHARS)},
-                        })
-                    elif item_type in ("function_call_output", "custom_tool_call_output"):
-                        events.append({
-                            "ts": ts, "kind": "tool_result",
-                            "text": cap_text(_tool_output_text(payload.get("output")),
-                                             TOOL_RESULT_CHARS),
-                            "tool": None, "role": "user", "extra": {},
-                        })
-                    elif item_type == "message":
-                        content = payload.get("content")
-                        if isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "output_text":
-                                    events.append({
-                                        "ts": ts, "kind": "assistant_text",
-                                        "text": cap_text(c.get("text"), MESSAGE_CHARS),
-                                        "tool": None, "role": "assistant", "extra": {},
-                                    })
+            elif t == "response_item":
+                item_type = payload.get("type", "")
+                if item_type in ("function_call", "custom_tool_call"):
+                    # A custom tool call is a freeform one — newer Codex runs
+                    # every shell command through `exec`, whose call body is
+                    # a JS snippet in `input` rather than JSON `arguments`.
+                    args = payload.get("arguments")
+                    if item_type == "custom_tool_call":
+                        args = payload.get("input")
+                    events.append({
+                        "ts": ts, "kind": "tool_use",
+                        "text": "", "tool": payload.get("name", "function"),
+                        "role": "assistant",
+                        "extra": {"arguments": cap_text(args, TOOL_ARG_CHARS)},
+                    })
+                elif item_type in ("function_call_output", "custom_tool_call_output"):
+                    events.append({
+                        "ts": ts, "kind": "tool_result",
+                        "text": cap_text(_tool_output_text(payload.get("output")),
+                                         TOOL_RESULT_CHARS),
+                        "tool": None, "role": "user", "extra": {},
+                    })
+                elif item_type == "message":
+                    content = payload.get("content")
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "output_text":
+                                events.append({
+                                    "ts": ts, "kind": "assistant_text",
+                                    "text": cap_text(c.get("text"), MESSAGE_CHARS),
+                                    "tool": None, "role": "assistant", "extra": {},
+                                })
     except Exception:
         pass
     return events[-limit:]
@@ -460,36 +454,16 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list
 
 # ---------- live session discovery (running codex TUIs as dashboard cards) ----------
 
-def _parse_iso_ms(ts: str) -> int:
-    """Best-effort ISO-8601 -> epoch ms; 0 on failure."""
-    if not ts:
-        return 0
-    try:
-        s = ts.strip().replace("Z", "+00:00")
-        return int(datetime.fromisoformat(s).timestamp() * 1000)
-    except Exception:
-        return 0
+def _read_tail_events(path: Path, max_lines: int = 120) -> list[dict]:
+    """Parse the last `max_lines` JSONL records of a rollout (newest last). A
+    card reads it once a tick and hands it to the helpers below."""
+    return transcripts._tail_lines(path, max_lines)
 
 
-def _read_tail_events(path: Path, max_lines: int = 60) -> list[dict]:
-    """Parse the last `max_lines` JSONL records of a rollout (newest last)."""
-    try:
-        with path.open() as f:
-            lines = f.readlines()
-    except Exception:
-        return []
-    out: list[dict] = []
-    for raw in lines[-max_lines:]:
-        try:
-            out.append(json.loads(raw))
-        except Exception:
-            continue
-    return out
-
-
-def _last_assistant_text(path: Path, since_ms: int = 0) -> str:
-    """Most recent assistant output_text, used as the card's current-task hint."""
-    for d in reversed(_read_tail_events(path, max_lines=120)):
+def _last_assistant_text(events: list[dict], since_ms: int = 0) -> str:
+    """Most recent assistant output_text in a rollout's tail `events`, used as
+    the card's current-task hint."""
+    for d in reversed(events):
         if d.get("type") != "response_item":
             continue
         if _before_clear(d.get("timestamp", ""), since_ms):
@@ -505,8 +479,9 @@ def _last_assistant_text(path: Path, since_ms: int = 0) -> str:
     return ""
 
 
-def _last_turn_error(path: Path, since_ms: int = 0) -> Optional[str]:
-    """Human-readable error of the LATEST completed turn, or None.
+def _last_turn_error(events: list[dict], since_ms: int = 0) -> Optional[str]:
+    """Human-readable error of the LATEST completed turn in a rollout's tail
+    `events`, or None.
 
     Codex records each turn's outcome as an event_msg/task_complete; a failed
     turn carries `error.message`, usually a JSON blob whose text lives at
@@ -514,7 +489,7 @@ def _last_turn_error(path: Path, since_ms: int = 0) -> Optional[str]:
     recent task_complete counts — a later successful turn clears the card. Repro:
     session 019f9feb, where every turn 400'd and the card showed nothing at all.
     """
-    for d in reversed(_read_tail_events(path, max_lines=120)):
+    for d in reversed(events):
         if d.get("type") != "event_msg":
             continue
         payload = d.get("payload") or {}
@@ -537,11 +512,12 @@ def _last_turn_error(path: Path, since_ms: int = 0) -> Optional[str]:
     return None
 
 
-def _infer_codex_status(path: Path, mtime: float) -> str:
+def _infer_codex_status(events: list[dict], mtime: float) -> str:
     """busy | idle, inferred from the last substantive rollout event + mtime.
 
-    Codex rollouts carry no explicit status field, so we read the tail and look
-    at the last meaningful event, skipping `token_count` telemetry noise:
+    Codex rollouts carry no explicit status field, so we look at the last
+    meaningful event of the tail `events` (its last 60 records), skipping
+    `token_count` telemetry noise:
       - a trailing tool call (a tool was issued, output pending) → busy
       - a rollout touched within the last few seconds → busy (actively writing)
       - otherwise → idle
@@ -552,7 +528,7 @@ def _infer_codex_status(path: Path, mtime: float) -> str:
     if (time.time() - mtime) < _BUSY_MTIME_WINDOW:
         return "busy"
     last_kind = ""
-    for d in _read_tail_events(path, max_lines=60):
+    for d in events[-60:]:
         t = d.get("type", "")
         payload = d.get("payload") or {}
         if t == "event_msg" and payload.get("type") == "token_count":
@@ -565,50 +541,6 @@ def _infer_codex_status(path: Path, mtime: float) -> str:
         elif t == "event_msg":
             last_kind = "event_" + str(payload.get("role") or payload.get("type") or "")
     return "busy" if last_kind in ("function_call", "custom_tool_call") else "idle"
-
-
-def _format_idle(seconds: int) -> str:
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    h, m = seconds // 3600, (seconds % 3600) // 60
-    return f"{h}h{m}m" if m else f"{h}h"
-
-
-def _classify_codex(status: str, idle_seconds: int, current_task: str) -> dict:
-    """Map a codex window to the dashboard's triage vocabulary."""
-    if status == "busy":
-        return {"triage": "working", "reason": "正在工作", "suggestion": ""}
-    idle_str = _format_idle(idle_seconds)
-    tail = f"。{current_task}" if current_task else ""
-    if idle_seconds >= _CLOSEABLE_THRESHOLD:
-        return {"triage": "closeable", "reason": f"空闲 {idle_str}{tail}", "suggestion": "可以关闭"}
-    if idle_seconds >= _IDLE_THRESHOLD:
-        return {"triage": "completed", "reason": f"已完成，空闲 {idle_str}{tail}", "suggestion": "建议 review"}
-    return {"triage": "completed", "reason": f"空闲 {idle_str}{tail}", "suggestion": ""}
-
-
-def _proc_table() -> dict[int, dict]:
-    """{pid: {ppid, tty, args}} for every process, via one `ps` call."""
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid=,ppid=,tty=,args="],
-            stderr=subprocess.DEVNULL, timeout=5,
-        ).decode("utf-8", "replace")
-    except Exception:
-        return {}
-    table: dict[int, dict] = {}
-    for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
-            continue
-        try:
-            pid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        table[pid] = {"ppid": ppid, "tty": parts[2], "args": parts[3]}
-    return table
 
 
 def _is_subagent_rollout(path: str) -> bool:
@@ -683,22 +615,22 @@ def _rollout_fd(pid: int) -> Optional[str]:
     return _newest_rollout_in_fd_dir(f"/proc/{pid}/fd", str(CODEX_SESSIONS_DIR))
 
 
-def _top_codex_ancestor(fd_pid: int, table: dict[int, dict]) -> int:
+def _top_codex_ancestor(fd_pid: int, table: dict[int, Proc]) -> int:
     """Walk up from the fd-holding inner process to the launcher process.
 
     The launcher (e.g. `node … codex --yolo`) is the right pid to expose as the
     card: killing it tears down the whole session, and it shares the tty with
     the inner binary so tmux-backed controls still resolve.
     """
-    tty = table.get(fd_pid, {}).get("tty", "")
+    tty = table[fd_pid].tty
     cur = fd_pid
     seen = {cur}
     while True:
-        pp = table.get(cur, {}).get("ppid", 0)
+        pp = table[cur].ppid
         info = table.get(pp)
         if not info or pp in seen:
             break
-        if "codex" in info.get("args", "") and info.get("tty", "") == tty:
+        if "codex" in info.args and info.tty == tty:
             cur = pp
             seen.add(cur)
         else:
@@ -711,23 +643,11 @@ def _top_codex_ancestor(fd_pid: int, table: dict[int, dict]) -> int:
 _BG_SUBCOMMANDS = {"mcp-server", "app-server", "exec"}
 
 
-def _codex_exe_index(tokens: list[str]) -> int:
-    """Index of the `codex` executable token, or -1.
-
-    Covers both the node launcher (`node …/bin/codex …`) and the inner binary
-    (`…/bin/codex …`); the executable is among the first two tokens.
-    """
-    for i, t in enumerate(tokens[:2]):
-        if os.path.basename(t) == "codex":
-            return i
-    return -1
-
-
 def _is_interactive_codex(args: str) -> bool:
     """True for an interactive Codex TUI process (`codex`, `codex --yolo`,
     `codex resume …`); False for non-codex procs and background subcommands."""
     toks = args.split()
-    i = _codex_exe_index(toks)
+    i = _exe_index(toks, "codex")
     if i < 0:
         return False
     for t in toks[i + 1:]:
@@ -735,14 +655,6 @@ def _is_interactive_codex(args: str) -> bool:
             continue  # skip flags to reach the subcommand, if any
         return t not in _BG_SUBCOMMANDS
     return True  # bare `codex` with no subcommand → interactive TUI
-
-
-def _proc_start_ms(pid: int) -> int:
-    """Approximate process start time (ms) from the /proc/<pid> dir mtime."""
-    try:
-        return int(os.stat(f"/proc/{pid}").st_mtime * 1000)
-    except Exception:
-        return 0
 
 
 def list_codex_windows() -> list[Window]:
@@ -755,24 +667,29 @@ def list_codex_windows() -> list[Window]:
 
     Linux-only (reads /proc); returns [] on any platform without it.
     """
+    return [w for w, _ in _discover()]
+
+
+def _discover() -> list[tuple[Window, list[dict]]]:
+    """list_codex_windows, each window with the tail of its rollout ([] before
+    it has one) — read once here for the status, and handed on so
+    codex_window_dicts reads the card's details off the same tail."""
     if not Path("/proc").is_dir():
         return []
-    table = _proc_table()
-    if not table:
-        return []
+    table = proc_table()
 
     # Group interactive codex processes (launcher + inner binary) by their tty;
     # one foreground tty == one session.
     by_tty: dict[str, list[int]] = {}
     for pid, info in table.items():
-        tty = info.get("tty", "")
+        tty = info.tty
         if not tty or tty in ("?", "??"):
             continue
-        if not _is_interactive_codex(info.get("args", "")):
+        if not _is_interactive_codex(info.args):
             continue
         by_tty.setdefault(tty, []).append(pid)
 
-    windows: list[Window] = []
+    windows: list[tuple[Window, list[dict]]] = []
     seen: set[int] = set()
     for tty, pids in by_tty.items():
         # The inner binary holds the rollout fd once a turn has happened.
@@ -808,6 +725,7 @@ def list_codex_windows() -> list[Window]:
         # cards by started_at and never displays it, so this is ordering-only.
         started_at = _proc_start_ms(card_pid)
 
+        events: list[dict] = []
         if rollout:
             rp = Path(rollout)
             try:
@@ -816,7 +734,8 @@ def list_codex_windows() -> list[Window]:
                 mtime = None
             meta = _parse_session_meta(rp) or {}
             cwd = cwd or meta.get("cwd", "") or ""
-            status = _infer_codex_status(rp, mtime) if mtime else "idle"
+            events = _read_tail_events(rp)
+            status = _infer_codex_status(events, mtime) if mtime else "idle"
             updated_at = int(mtime * 1000) if mtime else started_at
             session_id = meta.get("id", rp.stem)
             version = str(meta.get("cli_version", ""))
@@ -829,7 +748,7 @@ def list_codex_windows() -> list[Window]:
             version = ""
             transcript = None
 
-        windows.append(Window(
+        windows.append((Window(
             pid=card_pid,
             session_id=session_id,
             cwd=cwd,
@@ -841,14 +760,16 @@ def list_codex_windows() -> list[Window]:
             started_at=started_at,
             updated_at=updated_at,
             version=version,
-            tty=get_tty(card_pid),
+            # The launcher shares the tty its group was found on (see
+            # _top_codex_ancestor).
+            tty=f"/dev/{tty}",
             transcript_path=transcript,
             alive=True,
             hidden=False,
             platform="codex",
-        ))
+        ), events))
 
-    windows.sort(key=lambda w: (-w.updated_at, w.pid))
+    windows.sort(key=lambda we: (-we[0].updated_at, we[0].pid))
     return windows
 
 
@@ -858,26 +779,19 @@ def codex_window_dicts() -> list[dict]:
     windows. Shell-process counts are filled in by the caller (platform-agnostic).
     """
     out: list[dict] = []
-    for w in list_codex_windows():
+    for w, events in _discover():
         d = w.to_dict()
         tp = Path(w.transcript_path) if w.transcript_path else None
         since = cleared_at_ms(w.pid)
-        activity = extract_codex_session_activity(tp) if tp else {
-            "skills_used": [], "memory_ops": [], "model": "", "effort": "",
-        }
-        current_task = _last_assistant_text(tp, since) if tp else ""
-        last_error = _last_turn_error(tp, since) if tp else None
-        tri = _classify_codex(w.status, d.get("idle_seconds", 0), current_task)
+        activity = extract_codex_session_activity(tp) if tp else {}
+        current_task = _last_assistant_text(events, since)
         d.update({
-            "shell_proc_count": 0,            # caller overwrites via one ps walk
             "permission_msg": None,
             "permission_ts": None,
             "first_input": (_extract_first_user_input(tp, since) if tp else "")[:100],
             "current_task": current_task or None,
-            "last_error": last_error,
-            "triage": tri["triage"],
-            "triage_reason": tri["reason"],
-            "triage_suggestion": tri["suggestion"],
+            "last_error": _last_turn_error(events, since),
+            **patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task),
             "skills_used": activity.get("skills_used", []),
             "memory_ops": activity.get("memory_ops", []),
             "background_tasks": [],

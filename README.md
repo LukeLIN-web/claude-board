@@ -136,7 +136,6 @@ available.
 | Resume | `claude --resume <sid>` — continue the original session (from the history list) |
 | Review | send `/humanize:ask-codex review` into the session (Linux + tmux) |
 | Close | SIGTERM — available on every card |
-| Export | export a conversation doc (timeline + plan history + skill/memory summary) |
 
 On **Codex** cards the platform-agnostic controls (Close, Send a prompt, Esc,
 Commit, Clear) work the same way — Codex has its own `/clear` ("clear the
@@ -303,7 +302,7 @@ core/
   patrol.py           triage classification engine
   codex.py            Codex session parsing + live-session discovery (/proc + fd)
   search.py           cross-platform ripgrep search
-  actions.py          focus / fork / close / export / spawn / send-prompt
+  actions.py          focus / fork / close / spawn / send-prompt
   peers.py            multi-host: poll peer boards, forward card actions
   tmux.py             tmux backend: spawn window + inject prompt (Linux)
   history.py          unified index + full-text rg search

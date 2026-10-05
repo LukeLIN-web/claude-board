@@ -4,12 +4,65 @@ httpx/TestClient is not a project dependency, so we exercise the route handler
 functions directly (FastAPI's decorator returns the original function) and the
 Pydantic request models at the model level.
 """
+import contextlib
+import types
 import unittest
 from unittest import mock
 
 import pydantic
 
 import app as appmod
+from tests.helpers import scratch_dir, user_row, write_jsonl
+
+# Everything _enriched_snapshot reads besides the cards themselves, each at a
+# value that adds nothing to a card: no hmz runs, no shells, no permission
+# toasts, no pane text (banner, dialog, queue, /btw aside), nothing in the
+# transcript, no peers. Stubbed whole so no test here runs `ps` or `tmux` or
+# reads a transcript path it made up. patrol.classify stays real: the triage it
+# gives the card is what StaleDialogOpenTests is about.
+_NEUTRAL = {
+    "hmz_window_dicts": (appmod.hmz, []),
+    "shell_descendant_counts": (appmod.sessions, {}),
+    "pending_by_tty": (appmod.perms, {}),
+    "available": (appmod.tmux, True),
+    "codex_pane_model": (appmod.actions, ""),
+    "pane_model": (appmod.actions, ""),
+    "pane_dialog": (appmod.actions, None),
+    "get_pane_queue": (appmod.actions, []),
+    "current_task_hint": (appmod.transcripts, None),
+    "current_model": (appmod.transcripts, ""),
+    "extract_skills_used": (appmod.transcripts, []),
+    "extract_memory_ops": (appmod.transcripts, []),
+    "extract_background_tasks": (appmod.transcripts, []),
+    "session_loop": (appmod.transcripts, None),
+    "pending": (appmod.promptqueue, []),
+    "maybe_capture": (appmod.btwcapture, None),
+    "latest": (appmod.btwlog, None),
+    "enabled": (appmod.peers, False),
+}
+
+
+@contextlib.contextmanager
+def _snapshot(windows=(), codex=(), **overrides):
+    """Run _enriched_snapshot over `windows` (Claude cards, as sessions.snapshot
+    lists them) and `codex` (live Codex cards), with every other input at its
+    _NEUTRAL value unless named in `overrides` (attribute name → return value).
+    Yields the mocks by attribute name, for tests that assert on the calls."""
+    unknown = set(overrides) - set(_NEUTRAL)
+    if unknown:
+        raise TypeError(f"_snapshot: nothing named {sorted(unknown)} is stubbed")
+    with contextlib.ExitStack() as stack:
+        stubs = {
+            "snapshot": stack.enter_context(mock.patch.object(
+                appmod.sessions, "snapshot",
+                side_effect=lambda: {"windows": list(windows), "counts": {}, "ts": 0})),
+            "codex_window_dicts": stack.enter_context(mock.patch.object(
+                appmod.codex, "codex_window_dicts", side_effect=lambda: list(codex))),
+        }
+        for name, (module, value) in _NEUTRAL.items():
+            stubs[name] = stack.enter_context(mock.patch.object(
+                module, name, return_value=overrides.get(name, value)))
+        yield types.SimpleNamespace(**stubs)
 
 
 class RequestModelTests(unittest.TestCase):
@@ -82,14 +135,9 @@ class HistoryTimelineVisibilityTests(unittest.TestCase):
     projects/-shared-ws-proj-evil reads, by its slug, as inside /shared/ws/proj."""
 
     def setUp(self):
-        import json, tempfile
-        from pathlib import Path
-        self.root = Path(tempfile.mkdtemp())
-        d = self.root / "-shared-ws-proj-evil"
-        d.mkdir()
-        (d / "sid1.jsonl").write_text(json.dumps(
-            {"type": "user", "cwd": "/shared/ws/proj-evil", "timestamp": "2026-09-08T20:40:00Z",
-             "message": {"content": "secret plans"}}) + "\n")
+        self.root = scratch_dir()
+        write_jsonl([user_row("secret plans", "2026-09-08T20:40:00Z", cwd="/shared/ws/proj-evil")],
+                    self.root / "-shared-ws-proj-evil" / "sid1.jsonl")
         env = mock.patch.dict("os.environ", {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj",
                                              "CLAUDE_FLEET_CWD_EXCLUDE": ""})
         env.start()
@@ -98,10 +146,6 @@ class HistoryTimelineVisibilityTests(unittest.TestCase):
         p = mock.patch.object(appmod.sessions, "PROJECTS_DIR", self.root)
         p.start()
         self.addCleanup(p.stop)
-
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.root, ignore_errors=True)
 
     def test_a_sibling_outside_the_allowlist_is_not_served(self):
         import fastapi
@@ -156,19 +200,13 @@ class BtwDismissRouteTests(unittest.TestCase):
 
 class SnapshotFlagTests(unittest.TestCase):
     def test_tmux_available_present_with_zero_windows(self):
-        empty = {"windows": [], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=empty), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True):
+        with _snapshot(available=True):
             snap = appmod._enriched_snapshot()
         self.assertIn("tmux_available", snap)
         self.assertTrue(snap["tmux_available"])
 
     def test_tmux_available_reflects_false(self):
-        empty = {"windows": [], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=empty), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=False):
+        with _snapshot(available=False):
             snap = appmod._enriched_snapshot()
         self.assertFalse(snap["tmux_available"])
 
@@ -180,34 +218,24 @@ class CardModelTests(unittest.TestCase):
     def setUp(self):
         appmod._banner_models.clear()
 
+    @staticmethod
+    def _win(**over):
+        # A live, visible session with a transcript; each test changes what it is about.
+        return {"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                "name": "s", "updated_at": 0, **over}
+
     def _run(self, win, model="claude-fable-5", banner=""):
-        snap = {"windows": [win], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.patrol, "classify",
-                               return_value={"triage": "", "reason": "", "suggestion": ""}), \
-             mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
-             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
-             mock.patch.object(appmod.transcripts, "current_task_hint", return_value=None), \
-             mock.patch.object(appmod.transcripts, "current_model",
-                               return_value=model), \
-             mock.patch.object(appmod.actions, "pane_model", return_value=banner):
+        with _snapshot([win], current_model=model, pane_model=banner):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_card_reports_the_running_model(self):
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0})
+        w = self._run(self._win())
         self.assertEqual(w["model"], "claude-fable-5")
         self.assertEqual(w["model_label"], "Fable 5")
 
     def test_no_transcript_means_no_model(self):
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": None, "cwd": "/x",
-                       "name": "s", "updated_at": 0})
+        w = self._run(self._win(transcript_path=None))
         self.assertEqual(w["model"], "")
         self.assertEqual(w["model_label"], "")
 
@@ -215,27 +243,21 @@ class CardModelTests(unittest.TestCase):
         # The banner says what the session was on when it last started or was
         # cleared; the transcript says what actually answered since. When both
         # speak, the transcript is the one that can't be stale.
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0}, banner="Opus 5")
+        w = self._run(self._win(), banner="Opus 5")
         self.assertEqual(w["model_label"], "Fable 5")
         self.assertEqual(w["model_source"], "transcript")
 
     def test_cleared_session_falls_back_to_its_banner(self):
         # /clear starts a fresh transcript: no assistant row, hence no model —
         # which is exactly when the card used to go blank.
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0}, model="", banner="Opus 5")
+        w = self._run(self._win(), model="", banner="Opus 5")
         self.assertEqual(w["model_label"], "Opus 5")
         self.assertEqual(w["model_source"], "banner")
         # No id is invented for it — the raw field stays empty.
         self.assertEqual(w["model"], "")
 
     def test_unreadable_banner_leaves_the_readout_blank(self):
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0}, model="", banner="")
+        w = self._run(self._win(), model="", banner="")
         self.assertEqual(w["model_label"], "")
         self.assertEqual(w["model_source"], "")
 
@@ -245,9 +267,7 @@ class CardModelTests(unittest.TestCase):
         # must not spend a capture-pane on each card each time. Proven by the
         # cached answer surviving a pane that has since started saying something
         # else, which cannot happen for real within one session id.
-        win = {"pid": 1, "session_id": "abc", "status": "idle", "hidden": False,
-               "alive": True, "tty": "pts/1", "transcript_path": "/t.jsonl",
-               "cwd": "/x", "name": "s", "updated_at": 0}
+        win = self._win(session_id="abc")
         self.assertEqual(self._run(win, model="", banner="Opus 5")["model_label"],
                          "Opus 5")
         self.assertEqual(self._run(win, model="", banner="Fable 5.1")["model_label"],
@@ -256,46 +276,40 @@ class CardModelTests(unittest.TestCase):
     def test_a_clear_re_reads_the_banner(self):
         # The new session id is the signal that the banner has been reprinted —
         # and that the model may have changed with it.
-        base = {"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                "name": "s", "updated_at": 0}
-        first = self._run({**base, "session_id": "abc"}, model="", banner="Opus 5")
-        second = self._run({**base, "session_id": "def"}, model="", banner="Fable 5.1")
+        first = self._run(self._win(session_id="abc"), model="", banner="Opus 5")
+        second = self._run(self._win(session_id="def"), model="", banner="Fable 5.1")
         self.assertEqual(first["model_label"], "Opus 5")
         self.assertEqual(second["model_label"], "Fable 5.1")
 
     def test_dead_window_is_not_scraped(self):
-        with mock.patch.object(appmod.actions, "pane_model") as pm:
-            w = self._run({"pid": 1, "status": "idle", "hidden": False,
-                           "alive": False, "tty": None, "transcript_path": None,
-                           "cwd": "/x", "name": "s", "updated_at": 0}, model="")
-        pm.assert_not_called()
+        with _snapshot([self._win(alive=False, tty=None, transcript_path=None)]) as stubs:
+            w = appmod._enriched_snapshot()["windows"][0]
+        stubs.pane_model.assert_not_called()
         self.assertEqual(w["model_label"], "")
 
     def test_hidden_agent_does_not_borrow_its_parents_banner(self):
         # A `.slock` sub-session shares the parent's tty, so the banner in that
         # pane names the parent's model — and sub-agents routinely run on
         # another one.
-        with mock.patch.object(appmod.actions, "pane_model") as pm:
-            w = self._run({"pid": 1, "status": "unknown", "hidden": True,
-                           "alive": True, "tty": "pts/1", "cwd": "/x/.slock/a",
-                           "transcript_path": "/t.jsonl", "name": "s",
-                           "updated_at": 0}, model="")
-        pm.assert_not_called()
+        with _snapshot([self._win(status="unknown", hidden=True,
+                                  cwd="/x/.slock/a")]) as stubs:
+            w = appmod._enriched_snapshot()["windows"][0]
+        stubs.pane_model.assert_not_called()
         self.assertEqual(w["model_label"], "")
 
     def test_cache_does_not_outlive_the_session(self):
-        win = {"pid": 1, "session_id": "abc", "status": "idle", "hidden": False,
-               "alive": True, "tty": "pts/1", "transcript_path": "/t.jsonl",
-               "cwd": "/x", "name": "s", "updated_at": 0}
-        self._run(win, model="", banner="Opus 5")
-        self.assertTrue(appmod._banner_models)
-        with mock.patch.object(appmod.sessions, "snapshot",
-                               return_value={"windows": [], "counts": {}, "ts": 0}), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True):
-            appmod._enriched_snapshot()
-        self.assertEqual(appmod._banner_models, {})
+        # A session that leaves the board takes its cached banner with it, so
+        # the cache tracks the board rather than growing an entry per session
+        # for the life of the process. Proven by the same pid and session id
+        # coming back to a fresh read — which, while cached, it would not get
+        # (test_banner_is_scraped_once_per_session_not_once_per_poll).
+        win = self._win(session_id="abc")
+        self.assertEqual(self._run(win, model="", banner="Opus 5")["model_label"],
+                         "Opus 5")
+        with _snapshot():
+            appmod._enriched_snapshot()  # the session is gone from this poll
+        self.assertEqual(self._run(win, model="", banner="Fable 5.1")["model_label"],
+                         "Fable 5.1")
 
 
 class HiddenAgentQueueTests(unittest.TestCase):
@@ -304,17 +318,7 @@ class HiddenAgentQueueTests(unittest.TestCase):
     render for them, not only for windows that report `status == "busy"`."""
 
     def _run(self, win):
-        snap = {"windows": [win], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.patrol, "classify",
-                               return_value={"triage": "", "reason": "", "suggestion": ""}), \
-             mock.patch.object(appmod.promptqueue, "pending",
-                               return_value=[{"id": 1, "text": "/btw"}]), \
-             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]):
+        with _snapshot([win], pending=["/btw"]):
             return appmod._enriched_snapshot()
 
     def test_queue_renders_for_hidden_agent_without_busy_status(self):
@@ -380,15 +384,7 @@ class StaleDialogOpenTests(unittest.TestCase):
                "hidden": False, "alive": True, "tty": "/dev/pts/9",
                "transcript_path": None, "name": "w", "cwd": "/x",
                "updated_at": int(time.time() * 1000), "idle_seconds": 0}
-        snap = {"windows": [win], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
-             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
-             mock.patch.object(appmod.actions, "pane_dialog", return_value=dialog):
+        with _snapshot([win], pane_dialog=dialog):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_dialog_without_menu_is_not_waiting(self):
@@ -416,10 +412,6 @@ class StaleDialogOpenTests(unittest.TestCase):
         self.assertEqual(w["triage_reason"], "trust prompt")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CodexCardModelTests(unittest.TestCase):
     """A Codex card reads its model + effort off the pane's status line when it
     can, and off the rollout (what the last turn ran on) otherwise."""
@@ -432,15 +424,9 @@ class CodexCardModelTests(unittest.TestCase):
                 "model_label": "gpt-6-astra medium", "model_source": "transcript"}
 
     def _run(self, pane_label):
-        snap = {"windows": [], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[self._card()]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.actions, "codex_pane_model", return_value=pane_label) as pm:
+        with _snapshot(codex=[self._card()], codex_pane_model=pane_label) as stubs:
             w = appmod._enriched_snapshot()["windows"][0]
-        pm.assert_called_once_with("pts/7")
+        stubs.codex_pane_model.assert_called_once_with("pts/7")
         return w
 
     def test_status_line_wins(self):

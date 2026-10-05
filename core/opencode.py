@@ -5,8 +5,10 @@ import json
 import sqlite3
 from typing import Optional
 
+from .search import excerpt
 from .sessions import HOME_BASE
 from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
+from .transcripts import _SKILL_PATH_RE
 
 OPENCODE_DB = HOME_BASE / ".local/share/opencode/opencode.db"
 
@@ -81,7 +83,7 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
         return []
     try:
         cur = conn.execute("""
-            SELECT m.id, m.time_created, json_extract(m.data, '$.role') as role,
+            SELECT json_extract(m.data, '$.role') as role,
                    p.data as part_data, p.time_created as part_time
             FROM message m
             JOIN part p ON p.message_id = m.id
@@ -95,7 +97,7 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
         conn.close()
 
     events: list[dict] = []
-    for msg_id, msg_time, role, part_data_str, part_time in rows:
+    for role, part_data_str, part_time in rows:
         try:
             pd = json.loads(part_data_str)
         except Exception:
@@ -111,21 +113,16 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
             events.append({"ts": ts, "kind": kind, "text": cap_text(text, MESSAGE_CHARS), "tool": None, "role": role or "assistant", "extra": {}})
 
         elif ptype == "tool":
-            tool_name = pd.get("tool", "")
             state = pd.get("state") or {}
-            inp = state.get("input") or {}
-            status = state.get("status", "")
-            if status == "completed" and state.get("output"):
-                events.append({"ts": ts, "kind": "tool_use", "text": "", "tool": tool_name, "role": "assistant",
-                               "extra": _tool_preview(tool_name, inp)})
-                output = cap_text(state.get("output"), TOOL_RESULT_CHARS)
-                events.append({"ts": ts, "kind": "tool_result", "text": output, "tool": None, "role": "user", "extra": {}})
-            elif status == "running" or not state.get("output"):
-                events.append({"ts": ts, "kind": "tool_use", "text": "", "tool": tool_name, "role": "assistant",
-                               "extra": _tool_preview(tool_name, inp)})
-
-        elif ptype == "reasoning":
-            continue
+            status, output = state.get("status", ""), state.get("output")
+            # A call that ended any other way (an error) with output gets no row.
+            if output and status not in ("completed", "running"):
+                continue
+            events.append({"ts": ts, "kind": "tool_use", "text": "", "tool": pd.get("tool", ""), "role": "assistant",
+                           "extra": _tool_preview(state.get("input") or {})})
+            if output and status == "completed":
+                events.append({"ts": ts, "kind": "tool_result", "text": cap_text(output, TOOL_RESULT_CHARS),
+                               "tool": None, "role": "user", "extra": {}})
 
     return events[-limit:]
 
@@ -163,18 +160,9 @@ def search_opencode(query: str) -> dict[str, list[str]]:
             text = json.dumps((pd.get("state") or {}).get("input") or {})
         if query.lower() not in text.lower():
             continue
-        idx = text.lower().find(query.lower())
-        start = max(0, idx - 60)
-        end = min(len(text), idx + len(query) + 60)
-        snippet = text[start:end].replace("\n", " ")
-        if start > 0:
-            snippet = "…" + snippet
-        if end < len(text):
-            snippet += "…"
-        if sid not in result:
-            result[sid] = []
-        if len(result[sid]) < 3:
-            result[sid].append(snippet)
+        snippets = result.setdefault(sid, [])
+        if len(snippets) < 3:
+            snippets.append(excerpt(text, query).replace("\n", " "))
     return result
 
 
@@ -186,7 +174,6 @@ def extract_opencode_session_activity(session_id: str) -> dict:
     OpenCode tools: bash, read, write, edit, skill (all lowercase).
     File path field: filePath (not file_path).
     """
-    import re
     conn = _get_conn()
     if not conn:
         return {"skills_used": [], "memory_ops": [], "skill_activity": {}}
@@ -210,7 +197,6 @@ def extract_opencode_session_activity(session_id: str) -> dict:
     memory_edits: dict[str, int] = {}
     memory_ops: list[dict] = []
     mem_seen: set[tuple[str, str]] = set()
-    skill_re = re.compile(r'/\.claude/skills/([^/]+)/')
 
     for (data_str,) in rows:
         try:
@@ -231,7 +217,7 @@ def extract_opencode_session_activity(session_id: str) -> dict:
 
         # File operations on skill files
         if tool in ("read", "write", "edit", "patch"):
-            m = skill_re.search(fp)
+            m = _SKILL_PATH_RE.search(fp)
             if m:
                 sk = m.group(1)
                 if tool == "read":
@@ -258,7 +244,7 @@ def extract_opencode_session_activity(session_id: str) -> dict:
 
         # Bash referencing skills
         if tool == "bash" and ("skills/" in cmd or "SKILL.md" in cmd):
-            matches = skill_re.findall(cmd)
+            matches = _SKILL_PATH_RE.findall(cmd)
             if matches:
                 for sk in set(matches):
                     skill_bash[sk] = skill_bash.get(sk, 0) + 1
@@ -284,7 +270,7 @@ def extract_opencode_session_activity(session_id: str) -> dict:
     }
 
 
-def _tool_preview(tool_name: str, inp: dict) -> dict:
+def _tool_preview(inp: dict) -> dict:
     preview: dict = {}
     for k, v in list(inp.items())[:4]:
         if isinstance(v, str):

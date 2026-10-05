@@ -29,6 +29,20 @@ def make_request(path="/", headers=None, client=("127.0.0.1", 5000), scheme="htt
     })
 
 
+def asgi_status(app, scope) -> int:
+    """Send one bodiless request through an ASGI app; return the response status."""
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    asyncio.run(app(scope, receive, send))
+    return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+
 def call_middleware(gate, path="/", headers=None, client=("127.0.0.1", 5000),
                     exempt=frozenset({"/login", "/logout"})):
     """Run one request through AuthMiddleware. Returns (status, reached_app)."""
@@ -39,18 +53,8 @@ def call_middleware(gate, path="/", headers=None, client=("127.0.0.1", 5000),
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"ok"})
 
-    sent = []
-
-    async def send(message):
-        sent.append(message)
-
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
-
     mw = auth.AuthMiddleware(downstream, gate, exempt)
-    req = make_request(path, headers, client)
-    asyncio.run(mw(dict(req.scope), receive, send))
-    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    status = asgi_status(mw, dict(make_request(path, headers, client).scope))
     return status, bool(reached)
 
 
@@ -304,27 +308,9 @@ class InstallTests(unittest.TestCase):
         next to it has to be shut. Also proves the routes are mounted at all —
         install() would otherwise be free to register nothing."""
         app = self._install()
-        self.assertEqual(self._request(app, "/login"), 200)
-        self.assertEqual(self._request(app, "/logout"), 303)
-        self.assertEqual(self._request(app, "/api/windows"), 401)
-
-    def _request(self, app, path):
-        sent = []
-
-        async def send(message):
-            sent.append(message)
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        scope = {
-            "type": "http", "http_version": "1.1", "method": "GET", "scheme": "http",
-            "path": path, "raw_path": path.encode(), "query_string": b"", "headers": [],
-            "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 80), "root_path": "",
-            "app": app,
-        }
-        asyncio.run(app(scope, receive, send))
-        return next(m["status"] for m in sent if m["type"] == "http.response.start")
+        for path, status in (("/login", 200), ("/logout", 303), ("/api/windows", 401)):
+            scope = dict(make_request(path).scope, root_path="", app=app)
+            self.assertEqual(asgi_status(app, scope), status, path)
 
 
 class GateConfigTests(unittest.TestCase):
@@ -340,7 +326,3 @@ class GateConfigTests(unittest.TestCase):
     def test_disabled_gate_authorizes_nothing_by_password(self):
         """An empty password must not make the empty string a valid login."""
         self.assertFalse(auth.Gate().password_ok(""))
-
-
-if __name__ == "__main__":
-    unittest.main()

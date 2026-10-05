@@ -1,12 +1,9 @@
 """Tests for the machine-local cwd visibility filter in core/sessions.py."""
-import json
-import shutil
-import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from core import sessions
+from tests.helpers import queue_op, scratch_dir, user_row, write_jsonl
 
 
 def _load_filters(include: str = "", exclude: str = "") -> None:
@@ -90,21 +87,16 @@ class TranscriptFilterTests(unittest.TestCase):
     """transcript_visible: the filter for a transcript, on the cwd it records."""
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = scratch_dir()
 
     def tearDown(self):
         _load_filters()
-        shutil.rmtree(self.root, ignore_errors=True)
 
     def _transcript(self, slug, cwd):
-        d = self.root / slug
-        d.mkdir()
-        p = d / "s.jsonl"
-        rows = [{"type": "queue-operation", "operation": "enqueue"}]
-        if cwd:
-            rows.append({"type": "user", "cwd": cwd, "message": {"content": "hi"}})
-        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        return p
+        """A transcript in projects/<slug>/ whose rows record `cwd` — none
+        when it is "" — behind a first row that names no cwd at all."""
+        rows = [queue_op("enqueue")] + ([user_row("hi", cwd=cwd)] if cwd else [])
+        return write_jsonl(rows, self.root / slug / "s.jsonl")
 
     def test_a_sibling_that_extends_the_name_is_not_inside(self):
         # The same boundary test_include_respects_path_boundary holds for a cwd.
@@ -165,7 +157,9 @@ class UninterruptibleWrappersTests(unittest.TestCase):
     CLAUDE = 100
 
     def _run(self, rows):
-        with mock.patch.object(sessions, "_proc_snapshot", return_value=rows):
+        table = {pid: sessions.Proc(ppid, stat, "?", comm, comm)
+                 for pid, ppid, stat, comm in rows}
+        with mock.patch.object(sessions, "proc_table", return_value=table):
             return sessions.uninterruptible_wrappers(self.CLAUDE)
 
     def test_bash_wrapper_with_d_grandchild_is_found(self):
@@ -221,7 +215,3 @@ class UninterruptibleWrappersTests(unittest.TestCase):
 
     def test_no_children_returns_empty(self):
         self.assertEqual(self._run([(self.CLAUDE, 1, "Ssl+", "claude")]), [])
-
-
-if __name__ == "__main__":
-    unittest.main()

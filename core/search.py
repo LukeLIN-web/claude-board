@@ -4,22 +4,29 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import sessions
-from .sessions import HOME_BASE, PROJECTS_DIR
+from .codex import CODEX_SESSIONS_DIR
+from .sessions import PROJECTS_DIR
 
-CODEX_HOME = HOME_BASE / ".codex"
-CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+# rg's --max-count. With context on, rg still prints a match that falls in the
+# last counted match's after-context, so the cap is applied again below.
+_HITS_PER_FILE = 5
+_CONTEXT_LINES = 3
+_TIMEOUT = 15  # seconds; a search still running then returns nothing
 
 
-def _project_slug_from_file(path: Path) -> str:
-    return path.parent.name
-
-
-def _session_id_from_file(path: Path) -> str:
-    return path.stem
+def rg_command(query: str, *flags: str) -> Optional[list[str]]:
+    """ripgrep for `query` over every Claude and Codex transcript, or None if
+    neither directory exists. `flags` go after the transcript globs, so a glob
+    among them takes precedence over those."""
+    dirs = [str(d) for d in (PROJECTS_DIR, CODEX_SESSIONS_DIR) if d.exists()]
+    if not dirs:
+        return None
+    return ["rg", "-S", "-g", "*.jsonl", "-g", "!*.wakatime", *flags, query, *dirs]
 
 
 def _extract_text(d: dict) -> str:
@@ -97,136 +104,124 @@ def _extract_type_label(d: dict) -> str:
     return t or "unknown"
 
 
-def _read_context(path: Path, center_line: int, radius: int = 3) -> list[dict]:
-    """Read ±radius lines around center_line, extract structured context."""
-    context: list[dict] = []
-    start = max(1, center_line - radius)
-    end = center_line + radius
-    try:
-        with path.open() as f:
-            for i, line in enumerate(f, start=1):
-                if i < start:
-                    continue
-                if i > end:
-                    break
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                text = _extract_text(d).strip()
-                if not text:
-                    continue
-                context.append({
-                    "line": i,
-                    "type": _extract_type_label(d),
-                    "text": text[:300],
-                    "is_match": i == center_line,
-                })
-    except Exception:
-        pass
-    return context
-
-
 def _detect_platform(path: Path) -> str:
     if str(CODEX_SESSIONS_DIR) in str(path):
         return "codex"
     return "claude"
 
 
+def _row(raw: str) -> dict:
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _file_hits(path: Path, lines: dict[int, str], matched: list[int], query: str) -> list[dict]:
+    """One file's hits, from the lines rg printed for it: each match plus the
+    context around it."""
+    platform = _detect_platform(path)
+    # Hide hits from projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/
+    # EXCLUDE, judged on the cwd the transcript records (its projects/<slug>
+    # name is lossy); codex sessions aren't cwd-addressable, so they're left
+    # untouched.
+    if platform == "claude" and not sessions.transcript_visible(path):
+        return []
+    rows = {n: _row(raw) for n, raw in lines.items()}
+    hits: list[dict] = []
+    for line_no in matched:
+        d = rows[line_no]
+        text = _extract_text(d).strip()
+        if not text:
+            text = lines[line_no].strip()[:200]
+        context: list[dict] = []
+        for i in range(max(1, line_no - _CONTEXT_LINES), line_no + _CONTEXT_LINES + 1):
+            ctx = _extract_text(rows.get(i) or {}).strip()
+            if ctx:
+                context.append({
+                    "line": i,
+                    "type": _extract_type_label(rows[i]),
+                    "text": ctx[:300],
+                    "is_match": i == line_no,
+                })
+        hits.append({
+            "path": str(path),
+            "line": line_no,
+            "project_slug": path.parent.name,
+            "session_id": path.stem,
+            "ts": d.get("timestamp") or "",
+            "excerpt": excerpt(text, query),
+            "platform": platform,
+            "context": context,
+        })
+    return hits
+
+
 def search(query: str, limit: int = 60) -> list[dict]:
     if not query.strip():
         return []
 
-    search_dirs: list[str] = []
-    if PROJECTS_DIR.exists():
-        search_dirs.append(str(PROJECTS_DIR))
-    if CODEX_SESSIONS_DIR.exists():
-        search_dirs.append(str(CODEX_SESSIONS_DIR))
-    if not search_dirs:
+    cmd = rg_command(query, "--json", "--max-count", str(_HITS_PER_FILE),
+                     "-C", str(_CONTEXT_LINES))
+    if not cmd:
         return []
-
-    cmd = [
-        "rg", "--json", "-i", "-S",
-        "--max-count", "5",
-        "-g", "*.jsonl",
-        "-g", "!*.wakatime",
-        query,
-    ] + search_dirs
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except FileNotFoundError:
         return []
+    # Read rg as it goes and stop it at `limit` hits: a common word matches in
+    # thousands of files, and waiting for all of them cost about a second for
+    # hits nobody would be shown.
+    expired = threading.Event()
+    timer = threading.Timer(_TIMEOUT, lambda: (expired.set(), proc.kill()))
 
+    # rg prints each file's records together, begin to end. Its match and
+    # context records carry the line itself, so a hit and the lines around it
+    # come straight from here rather than from reading the file again.
     hits: list[dict] = []
-    seen: set[tuple[str, int]] = set()
-    for line in proc.stdout.splitlines():
+    lines: dict[int, str] = {}
+    matched: list[int] = []
+    with proc:
+        timer.start()
         try:
-            rec = json.loads(line)
-        except Exception:
-            continue
-        if rec.get("type") != "match":
-            continue
-        data = rec.get("data") or {}
-        path_info = data.get("path") or {}
-        text_info = data.get("lines") or {}
-        path = path_info.get("text")
-        line_no = data.get("line_number")
-        if not path or not line_no:
-            continue
-        key = (path, line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        p = Path(path)
-        # Hide hits from projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/
-        # EXCLUDE, judged on the cwd the transcript records (its projects/<slug>
-        # name is lossy); codex sessions aren't cwd-addressable, so they're left
-        # untouched.
-        if _detect_platform(p) == "claude" and not sessions.transcript_visible(p):
-            continue
-        raw = _read_line(p, line_no) or (text_info.get("text") or "")
-        try:
-            d = json.loads(raw)
-        except Exception:
-            d = {}
-        text = _extract_text(d).strip()
-        if not text:
-            text = (text_info.get("text") or "").strip()[:200]
-
-        context = _read_context(p, line_no, radius=3)
-
-        hits.append({
-            "path": path,
-            "line": line_no,
-            "project_slug": _project_slug_from_file(p),
-            "session_id": _session_id_from_file(p),
-            "ts": d.get("timestamp") or "",
-            "type": d.get("type") or "",
-            "excerpt": _excerpt(text, query),
-            "permission_mode": d.get("permissionMode"),
-            "platform": _detect_platform(p),
-            "context": context,
-        })
-        if len(hits) >= limit:
-            break
+            for out in proc.stdout:
+                try:
+                    rec = json.loads(out)
+                except Exception:
+                    continue
+                kind, data = rec.get("type"), rec.get("data") or {}
+                if kind == "begin":
+                    lines, matched = {}, []
+                elif kind in ("match", "context"):
+                    line_no = data.get("line_number")
+                    if not line_no:
+                        continue
+                    lines[line_no] = (data.get("lines") or {}).get("text") or ""
+                    if kind == "match" and len(matched) < _HITS_PER_FILE:
+                        matched.append(line_no)
+                elif kind == "end" and matched:
+                    path = (data.get("path") or {}).get("text")
+                    if path:
+                        hits += _file_hits(Path(path), lines, matched, query)
+                    if len(hits) >= limit:
+                        break
+        finally:
+            timer.cancel()
+            proc.kill()
+    if expired.is_set():
+        return []
+    hits = hits[:limit]
     hits.sort(key=lambda h: h.get("ts") or "", reverse=True)
     return hits
 
 
-def _read_line(path: Path, line_no: int) -> Optional[str]:
-    try:
-        with path.open() as f:
-            for i, line in enumerate(f, start=1):
-                if i == line_no:
-                    return line.rstrip("\n")
-    except Exception:
-        return None
-    return None
-
-
-def _excerpt(text: str, query: str, span: int = 120) -> str:
+def excerpt(text: str, query: str, span: int = 120,
+            tidy: Callable[[str], str] = str) -> str:
+    """`text` cut to `span` chars around the first match of `query`, a "…"
+    marking each cut. `tidy` runs on the cut before the marks go on."""
     if not text:
         return ""
     m = re.search(re.escape(query), text, re.IGNORECASE)
@@ -234,7 +229,7 @@ def _excerpt(text: str, query: str, span: int = 120) -> str:
         return text[: span * 2]
     start = max(0, m.start() - span // 2)
     end = min(len(text), m.end() + span // 2)
-    snippet = text[start:end]
+    snippet = tidy(text[start:end])
     if start > 0:
         snippet = "…" + snippet
     if end < len(text):

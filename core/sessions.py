@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, NamedTuple, Optional
 
 def _home_base() -> Path:
     """Base dir the dashboard reads from. Override with CLAUDE_FLEET_HOME to
@@ -169,101 +170,115 @@ def _proc_start_ms(pid: int) -> int:
         return 0
 
 
-def _pid_tty(pid: int) -> Optional[str]:
+class Proc(NamedTuple):
+    """One process, as `ps` lists it."""
+    ppid: int
+    stat: str   # raw ps STAT; its first letter is the scheduler state ('D' == uninterruptible sleep)
+    tty: str    # controlling terminal, e.g. "pts/3"; "?" (Linux) / "??" (macOS) for none
+    comm: str   # process name — what counts as a shell
+    args: str   # the whole command line
+
+
+# ucomm leads because it is the one column besides args that can hold spaces
+# ("tmux: server"), and args has to come last since it runs to the end of the
+# line — so a row is split on the pid/ppid/STAT that follow the name. ucomm is
+# the process name: `comm` on Linux, while macOS's `comm` is the executable's
+# path, which ps cuts to 16 characters anywhere but the last column.
+_PS_FORMAT = "ucomm=,pid=,ppid=,stat=,tty=,args="
+_PS_ROW = re.compile(r"^(.*?)\s+(\d+)\s+(\d+)\s+([A-Z]\S*)\s+(\S+)(?:\s+(.*))?$")
+
+# One `ps` pass serves every reader of the process table in a tick — process-
+# first Claude, Codex and hmz discovery, the cards' ttys, the shell counts —
+# where each used to fork its own `ps -e` (~55 ms apiece on a busy host). The
+# 2s watcher tick reads it fresh; whatever else runs within the second shares it.
+_PROC_TTL = 1.0
+_proc_cache: tuple[float, dict[int, Proc]] = (float("-inf"), {})
+
+
+def _clear_caches() -> None:
+    """Forget the cached process table, so the next read runs `ps` (tests that
+    stub `ps` call this first)."""
+    global _proc_cache
+    _proc_cache = (float("-inf"), {})
+
+
+def proc_table(max_age: float = _PROC_TTL) -> dict[int, Proc]:
+    """{pid: Proc} for every process, in ps order, from one `ps` call; {} on any
+    failure (e.g. `ps` unavailable). A table read within `max_age` seconds is
+    reused; it is shared, so callers must not change it."""
+    global _proc_cache
+    now = time.monotonic()
+    ts, table = _proc_cache
+    if now - ts < max_age:
+        return table
     try:
         out = subprocess.check_output(
-            ["ps", "-o", "tty=", "-p", str(pid)],
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        ).decode().strip()
+            ["ps", "-eo", _PS_FORMAT],
+            stderr=subprocess.DEVNULL, timeout=5,
+        ).decode("utf-8", "replace")
     except Exception:
-        return None
-    if not out or out == "??":
-        return None
-    return f"/dev/{out}"
+        out = ""
+    table = {}
+    for line in out.splitlines():
+        m = _PS_ROW.match(line)
+        if m:
+            comm, pid, ppid, stat, tty, args = m.groups()
+            table[int(pid)] = Proc(int(ppid), stat, tty,
+                                   comm.strip().rsplit("/", 1)[-1], args or "")
+    _proc_cache = (now, table)
+    return table
 
 
-_TTY_CACHE: dict[int, Optional[str]] = {}
+def _dev_tty(table: dict[int, Proc], pid: int) -> Optional[str]:
+    """`/dev/<tty>` of `pid`, None when it isn't in the table. The rule is the
+    one `ps -o tty= -p <pid>` was read with here: only macOS's "??" means no
+    terminal, so a Linux pid without one reads as "/dev/?"."""
+    p = table.get(pid)
+    if not p or not p.tty or p.tty == "??":
+        return None
+    return f"/dev/{p.tty}"
+
 
 # Process names treated as a "shell" when counting background shells per session.
 _SHELL_COMMS = {"bash", "sh", "zsh", "dash", "fish", "ksh", "tcsh", "csh", "ash"}
 
 
-def shell_descendant_counts(pids: list[int]) -> dict[int, int]:
-    """Count descendant shell processes for each pid via a single `ps` call.
+def _children(table: dict[int, Proc]) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for pid, p in table.items():
+        children.setdefault(p.ppid, []).append(pid)
+    return children
 
-    Walks the full process tree once and, for every requested pid, counts how
-    many of its descendants are shell processes (bash/sh/zsh/...). Used to show
-    how many background shells a Claude Code session currently has running.
+
+def _subtree(children: dict[int, list[int]], root: int) -> Iterator[int]:
+    """`root` and every process under it, each once."""
+    stack = [root]
+    seen: set[int] = set()
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        yield cur
+        stack.extend(children.get(cur, []))
+
+
+def shell_descendant_counts(pids: list[int]) -> dict[int, int]:
+    """Count descendant shell processes for each pid from one process table.
+
+    Walks the process tree and, for every requested pid, counts how many of its
+    descendants are shell processes (bash/sh/zsh/...). Used to show how many
+    background shells a Claude Code session currently has running.
     Returns {pid: count}; all-zero on any failure (e.g. `ps` unavailable).
     """
     targets = set(pids)
     if not targets:
         return {}
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid=,ppid=,comm="],
-            stderr=subprocess.DEVNULL, timeout=5,
-        ).decode("utf-8", "replace")
-    except Exception:
-        return {pid: 0 for pid in targets}
-
-    children: dict[int, list[int]] = {}
-    comm: dict[int, str] = {}
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        try:
-            cpid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        comm[cpid] = parts[2].rsplit("/", 1)[-1]
-        children.setdefault(ppid, []).append(cpid)
-
-    result: dict[int, int] = {}
-    for pid in targets:
-        count = 0
-        stack = list(children.get(pid, []))
-        seen: set[int] = set()
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            if comm.get(cur, "") in _SHELL_COMMS:
-                count += 1
-            stack.extend(children.get(cur, []))
-        result[pid] = count
-    return result
-
-
-def _proc_snapshot() -> list[tuple[int, int, str, str]]:
-    """One `ps` pass → [(pid, ppid, stat, comm), ...]; empty on any failure.
-
-    Split out from uninterruptible_wrappers so the escalation logic can be
-    unit-tested against a synthetic process tree without spawning processes.
-    `stat` is the raw ps STAT field — its first letter is the scheduler state
-    ('D' == uninterruptible sleep).
-    """
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid=,ppid=,stat=,comm="],
-            stderr=subprocess.DEVNULL, timeout=5,
-        ).decode("utf-8", "replace")
-    except Exception:
-        return []
-    rows: list[tuple[int, int, str, str]] = []
-    for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
-            continue
-        try:
-            pid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        rows.append((pid, ppid, parts[2], parts[3].rsplit("/", 1)[-1]))
-    return rows
+    table = proc_table()
+    children = _children(table)
+    return {pid: sum(1 for cur in _subtree(children, pid)
+                     if cur != pid and table[cur].comm in _SHELL_COMMS)
+            for pid in targets}
 
 
 def uninterruptible_wrappers(claude_pid: int) -> list[int]:
@@ -281,49 +296,15 @@ def uninterruptible_wrappers(claude_pid: int) -> list[int]:
 
     Restricting to shells with a D descendant is the safety gate: a normal
     long-running command (which Esc *can* interrupt) is left alone, and a
-    non-shell child such as the codex mcp-server is never targeted.
+    non-shell child such as the codex mcp-server is never targeted. The table is
+    read fresh rather than taken from the tick's cache: what this returns gets
+    SIGKILLed.
     """
-    rows = _proc_snapshot()
-    if not rows:
-        return []
-    children: dict[int, list[int]] = {}
-    stat: dict[int, str] = {}
-    comm: dict[int, str] = {}
-    for pid, ppid, st, cm in rows:
-        children.setdefault(ppid, []).append(pid)
-        stat[pid] = st
-        comm[pid] = cm
-
-    def _has_d_in_subtree(root: int) -> bool:
-        stack = [root]
-        seen: set[int] = set()
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            if stat.get(cur, "").startswith("D"):
-                return True
-            stack.extend(children.get(cur, []))
-        return False
-
-    wrappers = []
-    for child in children.get(claude_pid, []):
-        if comm.get(child, "") in _SHELL_COMMS and _has_d_in_subtree(child):
-            wrappers.append(child)
-    return wrappers
-
-
-def get_tty(pid: int) -> Optional[str]:
-    if pid not in _TTY_CACHE:
-        _TTY_CACHE[pid] = _pid_tty(pid)
-    return _TTY_CACHE[pid]
-
-
-def _prune_tty_cache(live_pids: set[int]) -> None:
-    for pid in list(_TTY_CACHE.keys()):
-        if pid not in live_pids:
-            _TTY_CACHE.pop(pid, None)
+    table = proc_table(max_age=0)
+    children = _children(table)
+    return [child for child in children.get(claude_pid, [])
+            if table[child].comm in _SHELL_COMMS
+            and any(table[cur].stat.startswith("D") for cur in _subtree(children, child))]
 
 
 @dataclass
@@ -367,7 +348,7 @@ def list_windows(include_dead: bool = False) -> list[Window]:
         return []
 
     windows: list[Window] = []
-    live_pids: set[int] = set()
+    table = proc_table()
 
     for f in SESSIONS_DIR.glob("*.json"):
         # Skip the legacy `session-{ts}.json` files (no pid).
@@ -384,8 +365,6 @@ def list_windows(include_dead: bool = False) -> list[Window]:
 
         pid = int(data["pid"])
         alive = _pid_alive(pid)
-        if alive:
-            live_pids.add(pid)
         if not alive and not include_dead:
             continue
 
@@ -422,14 +401,12 @@ def list_windows(include_dead: bool = False) -> list[Window]:
                 # from the epoch (which renders as ~494593h ago).
                 updated_at=int(data.get("updatedAt") or data.get("startedAt", 0)),
                 version=str(data.get("version", "")),
-                tty=get_tty(pid) if alive else None,
+                tty=_dev_tty(table, pid) if alive else None,
                 transcript_path=str(transcript) if transcript.exists() else None,
                 alive=alive,
                 hidden=hidden,
             )
         )
-
-    _prune_tty_cache(live_pids)
 
     # Newest activity first.
     windows.sort(key=lambda w: (-w.updated_at, w.pid))
@@ -441,11 +418,12 @@ def list_windows(include_dead: bool = False) -> list[Window]:
 _CLAUDE_BG_SUBCOMMANDS = {"mcp", "config", "doctor", "update", "install", "migrate-installer"}
 
 
-def _claude_exe_index(tokens: list[str]) -> int:
-    """Index of the `claude` executable token, or -1. Covers both a bare
-    `claude …` and a node launcher (`node …/bin/claude …`)."""
+def _exe_index(tokens: list[str], name: str) -> int:
+    """Index of the `name` executable token (`claude`, `codex`), or -1. Covers
+    both a bare `name …` and a node launcher (`node …/bin/name …`): the
+    executable is among the first two tokens."""
     for i, t in enumerate(tokens[:2]):
-        if os.path.basename(t) == "claude":
+        if os.path.basename(t) == name:
             return i
     return -1
 
@@ -455,7 +433,7 @@ def _parse_claude_proc(args: str | list[str]) -> Optional[dict]:
     when there is one (see _proc_argv). Returns {session_id} for an interactive
     Claude TUI process (resume id parsed when present), or None otherwise."""
     toks = args.split() if isinstance(args, str) else list(args)
-    i = _claude_exe_index(toks)
+    i = _exe_index(toks, "claude")
     if i < 0:
         return None
     rest = toks[i + 1:]
@@ -502,7 +480,7 @@ def _proc_argv(pid: int, args: str) -> str | list[str]:
 
 def _parse_ps_claude(pid: int, args: str) -> Optional[dict]:
     """_parse_claude_proc for one `ps` row, on the real argv when it's a claude."""
-    if _claude_exe_index(args.split()) < 0:
+    if _exe_index(args.split(), "claude") < 0:
         return None  # not claude: no /proc read for every process on the host
     return _parse_claude_proc(_proc_argv(pid, args))
 
@@ -560,13 +538,11 @@ def list_claude_proc_windows(
     """
     if not Path("/proc").is_dir():
         return []
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid=,tty=,args="],
-            stderr=subprocess.DEVNULL, timeout=5,
-        ).decode("utf-8", "replace")
-    except Exception:
-        return []
+    # Every `claude` TUI process, in ps order, with what its command line says —
+    # read off the real argv (_parse_ps_claude), since ps's space-joined args
+    # can't tell an opening prompt from flags and subcommands.
+    procs = [(pid, p.tty, parsed) for pid, p in proc_table().items()
+             if (parsed := _parse_ps_claude(pid, p.args)) is not None]
 
     windows: list[Window] = []
     seen_ttys: set[str] = set(known_ttys)
@@ -578,28 +554,12 @@ def list_claude_proc_windows(
     # so absent from known_sids), and the ps scan order is arbitrary — without
     # this a fresh spawn processed first would adopt a resumed session's
     # transcript (its file's mtime is refreshed by the resume itself).
-    for _line in out.splitlines():
-        _parts = _line.split(None, 2)
-        if len(_parts) >= 3 and _parts[0].isdigit():
-            _p = _parse_ps_claude(int(_parts[0]), _parts[2])
-            if _p and _p.get("session_id"):
-                claimed_sids.add(_p["session_id"])
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        tty_raw, args = parts[1], parts[2]
+    claimed_sids.update(parsed["session_id"] for _, _, parsed in procs if parsed["session_id"])
+    for pid, tty_raw, parsed in procs:
         if tty_raw in ("?", "??") or not tty_raw:
             continue  # no controlling terminal → background/daemon, not a window
         if pid in known_pids:
             continue  # already carded from its session file
-        parsed = _parse_ps_claude(pid, args)
-        if parsed is None:
-            continue
         tty = f"/dev/{tty_raw}"
         if tty in seen_ttys:
             continue  # one card per terminal; file-based window or earlier proc wins
@@ -618,6 +578,8 @@ def list_claude_proc_windows(
         slug = _cwd_to_project_slug(cwd)
         start = _proc_start_ms(pid) or int(time.time() * 1000)
 
+        # The newest unclaimed transcript written since this process started.
+        disc_sid, disc_path = _discover_proc_transcript(slug, start, claimed_sids)
         if session_id:
             transcript = PROJECTS_DIR / slug / f"{session_id}.jsonl"
             # Recent Claude FORKS a new session id on `--resume <id>`: the
@@ -628,7 +590,6 @@ def list_claude_proc_windows(
             # (The resume-arg id is pre-claimed above, so discovery returns the
             # fork, not the frozen original; None when the session simply appends
             # to the resume-arg file, the older-Claude behavior.)
-            disc_sid, disc_path = _discover_proc_transcript(slug, start, claimed_sids)
             if disc_sid:
                 try:
                     forked = (not transcript.exists()) or (
@@ -637,16 +598,13 @@ def list_claude_proc_windows(
                     forked = True
                 if forked:
                     session_id, transcript = disc_sid, Path(disc_path)
-        else:
+        elif disc_sid:
             # Fresh spawn (no --resume id, no session file): recover the
             # transcript it's writing so the card and prompt-queue reconciliation
             # have something to read instead of a permanent blank.
-            disc_sid, disc_path = _discover_proc_transcript(slug, start, claimed_sids)
-            if disc_sid:
-                session_id = disc_sid
-                transcript = Path(disc_path)
-            else:
-                transcript = None
+            session_id, transcript = disc_sid, Path(disc_path)
+        else:
+            transcript = None
         if session_id:
             claimed_sids.add(session_id)
         # Prefer the (resumed/discovered) transcript's mtime as the activity time
@@ -683,32 +641,33 @@ def list_claude_proc_windows(
     return windows
 
 
-def find_window(pid: int) -> Optional[Window]:
-    for w in list_windows(include_dead=True):
-        if w.pid == pid:
-            return w
+def _all_windows() -> Iterator[Window]:
+    """Every window the board can resolve, cheapest source first and lazily, so
+    a lookup that hits early never pays for the process discovery after it."""
+    yield from list_windows(include_dead=True)
     # Freshly spawned / resume-picker Claude sessions aren't backed by a
     # ~/.claude/sessions file yet — resolve them from the live process so the
     # card's actions (timeline, menu, prompt, keys, close) work, not just the
-    # card's display. Empty known-sets ⇒ no dedup; we already missed above.
-    for w in list_claude_proc_windows(set(), set()):
-        if w.pid == pid:
-            return w
+    # card's display, and so a `claude --resume <id>` parked on the summary
+    # picker resolves by id for resume/fork/locate. Empty known-sets ⇒ no dedup.
+    yield from list_claude_proc_windows(set(), set())
     # Live Codex and hmz sessions aren't backed by ~/.claude/sessions files;
     # they're discovered from running processes. Late import to avoid a circular
     # dependency (both import HOME_BASE from this module).
-    try:
-        from . import codex, hmz
-        for w in codex.list_codex_windows() + hmz.list_hmz_windows():
-            if w.pid == pid:
-                return w
-    except Exception:
-        pass
-    return None
+    from . import codex, hmz
+    for discover in (codex.list_codex_windows, hmz.list_hmz_windows):
+        try:
+            yield from discover()
+        except Exception:
+            pass
+
+
+def find_window(pid: int) -> Optional[Window]:
+    return next((w for w in _all_windows() if w.pid == pid), None)
 
 
 def find_window_by_session(session_id: str) -> Optional[Window]:
-    """Resolve a window by its Claude/Codex session id, or a unique prefix.
+    """Resolve a window by its Claude/Codex/hmz session id, or a unique prefix.
 
     This is the reverse lookup of `find_window`: humans and external tools
     (skills, monitors, scripts) usually hold a session id — e.g. from a
@@ -720,21 +679,8 @@ def find_window_by_session(session_id: str) -> Optional[Window]:
     if not sid:
         return None
 
-    def _candidates():
-        yield from list_windows(include_dead=True)
-        # Process-discovered Claude sessions (no session file yet) — e.g. a
-        # `claude --resume <id>` parked on the summary picker, whose id we want
-        # resume/fork/locate to resolve. See find_window.
-        yield from list_claude_proc_windows(set(), set())
-        # Live Codex sessions come from process discovery (see find_window).
-        try:
-            from . import codex
-            yield from codex.list_codex_windows()
-        except Exception:
-            pass
-
     prefix_matches: list[Window] = []
-    for w in _candidates():
+    for w in _all_windows():
         wid = (w.session_id or "").lower()
         if wid == sid:
             return w
@@ -746,7 +692,8 @@ def find_window_by_session(session_id: str) -> Optional[Window]:
 
 
 def snapshot() -> dict:
-    """Top-level state for the dashboard."""
+    """Top-level state for the dashboard. The header `counts` are the app
+    layer's (app._finalize_snapshot): they go by triage, which it attaches."""
     wins = list_windows()
     # Surface live `claude` processes that haven't registered a session file yet
     # (fresh spawns / resume parked on the summary picker) so they still card.
@@ -754,20 +701,7 @@ def snapshot() -> dict:
     known_ttys = {w.tty for w in wins if w.tty}
     known_sids = {w.session_id for w in wins if w.session_id}
     wins.extend(list_claude_proc_windows(known_pids, known_ttys, known_sids))
-    # Counts cover only real user windows; `.slock` agent sub-sessions are
-    # rendered separately at the bottom of the dashboard and excluded here.
-    # These status-based tallies are a fallback: the app layer recomputes
-    # `counts` by triage (after attaching it) so the header chips match.
-    visible = [w for w in wins if not w.hidden]
-    waiting = [w for w in visible if w.status == "waiting"]
-    busy = [w for w in visible if w.status == "busy"]
     return {
         "windows": [w.to_dict() for w in wins],
-        "counts": {
-            "total": len(visible),
-            "busy": len(busy),
-            "waiting": len(waiting),
-            "idle": len(visible) - len(busy) - len(waiting),
-        },
         "ts": int(time.time() * 1000),
     }

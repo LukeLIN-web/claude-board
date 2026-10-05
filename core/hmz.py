@@ -54,9 +54,9 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import codex, tmux, transcripts
-from .codex import _classify_codex, _proc_start_ms, _proc_table
-from .sessions import HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive, get_tty
+from . import codex, patrol, tmux, transcripts
+from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
+                       _proc_start_ms, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
 
 HMZ_HOME = HOME_BASE / ".hmz"
@@ -130,23 +130,19 @@ def _latest_epic(cwd: str, home: Optional[Path] = None) -> Optional[Path]:
     """epic.jsonl of the newest run in `cwd`, or None before the first one."""
     runs = (home or _default_home()) / "epics" / _PLAIN.sub("-", cwd)
     try:
-        names = sorted(n for n in os.listdir(runs) if (runs / n / "epic.jsonl").is_file())
+        names = sorted(os.listdir(runs), reverse=True)
     except OSError:
         return None
-    return runs / names[-1] / "epic.jsonl" if names else None
+    return next((runs / n / "epic.jsonl" for n in names if (runs / n / "epic.jsonl").is_file()),
+                None)
 
 
 def _events(path: Path) -> list[dict]:
     out: list[dict] = []
     try:
-        with path.open() as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(d, dict):
-                    out.append(d)
+        for d in transcripts._iter_lines(path):
+            if isinstance(d, dict):
+                out.append(d)
     except OSError:
         pass
     return out
@@ -268,18 +264,27 @@ def _logs(epic: Path, opened: dict, of: dict = _LOGS) -> list[Path]:
         return []
 
 
-def _last_logged(epic: Path) -> int:
-    """Epoch ms of the newest write to any of the run's records or session logs.
-    The epic itself is written only when a session opens or the run ends, so a
-    turn hours long leaves it untouched."""
-    paths = _records(epic) + [p for o in _opened(epic) for p in _logs(epic, o)]
-    newest = 0.0
-    for p in paths:
-        try:
-            newest = max(newest, p.stat().st_mtime)
-        except OSError:
-            pass
-    return int(newest * 1000)
+def _activity(epic: Path) -> tuple[int, Optional[dict], Optional[Path]]:
+    """(newest, at_work, log) of a run, from one look at its files.
+
+    `newest` is the epoch ms of the newest write to any of the run's records or
+    session logs. The epic itself is written only when a session opens or the
+    run ends, so a turn hours long leaves it untouched.
+
+    `at_work` is the `opened` line of the agent at work, `log` its session log:
+    the agent whose session log was written last — agents that take turns resume
+    their sessions rather than open new ones — or, with no log to go by, the
+    last to open one (log None; at_work None before any session opened)."""
+    opened = _opened(epic)
+    newest = max((_mtime(r) for r in _records(epic)), default=0.0)
+    at_work, log, newest_log = (opened[-1] if opened else None), None, -1.0
+    for o in opened:
+        for p in _logs(epic, o):
+            m = _mtime(p)
+            newest = max(newest, m)
+            if m >= newest_log:
+                at_work, log, newest_log = o, p, m
+    return int(newest * 1000), at_work, log
 
 
 def _models(began: dict) -> str:
@@ -605,41 +610,40 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
             "budget_label": _budget_label(budget)}
 
 
-def _current_task(events: list[dict], epic: Optional[Path] = None) -> str:
+def _current_task(events: list[dict], at_work: Optional[dict], log: Optional[Path]) -> str:
     """`<flow> · <agent at work>: <what its session is doing>`, or how the run
-    ended. The agent at work is the one whose session log was written last —
-    agents that take turns resume their sessions rather than open new ones —
-    or, with no log to go by, the last to open one."""
+    ended. `at_work` and `log` are _activity's."""
     flow = _began(events).get("flow", "")
     end = _ended(events)
     if end:
         return f"{flow} {end.get('how', 'ended')}"
-    opened = _opened(epic) if epic else [e for e in events if e.get("event") == "opened"]
-    if not opened:
+    if not at_work:
         return flow
-    at_work, log, newest = opened[-1], None, -1.0
-    for o in opened if epic else []:
-        for p in _logs(epic, o):
-            if _mtime(p) >= newest:
-                at_work, log, newest = o, p, _mtime(p)
     task = f"{flow} · {at_work.get('agent', '')}"
     hint = ""
     if log and at_work.get("backend") == "claude":
         hint = transcripts.current_task_hint(log) or ""
     elif log and at_work.get("backend") == "codex":
-        hint = codex._last_assistant_text(log)
+        hint = codex._last_assistant_text(codex._read_tail_events(log))
     return f"{task}: {hint}" if hint else task
 
 
 def list_hmz_windows() -> list[Window]:
     """Running hmz interfaces, one Window per tty, minus those the machine-local
     cwd filter hides. Linux-only (/proc)."""
+    return [w for w, *_ in _discover()]
+
+
+def _discover() -> list[tuple[Window, list[dict], Optional[dict], Optional[Path]]]:
+    """list_hmz_windows, each window with its latest run's events and the agent
+    at work there with its log (see _activity) — read once, for the card's
+    status and time here and its details in hmz_window_dicts."""
     if not Path("/proc").is_dir():
         return []
-    windows: list[Window] = []
-    for pid, info in _proc_table().items():
-        tty = info.get("tty", "")
-        if not tty or tty in ("?", "??") or not _is_interactive_hmz(info.get("args", "")):
+    windows: list[tuple[Window, list[dict], Optional[dict], Optional[Path]]] = []
+    for pid, info in proc_table().items():
+        tty = info.tty
+        if not tty or tty in ("?", "??") or not _is_interactive_hmz(info.args):
             continue
         if not _pid_alive(pid):
             continue
@@ -652,12 +656,14 @@ def list_hmz_windows() -> list[Window]:
         started_at = _proc_start_ms(pid)
         epic = _latest_epic(cwd, _home(pid))
         status, updated_at, session_id = "idle", started_at, f"hmz-{pid}"
+        events, at_work, log = [], None, None
         if epic:
             events = _events(epic)
+            newest, at_work, log = _activity(epic)
             status = "busy" if _began(events) and not _ended(events) else "idle"
-            updated_at = max(started_at, _last_logged(epic))
+            updated_at = max(started_at, newest)
             session_id = epic.parent.name
-        windows.append(Window(
+        windows.append((Window(
             pid=pid,
             session_id=session_id,
             cwd=cwd,
@@ -669,13 +675,13 @@ def list_hmz_windows() -> list[Window]:
             started_at=started_at,
             updated_at=updated_at,
             version="",
-            tty=get_tty(pid),
+            tty=f"/dev/{tty}",
             transcript_path=str(epic) if epic else None,
             alive=True,
             hidden=False,
             platform="hmz",
-        ))
-    windows.sort(key=lambda w: (-w.updated_at, w.pid))
+        ), events, at_work, log))
+    windows.sort(key=lambda found: (-found[0].updated_at, found[0].pid))
     return windows
 
 
@@ -696,29 +702,24 @@ def hmz_window_dicts() -> list[dict]:
     """Live hmz windows as dashboard dicts, the shape codex_window_dicts gives.
     Shell-process counts are filled in by the caller."""
     out: list[dict] = []
-    for w in list_hmz_windows():
+    for w, events, at_work, log in _discover():
         d = w.to_dict()
-        epic = Path(w.transcript_path) if w.transcript_path else None
-        events = _events(epic) if epic else []
         began, end = _began(events), _ended(events)
-        current_task = _current_task(events, epic)
-        tri = _classify_codex(w.status, d.get("idle_seconds", 0), current_task)
+        current_task = _current_task(events, at_work, log)
+        tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
         crumb = menu(w)
         if crumb:
             # Not waiting_perm: that card's Quick Approve would type "1" into it.
-            tri = {"triage": "stalled", "reason": f"停在菜单：{crumb}",
-                   "suggestion": "去终端填完并 Save"}
+            tri = {"triage": "stalled", "triage_reason": f"停在菜单：{crumb}",
+                   "triage_suggestion": "去终端填完并 Save"}
         models = _models(began)
         d.update({
-            "shell_proc_count": 0,
             "permission_msg": None,
             "permission_ts": None,
             "first_input": str(began.get("task") or "").strip().split("\n")[0][:100],
             "current_task": current_task or None,
             "last_error": f"{began.get('flow', 'run')} failed" if end.get("how") == "failed" else None,
-            "triage": tri["triage"],
-            "triage_reason": tri["reason"],
-            "triage_suggestion": tri["suggestion"],
+            **tri,
             "skills_used": [],
             "memory_ops": [],
             "background_tasks": [],
@@ -727,7 +728,10 @@ def hmz_window_dicts() -> list[dict]:
             "effort": "",
             "model_label": models,
             "model_source": "transcript" if models else "",
-            **_spending(epic, events, _home(w.pid)),
+            # The bill walks the run's sessions again, sub-agents' logs too (which
+            # _activity leaves out); each log is read on from where it stopped.
+            **_spending(Path(w.transcript_path) if w.transcript_path else None,
+                        events, _home(w.pid)),
         })
         out.append(d)
     return out
@@ -751,11 +755,6 @@ def _history(path: Path, start: int = 0) -> list[dict]:
             out.append({"at": str(d.get("at") or ""), "workdir": str(d.get("workdir") or ""),
                         "text": d["text"]})
     return out
-
-
-def _said(path: Path, start: int = 0) -> list[tuple[str, str]]:
-    """(workdir, text) of each line in hmz's history.jsonl from byte `start` on."""
-    return [(d["workdir"], d["text"]) for d in _history(path, start)]
 
 
 def typed(pid: int, cwd: str, since_ms: int) -> list[dict]:
@@ -784,13 +783,13 @@ def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]
     except OSError:
         mark = 0
     want = _squeeze(text)
-    said = _said(path)
+    said = _history(path)
     # hmz's "last given" is the newest line typed in this directory, or the
     # newest anywhere when nothing was ever typed here.
-    here = [t for where, t in said if where == cwd] or [t for _, t in said]
+    here = [d["text"] for d in said if d["workdir"] == cwd] or [d["text"] for d in said]
     if here and _squeeze(here[-1]) == want:
         return lambda: tmux._shown_above_composer(pane, text)
-    return lambda: any(_squeeze(t) == want for _, t in _said(path, mark))
+    return lambda: any(_squeeze(d["text"]) == want for d in _history(path, mark))
 
 
 # hmz's own lines are the interface's, not an agent's, and each begins "hmz: ".

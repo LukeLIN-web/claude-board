@@ -2,14 +2,24 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import time
 from dataclasses import dataclass, asdict, field
+from itertools import islice
 from pathlib import Path
 from typing import Optional
 
-from .sessions import CLAUDE_HOME, HOME_BASE, PROJECTS_DIR
+from .search import excerpt, rg_command
+from .sessions import CLAUDE_HOME, PROJECTS_DIR, list_windows
+from .transcripts import (
+    _iter_lines,
+    _row_model,
+    clean_user_text,
+    is_injected_text,
+    is_injected_user_row,
+    memo_by_file,
+    session_activity,
+)
 
 HISTORY_JSONL = CLAUDE_HOME / "history.jsonl"
 
@@ -39,22 +49,14 @@ _cache: list[HistorySession] = []
 _cache_ts: float = 0
 _CACHE_TTL = 30
 
-# Per-transcript enrichment (skills/memory/model/first-input) costs ~4-5 full
-# reads of each .jsonl. With ~1k sessions that made a cold index build take
-# 15s+, and it ran on every cache miss. We now only enrich the most-recent
-# sessions (the History panel shows recent sessions; older ones still appear as
-# cheap skeletons) and memoize each result by (sid, mtime) so the periodic
-# rebuild never re-parses an unchanged transcript.
+# Per-transcript enrichment (skills/memory/model/first-input) costs a full read
+# of each .jsonl. With ~1k sessions that made a cold index build take 15s+, and
+# it ran on every cache miss. We now only enrich the most-recent sessions (the
+# History panel shows recent sessions; older ones still appear as cheap
+# skeletons), and every read below is memoized on the transcript's (mtime,
+# size) (transcripts.memo_by_file, which keeps room for this many), so the
+# periodic rebuild never re-parses an unchanged transcript.
 _ENRICH_LIMIT = 200
-_enrich_cache: dict[tuple, dict] = {}
-
-
-def _clear_caches() -> None:
-    """Reset memoized index + enrichment state (tests / explicit refresh)."""
-    global _cache, _cache_ts
-    _cache = []
-    _cache_ts = 0
-    _enrich_cache.clear()
 
 
 def _load_history_jsonl() -> dict[str, dict]:
@@ -97,10 +99,6 @@ def _scan_transcripts() -> dict[str, dict]:
         if not proj_dir.is_dir():
             continue
         for f in proj_dir.glob("*.jsonl"):
-            if f.name.endswith(".wakatime"):
-                continue
-            if "subagents" in f.parts:
-                continue
             sid = f.stem
             try:
                 st = f.stat()
@@ -115,60 +113,10 @@ def _scan_transcripts() -> dict[str, dict]:
     return out
 
 
-def _find_alive_pids() -> set[str]:
-    sessions_dir = CLAUDE_HOME / "sessions"
-    alive: set[str] = set()
-    if not sessions_dir.exists():
-        return alive
-    for f in sessions_dir.glob("*.json"):
-        if f.name.startswith("session-"):
-            continue
-        try:
-            d = json.loads(f.read_text())
-            pid = d.get("pid")
-            sid = d.get("sessionId", "")
-            if pid and sid:
-                try:
-                    os.kill(int(pid), 0)
-                    alive.add(sid)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-        except Exception:
-            pass
-    return alive
-
-
-def _extract_skills_from_transcript(path: Path) -> list[str]:
-    """Extract unique skill names invoked via Skill tool_use."""
-    skills: list[str] = []
-    seen: set[str] = set()
-    try:
-        with path.open() as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if d.get("type") != "assistant":
-                    continue
-                content = (d.get("message") or {}).get("content", [])
-                if not isinstance(content, list):
-                    continue
-                for c in content:
-                    if isinstance(c, dict) and c.get("name") == "Skill":
-                        skill_name = (c.get("input") or {}).get("skill", "")
-                        if skill_name and skill_name not in seen:
-                            seen.add(skill_name)
-                            skills.append(skill_name)
-    except Exception:
-        pass
-    return skills
-
-
 def _build_index() -> list[HistorySession]:
     hist = _load_history_jsonl()
     transcripts = _scan_transcripts()
-    alive = _find_alive_pids()
+    alive = {w.session_id for w in list_windows() if w.session_id}
 
     all_sids = set(hist.keys()) | set(transcripts.keys())
     sessions: list[HistorySession] = []
@@ -197,20 +145,13 @@ def _build_index() -> list[HistorySession]:
             transcript_size=t.get("size", 0),
             transcript_mtime=t.get("mtime", 0),
             is_alive=sid in alive,
-            platform="claude",
-            model="",
-            skills_used=[],
-            memory_ops=[],
-            skill_breakdown={},
-            memory_breakdown={},
         ))
 
     # Merge Codex sessions
     try:
         from .codex import list_codex_sessions
         for cs in list_codex_sessions():
-            d = cs.to_history_dict()
-            sessions.append(HistorySession(**d))
+            sessions.append(HistorySession(**cs))
     except Exception:
         pass
 
@@ -231,40 +172,16 @@ def _build_index() -> list[HistorySession]:
     return sessions
 
 
-def _compute_enrichment(sid: str, tp: str) -> dict:
-    """The expensive per-transcript reads, isolated for memoization."""
-    from .transcripts import extract_memory_ops, count_skill_activity, count_memory_activity
-    sa = count_skill_activity(tp)
-    return {
-        "first_input": _extract_first_user_text(Path(tp)),
-        "skills": _extract_skills_from_transcript(Path(tp)),
-        "mem_ops": extract_memory_ops(tp),
-        "model": _extract_model(Path(tp)),
-        "skill_breakdown": {
-            "per_skill_invokes": sa.get("per_skill_invokes", {}),
-            "per_skill_reads": sa.get("per_skill_reads", {}),
-            "per_skill_writes": sa.get("per_skill_writes", {}),
-            "per_skill_bash_refs": sa.get("per_skill_bash_refs", {}),
-        },
-        "memory_breakdown": count_memory_activity(tp),
-    }
-
-
 def _apply_enrichment(s: HistorySession) -> None:
-    """Fill skills/memory/model/first-input on `s`, memoized by (sid, mtime)."""
-    key = (s.session_id, s.transcript_mtime)
-    enr = _enrich_cache.get(key)
-    if enr is None:
-        enr = _compute_enrichment(s.session_id, s.transcript_path)
-        if len(_enrich_cache) > 2000:  # keep unbounded growth in check
-            _enrich_cache.clear()
-        _enrich_cache[key] = enr
-    s.first_input = s.first_input or enr["first_input"]
-    s.model = enr["model"]
-    s.skills_used = enr["skills"]
-    s.memory_ops = enr["mem_ops"]
-    s.skill_breakdown = enr["skill_breakdown"]
-    s.memory_breakdown = enr["memory_breakdown"]
+    """Fill skills/memory/model/first-input on `s` from its transcript."""
+    tp = Path(s.transcript_path)
+    activity = session_activity(tp)
+    s.first_input = s.first_input or _extract_first_user_text(tp)
+    s.model = _extract_model(tp)
+    s.skills_used = activity["skills_used"]
+    s.memory_ops = activity["memory_ops"]
+    s.skill_breakdown = activity["skill_breakdown"]
+    s.memory_breakdown = activity["memory_breakdown"]
 
 
 # How far to look for a title before settling for what's been found. The first
@@ -273,6 +190,7 @@ def _apply_enrichment(s: HistorySession) -> None:
 _TITLE_SCAN_LINES = 400
 
 
+@memo_by_file
 def _extract_first_user_text(path: Path) -> str:
     """What the human first asked this session for — the card's title.
 
@@ -287,57 +205,37 @@ def _extract_first_user_text(path: Path) -> str:
         what the session is for, so it's kept only as a fallback for a session
         that never said anything else.
     """
-    # Imported here, not at module scope: `transcripts` is a local name in
-    # index_sessions below, and a module-level import would read as shadowed.
-    from .transcripts import clean_user_text, is_injected_text, is_injected_user_row
-
     fallback = ""
-    try:
-        with path.open() as f:
-            for lineno, line in enumerate(f):
-                if lineno >= _TITLE_SCAN_LINES:
-                    break
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if d.get("type") != "user" or is_injected_user_row(d):
-                    continue
-                msg = d.get("message", {})
-                content = msg.get("content", [])
-                if isinstance(content, str):
-                    texts = [content]
-                elif isinstance(content, list):
-                    texts = [c.get("text") or "" for c in content
-                             if isinstance(c, dict) and c.get("type") == "text"]
-                else:
-                    continue
-                for raw in texts:
-                    if not raw.strip() or is_injected_text(raw):
-                        continue
-                    cleaned = clean_user_text(raw)[:300]
-                    if "<command-name>" in raw:
-                        fallback = fallback or cleaned
-                    else:
-                        return cleaned
-    except Exception:
-        pass
+    for d in islice(_iter_lines(path), _TITLE_SCAN_LINES):
+        if d.get("type") != "user" or is_injected_user_row(d):
+            continue
+        content = (d.get("message") or {}).get("content", [])
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [c.get("text") or "" for c in content
+                     if isinstance(c, dict) and c.get("type") == "text"]
+        else:
+            continue
+        for raw in texts:
+            if not raw.strip() or is_injected_text(raw):
+                continue
+            cleaned = clean_user_text(raw)[:300]
+            if "<command-name>" in raw:
+                fallback = fallback or cleaned
+            else:
+                return cleaned
     return fallback
 
 
+@memo_by_file
 def _extract_model(path: Path) -> str:
-    try:
-        with path.open() as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if d.get("type") != "assistant":
-                    continue
-                return (d.get("message") or {}).get("model", "")
-    except Exception:
-        pass
+    """The model the session started on (transcripts.current_model is the one
+    it is on now)."""
+    for d in _iter_lines(path):
+        model = _row_model(d)
+        if model:
+            return model
     return ""
 
 
@@ -346,23 +244,9 @@ def _rg_search_sessions(query: str) -> dict[str, list[str]]:
 
     Returns {session_id: [snippet1, snippet2, ...]}.
     """
-    search_dirs: list[str] = []
-    if PROJECTS_DIR.exists():
-        search_dirs.append(str(PROJECTS_DIR))
-    codex_dir = HOME_BASE / ".codex" / "sessions"
-    if codex_dir.exists():
-        search_dirs.append(str(codex_dir))
-    if not search_dirs:
+    cmd = rg_command(query, "--max-count", "3", "-g", "!*subagents*", "--no-heading")
+    if not cmd:
         return {}
-    cmd = [
-        "rg", "-i", "-S",
-        "--max-count", "3",
-        "-g", "*.jsonl",
-        "-g", "!*.wakatime",
-        "-g", "!*subagents*",
-        "--no-heading",
-        query,
-    ] + search_dirs
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -374,50 +258,47 @@ def _rg_search_sessions(query: str) -> dict[str, list[str]]:
         colon = raw_line.find(".jsonl:")
         if colon < 0:
             continue
-        fpath = raw_line[:colon + 6]
+        sid = Path(raw_line[:colon + 6]).stem
         content = raw_line[colon + 7:]
-        sid = Path(fpath).stem
-        # Extract a human-readable snippet around the match
-        idx = content.lower().find(ql)
-        if idx < 0:
+        # rg took the query as a pattern; only a literal hit has a snippet.
+        if ql not in content.lower():
             continue
-        start = max(0, idx - 60)
-        end = min(len(content), idx + len(query) + 60)
-        snippet = content[start:end].replace("\n", " ").replace("\\n", " ").strip()
-        if start > 0:
-            snippet = "…" + snippet
-        if end < len(content):
-            snippet = snippet + "…"
-        if sid not in result:
-            result[sid] = []
-        if len(result[sid]) < 3:
-            result[sid].append(snippet)
+        snippets = result.setdefault(sid, [])
+        if len(snippets) < 3:
+            snippets.append(excerpt(content, query, tidy=_one_line))
     return result
 
 
-def list_sessions(
-    q: Optional[str] = None,
-    page: int = 1,
-    limit: int = 30,
-    include_alive: bool = True,
-    platform: Optional[str] = None,
-) -> dict:
+def _one_line(raw: str) -> str:
+    """A slice of a raw jsonl line as one line of text: real and escaped
+    newlines both read as spaces."""
+    return raw.replace("\n", " ").replace("\\n", " ").strip()
+
+
+def index() -> list[HistorySession]:
+    """Every past session, newest first (rebuilt at most every _CACHE_TTL
+    seconds). The sessions are shared, so callers must not change them.
+
+    The machine-local cwd visibility filter (CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE)
+    applies here, up front, so every consumer — the History panel, Skills/Memory
+    reverse-lookups + counts, and resume/fork (which resolve sessions through
+    here) — only ever sees and acts on visible projects."""
     global _cache, _cache_ts
     now = time.time()
     if now - _cache_ts > _CACHE_TTL or not _cache:
         _cache = _build_index()
         _cache_ts = now
-
-    # Apply the machine-local cwd visibility filter (CLAUDE_FLEET_CWD_INCLUDE/
-    # EXCLUDE) up front so every consumer — the History panel, Skills/Memory
-    # reverse-lookups + counts, and resume/fork (which resolve sessions through
-    # here) — only ever sees and acts on visible projects.
     from .sessions import _cwd_visible
-    filtered = [s for s in _cache if _cwd_visible(s.project)]
-    if not include_alive:
-        filtered = [s for s in filtered if not s.is_alive]
-    if platform:
-        filtered = [s for s in filtered if s.platform == platform]
+    return [s for s in _cache if _cwd_visible(s.project)]
+
+
+def get(session_id: str) -> Optional[HistorySession]:
+    """The visible session `session_id`, or None when the index doesn't know it."""
+    return next((s for s in index() if s.session_id == session_id), None)
+
+
+def list_sessions(q: Optional[str] = None, page: int = 1, limit: int = 30) -> dict:
+    filtered = index()
     rg_matches: dict[str, list[str]] = {}
     if q:
         ql = q.lower()

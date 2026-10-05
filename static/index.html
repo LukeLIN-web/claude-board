@@ -10,7 +10,7 @@
   [x-cloak] { display: none !important; }
   @keyframes pulse-red { 0%,100%{opacity:1} 50%{opacity:.5} }
   .pulse-red { animation: pulse-red 1.2s ease-in-out infinite; }
-  .status-busy, .triage-working { background-color: #10b981; }
+  .triage-working { background-color: #10b981; }
   .triage-waiting_perm { background-color: #ef4444; animation: pulse-red 1.2s ease-in-out infinite; }
   .triage-stalled { background-color: #f59e0b; }
   .triage-completed { background-color: #3b82f6; }
@@ -172,7 +172,7 @@
         <div class="border rounded text-xs"
              :class="sk.is_system ? 'border-purple-200 bg-purple-50/30' : ''">
           <div class="px-3 py-2 cursor-pointer hover:bg-gray-50 transition"
-               @click="toggleSkillExpand(sk.name)">
+               @click="toggleUsage('skills', sk.name)">
             <div class="flex items-center gap-2">
               <span class="text-gray-400 text-[10px] shrink-0"
                     x-text="expandedSkill === sk.name ? '▼' : '▶'"></span>
@@ -200,7 +200,7 @@
                    @click="openHistoryTimeline(row.session_id); showSkills = false">
                 <div class="flex items-center gap-1">
                   <span class="text-[9px] px-1 rounded text-white shrink-0"
-                        :class="row.platform==='codex' ? 'bg-green-500' : row.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                        :class="platformClass(row.platform)"
                         x-text="row.platform"></span>
                   <span class="text-gray-700 truncate flex-1" x-text="row.title"></span>
                   <span class="text-[10px] text-gray-500 shrink-0 font-mono">
@@ -234,7 +234,7 @@
             <div class="border rounded text-xs"
                  :class="m.in_memory_index ? 'border-emerald-200 bg-emerald-50/30' : ''">
               <div class="px-3 py-2 cursor-pointer hover:bg-gray-50"
-                   @click="toggleMemoryExpand(m.file_stem)">
+                   @click="toggleUsage('memory', m.file_stem)">
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-1 min-w-0">
                     <span class="text-gray-400 text-[10px] shrink-0"
@@ -258,7 +258,7 @@
                          @click="openHistoryTimeline(row.session_id); showMemory = false">
                       <div class="flex items-center gap-1">
                         <span class="text-[9px] px-1 rounded text-white shrink-0"
-                              :class="row.platform==='codex' ? 'bg-green-500' : row.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                              :class="platformClass(row.platform)"
                               x-text="row.platform"></span>
                         <span class="text-gray-700 truncate flex-1" x-text="row.title"></span>
                         <span class="font-mono text-[10px] shrink-0">
@@ -298,7 +298,7 @@
              @click="openTimelineForSession(hit.session_id)">
           <div class="flex items-center gap-2 text-xs text-gray-500">
             <span class="px-1 rounded text-white text-[10px]"
-                  :class="hit.platform==='codex' ? 'bg-green-500' : hit.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                  :class="platformClass(hit.platform)"
                   x-text="hit.platform"></span>
             <span x-text="fmtDateTimeET(hit.ts)" :title="hit.ts || ''"></span>
             <span class="bg-gray-100 rounded px-1" x-text="hit.project_slug?.slice(0,30)"></span>
@@ -332,7 +332,7 @@
             <span class="inline-block w-3 h-3 rounded-full shrink-0" :class="'triage-' + w.triage"></span>
             <span class="font-semibold text-sm truncate" x-text="w.name || w.first_input || w.project_name"></span>
             <span class="text-[10px] text-white px-1.5 rounded-full shrink-0 font-medium"
-                  :class="w.platform === 'codex' ? 'bg-green-500' : w.platform === 'hmz' ? 'bg-violet-500' : 'bg-blue-500'"
+                  :class="platformClass(w.platform)"
                   x-text="w.platform === 'codex' || w.platform === 'hmz' ? w.platform : 'cc'"></span>
             <span class="text-[10px] px-1.5 rounded-full text-white shrink-0" :class="'triage-' + w.triage"
                   x-text="w.triage"></span>
@@ -396,7 +396,7 @@
             </template>
             <template x-for="m in (w.memory_ops||[])" :key="m.name+m.operation">
               <span class="text-[10px] px-1.5 rounded"
-                    :class="m.operation === 'read' ? 'bg-sky-50 text-sky-600' : 'bg-pink-50 text-pink-600'"
+                    :class="memOpClass(m.operation)"
                     x-text="(m.operation === 'read' ? '↓' : '↑') + m.name"></span>
             </template>
           </div>
@@ -449,11 +449,7 @@
           </div>
         </div>
         <div class="px-4 pb-3 pt-1 flex gap-2 flex-wrap" @click.stop>
-          <button x-show="false" @click="focusWindow(w.key)"
-                  class="text-xs px-2 py-1 rounded border transition"
-                  :class="w.triage === 'waiting_perm' ? 'border-red-300 text-red-600 hover:bg-red-50 font-medium' : 'border-gray-200 text-gray-600 hover:bg-gray-100'">
-            Focus</button>
-          <button x-show="tmuxAvailable && w.platform !== 'codex' && w.platform !== 'hmz'" @click="sendReview(w.key)" :disabled="!!promptSending[w.key]"
+          <button x-show="tmuxAvailable && w.platform !== 'codex' && w.platform !== 'hmz'" @click="sendCanned(w.key, '/humanize:ask-codex review', 'Review')" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /humanize:ask-codex review to this session">
             Review</button>
@@ -463,14 +459,11 @@
           <button x-show="w.platform !== 'codex' && w.platform !== 'hmz'" @click="forkWindow(w.key)"
                   class="text-xs border border-green-200 text-green-600 px-2 py-1 rounded hover:bg-green-50 transition">
             Fork</button>
-          <button x-show="false" @click="exportWindow(w.key)"
-                  class="text-xs border border-gray-200 text-gray-600 px-2 py-1 rounded hover:bg-gray-100 transition">
-            Export</button>
           <button x-show="tmuxAvailable" @click="sendClear(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
             Clear</button>
-          <button x-show="tmuxAvailable" @click="sendCommit(w.key)" :disabled="!!promptSending[w.key]"
+          <button x-show="tmuxAvailable" @click="sendCanned(w.key, 'commit and push', 'Commit')" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Ask this session to commit and push">
             Commit</button>
@@ -544,8 +537,9 @@
       <h2 class="font-semibold flex items-center gap-2">
         <span x-text="timelineData?.project_name || timelineData?.project_slug || ''"></span>
         <span class="text-xs text-gray-400 font-normal" x-text="'session:' + (timelineData?.session_id || '').slice(0,8)"></span>
-        <span x-show="timelineData?.platform === 'codex'" class="text-[10px] bg-green-500 text-white px-1.5 rounded">codex</span>
-        <span x-show="timelineData?.platform === 'hmz'" class="text-[10px] bg-violet-500 text-white px-1.5 rounded">hmz</span>
+        <span x-show="timelineData?.platform && timelineData.platform !== 'claude'"
+              class="text-[10px] text-white px-1.5 rounded" :class="platformClass(timelineData?.platform)"
+              x-text="timelineData?.platform"></span>
       </h2>
       <div class="flex items-center gap-2">
         <!-- Assistant font-size adjuster -->
@@ -561,7 +555,7 @@
                 class="text-xs border border-purple-200 text-purple-600 px-2 py-1 rounded hover:bg-purple-50 transition"
                 :class="showPlanHistory ? 'bg-purple-50' : ''">
           Plan · <span x-text="timelineData?.plan_history?.length || 0"></span> 版本</button>
-        <button @click="expandedKey = null; expandedHistoryId = null; timelineData = null; planData = null"
+        <button @click="closeTimeline()"
                 class="text-gray-400 hover:text-gray-700 text-lg">&times;</button>
       </div>
     </div>
@@ -576,9 +570,12 @@
         <span class="text-xs text-gray-500" x-text="timelineData?.menu?.multi ? 'click options to toggle, then Continue →' : 'click an option (its number is sent to the menu)'"></span>
       </div>
       <div class="font-medium text-gray-800 mb-2" x-text="timelineData?.menu?.prompt"></div>
+      <!-- An option sends its number. Single-select: the digit selects + submits
+           immediately. multiSelect: it just toggles that option's checkbox,
+           and the refresh that follows redraws the state. -->
       <div class="space-y-1">
         <template x-for="opt in (timelineData?.menu?.options || [])" :key="opt.num">
-          <button @click="answerMenuKey(expandedKey, opt.num)"
+          <button @click="pressKey(expandedKey, [String(opt.num)])"
                   class="block w-full text-left border bg-white rounded px-2 py-1.5 hover:bg-gray-50 transition"
                   :class="timelineData?.menu?.kind === 'permission' ? 'border-red-200' : 'border-amber-200'">
             <span x-show="opt.checked !== undefined" class="mr-1" x-text="opt.checked ? '☑' : '☐'"></span>
@@ -590,15 +587,16 @@
       </div>
       <div class="flex items-center gap-2 mt-2 flex-wrap">
         <!-- Single-select / review: Enter confirms the highlighted option. -->
-        <button x-show="!timelineData?.menu?.multi" @click="answerQuestionSubmit(expandedKey)"
+        <button x-show="!timelineData?.menu?.multi" @click="pressKey(expandedKey, ['Enter'], { always: true })"
                 class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
           Submit (Enter)</button>
         <!-- multiSelect: Enter only TOGGLES the highlighted row, so advance with
-             Tab to the next question / the "Ready to submit" review screen. -->
-        <button x-show="timelineData?.menu?.multi" @click="answerMenuAdvance(expandedKey)"
+             Tab to the next question / the "Ready to submit" review screen
+             (which renders as a picker). -->
+        <button x-show="timelineData?.menu?.multi" @click="pressKey(expandedKey, ['Tab'], { always: true })"
                 class="text-xs border border-emerald-300 text-emerald-700 px-3 py-1 rounded hover:bg-emerald-50 transition">
           Continue → (Tab)</button>
-        <button @click="answerQuestionCancel(expandedKey)"
+        <button @click="pressKey(expandedKey, ['Escape'], { always: true })"
                 class="text-xs border border-gray-300 text-gray-600 px-3 py-1 rounded hover:bg-gray-100 transition">
           Cancel (Esc)</button>
         <button @click="refreshTimeline()"
@@ -660,7 +658,7 @@
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-2">
           <span class="font-semibold text-purple-800">Plan</span>
-          <button @click="showCurrentPlan(expandedKey || timelineData?.session_id)"
+          <button @click="showCurrentPlan()"
                   class="text-xs border border-purple-400 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100 font-medium"
                   :class="planData ? 'bg-purple-100' : ''">
             查看当前 plan
@@ -674,20 +672,19 @@
         <div class="flex items-center justify-between mb-2">
           <span class="font-medium text-purple-900 text-xs" x-text="planData?.plan?.name || ''"></span>
           <div class="flex gap-2">
-            <button @click="copyPlanContent()"
-                    class="text-xs border border-purple-300 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100"
-                    x-text="copyButtonText">Copy</button>
+            <button @click="copyText(planData?.plan?.content)"
+                    class="text-xs border border-purple-300 text-purple-700 px-2 py-0.5 rounded hover:bg-purple-100">Copy</button>
             <button @click="planData = null" class="text-purple-400 hover:text-purple-700">&times;</button>
           </div>
         </div>
         <textarea readonly class="w-full text-xs text-purple-900 max-h-80 font-mono p-2 border rounded bg-purple-50/30"
-                  rows="12" x-ref="planTextarea"
+                  rows="12"
                   x-text="planData?.plan?.content || ''"></textarea>
       </div>
       <div class="space-y-2 max-h-[40vh] overflow-y-auto">
         <template x-for="(ph, idx) in (timelineData?.plan_history||[]).slice().reverse()" :key="idx">
           <div class="border border-purple-200 rounded bg-white">
-            <div class="px-3 py-2 flex items-center justify-between cursor-pointer hover:bg-purple-25"
+            <div class="px-3 py-2 flex items-center justify-between cursor-pointer"
                  @click="ph._expanded = !ph._expanded">
               <div class="flex items-center gap-2">
                 <span class="font-mono text-purple-700 text-xs font-bold" x-text="ph.version_label"></span>
@@ -727,7 +724,7 @@
       </template>
       <template x-for="m in (timelineData?.memory_ops||[])" :key="'m'+m.name+m.operation">
         <span class="px-2 py-0.5 rounded cursor-pointer hover:opacity-80 transition"
-              :class="m.operation === 'read' ? 'bg-sky-100 text-sky-700 hover:bg-sky-200' : 'bg-pink-100 text-pink-700 hover:bg-pink-200'"
+              :class="memOpClass(m.operation)"
               @click="showMemoryDetail(m.name, m.operation)"
               x-text="(m.operation === 'read' ? 'mem↓ ' : 'mem↑ ') + m.name"></span>
       </template>
@@ -762,7 +759,6 @@
       </div>
       <template x-for="ev in visibleEvents" :key="ev._idx">
         <div :id="'tl-ev-'+ev._idx" class="text-sm border-l-2 pl-3 py-1"
-             x-show="ev.kind !== 'system'"
              :class="{
                'border-blue-400': ev.kind==='user_text' && !ev.extra?.pending,
                'border-orange-300 border-dashed': ev.extra?.pending,
@@ -774,7 +770,7 @@
                'border-pink-500': ev.kind==='memory_write',
                'border-violet-500': ev.kind==='model',
                'border-cyan-500': ev.kind==='recap',
-               'border-gray-300': ev.kind==='tool_result'||ev.kind==='system'
+               'border-gray-300': ev.kind==='tool_result'
              }">
           <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
             <span x-text="fmtTimeET(ev.ts)" :title="ev.ts || ''"></span>
@@ -950,7 +946,7 @@
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
               <span class="px-1 rounded text-white text-[10px]"
-                    :class="s.platform==='codex' ? 'bg-green-500' : s.platform==='opencode' ? 'bg-orange-500' : 'bg-blue-500'"
+                    :class="platformClass(s.platform)"
                     x-text="s.platform || 'claude'"></span>
               <span class="font-medium text-gray-800 truncate" x-text="s.first_input?.slice(0,80) || s.session_id.slice(0,8)"></span>
             </div>
@@ -965,7 +961,7 @@
               </template>
               <span x-show="(s.skills_used||[]).length > 3" class="text-gray-300" x-text="'+' + ((s.skills_used||[]).length - 3)"></span>
               <template x-for="m in (s.memory_ops||[]).slice(0,3)" :key="m.name+m.operation">
-                <span class="rounded px-1" :class="m.operation==='read' ? 'bg-sky-50 text-sky-600' : 'bg-pink-50 text-pink-600'"
+                <span class="rounded px-1" :class="memOpClass(m.operation)"
                       x-text="(m.operation==='read'?'↓':'↑')+m.name"></span>
               </template>
             </div>
@@ -1033,7 +1029,7 @@
 <div class="fixed bottom-4 right-4 z-50 space-y-2">
   <template x-for="t in toasts" :key="t.id">
     <div class="toast-enter bg-gray-900 text-white text-sm rounded-lg px-4 py-2 shadow-lg max-w-sm"
-         x-text="t.msg" x-show="true" x-transition></div>
+         x-text="t.msg"></div>
   </template>
 </div>
 
@@ -1062,6 +1058,13 @@
 // matches when searching.
 const HISTORY_LIMIT = 20;
 
+// Pin each card to a fixed position by creation time so panels never jump when
+// a session's status flips (working ↔ completed) — the server sorts by recent
+// activity, which reshuffles cards and is easy to misclick. started_at is
+// immutable per session; pid is the tiebreaker (and fallback for sessions with
+// no recorded start time).
+const byStartedAt = (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid;
+
 function fleet() {
   return {
     windows: [],
@@ -1072,6 +1075,9 @@ function fleet() {
     // This board's own host label, and the peer health rows it reports.
     localHost: '',
     peers: [],
+    // Every machine this board is showing, one row each (see _hostRows).
+    // Kept rather than derived on read: every card and the spawn picker ask.
+    hosts: [],
     searchQuery: '',
     searchResults: null,
     expandedKey: null,
@@ -1109,7 +1115,6 @@ function fleet() {
     memoryData: null,
     memoryDetail: null,
     showPlanHistory: false,
-    copyButtonText: 'Copy',
     expandedSkill: null,
     skillSessions: {},
     expandedMemory: null,
@@ -1149,7 +1154,7 @@ function fleet() {
     // Every machine this board is showing: its own first, then each configured
     // peer. Peers appear even while offline — a machine whose board died should
     // read as "no answer from 75", not quietly vanish from the header.
-    get hosts() {
+    _hostRows() {
       const counts = {};
       for (const w of this.windows) counts[w.host] = (counts[w.host] || 0) + 1;
       const rows = [{ host: this.localHost, online: true, error: null,
@@ -1161,17 +1166,19 @@ function fleet() {
       return rows.filter(r => r.host);
     },
 
+    // The distinct directories of the cards `keep` accepts, in card order.
+    _cwds(keep) {
+      const seen = new Set();
+      for (const w of this.windows) if (w.cwd && keep(w)) seen.add(w.cwd);
+      return [...seen];
+    },
     // Directories to offer when spawning. Scoped to the machine the spawn will
     // run on: another host's paths may not exist there, and a spawn into a
     // missing directory is a confusing failure.
     get recentCwds() {
       const host = this.spawnHost || this.localHost;
-      const seen = [];
-      for (const w of this.windows) {
-        if (this.hosts.length > 1 && w.host !== host) continue;
-        if (w.cwd && !seen.includes(w.cwd)) seen.push(w.cwd);
-      }
-      return seen;
+      const multi = this.hosts.length > 1;
+      return this._cwds(w => !multi || w.host === host);
     },
     // Other machines' card directories that the spawn host confirmed it has
     // (refreshSpawnDirs) — most live on the shared mount, so a fresh machine
@@ -1179,15 +1186,13 @@ function fleet() {
     get otherCwds() {
       const host = this.spawnHost || this.localHost;
       if (this.spawnOtherDirs.host !== host) return [];
-      return this.spawnOtherDirs.paths.filter(d => !this.recentCwds.includes(d));
+      const recent = new Set(this.recentCwds);
+      return this.spawnOtherDirs.paths.filter(d => !recent.has(d));
     },
     async refreshSpawnDirs() {
       if (this.hosts.length < 2) return;
       const host = this.spawnHost || this.localHost;
-      const paths = [];
-      for (const w of this.windows) {
-        if (w.host !== host && w.cwd && !paths.includes(w.cwd)) paths.push(w.cwd);
-      }
+      const paths = this._cwds(w => w.host !== host);
       const d = paths.length ? await this.apiPost('/api/spawn-dirs', { paths, host })
                              : { ok: true, paths: [] };
       // The answer is for the host asked; drop it if the picker moved on meanwhile.
@@ -1205,21 +1210,12 @@ function fleet() {
       const list = this.statusFilter
         ? base.filter(w => w.triage === this.statusFilter)
         : base;
-      // Pin each card to a fixed position by creation time so panels never
-      // jump when a session's status flips (working ↔ completed) — the server
-      // sorts by recent activity, which reshuffles cards and is easy to
-      // misclick. started_at is immutable per session; pid is the tiebreaker
-      // (and fallback for sessions with no recorded start time).
-      return list.slice().sort(
-        (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid
-      );
+      return list.slice().sort(byStartedAt);
     },
     // Internal `.slock` agent sub-sessions — rendered at the very bottom of the
     // page, separated from real user windows.
     get hiddenWindows() {
-      return this.windows.filter(w => w.hidden).slice().sort(
-        (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid
-      );
+      return this.windows.filter(w => w.hidden).sort(byStartedAt);
     },
 
     // The trailing slice of the open timeline that actually gets rendered.
@@ -1247,7 +1243,7 @@ function fleet() {
     },
 
     init() {
-      fetch('/api/windows').then(r => r.json()).then(d => this.applySnapshot(d));
+      this._fetchSnapshot();
       this.loadHistory();
       // ?snapshot renders a one-shot static view (no live SSE) — handy for
       // embeds and for headless screenshots.
@@ -1268,7 +1264,20 @@ function fleet() {
       // Poll the open live timeline every 2.5s. SSE only fires on state changes,
       // but a session can sit silently at a question/permission picker — polling
       // guarantees the menu (captured from the pane) shows up and stays current.
-      setInterval(() => { if (this.expandedKey !== null) this.refreshTimeline(); }, 2500);
+      // Not while the tab is hidden: nobody is reading it, and the first tick
+      // after the user comes back brings it current.
+      setInterval(() => {
+        if (this.expandedKey !== null && !document.hidden) this.refreshTimeline();
+      }, 2500);
+    },
+
+    // Fetch the card snapshot over a plain request and draw it. A failure is
+    // left for the stream or the next poll to make good.
+    async _fetchSnapshot() {
+      try {
+        const r = await fetch('/api/windows');
+        if (r.ok) this.applySnapshot(await r.json());
+      } catch (e) { /* transient; the next snapshot catches up */ }
     },
 
     // Open the snapshot stream that feeds the card list.
@@ -1304,8 +1313,9 @@ function fleet() {
           // EventSource hides the status code, so a stream dropped by an
           // expired auth cookie is indistinguishable from a network blip.
           // This probe goes through the wrapped fetch above, which turns a
-          // 401 into a redirect to the login page.
-          fetch('/api/windows').catch(() => {});
+          // 401 into a redirect to the login page — and otherwise brings the
+          // cards current while the stream reconnects.
+          this._fetchSnapshot();
           this._openEvents();
         }, 5000);
       };
@@ -1329,11 +1339,7 @@ function fleet() {
         this._snapshotPoll = setInterval(() => {
           // A backgrounded tab isn't being read; skip the round trip and let
           // the next tick after the user returns bring the cards current.
-          if (document.hidden) return;
-          fetch('/api/windows')
-            .then((r) => (r.ok ? r.json() : null))
-            .then((d) => { if (d) this.applySnapshot(d); })
-            .catch(() => { /* transient; next tick retries */ });
+          if (!document.hidden) this._fetchSnapshot();
         }, 3000);
       }, ms);
     },
@@ -1355,6 +1361,7 @@ function fleet() {
         if (!this.spawnHost) this.spawnHost = snap.host;
       }
       this.peers = snap.peers || [];
+      this.hosts = this._hostRows();
       this.counts = snap.counts || this.counts;
       if ('tmux_available' in snap) this.tmuxAvailable = !!snap.tmux_available;
       // If a live session's timeline is open and its activity advanced (the
@@ -1375,19 +1382,21 @@ function fleet() {
     async refreshTimeline() {
       const key = this.expandedKey;
       if (key === null) return;
-      const el = this.$refs.eventsList;
-      const stick = !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 60;
       try {
         const r = await fetch(`/api/windows/${key}/timeline`);
         if (!r.ok) return;
-        const data = await r.json();
+        const txt = await r.text();
         if (this.expandedKey !== key) return; // user navigated away mid-fetch
         // Skip the re-render when nothing changed — the poller calls this every
         // few seconds, and reassigning would flicker the list and fight scroll.
-        const sig = JSON.stringify(data);
-        if (sig === this._timelineSig) return;
-        this._timelineSig = sig;
-        this.timelineData = data;
+        // Compared as the raw response: no need to parse a timeline only to
+        // find it unchanged.
+        if (txt === this._timelineSig) return;
+        // Where the reader is scrolled, taken before the new rows go in.
+        const el = this.$refs.eventsList;
+        const stick = !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 60;
+        this._timelineSig = txt;
+        this.timelineData = JSON.parse(txt);
         if (stick) {
           this.$nextTick(() => {
             const e = this.$refs.eventsList; if (e) e.scrollTop = e.scrollHeight;
@@ -1407,6 +1416,16 @@ function fleet() {
         const e = this.$refs.eventsList;
         if (e && fromBottom !== null) e.scrollTop = e.scrollHeight - fromBottom;
       });
+    },
+
+    // Badge colour for a session's platform, the same on cards, the timeline,
+    // history, search and the Skills/Memory session lists.
+    platformClass(p) {
+      return { codex: 'bg-green-500', hmz: 'bg-violet-500', opencode: 'bg-orange-500' }[p] || 'bg-blue-500';
+    },
+    // Tag colour for a memory read (↓) vs a write or edit (↑).
+    memOpClass(op) {
+      return op === 'read' ? 'bg-sky-50 text-sky-600' : 'bg-pink-50 text-pink-600';
     },
 
     formatIdle(seconds) {
@@ -1470,6 +1489,26 @@ function fleet() {
       }
     },
 
+    // POST one action and toast how it went: `ok` on success — a string, or a
+    // function of the response for a toast that reports what came back — and
+    // `fail` + the error otherwise. With `busy` (a per-card flag map) and `key`,
+    // the action is skipped while that card's flag is up and holds it until
+    // the answer is in, so a double click sends once and the button can show
+    // it's working. Resolves to the response.
+    async act(url, { body, ok, fail, busy, key } = {}) {
+      if (busy) {
+        if (busy[key]) return;
+        busy[key] = true;
+      }
+      try {
+        const d = await this.apiPost(url, body);
+        this.toast(d.ok ? (typeof ok === 'function' ? ok(d) : ok) : fail + (d.error || ''));
+        return d;
+      } finally {
+        if (busy) busy[key] = false;
+      }
+    },
+
     // Convert a UTC ISO timestamp to US Eastern time (America/New_York, DST-aware).
     // The transcript stores ts as UTC ISO-8601; raw string-slicing would show UTC.
     // Falls back to the original string slice if the value can't be parsed.
@@ -1526,9 +1565,9 @@ function fleet() {
       else this.toast('Dismiss failed: ' + (d.error || ''));
     },
 
-    async forkWindow(key) {
-      const d = await this.apiPost(`/api/windows/${key}/fork`);
-      this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
+    forkWindow(key) {
+      return this.act(`/api/windows/${key}/fork`,
+                      { ok: 'Forked → new session (inherits history)', fail: 'Fork failed: ' });
     },
 
     async spawnSession() {
@@ -1583,28 +1622,19 @@ function fleet() {
       return '';
     },
 
-    async sendClear(key) {
-      if (this.promptSending[key]) return;
-      this.promptSending[key] = true;
+    sendClear(key) {
       // Dedicated endpoint: sends /clear AND (for Codex, whose /clear leaves the
       // rollout file intact) blanks the card's pre-clear preview server-side.
-      try {
-        const d = await this.apiPost(`/api/windows/${key}/clear`);
-        this.toast(d.ok ? 'Sent /clear' : 'Clear failed: ' + (d.error || ''));
-      } finally {
-        this.promptSending[key] = false;
-      }
+      return this.act(`/api/windows/${key}/clear`,
+                      { ok: 'Sent /clear', fail: 'Clear failed: ', busy: this.promptSending, key });
     },
 
-    async sendCommit(key) {
-      if (this.promptSending[key]) return;
-      this.promptSending[key] = true;
-      try {
-        const d = await this.apiPost(`/api/windows/${key}/prompt`, { text: 'commit and push' });
-        this.toast(d.ok ? 'Sent commit and push' : 'Commit failed: ' + (d.error || ''));
-      } finally {
-        this.promptSending[key] = false;
-      }
+    // A card button's canned prompt (Commit, Review), held under the same
+    // per-card flag as Send so it can't interleave with a typed prompt.
+    sendCanned(key, text, what) {
+      return this.act(`/api/windows/${key}/prompt`,
+                      { body: { text }, ok: 'Sent ' + text, fail: what + ' failed: ',
+                        busy: this.promptSending, key });
     },
 
     // The select snaps back to its idle option, which carries w.model_label — the
@@ -1634,124 +1664,83 @@ function fleet() {
       return (w.model ? 'Running on ' + w.model + '. ' : (w.model_source === 'banner' ? 'On ' + w.model_label + ', per the banner it printed at startup / after /clear — it has not answered since. ' : ''))
         + 'Switch this session\'s model (this session only — your default for new sessions is untouched). Shows the model that last answered; before its first reply, the one its welcome banner names.';
     },
-    async switchModel(w, pick) {
+    switchModel(w, pick) {
       if (!pick) return;
       const key = w.key;
-      if (this.promptSending[key]) return;
       // 'model:gpt-5.6-sol' / 'effort:high' / 'model:opus' — one field per pick,
       // the other left to the session (see actions._switch_codex_model).
       const i = pick.indexOf(':');
       const kind = pick.slice(0, i), name = pick.slice(i + 1);
       const body = kind === 'effort' ? { effort: name } : { model: name };
-      this.promptSending[key] = true;
-      try {
-        const d = await this.apiPost(`/api/windows/${key}/model`, body);
-        // d.model is the row that was committed — "Opus (1M context)" where the
-        // alias only said "opus", "gpt-5.6-sol high" where only one of the two
-        // was picked — which the card's label can't say on its own.
-        const scope = w.platform === 'codex' ? 'also the new default in ~/.codex/config.toml' : 'this session only';
-        this.toast(d.ok ? `Model → ${d.model || name} (${scope})` : 'Model switch failed: ' + (d.error || ''));
-      } finally {
-        this.promptSending[key] = false;
-      }
+      // d.model is the row that was committed — "Opus (1M context)" where the
+      // alias only said "opus", "gpt-5.6-sol high" where only one of the two
+      // was picked — which the card's label can't say on its own.
+      const scope = w.platform === 'codex' ? 'also the new default in ~/.codex/config.toml' : 'this session only';
+      return this.act(`/api/windows/${key}/model`,
+                      { body, ok: (d) => `Model → ${d.model || name} (${scope})`,
+                        fail: 'Model switch failed: ', busy: this.promptSending, key });
     },
 
-    async sendReview(key) {
-      if (this.promptSending[key]) return;
-      this.promptSending[key] = true;
-      try {
-        const d = await this.apiPost(`/api/windows/${key}/prompt`, { text: '/humanize:ask-codex review' });
-        this.toast(d.ok ? 'Sent /humanize:ask-codex review' : 'Review failed: ' + (d.error || ''));
-      } finally {
-        this.promptSending[key] = false;
-      }
+    respondPermission(key, choice) {
+      return this.act(`/api/windows/${key}/permission`,
+                      { body: { choice }, ok: choice === 'approve' ? 'Approved' : 'Sent',
+                        fail: 'Permission failed: ', busy: this.permSending, key });
     },
 
-    async respondPermission(key, choice) {
-      if (this.permSending[key]) return;
-      this.permSending[key] = true;
-      const labels = { approve: 'Approved', approve_always: 'Approved (always)', deny: 'Denied' };
-      try {
-        const d = await this.apiPost(`/api/windows/${key}/permission`, { choice });
-        this.toast(d.ok ? (labels[choice] || 'Sent') : 'Permission failed: ' + (d.error || ''));
-      } finally {
-        this.permSending[key] = false;
-      }
-    },
-
-    async sendKeys(key, keys) {
+    // Press `keys` in the session's pane, then pull the screen state that
+    // follows (next question, toggled checkbox, menu gone) 400ms later. `sent`
+    // toasts a press that landed; `always` refreshes after a failed one too.
+    async pressKey(key, keys, { sent, always } = {}) {
       const d = await this.apiPost(`/api/windows/${key}/keys`, { keys });
       if (!d.ok) this.toast('Failed: ' + (d.error || ''));
-      return d.ok;
+      else if (sent) this.toast(sent);
+      if (d.ok || always) setTimeout(() => this.refreshTimeline(), 400);
     },
-    // Press an option's number key in the live menu (question or permission).
-    // Single-select: the digit selects + submits immediately. multiSelect: the
-    // digit just toggles that option's checkbox, so refresh to redraw the state.
-    async answerMenuKey(key, n) {
-      if (await this.sendKeys(key, [String(n)])) {
-        // Pull the next screen state (next question, toggled state, or menu gone).
-        setTimeout(() => this.refreshTimeline(), 400);
-      }
-    },
-    // multiSelect advance: Enter only toggles a row, so Tab moves on to the next
-    // question / the "Ready to submit" review screen (which renders as a picker).
-    answerMenuAdvance(key) { this.sendKeys(key, ['Tab']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
-    answerQuestionSubmit(key) { this.sendKeys(key, ['Enter']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
-    answerQuestionCancel(key) { this.sendKeys(key, ['Escape']).then(() => setTimeout(() => this.refreshTimeline(), 400)); },
     // Interrupt whatever the session is doing — same as pressing Esc in the terminal.
-    async sendEscape(key) {
-      if (await this.sendKeys(key, ['Escape'])) {
-        this.toast('Esc sent');
-        setTimeout(() => this.refreshTimeline(), 400);
-      }
+    sendEscape(key) {
+      return this.pressKey(key, ['Escape'], { sent: 'Esc sent' });
     },
 
-    async closeWindow(key) {
-      const d = await this.apiPost(`/api/windows/${key}/close`);
-      this.toast(d.ok ? 'Closed ' + (d.name || key) : 'Failed: ' + (d.error || ''));
+    closeWindow(key) {
+      return this.act(`/api/windows/${key}/close`,
+                      { ok: (d) => 'Closed ' + (d.name || key), fail: 'Failed: ' });
     },
 
-    async exportWindow(key) {
-      this.toast('Exporting...');
-      const d = await this.apiPost(`/api/windows/${key}/export`);
-      if (d.ok && d.doc_url) {
-        this.toast('Exported: ' + d.doc_url);
-        window.open(d.doc_url, '_blank');
-      } else if (d.ok) {
-        this.toast('Exported: ' + (d.title || ''));
-      } else {
-        this.toast('Export failed: ' + (d.stderr || d.error || ''));
-      }
-    },
-
-    async toggleExpand(key) {
-      if (this.expandedKey === key) {
-        this.expandedKey = null; this.expandedUpdatedAt = null;
-        this.timelineData = null; this.planData = null;
-        return;
-      }
-      this.expandedKey = key;
-      this.expandedHistoryId = null;
+    // A different session is going into the timeline panel: drop the view
+    // state that belonged to the last one.
+    _resetTimeline() {
       this.planData = null;
-      this.showPlanHistory = false;
       this.timelineWindow = 200; // fresh session: back to the trailing window
       this.eventExpanded = {};   // indices belong to the old session's events
-      // Baseline the activity marker so the next bump (assistant reply, tool
-      // call) triggers an auto-refresh via applySnapshot.
-      this.expandedUpdatedAt = this.windows.find((w) => w.key === key)?.updated_at ?? null;
-      this._timelineSig = null; // force first poll/refresh to render this session
-      const r = await fetch(`/api/windows/${key}/timeline`);
-      this.timelineData = await r.json();
-      this._timelineSig = JSON.stringify(this.timelineData);
+      this._timelineSig = null;  // force the first refresh to render this session
+    },
+    closeTimeline() {
+      this.expandedKey = null; this.expandedHistoryId = null; this.expandedUpdatedAt = null;
+      this.timelineData = null; this.planData = null;
+    },
+    // Bring the freshly loaded panel into view, scrolled to its newest event.
+    _revealTimeline() {
       this.$nextTick(() => {
         this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         const el = this.$refs.eventsList; if (el) el.scrollTop = el.scrollHeight;
       });
     },
 
-    async loadPlan(key) {
-      const r = await fetch(`/api/windows/${key}/plan`);
-      this.planData = await r.json();
+    async toggleExpand(key) {
+      if (this.expandedKey === key) { this.closeTimeline(); return; }
+      this._resetTimeline();
+      this.showPlanHistory = false;
+      this.expandedKey = key;
+      this.expandedHistoryId = null;
+      // Baseline the activity marker so the next bump (assistant reply, tool
+      // call) triggers an auto-refresh via applySnapshot.
+      this.expandedUpdatedAt = this.windows.find((w) => w.key === key)?.updated_at ?? null;
+      await this.refreshTimeline();
+      // Nothing rendered (the fetch failed): don't leave the last session's
+      // timeline, and its menu buttons, standing under this card's key. The
+      // poll keeps trying.
+      if (this.expandedKey === key && this._timelineSig === null) this.timelineData = null;
+      this._revealTimeline();
     },
 
     async openTimelineForSession(sessionId) {
@@ -1785,36 +1774,29 @@ function fleet() {
     },
 
     async openHistoryTimeline(sessionId) {
+      this._resetTimeline();
       this.expandedKey = null;
       this.expandedHistoryId = sessionId;
-      this.planData = null;
-      this.timelineWindow = 200;
-      this.eventExpanded = {};
       const r = await fetch(`/api/history/${sessionId}/timeline`);
       if (r.ok) {
         this.timelineData = await r.json();
-        this.$nextTick(() => {
-          this.$refs.timelinePanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          const el = this.$refs.eventsList; if (el) el.scrollTop = el.scrollHeight;
-        });
+        this._revealTimeline();
       } else {
         this.toast('No transcript for this session');
         this.expandedHistoryId = null;
       }
     },
 
-    async resumeSession(s) {
-      const d = await this.apiPost(`/api/history/${s.session_id}/resume`);
-      if (d.ok) {
-        this.toast(d.action === 'focused' ? 'Focused existing window' : 'Resumed session');
-      } else {
-        this.toast('Resume failed: ' + (d.error || ''));
-      }
+    resumeSession(s) {
+      return this.act(`/api/history/${s.session_id}/resume`, {
+        ok: (d) => d.action === 'focused' ? 'Focused existing window' : 'Resumed session',
+        fail: 'Resume failed: ',
+      });
     },
 
-    async forkHistorySession(s) {
-      const d = await this.apiPost(`/api/history/${s.session_id}/fork`);
-      this.toast(d.ok ? 'Forked → new session (inherits history)' : 'Fork failed: ' + (d.error || ''));
+    forkHistorySession(s) {
+      return this.act(`/api/history/${s.session_id}/fork`,
+                      { ok: 'Forked → new session (inherits history)', fail: 'Fork failed: ' });
     },
 
     scrollToSkill(skillName) {
@@ -1852,7 +1834,7 @@ function fleet() {
       }
     },
 
-    async showCurrentPlan(pidOrSid) {
+    async showCurrentPlan() {
       // For active windows use /api/windows/{pid}/plan; for history sessions
       // fall back to scanning plan_history for the latest write content.
       if (this.expandedKey) {
@@ -1872,46 +1854,39 @@ function fleet() {
     },
 
     async copyText(text) {
+      text = text || '';
       try {
-        await navigator.clipboard.writeText(text || '');
-        this.toast('Copied to clipboard');
-      } catch(e) {
-        this.toast('Copy failed: ' + e.message);
+        await navigator.clipboard.writeText(text);
+      } catch (e) {
+        // navigator.clipboard only exists in a secure context, so on a board
+        // reached over plain http (a LAN address) it is undefined. Copy the
+        // old way instead: select a throwaway textarea and execCommand.
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch { /* reported below */ }
+        ta.remove();
+        if (!copied) { this.toast('Copy failed: ' + e.message); return; }
       }
+      this.toast('Copied to clipboard');
     },
 
-    async copyPlanContent() {
-      const txt = this.planData?.plan?.content || '';
-      try {
-        await navigator.clipboard.writeText(txt);
-        this.copyButtonText = 'Copied ✓';
-        setTimeout(() => { this.copyButtonText = 'Copy'; }, 2000);
-      } catch(e) {
-        // Fallback: select textarea
-        const ta = this.$refs.planTextarea;
-        if (ta) { ta.select(); document.execCommand('copy'); }
-        this.copyButtonText = 'Copied (fallback)';
-        setTimeout(() => { this.copyButtonText = 'Copy'; }, 2000);
-      }
-    },
-
-    async toggleSkillExpand(name) {
-      if (this.expandedSkill === name) { this.expandedSkill = null; return; }
-      this.expandedSkill = name;
-      if (!this.skillSessions[name]) {
-        const r = await fetch(`/api/skills/${encodeURIComponent(name)}/sessions`);
+    // Expand a Skills (`kind` 'skills') or Memory ('memory') row, loading the
+    // sessions that touched it the first time it opens.
+    async toggleUsage(kind, name) {
+      const [open, cache] = kind === 'skills' ? ['expandedSkill', 'skillSessions']
+                                              : ['expandedMemory', 'memorySessions'];
+      if (this[open] === name) { this[open] = null; return; }
+      this[open] = name;
+      if (!this[cache][name]) {
+        const r = await fetch(`/api/${kind}/${encodeURIComponent(name)}/sessions`);
         const d = await r.json();
-        this.skillSessions[name] = d.sessions || [];
-      }
-    },
-
-    async toggleMemoryExpand(name) {
-      if (this.expandedMemory === name) { this.expandedMemory = null; return; }
-      this.expandedMemory = name;
-      if (!this.memorySessions[name]) {
-        const r = await fetch(`/api/memory/${encodeURIComponent(name)}/sessions`);
-        const d = await r.json();
-        this.memorySessions[name] = d.sessions || [];
+        this[cache][name] = d.sessions || [];
       }
     },
 

@@ -67,11 +67,6 @@ def _pane_text(live: Live) -> str:
     return tmux.capture_pane(live.pane).get("text", "")
 
 
-def _display(pane: str, fmt: str) -> str:
-    r = tmux._run("display-message", "-p", "-t", pane, fmt)
-    return r["stdout"].strip() if r["ok"] else ""
-
-
 def _composer(live: Live) -> str:
     text = _pane_text(live)
     return text if "❯" in text and not actions._trust_prompt_painting(text) else ""
@@ -115,8 +110,9 @@ def _spawn(cwd: str, version: str) -> Live:
     assert r["ok"], f"spawn failed: {r}"
     pane = r["pane_id"]
     trust = actions.confirm_trust_prompt(pane)
-    return Live(pane=pane, pid=int(_display(pane, "#{pane_pid}") or 0),
-                tty=_display(pane, "#{pane_tty}"), cwd=cwd, version=version, trust=trust)
+    return Live(pane=pane, pid=int(tmux._display(pane, "#{pane_pid}") or 0),
+                tty=tmux._display(pane, "#{pane_tty}") or "", cwd=cwd, version=version,
+                trust=trust)
 
 
 def _close(live: Live) -> None:

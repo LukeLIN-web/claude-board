@@ -37,10 +37,28 @@ _cache: dict[str, list[dict]] = {}
 # max+1, so two writers racing (watcher thread vs. a btwcapture thread) could
 # otherwise mint the same id and dismiss() would then hide both entries.
 _lock = threading.Lock()
+# session_id -> (the _cache list it was built from, entries() of it). entries()
+# runs on every poll — latest() for the card, has_slice() for the capture gate —
+# and re-ranks the whole log each time, though the log only changes through
+# record()/dismiss(), which drop the session's entry here. Holding the source
+# list too means a log re-read from disk is never answered from a stale build.
+_entries_cache: dict[str, tuple[list[dict], list[dict]]] = {}
+_ENTRIES_CACHE_MAX = 256  # sessions; the oldest build is dropped past this
 
 
 def _path(session_id: str) -> Path:
     return _DIR / f"{session_id}.jsonl"
+
+
+def _append(session_id: str, obj: dict) -> None:
+    """Append one line to the session's log; a disk failure degrades to
+    in-memory only."""
+    try:
+        _DIR.mkdir(parents=True, exist_ok=True)
+        with _path(session_id).open("a") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def _load(session_id: str) -> list[dict]:
@@ -94,12 +112,8 @@ def record(session_id: str, question: str, answer: str) -> Optional[dict]:
         next_id = max((e.get("id") or 0 for e in items), default=0) + 1
         entry = {"id": next_id, "ts": time.time(), "question": q, "answer": a}
         items.append(entry)
-        try:
-            _DIR.mkdir(parents=True, exist_ok=True)
-            with _path(session_id).open("a") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass  # disk failure degrades to in-memory only
+        _entries_cache.pop(session_id, None)
+        _append(session_id, entry)
     return entry
 
 
@@ -167,12 +181,8 @@ def dismiss(session_id: str, entry_id: int) -> bool:
                 hit = True
         if not hit:
             return False
-        try:
-            _DIR.mkdir(parents=True, exist_ok=True)
-            with _path(session_id).open("a") as f:
-                f.write(json.dumps({"dismiss": entry_id}) + "\n")
-        except Exception:
-            pass  # disk failure degrades to in-memory only
+        _entries_cache.pop(session_id, None)
+        _append(session_id, {"dismiss": entry_id})
     return True
 
 
@@ -214,17 +224,29 @@ def entries(session_id: str) -> list[dict]:
     first is dismissed), so they collapse to the single best-looking capture; the
     log keeps them all, because which capture is best is only decidable once the
     later ones exist. An aside the reader dismissed stays dismissed whichever of
-    its captures was on the card at the time."""
-    items = _load(session_id) if session_id else []
-    out: list[dict] = []
-    run: list[dict] = []
-    for e in items:
-        if run and _fingerprint(run[-1].get("question")) != _fingerprint(e.get("question")):
+    its captures was on the card at the time.
+
+    The returned list is shared between calls (see _entries_cache): read it,
+    never mutate it."""
+    if not session_id:
+        return []
+    with _lock:
+        items = _load(session_id)
+        built = _entries_cache.get(session_id)
+        if built is not None and built[0] is items:
+            return built[1]
+        out: list[dict] = []
+        run: list[dict] = []
+        for e in items:
+            if run and _fingerprint(run[-1].get("question")) != _fingerprint(e.get("question")):
+                out.append(_pick(run))
+                run = []
+            run.append(e)
+        if run:
             out.append(_pick(run))
-            run = []
-        run.append(e)
-    if run:
-        out.append(_pick(run))
+        _entries_cache[session_id] = (items, out)
+        if len(_entries_cache) > _ENTRIES_CACHE_MAX:
+            _entries_cache.pop(next(iter(_entries_cache)))
     return out
 
 
@@ -234,20 +256,6 @@ def _pick(run: list[dict]) -> dict:
     if not best.get("dismissed") and any(e.get("dismissed") for e in run):
         best = {**best, "dismissed": True}
     return best
-
-
-def clear(session_id: str) -> None:
-    """Drop a session's archive (memory + disk). Not called on idle — the archive
-    is meant to outlive the session; provided for explicit resets."""
-    if not session_id:
-        return
-    _cache.pop(session_id, None)
-    try:
-        _path(session_id).unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
 
 
 def _iso(ts: float) -> str:

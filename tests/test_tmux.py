@@ -39,6 +39,46 @@ def _patch_run(side_effect=None, **proc_kwargs):
     return mock.patch.object(tmux.subprocess, "run", return_value=FakeProc(**proc_kwargs))
 
 
+def _recorder(calls, **proc):
+    """A subprocess.run stand-in that appends each argv to `calls` and answers
+    every call with the same FakeProc(**proc)."""
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return FakeProc(**proc)
+    return fake_run
+
+
+def _server(calls=None, *, sessions=("alpha",), pane="%9", panes=None,
+            in_mode=False, window_error=None):
+    """A fake tmux server for new_window, recording each argv into `calls`.
+
+    `sessions` is what list-sessions shows (none: no server is running yet);
+    `pane` is the id a new window or session reports; `panes`, when given, is
+    what list-panes prints; `in_mode` opens that pane in view-mode;
+    `window_error` makes new-window / new-session fail with that stderr.
+    """
+    def fake_run(argv, **kw):
+        if calls is not None:
+            calls.append(argv)
+        if "list-sessions" in argv:
+            if not sessions:
+                return FakeProc(returncode=1, stderr="no server")
+            return FakeProc(stdout="".join(f"{s}\n" for s in sessions))
+        if "list-panes" in argv and panes is not None:
+            return FakeProc(stdout=panes)
+        if "#{pane_in_mode}" in argv:
+            return FakeProc(stdout="1\n" if in_mode else "0\n")
+        if window_error and ("new-window" in argv or "new-session" in argv):
+            return FakeProc(returncode=1, stderr=window_error)
+        return FakeProc(stdout=f"{pane}\n")
+    return fake_run
+
+
+def _argv(calls, command):
+    """The first recorded tmux argv that runs `command`."""
+    return next(a for a in calls if command in a)
+
+
 # Stand-in for the resolved CLI. new_window launches by absolute path, so argv
 # assertions would otherwise read whatever `claude` this machine has installed —
 # or fail outright on one that has none.
@@ -50,9 +90,6 @@ def _pin_cli(path=_EXE):
 
 
 class RunHelperTests(unittest.TestCase):
-    def setUp(self):
-        tmux._clear_caches()
-
     def test_run_returns_structured_schema_on_success(self):
         with _patch_run(returncode=0, stdout="hi", stderr=""):
             r = tmux._run("display-message", "-p", "x")
@@ -93,9 +130,6 @@ class RunHelperTests(unittest.TestCase):
 class SocketArgsTests(unittest.TestCase):
     """FLEET_TMUX_SOCKET routes every call to an isolated tmux server."""
 
-    def setUp(self):
-        tmux._clear_caches()
-
     def test_run_injects_socket_before_command(self):
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board"}, clear=True):
             with _patch_run(returncode=0) as m:
@@ -122,29 +156,25 @@ class SocketArgsTests(unittest.TestCase):
         # out of sessions[0] on that server, so cards land wherever that server
         # already hosts, not a hard-coded name.
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="beauty\n")
-            return FakeProc(returncode=0, stdout="%3\n")
-
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board"}, clear=True), \
              _pin_cli(), mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)), \
              mock.patch.object(tmux, "pane_alive", return_value=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls, sessions=["beauty"], pane="%3")):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
-        list_argv = [a for a in calls if "list-sessions" in a][0]
-        self.assertEqual(list_argv[:3], ["tmux", "-L", "board"])
-        new_win_argv = [a for a in calls if "new-window" in a][0]
+        self.assertEqual(_argv(calls, "list-sessions")[:3], ["tmux", "-L", "board"])
+        new_win_argv = _argv(calls, "new-window")
         self.assertEqual(new_win_argv[:4], ["tmux", "-L", "board", "new-window"])
         self.assertIn("beauty", new_win_argv)  # sessions[0], not a pin
 
 
+# Only available() and pane_for_tty() read tmux's module caches, so only their
+# classes reset them: before each test, and after, so what a test cached never
+# reaches the next class.
 class AvailableTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
+        self.addCleanup(tmux._clear_caches)
 
     def test_available_true_when_tmux_env_set(self):
         with mock.patch.dict("os.environ", {"TMUX": "/tmp/tmux-1/default,123,0"}):
@@ -173,21 +203,15 @@ class AvailableTests(unittest.TestCase):
 
 
 class ListPanesTests(unittest.TestCase):
-    def setUp(self):
-        tmux._clear_caches()
-
     def test_list_panes_parses_tab_format(self):
-        out = "%5\t/dev/pts/3\twork\t/home/u/proj\n%6\t/dev/pts/9\tmain\t/tmp\n"
+        out = "%5\t/dev/pts/3\n%6\t/dev/pts/9\n"
         with _patch_run(returncode=0, stdout=out) as m:
             panes = tmux.list_panes()
         argv = m.call_args[0][0]
         self.assertIn("list-panes", argv)
         self.assertIn("-a", argv)
         self.assertEqual(len(panes), 2)
-        self.assertEqual(
-            panes[0],
-            {"pane_id": "%5", "tty": "/dev/pts/3", "session": "work", "path": "/home/u/proj"},
-        )
+        self.assertEqual(panes[0], {"pane_id": "%5", "tty": "/dev/pts/3"})
 
     def test_list_panes_returns_empty_on_error(self):
         with _patch_run(side_effect=FileNotFoundError("tmux")):
@@ -197,6 +221,7 @@ class ListPanesTests(unittest.TestCase):
 class PaneForTtyTests(unittest.TestCase):
     def setUp(self):
         tmux._clear_caches()
+        self.addCleanup(tmux._clear_caches)
         self._out = "%5\t/dev/pts/3\twork\t/home/u/proj\n"
 
     def test_matches_with_dev_prefix(self):
@@ -216,10 +241,20 @@ class PaneForTtyTests(unittest.TestCase):
             self.assertIsNone(tmux.pane_for_tty(""))
             self.assertIsNone(tmux.pane_for_tty("   "))
 
+    def test_hit_reuses_the_listing_and_a_miss_relists(self):
+        # Every card resolves its pane on every poll; a fresh listing each time
+        # was a `list-panes` fork per card. A miss must still re-list, or a
+        # pane spawned since the last listing would read as missing.
+        with _patch_run(returncode=0, stdout=self._out) as m:
+            self.assertEqual(tmux.pane_for_tty("/dev/pts/3"), "%5")
+            self.assertEqual(tmux.pane_for_tty("pts/3"), "%5")
+            self.assertEqual(m.call_count, 1)
+            self.assertIsNone(tmux.pane_for_tty("pts/99"))
+            self.assertEqual(m.call_count, 2)
+
 
 class NewWindowTests(unittest.TestCase):
     def setUp(self):
-        tmux._clear_caches()
         # Pin what the argv assertions below see. The post-spawn liveness probe
         # is SpawnLandedTests' subject, not theirs — stubbed here so it neither
         # sleeps nor needs every fake to model `list-panes`.
@@ -231,20 +266,12 @@ class NewWindowTests(unittest.TestCase):
 
     def test_argv_uses_env_target(self):
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="mysess\nother\n")
-            return FakeProc(returncode=0, stdout="%12\n")
-
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "mysess"}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls, sessions=["mysess", "other"], pane="%12")):
                 r = tmux.new_window("/home/u/proj")
-        new_win_argv = [a for a in calls if "new-window" in a][0]
         self.assertEqual(
-            new_win_argv,
+            _argv(calls, "new-window"),
             ["tmux", "new-window", "-P", "-F", "#{pane_id}",
              "-t", "mysess", "-c", "/home/u/proj",
              _EXE, "--dangerously-skip-permissions"],
@@ -254,34 +281,19 @@ class NewWindowTests(unittest.TestCase):
 
     def test_falls_back_to_first_listed_session(self):
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="alpha\nbeta\n")
-            return FakeProc(returncode=0, stdout="%20\n")
-
         with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls, sessions=["alpha", "beta"], pane="%20")):
                 r = tmux.new_window("/tmp")
-        new_win_argv = [a for a in calls if "new-window" in a][0]
-        self.assertIn("alpha", new_win_argv)
+        self.assertIn("alpha", _argv(calls, "new-window"))
         self.assertTrue(r["ok"])
 
     def test_cold_start_creates_session_instead_of_new_window(self):
         # Zero sessions: must bootstrap a host session running cmd directly,
         # not dead-end. new-window has nothing to attach to.
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=1, stdout="", stderr="no server")
-            return FakeProc(returncode=0, stdout="%1\n")
-
         with mock.patch.dict("os.environ", {}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls, sessions=(), pane="%1")):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%1")
@@ -289,10 +301,8 @@ class NewWindowTests(unittest.TestCase):
         # The server must be started in its own call *before* new-session, so a
         # cold-start new-session only attaches and never forks the daemon under
         # our captured pipe (the "Spawning…" hang). Order matters.
-        start_idx = next(i for i, a in enumerate(calls) if "start-server" in a)
-        new_sess_idx = next(i for i, a in enumerate(calls) if "new-session" in a)
-        self.assertLess(start_idx, new_sess_idx)
-        new_sess_argv = [a for a in calls if "new-session" in a][0]
+        new_sess_argv = _argv(calls, "new-session")
+        self.assertLess(calls.index(_argv(calls, "start-server")), calls.index(new_sess_argv))
         self.assertEqual(
             new_sess_argv,
             ["tmux", "new-session", "-d", "-s", "fleet",
@@ -305,24 +315,14 @@ class NewWindowTests(unittest.TestCase):
         # to show the error; every key sent there would be eaten by the mode, so
         # the spawn has to cancel it before the trust prompt is answered.
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=1, stdout="", stderr="no server")
-            if "#{pane_in_mode}" in argv:
-                return FakeProc(returncode=0, stdout="1\n")
-            return FakeProc(returncode=0, stdout="%1\n")
-
         with mock.patch.dict("os.environ", {}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls, sessions=(), pane="%1", in_mode=True)):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
-        self.assertIn(["tmux", "send-keys", "-t", "%1", "-X", "cancel"], calls)
-        new_sess_idx = next(i for i, a in enumerate(calls) if "new-session" in a)
-        cancel_idx = calls.index(["tmux", "send-keys", "-t", "%1", "-X", "cancel"])
-        self.assertLess(new_sess_idx, cancel_idx)
+        cancel = ["tmux", "send-keys", "-t", "%1", "-X", "cancel"]
+        self.assertIn(cancel, calls)
+        self.assertLess(calls.index(_argv(calls, "new-session")), calls.index(cancel))
 
     def test_spawned_command_force_unsets_board_venv_markers(self):
         # A long-lived tmux server started while the board's .venv was active
@@ -330,19 +330,12 @@ class NewWindowTests(unittest.TestCase):
         # the pane command must be wrapped in `env -u …` so the spawned session
         # can't inherit those markers regardless of the server's stale env.
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="alpha\n")
-            return FakeProc(returncode=0, stdout="%9\n")
-
         with mock.patch.dict("os.environ", {}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value={"/board/.venv/bin"}):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls)):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
-        new_win_argv = [a for a in calls if "new-window" in a][0]
+        new_win_argv = _argv(calls, "new-window")
         # `env -u VIRTUAL_ENV -u VIRTUAL_ENV_PROMPT -u PYTHONHOME` precedes `claude`.
         claude_idx = new_win_argv.index(_EXE)
         self.assertEqual(new_win_argv[claude_idx - 7:claude_idx],
@@ -350,13 +343,8 @@ class NewWindowTests(unittest.TestCase):
                           "-u", "VIRTUAL_ENV_PROMPT", "-u", "PYTHONHOME"])
 
     def test_new_window_nonzero_exit_returns_error(self):
-        def fake_run(argv, **kw):
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="alpha\n")
-            return FakeProc(returncode=1, stderr="can't create window")
-
         with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(window_error="can't create window")):
                 r = tmux.new_window("/tmp")
         self.assertFalse(r["ok"])
         self.assertIn("create window", r["error"])
@@ -365,34 +353,20 @@ class NewWindowTests(unittest.TestCase):
         # A pinned FLEET_TMUX_SESSION that doesn't exist yet is created (named),
         # not treated as an error — the env var names the host session to use.
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="alpha\nbeta\n")
-            return FakeProc(returncode=0, stdout="%7\n")
-
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "ghost"}, clear=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls, sessions=["alpha", "beta"], pane="%7")):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
-        new_sess_argv = [a for a in calls if "new-session" in a][0]
-        self.assertIn("ghost", new_sess_argv)
+        self.assertIn("ghost", _argv(calls, "new-session"))
         self.assertFalse(any("new-window" in a for a in calls))
-
 
     def test_missing_cli_fails_before_opening_a_window(self):
         # The board's PATH is what the pane gets, not the tmux server's. When
         # the board cannot see the CLI, spawning would open a window that dies
         # 127 and disappears — a "success" with no card behind it. Refuse.
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0, stdout="alpha\n")
-
         with _pin_cli(None), mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(calls)):
                 r = tmux.new_window("/tmp")
         self.assertFalse(r["ok"])
         self.assertIn("claude not found", r["error"])
@@ -403,7 +377,6 @@ class SpawnLandedTests(unittest.TestCase):
     """The post-spawn probe: a pane id is not yet a running session."""
 
     def setUp(self):
-        tmux._clear_caches()
         for patcher in (_pin_cli(),
                         mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,))):
             patcher.start()
@@ -413,40 +386,23 @@ class SpawnLandedTests(unittest.TestCase):
         # tmux prints a pane id for a window it created even when the command in
         # it exits before anyone looks. Re-probing the pane is what turns that
         # into an error the dashboard can show instead of a phantom spawn.
-        def fake_run(argv, **kw):
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="alpha\n")
-            if "list-panes" in argv:
-                # The window is already gone; only the old panes are listed.
-                return FakeProc(returncode=0, stdout="%1\t/dev/pts/1\talpha\t/tmp\n")
-            return FakeProc(returncode=0, stdout="%9\n")
-
+        # The window is already gone; only the old panes are listed.
         with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(panes="%1\t/dev/pts/1\talpha\t/tmp\n")):
                 r = tmux.new_window("/tmp")
         self.assertFalse(r["ok"])
         self.assertEqual(r["pane_id"], "%9")
         self.assertIn("exited immediately", r["error"])
 
     def test_live_pane_is_reported_as_spawned(self):
-        def fake_run(argv, **kw):
-            if "list-sessions" in argv:
-                return FakeProc(returncode=0, stdout="alpha\n")
-            if "list-panes" in argv:
-                return FakeProc(returncode=0, stdout="%9\t/dev/pts/9\talpha\t/tmp\n")
-            return FakeProc(returncode=0, stdout="%9\n")
-
         with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+            with _patch_run(_server(panes="%9\t/dev/pts/9\talpha\t/tmp\n")):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%9")
 
 
 class ResolveCliTests(unittest.TestCase):
-    def setUp(self):
-        tmux._clear_caches()
-
     def test_prefers_what_the_spawn_path_resolves(self):
         with mock.patch.object(tmux.shutil, "which", return_value="/usr/bin/claude") as w:
             self.assertEqual(tmux._resolve_cli("claude"), "/usr/bin/claude")
@@ -482,16 +438,16 @@ class ResolveCliTests(unittest.TestCase):
 
 class SendTextTests(unittest.TestCase):
     def setUp(self):
-        tmux._clear_caches()
+        # Every send that gets as far as Enter then waits out the submit-verify;
+        # record the waits instead of sleeping them.
+        self.sleeps = []
+        patcher = mock.patch.object(tmux.time, "sleep", side_effect=self.sleeps.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_sends_literal_then_separate_enter(self):
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+        with _patch_run(_recorder(calls)):
             r = tmux.send_text("%5", "hello world")
         self.assertTrue(r["ok"])
         self.assertEqual(
@@ -502,68 +458,40 @@ class SendTextTests(unittest.TestCase):
 
     def test_literal_failure_short_circuits_before_enter(self):
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=1, stderr="bad pane")
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+        with _patch_run(_recorder(calls, returncode=1, stderr="bad pane")):
             r = tmux.send_text("%5", "hi")
         self.assertFalse(r["ok"])
         self.assertEqual(len(calls), 1)  # Enter never sent
 
     def test_slash_prefix_settles_before_enter(self):
         calls = []
-        sleeps = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
+        with _patch_run(_recorder(calls)):
             r = tmux.send_text("%5", "/research-pipeline")
         self.assertTrue(r["ok"])
-        self.assertEqual(sleeps[0], tmux._SLASH_SETTLE)
+        self.assertEqual(self.sleeps[0], tmux._SLASH_SETTLE)
         self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
 
     def test_settle_before_enter_pauses_plain_text(self):
         calls = []
-        sleeps = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
+        with _patch_run(_recorder(calls)):
             r = tmux.send_text("%5", "hello", settle_before_enter=tmux._CODEX_ENTER_SETTLE)
         self.assertTrue(r["ok"])
-        self.assertEqual(sleeps, [tmux._CODEX_ENTER_SETTLE])
+        # The settle before Enter, then the submit-verify's wait after it.
+        self.assertEqual(self.sleeps, [tmux._CODEX_ENTER_SETTLE, tmux._SUBMIT_VERIFY_WAIT])
         self.assertEqual(calls[1], ["tmux", "send-keys", "-t", "%5", "Enter"])
 
     def test_slash_settle_wins_when_longer_than_caller_settle(self):
         # A slash prompt with a smaller caller settle still waits the slash time.
-        sleeps = []
-
-        def fake_run(argv, **kw):
-            return FakeProc(returncode=0)
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append):
+        with _patch_run(_recorder([])):
             r = tmux.send_text("%5", "/foo", settle_before_enter=0.1)
         self.assertTrue(r["ok"])
-        self.assertEqual(sleeps[0], tmux._SLASH_SETTLE)
+        self.assertEqual(self.sleeps[0], tmux._SLASH_SETTLE)
 
-    def test_plain_text_does_not_sleep(self):
-        def fake_run(argv, **kw):
-            return FakeProc(returncode=0)
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(tmux.time, "sleep") as sl:
+    def test_plain_text_does_not_settle_before_enter(self):
+        with _patch_run(_recorder([])):
             r = tmux.send_text("%5", "research-pipeline")
         self.assertTrue(r["ok"])
-        sl.assert_not_called()
+        self.assertEqual(self.sleeps, [tmux._SUBMIT_VERIFY_WAIT])  # only the post-Enter check
 
     def test_enter_failure_is_reported(self):
         def fake_run(argv, **kw):
@@ -571,7 +499,7 @@ class SendTextTests(unittest.TestCase):
                 return FakeProc(returncode=1, stderr="enter failed")
             return FakeProc(returncode=0)
 
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+        with _patch_run(fake_run):
             r = tmux.send_text("%5", "hi")
         self.assertFalse(r["ok"])
         self.assertIn("enter failed", r["error"])
@@ -580,9 +508,6 @@ class SendTextTests(unittest.TestCase):
 class ExitCopyModeTests(unittest.TestCase):
     """A pane in copy-mode (mouse scroll / view-mode) eats injected keystrokes;
     exit_copy_mode must kick it back to the TUI before any send."""
-
-    def setUp(self):
-        tmux._clear_caches()
 
     def test_cancels_when_pane_in_copy_mode(self):
         calls = []
@@ -593,53 +518,32 @@ class ExitCopyModeTests(unittest.TestCase):
                 return FakeProc(returncode=0, stdout="1\n")
             return FakeProc(returncode=0)
 
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+        with _patch_run(fake_run):
             tmux.exit_copy_mode("%5")
         self.assertIn(["tmux", "send-keys", "-t", "%5", "-X", "cancel"], calls)
 
     def test_noop_when_not_in_mode(self):
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0, stdout="0\n")
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+        with _patch_run(_recorder(calls, stdout="0\n")):
             tmux.exit_copy_mode("%5")
         self.assertEqual(len(calls), 1)  # probe only, no cancel
 
     def test_noop_when_probe_fails(self):
         calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=1, stderr="no such pane")
-
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+        with _patch_run(_recorder(calls, returncode=1, stderr="no such pane")):
             tmux.exit_copy_mode("%5")
         self.assertEqual(len(calls), 1)
 
 
 class SendTextVerifySubmitTests(unittest.TestCase):
-    """verify_submit confirms the Codex composer emptied and resends Enter."""
-
-    def setUp(self):
-        tmux._clear_caches()
-
-    @staticmethod
-    def _recorder(calls):
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-        return fake_run
-
+    """send_text confirms the composer emptied and resends Enter."""
 
     def test_no_resend_when_composer_already_empty(self):
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=False):
-            r = tmux.send_text("%5", "hello", verify_submit=True)
+            r = tmux.send_text("%5", "hello")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submit Enter only, no resend
@@ -647,32 +551,31 @@ class SendTextVerifySubmitTests(unittest.TestCase):
     def test_resends_enter_until_composer_clears(self):
         calls = []
         states = iter([True, False])  # stranded once, then submitted
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail",
                                   side_effect=lambda *a: next(states)):
-            r = tmux.send_text("%5", "hello", verify_submit=True)
+            r = tmux.send_text("%5", "hello")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 2)  # initial submit + one resend
 
     def test_reports_failure_when_prompt_never_submits(self):
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail", return_value=True):
-            r = tmux.send_text("%5", "hello", verify_submit=True)
+            r = tmux.send_text("%5", "hello")
         self.assertFalse(r["ok"])
         self.assertIn("unsent", r["error"])
 
     def test_slash_prompt_auto_verifies_submit(self):
         # Claude's slash popup can eat the submit Enter (it selects the
         # highlighted completion instead), silently stranding e.g. "/clear" in
-        # the composer. Slash prompts must verify-and-resend without the caller
-        # opting in via verify_submit.
+        # the composer. Slash prompts must verify-and-resend.
         calls = []
         states = iter([True, False])  # stranded once, then submitted
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_composer_has_tail",
                                   side_effect=lambda *a: next(states)):
@@ -701,45 +604,25 @@ class SendTextVerifySubmitTests(unittest.TestCase):
                 return FakeProc(returncode=0, stdout=overlay_screen)
             return FakeProc(returncode=0)
 
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+        with _patch_run(fake_run), \
                 mock.patch.object(tmux.time, "sleep"):
             r = tmux.send_text("%5", "/btw hello, just reply ok")
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submit Enter only — overlay untouched
 
-    def test_plain_text_still_skips_verification_by_default(self):
-        calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
-                mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_composer_has_tail") as tail:
-            r = tmux.send_text("%5", "hello")
-        self.assertTrue(r["ok"])
-        tail.assert_not_called()
-        enters = [c for c in calls if c[-1] == "Enter"]
-        self.assertEqual(len(enters), 1)
-
 
 class SendTextVerifyLandedTests(unittest.TestCase):
     """verify_landed confirms the literal text reached the composer before Enter,
     re-sending it (clearing the composer first) when a busy-pane re-render dropped it."""
 
-    def setUp(self):
-        tmux._clear_caches()
-
-    @staticmethod
-    def _recorder(calls):
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-        return fake_run
-
     def test_no_resend_when_text_lands_first_try(self):
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
-                mock.patch.object(tmux, "_composer_has_tail", return_value=True):
+                mock.patch.object(tmux, "_tail_in",
+                                  side_effect=[True, False]):  # landed, then submitted
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
@@ -762,11 +645,11 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 order.append("type")
             return FakeProc(returncode=0)
 
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+        with _patch_run(fake_run), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer",
                                   side_effect=lambda p: order.append("clear")), \
-                mock.patch.object(tmux, "_composer_has_tail",
+                mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
             r = tmux.send_text("%5", "/clear", verify_landed=True)
         self.assertTrue(r["ok"])
@@ -775,11 +658,11 @@ class SendTextVerifyLandedTests(unittest.TestCase):
 
     def test_resends_text_after_clearing_when_dropped_once(self):
         calls = []
-        landed = iter([False, True])  # dropped once, then lands
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        landed = iter([False, True, False])  # dropped once, lands, submits
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
-                mock.patch.object(tmux, "_composer_has_tail",
+                mock.patch.object(tmux, "_tail_in",
                                   side_effect=lambda *a: next(landed)):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertTrue(r["ok"])
@@ -791,10 +674,10 @@ class SendTextVerifyLandedTests(unittest.TestCase):
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
-                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+                mock.patch.object(tmux, "_tail_in", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
@@ -812,9 +695,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         # check waits must escalate so ordinary render lag doesn't get
         # misreported as a dropped prompt.
         sleeps = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder([])), \
+        with _patch_run(_recorder([])), \
                 mock.patch.object(tmux.time, "sleep", side_effect=sleeps.append), \
-                mock.patch.object(tmux, "_composer_has_tail", return_value=False):
+                mock.patch.object(tmux, "_tail_in", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertFalse(r["ok"])
         self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
@@ -824,11 +707,11 @@ class SendTextVerifyLandedTests(unittest.TestCase):
     def test_landed_then_verifies_submit_together(self):
         # The two phases compose: text lands before Enter, composer empties after.
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_composer_has_tail",
+                mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
-            r = tmux.send_text("%5", "hello", verify_landed=True, verify_submit=True)
+            r = tmux.send_text("%5", "hello", verify_landed=True)
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
@@ -839,7 +722,6 @@ class SendTextConfirmedTests(unittest.TestCase):
     succeeds only on the caller's evidence that the line was taken."""
 
     def setUp(self):
-        tmux._clear_caches()
         self.now = [1000.0]
         self.calls = []
         self.inputs = []
@@ -889,7 +771,7 @@ class SendTextConfirmedTests(unittest.TestCase):
         def fake_run(argv, **kw):
             self.calls.append(argv)
             return FakeProc(returncode=1 if "paste-buffer" in argv else 0, stderr="no pane")
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+        with _patch_run(fake_run), \
                 mock.patch.object(tmux, "_clear_composer"):
             r = tmux.send_text_confirmed("%5", "hello", lambda: True)
         self.assertFalse(r["ok"])
@@ -1139,13 +1021,6 @@ class ClearComposerTests(unittest.TestCase):
     against the pane, falling back to blind presses when the pane won't redraw."""
 
     @staticmethod
-    def _recorder(calls):
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-        return fake_run
-
-    @staticmethod
     def _presses(calls):
         n = len(tmux._CLEAR_KEYS)
         return [c for c in calls if tuple(c[-n:]) == tmux._CLEAR_KEYS]
@@ -1158,7 +1033,7 @@ class ClearComposerTests(unittest.TestCase):
         # keys go in one send-keys.
         calls = []
         screens = iter(["❯ aaa\n  bbb\n────────────\n", "❯ \n────────────\n"])
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
@@ -1175,7 +1050,7 @@ class ClearComposerTests(unittest.TestCase):
             "❯ \n────────────\n",
         ])
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
@@ -1184,7 +1059,7 @@ class ClearComposerTests(unittest.TestCase):
 
     def test_already_empty_composer_sends_nothing(self):
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ \n────────────\n"}):
@@ -1196,7 +1071,7 @@ class ClearComposerTests(unittest.TestCase):
         # (no progress), so the loop must stop reading and queue enough blind
         # presses to clear a worst-case wrapped paste whenever the pane wakes.
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ stuck text\n────────────\n"}):
@@ -1205,7 +1080,7 @@ class ClearComposerTests(unittest.TestCase):
 
     def test_capture_failure_falls_back_to_blind_presses(self):
         calls = []
-        with mock.patch.object(tmux.subprocess, "run", side_effect=self._recorder(calls)), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane", return_value={"ok": False}):
             tmux._clear_composer("%5")
@@ -1279,10 +1154,7 @@ class TrailingSemicolonEscapeTests(unittest.TestCase):
 
     def test_send_text_escapes_trailing_semicolon(self):
         calls = []
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"):
             r = tmux.send_text("%5", "do the thing;")
         self.assertTrue(r["ok"])
@@ -1294,21 +1166,14 @@ class TrailingSemicolonEscapeTests(unittest.TestCase):
         # the landed-verify needle must keep matching against the RAW text.
         calls = []
         seen_tails = []
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            return FakeProc(returncode=0)
-        def fake_tail(pane, text, marker="❯"):
+        def fake_tail(cap, text, marker="❯"):
             seen_tails.append(text)
-            return True
-        with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run), \
+            return len(seen_tails) == 1  # landed, then submitted
+        with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_composer_has_tail", side_effect=fake_tail):
+                mock.patch.object(tmux, "_tail_in", side_effect=fake_tail):
             r = tmux.send_text("%5", "goal 2. 重跑(钉死);", verify_landed=True)
         self.assertTrue(r["ok"])
         (literal,) = self._literal_calls(calls)
         self.assertEqual(literal[-1], "goal 2. 重跑(钉死)\\;")
-        self.assertEqual(seen_tails, ["goal 2. 重跑(钉死);"])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(set(seen_tails), {"goal 2. 重跑(钉死);"})
