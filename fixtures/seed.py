@@ -27,6 +27,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The board's own cwd -> project-dir rule, so the transcripts land where it looks.
+# Run as a script, only fixtures/ is on sys.path; core.sessions needs nothing
+# beyond the stdlib, so this still runs on a bare python3.
+sys.path.insert(0, str(HERE.parent))
+from core.sessions import _cwd_to_project_slug
+
 DEMO = Path(os.environ.get("CLAUDE_FLEET_HOME") or (HERE / "demo-home")).expanduser()
 CLAUDE = DEMO / ".claude"
 PIDFILE = DEMO / ".demo-pids"
@@ -82,11 +88,6 @@ def mem_read(name: str, tid: str) -> dict:
     return t_tool("Read", {"file_path": f"{DISPLAY_CLAUDE}/projects/{SLUG}/memory/{name}.md"}, tid)
 
 
-def mem_write(name: str, content: str, tid: str) -> dict:
-    return t_tool("Write", {"file_path": f"{DISPLAY_CLAUDE}/projects/{SLUG}/memory/{name}.md",
-                            "content": content}, tid)
-
-
 def skill_file_read(skill: str, tid: str) -> dict:
     return t_tool("Read", {"file_path": f"{DISPLAY_CLAUDE}/skills/{skill}/SKILL.md"}, tid)
 
@@ -107,7 +108,7 @@ def plan_edit(fname: str, old: str, new: str, tid: str) -> dict:
                            "old_string": old, "new_string": new}, tid)
 
 
-SLUG = DEMO_CWD_ROOT.replace("/", "-").replace("_", "-").replace(".", "-")  # -home-dev-acme
+SLUG = _cwd_to_project_slug(DEMO_CWD_ROOT)  # -home-dev-acme
 
 
 # ---------- fixture content ----------
@@ -130,82 +131,76 @@ MEMORIES = {
     "db-guidelines": ("reference", "Migrations are forward-only. Never drop a column in the same release that stops writing it."),
 }
 
-# (key, name, status, waitingFor, stop_reason, idle_secs, first_input, blocks_builder)
-def live_sessions() -> list[dict]:
-    return [
-        dict(key="build-auth-api", name="build-auth-api", status="busy", waiting=None,
-             stop="tool_use", idle=40, model=MODEL,
-             first="Add a JWT auth middleware to the /v1 API",
-             events=lambda: [
-                 user_text("Add a JWT auth middleware to the /v1 API", 600),
-                 asst([t_text("I'll scaffold the middleware and wire it into the router."),
-                       skill_call("api-scaffold", "route=auth", "t1")], 560, "tool_use"),
-                 tool_result("t1", "created src/middleware/auth.ts", 555),
-                 asst([t_text("Now adding the token verification helper."),
-                       t_tool("Write", {"file_path": f"{DEMO_CWD_ROOT}/src/auth/verify.ts",
-                                        "content": "export function verify(t){...}"}, "t2")], 50, "tool_use"),
-             ]),
-        dict(key="fix-flaky-tests", name="fix-flaky-tests", status="waiting",
-             waiting="Bash(npm test) needs approval", stop="tool_use", idle=20, model=MODEL,
-             first="The checkout e2e test is flaky, can you stabilize it",
-             events=lambda: [
-                 user_text("The checkout e2e test is flaky, can you stabilize it", 300),
-                 asst([t_text("Let me reproduce it first."),
-                       skill_call("test-runner", "suite=e2e", "t1")], 260, "tool_use"),
-                 tool_result("t1", "FAIL checkout.e2e.ts (2/10 runs)", 255),
-                 asst([t_text("I'll run it 20x to measure the flake rate."),
-                       bash("npm test -- checkout.e2e --runs 20", "t2", "stress the flaky test")], 25, "tool_use"),
-             ]),
-        dict(key="refactor-payments", name="refactor-payments", status="idle", waiting=None,
-             stop="tool_use", idle=12 * MIN, model=MODEL,
-             first="Refactor the payments module to use the new ledger client",
-             events=lambda: [
-                 user_text("Refactor the payments module to use the new ledger client", 40 * MIN),
-                 asst([t_text("Reading the existing payments code and the ledger conventions."),
-                       mem_read("api-conventions", "t1")], 38 * MIN, "tool_use"),
-                 tool_result("t1", "loaded api-conventions", 37 * MIN),
-                 asst([t_text("Editing the charge handler."),
-                       t_tool("Edit", {"file_path": f"{DEMO_CWD_ROOT}/src/payments/charge.ts",
-                                       "old_string": "oldClient", "new_string": "ledgerClient"}, "t2")], 13 * MIN, "tool_use"),
-             ]),
-        dict(key="write-api-docs", name="write-api-docs", status="idle", waiting=None,
-             stop="end_turn", idle=22 * MIN, model=MODEL,
-             first="Document the new auth endpoints in the API reference",
-             events=lambda: [
-                 user_text("Document the new auth endpoints in the API reference", 60 * MIN),
-                 asst([t_text("Drafting docs from the route definitions."),
-                       skill_call("changelog-gen", "", "t1"),
-                       mem_read("api-conventions", "t2")], 55 * MIN, "tool_use"),
-                 tool_result("t1", "drafted", 54 * MIN),
-                 asst([t_text("Done — added /v1/auth/login and /v1/auth/refresh to docs/api.md with examples.")], 22 * MIN, "end_turn"),
-             ]),
-        dict(key="migrate-postgres", name="migrate-postgres-15", status="idle", waiting=None,
-             stop="end_turn", idle=2 * HOUR + 10 * MIN, model=MODEL,
-             first="Migrate the staging database to Postgres 15",
-             events=lambda: [
-                 user_text("Migrate the staging database to Postgres 15", 5 * HOUR),
-                 asst([t_text("Planning the migration."),
-                       plan_write("pg15-migration.md", "# PG15 migration\n\n1. snapshot\n2. upgrade\n3. verify", "t1")], 4.5 * HOUR, "tool_use"),
-                 asst([t_text("Refining the plan after checking replica lag."),
-                       plan_edit("pg15-migration.md", "3. verify", "3. verify\n4. cut over replicas", "t2"),
-                       skill_call("db-migrate", "target=pg15", "t3"),
-                       mem_read("db-guidelines", "t4")], 4 * HOUR, "tool_use"),
-                 tool_result("t3", "migration applied to staging", 3.9 * HOUR),
-                 asst([t_text("Migration complete; staging is on PG15 and smoke tests pass.")], 2 * HOUR + 10 * MIN, "end_turn"),
-             ]),
-        dict(key="optimize-images", name="optimize-image-pipeline", status="idle", waiting=None,
-             stop="tool_use", idle=2 * MIN, model=MODEL,
-             first="Speed up the thumbnail generation pipeline",
-             events=lambda: [
-                 user_text("Speed up the thumbnail generation pipeline", 30 * MIN),
-                 asst([t_text("Profiling the current pipeline in the background while I read the code."),
-                       bash("python bench/profile_thumbs.py --runs 200 > /tmp/prof.txt", "bg1",
-                            "profile thumbnail pipeline", bg=True)], 28 * MIN, "tool_use"),
-                 asst([t_text("Reading the resize worker."),
-                       skill_file_read("deploy-helper", "t2"),
-                       bash("grep -rn skills/ src/ | head", "t3", "find skill refs")], 2 * MIN, "tool_use"),
-             ]),
-    ]
+# Live sessions (main() gives each an alive PID, which is what makes it a card).
+LIVE_SESSIONS = [
+    dict(key="build-auth-api", name="build-auth-api", status="busy", waiting=None, idle=40,
+         first="Add a JWT auth middleware to the /v1 API",
+         events=[
+             user_text("Add a JWT auth middleware to the /v1 API", 600),
+             asst([t_text("I'll scaffold the middleware and wire it into the router."),
+                   skill_call("api-scaffold", "route=auth", "t1")], 560, "tool_use"),
+             tool_result("t1", "created src/middleware/auth.ts", 555),
+             asst([t_text("Now adding the token verification helper."),
+                   t_tool("Write", {"file_path": f"{DEMO_CWD_ROOT}/src/auth/verify.ts",
+                                    "content": "export function verify(t){...}"}, "t2")], 50, "tool_use"),
+         ]),
+    dict(key="fix-flaky-tests", name="fix-flaky-tests", status="waiting",
+         waiting="Bash(npm test) needs approval", idle=20,
+         first="The checkout e2e test is flaky, can you stabilize it",
+         events=[
+             user_text("The checkout e2e test is flaky, can you stabilize it", 300),
+             asst([t_text("Let me reproduce it first."),
+                   skill_call("test-runner", "suite=e2e", "t1")], 260, "tool_use"),
+             tool_result("t1", "FAIL checkout.e2e.ts (2/10 runs)", 255),
+             asst([t_text("I'll run it 20x to measure the flake rate."),
+                   bash("npm test -- checkout.e2e --runs 20", "t2", "stress the flaky test")], 25, "tool_use"),
+         ]),
+    dict(key="refactor-payments", name="refactor-payments", status="idle", waiting=None, idle=12 * MIN,
+         first="Refactor the payments module to use the new ledger client",
+         events=[
+             user_text("Refactor the payments module to use the new ledger client", 40 * MIN),
+             asst([t_text("Reading the existing payments code and the ledger conventions."),
+                   mem_read("api-conventions", "t1")], 38 * MIN, "tool_use"),
+             tool_result("t1", "loaded api-conventions", 37 * MIN),
+             asst([t_text("Editing the charge handler."),
+                   t_tool("Edit", {"file_path": f"{DEMO_CWD_ROOT}/src/payments/charge.ts",
+                                   "old_string": "oldClient", "new_string": "ledgerClient"}, "t2")], 13 * MIN, "tool_use"),
+         ]),
+    dict(key="write-api-docs", name="write-api-docs", status="idle", waiting=None, idle=22 * MIN,
+         first="Document the new auth endpoints in the API reference",
+         events=[
+             user_text("Document the new auth endpoints in the API reference", 60 * MIN),
+             asst([t_text("Drafting docs from the route definitions."),
+                   skill_call("changelog-gen", "", "t1"),
+                   mem_read("api-conventions", "t2")], 55 * MIN, "tool_use"),
+             tool_result("t1", "drafted", 54 * MIN),
+             asst([t_text("Done — added /v1/auth/login and /v1/auth/refresh to docs/api.md with examples.")], 22 * MIN, "end_turn"),
+         ]),
+    dict(key="migrate-postgres", name="migrate-postgres-15", status="idle", waiting=None, idle=2 * HOUR + 10 * MIN,
+         first="Migrate the staging database to Postgres 15",
+         events=[
+             user_text("Migrate the staging database to Postgres 15", 5 * HOUR),
+             asst([t_text("Planning the migration."),
+                   plan_write("pg15-migration.md", "# PG15 migration\n\n1. snapshot\n2. upgrade\n3. verify", "t1")], 4.5 * HOUR, "tool_use"),
+             asst([t_text("Refining the plan after checking replica lag."),
+                   plan_edit("pg15-migration.md", "3. verify", "3. verify\n4. cut over replicas", "t2"),
+                   skill_call("db-migrate", "target=pg15", "t3"),
+                   mem_read("db-guidelines", "t4")], 4 * HOUR, "tool_use"),
+             tool_result("t3", "migration applied to staging", 3.9 * HOUR),
+             asst([t_text("Migration complete; staging is on PG15 and smoke tests pass.")], 2 * HOUR + 10 * MIN, "end_turn"),
+         ]),
+    dict(key="optimize-images", name="optimize-image-pipeline", status="idle", waiting=None, idle=2 * MIN,
+         first="Speed up the thumbnail generation pipeline",
+         events=[
+             user_text("Speed up the thumbnail generation pipeline", 30 * MIN),
+             asst([t_text("Profiling the current pipeline in the background while I read the code."),
+                   bash("python bench/profile_thumbs.py --runs 200 > /tmp/prof.txt", "bg1",
+                        "profile thumbnail pipeline", bg=True)], 28 * MIN, "tool_use"),
+             asst([t_text("Reading the resize worker."),
+                   skill_file_read("deploy-helper", "t2"),
+                   bash("grep -rn skills/ src/ | head", "t3", "find skill refs")], 2 * MIN, "tool_use"),
+         ]),
+]
 
 
 # History-only sessions (no live PID needed — they populate the History list).
@@ -294,14 +289,13 @@ def main() -> int:
     sid_n = 0
 
     # live sessions (need alive PIDs)
-    for spec in live_sessions():
+    for spec in LIVE_SESSIONS:
         sid_n += 1
         sid = f"demo-{sid_n:04d}-{spec['key']}"
         proc = subprocess.Popen(["sleep", "100000"], start_new_session=True,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         pids.append(proc.pid)
-        rows = spec["events"]()
-        write_jsonl(proj / f"{sid}.jsonl", rows)
+        write_jsonl(proj / f"{sid}.jsonl", spec["events"])
         sess = {
             "pid": proc.pid, "sessionId": sid, "cwd": DEMO_CWD_ROOT,
             "name": spec["name"], "status": spec["status"],

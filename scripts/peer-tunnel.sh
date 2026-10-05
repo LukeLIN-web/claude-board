@@ -23,15 +23,9 @@
 # Exit codes: 0 ok · 2 usage/config
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# .env.local, then .env.local.<hostname>; sets RUN_DIR, defines wait_for.
+source scripts/env.sh
 
-if [ -f .env.local ]; then
-    set -a; source .env.local; set +a
-fi
-if [ -f ".env.local.$(hostname)" ]; then
-    set -a; source ".env.local.$(hostname)"; set +a
-fi
-
-RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-fleet"
 TUNNELS="${FLEET_PEER_TUNNELS:-}"
 
 # `ss` is the check that matters: a supervisor pid says a process exists, a
@@ -110,11 +104,7 @@ for spec in $TUNNELS; do
     setsid "$0" __supervise "$spec" >> "$RUN_DIR/peer-tunnel.log" 2>&1 < /dev/null &
     printf '%s\n' "$!" > "$pidfile"
     # ssh's handshake is a round trip; give it one before reporting.
-    for _ in $(seq 10); do
-        listening "$lport" && break
-        sleep 1
-    done
-    listening "$lport" \
+    wait_for 10 1 listening "$lport" \
         && echo "[peer-tunnel] $spec — up" \
         || echo "[peer-tunnel] $spec — did not come up; see $RUN_DIR/peer-tunnel.log" >&2
 done

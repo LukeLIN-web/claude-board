@@ -24,12 +24,9 @@
 # Exit codes: 0 ok · 2 usage/config · 3 board not running · 4 tunnel failed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# .env.local, then .env.local.<hostname>; sets PORT, defines wait_for.
+source scripts/env.sh
 
-if [ -f .env.local ]; then
-    set -a; source .env.local; set +a
-fi
-
-PORT="${CLAUDE_FLEET_PORT:-7879}"
 DOMAIN="${FLEET_TUNNEL_DOMAIN:-}"
 EMAILS="${FLEET_TUNNEL_ALLOWED_EMAILS:-}"
 NGROK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ngrok"
@@ -133,12 +130,7 @@ setsid ngrok http "$PORT" \
     --log stdout --log-format logfmt \
     > "$LOG" 2>&1 < /dev/null &
 
-for _ in $(seq 20); do
-    grep -q "started tunnel" "$LOG" 2>/dev/null && break
-    sleep 1
-done
-
-if grep -q "started tunnel" "$LOG" 2>/dev/null; then
+if wait_for 20 1 grep -q "started tunnel" "$LOG" 2>/dev/null; then
     echo "[tunnel] up -> https://$DOMAIN (Google sign-in required)"
     exit 0
 fi

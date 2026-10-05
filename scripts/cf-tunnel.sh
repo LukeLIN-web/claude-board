@@ -31,18 +31,9 @@
 #             · 5 board is running WITHOUT the gate (refusing to publish).
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# .env.local, then .env.local.<hostname>; sets PORT and RUN_DIR, defines wait_for.
+source scripts/env.sh
 
-if [ -f .env.local ]; then
-    set -a; source .env.local; set +a
-fi
-# Same two-file layering run.sh uses, so this reads the port the board on THIS
-# host was actually started with.
-if [ -f ".env.local.$(hostname)" ]; then
-    set -a; source ".env.local.$(hostname)"; set +a
-fi
-
-PORT="${CLAUDE_FLEET_PORT:-7879}"
-RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-fleet"
 LOG="$RUN_DIR/cf-tunnel.log"
 URL_FILE="$RUN_DIR/cf-tunnel.url"
 WATCHDOG_PID_FILE="$RUN_DIR/cf-tunnel.watchdog.pid"
@@ -70,6 +61,11 @@ gate_verdict() {
     000)         echo down ;;
     *)           echo odd ;;
     esac
+}
+
+# cloudflared prints the assigned hostname into its startup banner.
+tunnel_url() {
+    grep -om1 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG" 2>/dev/null
 }
 
 watchdog_running() {
@@ -183,21 +179,14 @@ setsid cloudflared tunnel --url "http://127.0.0.1:$PORT" \
     --no-autoupdate \
     > "$LOG" 2>&1 < /dev/null &
 
-# cloudflared prints the assigned hostname into its startup banner. Poll for it
-# rather than sleeping a fixed amount: the handshake is usually a couple of
-# seconds but is a network round trip, not a constant.
-url=""
-for _ in $(seq 30); do
-    url="$(grep -om1 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG" 2>/dev/null)"
-    [ -n "$url" ] && break
-    sleep 1
-done
-
-if [ -z "$url" ]; then
+# Poll for the URL rather than sleeping a fixed amount: the handshake is usually
+# a couple of seconds but is a network round trip, not a constant.
+if ! wait_for 30 1 tunnel_url >/dev/null; then
     echo "[cf-tunnel] failed to get a URL; last lines of $LOG:" >&2
     tail -10 "$LOG" >&2
     exit 4
 fi
+url="$(tunnel_url)"
 
 printf '%s\n' "$url" > "$URL_FILE"
 echo "[cf-tunnel] up -> $url (password required)"
