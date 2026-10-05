@@ -300,6 +300,30 @@ class NewWindowTests(unittest.TestCase):
              _EXE, "--dangerously-skip-permissions"],
         )
 
+    def test_cold_start_leaves_the_config_error_view_mode(self):
+        # A fresh server with a bad tmux config opens its first pane in view-mode
+        # to show the error; every key sent there would be eaten by the mode, so
+        # the spawn has to cancel it before the trust prompt is answered.
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "list-sessions" in argv:
+                return FakeProc(returncode=1, stdout="", stderr="no server")
+            if "#{pane_in_mode}" in argv:
+                return FakeProc(returncode=0, stdout="1\n")
+            return FakeProc(returncode=0, stdout="%1\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        self.assertIn(["tmux", "send-keys", "-t", "%1", "-X", "cancel"], calls)
+        new_sess_idx = next(i for i, a in enumerate(calls) if "new-session" in a)
+        cancel_idx = calls.index(["tmux", "send-keys", "-t", "%1", "-X", "cancel"])
+        self.assertLess(new_sess_idx, cancel_idx)
+
     def test_spawned_command_force_unsets_board_venv_markers(self):
         # A long-lived tmux server started while the board's .venv was active
         # re-injects VIRTUAL_ENV into every new pane. When the board is in a venv,

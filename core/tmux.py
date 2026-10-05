@@ -382,6 +382,13 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     if not _spawn_landed(pane_id):
         return {"ok": False, "pane_id": pane_id,
                 "error": f"the spawned pane exited immediately: {' '.join(cmd)}"}
+    # A tmux server whose config has an error shows that error in the first pane
+    # it opens, in view-mode, and view-mode eats every key sent to the pane: the
+    # trust prompt's Down, the resume picker's, the first prompt's text. The cold
+    # start above is exactly that first pane, so a board whose server had exited
+    # (its own socket, after the last card closed) spawned a card it could not
+    # drive. Leave the mode now, before anyone types into it.
+    exit_copy_mode(pane_id)
     return {"ok": True, "pane_id": pane_id}
 
 
