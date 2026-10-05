@@ -88,7 +88,6 @@ def classify(window_dict: dict) -> dict:
     """
     status = window_dict.get("status", "unknown")
     idle = window_dict.get("idle_seconds", 0)
-    name = window_dict.get("name") or window_dict.get("project_name") or ""
     transcript = window_dict.get("transcript_path")
 
     if status == "waiting":

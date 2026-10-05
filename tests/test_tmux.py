@@ -9,7 +9,7 @@ from core import tmux
 # Every argv assertion below is about the command being built, so the module runs
 # with FLEET_TMUX_SOCKET unset. Leaving it to the ambient environment made these
 # tests pass or fail on whether the machine running them had `.env.local`'s
-# socket exported — `tmux …` there, `tmux -L juyi …` here. SocketArgsTests sets
+# socket exported — `tmux …` there, `tmux -L board …` here. SocketArgsTests sets
 # the variable itself, and covers what it does.
 _ambient_socket = None
 
@@ -97,11 +97,11 @@ class SocketArgsTests(unittest.TestCase):
         tmux._clear_caches()
 
     def test_run_injects_socket_before_command(self):
-        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True):
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board"}, clear=True):
             with _patch_run(returncode=0) as m:
                 tmux._run("list-panes", "-a")
         argv = m.call_args[0][0]
-        self.assertEqual(argv, ["tmux", "-L", "juyi", "list-panes", "-a"])
+        self.assertEqual(argv, ["tmux", "-L", "board", "list-panes", "-a"])
 
     def test_run_omits_socket_when_unset(self):
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -118,7 +118,7 @@ class SocketArgsTests(unittest.TestCase):
         self.assertEqual(argv, ["tmux", "list-panes"])
 
     def test_new_window_targets_socketed_server(self):
-        # Socket is dedicated (-L juyi) but the session is NOT pinned: it falls
+        # Socket is dedicated (-L board) but the session is NOT pinned: it falls
         # out of sessions[0] on that server, so cards land wherever that server
         # already hosts, not a hard-coded name.
         calls = []
@@ -129,16 +129,16 @@ class SocketArgsTests(unittest.TestCase):
                 return FakeProc(returncode=0, stdout="beauty\n")
             return FakeProc(returncode=0, stdout="%3\n")
 
-        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "juyi"}, clear=True), \
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board"}, clear=True), \
              _pin_cli(), mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)), \
              mock.patch.object(tmux, "pane_alive", return_value=True):
             with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
         list_argv = [a for a in calls if "list-sessions" in a][0]
-        self.assertEqual(list_argv[:3], ["tmux", "-L", "juyi"])
+        self.assertEqual(list_argv[:3], ["tmux", "-L", "board"])
         new_win_argv = [a for a in calls if "new-window" in a][0]
-        self.assertEqual(new_win_argv[:4], ["tmux", "-L", "juyi", "new-window"])
+        self.assertEqual(new_win_argv[:4], ["tmux", "-L", "board", "new-window"])
         self.assertIn("beauty", new_win_argv)  # sessions[0], not a pin
 
 
@@ -299,6 +299,30 @@ class NewWindowTests(unittest.TestCase):
              "-P", "-F", "#{pane_id}", "-c", "/tmp",
              _EXE, "--dangerously-skip-permissions"],
         )
+
+    def test_cold_start_leaves_the_config_error_view_mode(self):
+        # A fresh server with a bad tmux config opens its first pane in view-mode
+        # to show the error; every key sent there would be eaten by the mode, so
+        # the spawn has to cancel it before the trust prompt is answered.
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if "list-sessions" in argv:
+                return FakeProc(returncode=1, stdout="", stderr="no server")
+            if "#{pane_in_mode}" in argv:
+                return FakeProc(returncode=0, stdout="1\n")
+            return FakeProc(returncode=0, stdout="%1\n")
+
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
+            with mock.patch.object(tmux.subprocess, "run", side_effect=fake_run):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        self.assertIn(["tmux", "send-keys", "-t", "%1", "-X", "cancel"], calls)
+        new_sess_idx = next(i for i, a in enumerate(calls) if "new-session" in a)
+        cancel_idx = calls.index(["tmux", "send-keys", "-t", "%1", "-X", "cancel"])
+        self.assertLess(new_sess_idx, cancel_idx)
 
     def test_spawned_command_force_unsets_board_venv_markers(self):
         # A long-lived tmux server started while the board's .venv was active

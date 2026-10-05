@@ -1288,11 +1288,11 @@ class SwitchModelTests(unittest.TestCase):
 CODEX_STATUS_IDLE = """\
 • Model changed to gpt-6-astra high
 › Ask Codex to do anything
-  gpt-6-astra high · /tmp/claude-1000/-shared-user62-workspace-juyi-qwen3omni/68473c29-b8ca-4346-bc…
+  gpt-6-astra high · /tmp/claude-1000/-home-u-work-qwen3omni/68473c29-b8ca-4346-bc…
 """
 CODEX_STATUS_BUSY = """\
 › Ask Codex to do anything
-  gpt-6-astra medium · /shared/user62/workspace/juyi/qwen3… Pursuing goal (1m)
+  gpt-6-astra medium · /home/u/work/qwen3… Pursuing goal (1m)
 """
 CODEX_BANNER_BOX = """\
 │ >_ OpenAI Codex (v0.153.4)                          │

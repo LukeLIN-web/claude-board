@@ -346,7 +346,6 @@ def _rg_search_sessions(query: str) -> dict[str, list[str]]:
 
     Returns {session_id: [snippet1, snippet2, ...]}.
     """
-    import re as _re
     search_dirs: list[str] = []
     if PROJECTS_DIR.exists():
         search_dirs.append(str(PROJECTS_DIR))

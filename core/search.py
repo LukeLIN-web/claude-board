@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import sessions
-from .sessions import CLAUDE_HOME, HOME_BASE, PROJECTS_DIR
+from .sessions import HOME_BASE, PROJECTS_DIR
 
 CODEX_HOME = HOME_BASE / ".codex"
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
@@ -60,7 +60,6 @@ def _extract_text(d: dict) -> str:
     # Codex format
     if t == "event_msg":
         payload = d.get("payload") or {}
-        role = payload.get("role", "")
         content = payload.get("content")
         if isinstance(content, str):
             return content

@@ -1,7 +1,6 @@
 """Global skill catalog from ~/.claude/skills/ + ~/.codex/skills/ + usage stats."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Optional
 

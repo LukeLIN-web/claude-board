@@ -15,7 +15,7 @@ from core import actions
 BANNER = """\
  ▐▛███▛█   Claude Code v2.1.259
 ▝▜██████▀  Opus 5 with xhigh effort · Claude Max
-  ▝▝ ▝▝    /shared/user75/workspace/juyi/qwen3omni
+  ▝▝ ▝▝    /home/u/work/qwen3omni
 
 ⚠ 1 MCP server needs authentication · run /mcp
 

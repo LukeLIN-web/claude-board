@@ -16,3 +16,5 @@ fixtures/demo-home/
 .env.local
 .env.local.*
 .aris
+# panes saved by failing live tests (tests/live/conftest.py)
+.live-captures/

@@ -197,6 +197,72 @@ class TestRefusal(unittest.TestCase):
         self.assertEqual(self._refusal(self._screen(["hmz: no such flow: x"]), "never typed"), "")
 
 
+class TestMenu(unittest.TestCase):
+    """A `$flow` its directory hasn't set up opens that flow's setup menu and
+    holds the line: no run, and only the terminal says why."""
+
+    # Copied from the pane while the live run waited on its setup.
+    SETUP = "\n".join([
+        "",
+        "  hmz › parallel_flame_chase                                 ● unsaved changes",
+        "  Configure each role: an agent (CLI, account, model and effort) or an",
+        "  ╭──────────────────────────────────────────────────────────────────────────╮",
+        "  │ coordinator                               claude/claude-opus-5-5:high ▸  │",
+        "  enter open   tab actions   esc close",
+    ])
+    BUDGET = ("  hmz › parallel_flame_chase › Set budget for parallel_flame_chase   ● unsaved\n"
+              "  A run stops at whichever limit it reaches first; at least one limit is\n")
+    CHAT = "\n".join([
+        "╭─── humanize v0.1.0 ───────────────────╮",
+        "│    The agent flow system for token maxxing.  │",
+        "────────────────────────────────────────",
+        "❯ ",
+        "  ◉ chat · /home/u/proj         ← monitor · ctrl+c exit",
+    ])
+
+    def _menu(self, screen, status="idle"):
+        w = TestNoRunNote._window(None)
+        w.status = status
+        with mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
+                mock.patch.object(hmz.tmux, "capture_pane",
+                                  return_value={"ok": True, "text": screen}):
+            return hmz.menu(w)
+
+    def test_the_setup_menu(self):
+        self.assertEqual(self._menu(self.SETUP), "parallel_flame_chase")
+
+    def test_a_page_inside_it(self):
+        self.assertEqual(self._menu(self.BUDGET),
+                         "parallel_flame_chase › Set budget for parallel_flame_chase")
+
+    def test_the_composer_is_no_menu(self):
+        self.assertEqual(self._menu(self.CHAT), "")
+
+    def test_a_running_flow_is_not_read(self):
+        self.assertEqual(self._menu(self.SETUP, status="busy"), "")
+
+    def test_the_card_says_where_it_waits(self):
+        w = TestNoRunNote._window(None)
+        with mock.patch.object(hmz, "list_hmz_windows", return_value=[w]), \
+                mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
+                mock.patch.object(hmz.tmux, "capture_pane",
+                                  return_value={"ok": True, "text": self.SETUP}):
+            d = hmz.hmz_window_dicts()[0]
+        self.assertEqual(d["triage"], "stalled")  # not waiting_perm: no Quick Approve "1"
+        self.assertEqual(d["triage_reason"], "停在菜单：parallel_flame_chase")
+
+    def test_the_timeline_says_so(self):
+        import app
+        w = TestNoRunNote._window(None)
+        with mock.patch.object(app.sessions, "find_window", return_value=w), \
+                mock.patch.object(hmz, "_home", return_value=Path(tempfile.gettempdir()) / "no-hmz"), \
+                mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
+                mock.patch.object(hmz.tmux, "capture_pane",
+                                  return_value={"ok": True, "text": self.SETUP}):
+            r = app.api_timeline("7")
+        self.assertEqual(r["note"], hmz.MENU_NOTE.format("parallel_flame_chase"))
+
+
 class TestTyped(unittest.TestCase):
     """The lines typed into one hmz, read off the history it shares with every
     other hmz of its home."""
@@ -244,7 +310,8 @@ class TestNoRunNote(unittest.TestCase):
         home.start()
         self.addCleanup(home.stop)
 
-    def _window(self, transcript_path):
+    @staticmethod
+    def _window(transcript_path):
         return hmz.Window(pid=7, session_id="hmz-7", cwd="/home/u/proj", project_name="proj",
                           project_slug="-home-u-proj", name=None, status="idle",
                           waiting_for=None, started_at=0, updated_at=0, version="",

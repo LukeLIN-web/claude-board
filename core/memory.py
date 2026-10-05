@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Optional
 
 from .sessions import PROJECTS_DIR
@@ -87,7 +86,6 @@ def _parse_memory_index(index_path) -> set:
     Any memory in this index is implicitly loaded into every session's
     system prompt by the harness.
     """
-    import re
     names: set[str] = set()
     try:
         text = index_path.read_text(errors="replace")
