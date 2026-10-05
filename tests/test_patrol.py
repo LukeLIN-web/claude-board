@@ -7,21 +7,11 @@ session waiting on work that is still running (leave it alone) and one holding a
 finished task's notification it never picked up (go type something). Both look
 identical from the outside: quiet session, no output, status says busy.
 """
-import json
-import shutil
-import tempfile
 import time
 import unittest
-from pathlib import Path
 
 from core import patrol, transcripts
-
-
-def _write(rows) -> Path:
-    d = Path(tempfile.mkdtemp())
-    p = d / "t.jsonl"
-    p.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
-    return p
+from tests.helpers import write_jsonl
 
 
 def _launch(tid, name, inp):
@@ -55,14 +45,8 @@ def _delivered(body, ts="2026-09-08T21:16:11Z"):
 class BackgroundLedgerTests(unittest.TestCase):
     """extract_background_tasks: launch → completion notification → delivery."""
 
-    def tearDown(self):
-        shutil.rmtree(self.p.parent, ignore_errors=True)
-
     def _tasks(self, rows):
-        if getattr(self, "p", None):  # a subTest loop writes more than one
-            shutil.rmtree(self.p.parent, ignore_errors=True)
-        self.p = _write(rows)
-        return transcripts.extract_background_tasks(self.p)
+        return transcripts.extract_background_tasks(write_jsonl(rows, ensure_ascii=False))
 
     def test_a_launch_with_no_notification_is_still_running(self):
         got = self._tasks([
@@ -225,12 +209,9 @@ class BackgroundLedgerTests(unittest.TestCase):
 class ClassifyTests(unittest.TestCase):
     """patrol.classify — background_tasks is supplied by app.py before the call."""
 
-    def tearDown(self):
-        shutil.rmtree(self.p.parent, ignore_errors=True)
-
     def _classify(self, rows, tasks=(), **over):
-        self.p = _write(rows)
-        w = {"status": "idle", "idle_seconds": 900, "transcript_path": str(self.p),
+        p = write_jsonl(rows, ensure_ascii=False)
+        w = {"status": "idle", "idle_seconds": 900, "transcript_path": str(p),
              "background_tasks": list(tasks)}
         w.update(over)
         return patrol.classify(w)
@@ -293,7 +274,3 @@ class ClassifyTests(unittest.TestCase):
             {"type": "agent", "description": "long scan", "command": "",
              "state": "running", "ts": 0.0}])
         self.assertEqual(got["triage"], "working")
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -7,6 +7,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
+from .transcripts import memo_by_file, tail_raw_lines
+
 FOCUS_LOG = Path("/tmp/claude-focus.log")
 
 # Sample line (from existing notify.sh):
@@ -45,11 +47,7 @@ def recent_events(limit: int = 50) -> list[PermEvent]:
         return []
     mtime = FOCUS_LOG.stat().st_mtime
     out: list[PermEvent] = []
-    try:
-        text = FOCUS_LOG.read_text(errors="replace")
-    except Exception:
-        return []
-    for line in text.splitlines()[-limit * 2 :]:
+    for line in tail_raw_lines(FOCUS_LOG, limit * 2):
         ev = _parse_line(line, mtime)
         if ev:
             out.append(ev)
@@ -63,6 +61,15 @@ def pending_by_tty() -> dict[str, PermEvent]:
     a window is *currently* blocked; this map just enriches the dashboard with
     the human-readable reason (the exact text the user saw in the toast).
     """
+    return _pending_by_tty(FOCUS_LOG)
+
+
+# The board asks on every 2 s refresh, and the log only changes when a toast
+# fires, so the parse is memoized on the log's (mtime, size) — every field,
+# `epoch` included, comes from those bytes and that mtime. `_log` is only the
+# memo's key (recent_events reads FOCUS_LOG), and the result is shared: read-only.
+@memo_by_file
+def _pending_by_tty(_log: Path) -> dict[str, PermEvent]:
     out: dict[str, PermEvent] = {}
     for ev in recent_events(limit=200):
         if not ev.tty:

@@ -1,63 +1,63 @@
 """Tests for session-id → tmux pane reverse lookup (/api/locate + helpers)."""
+import contextlib
 import unittest
 from unittest import mock
 
 import app as appmod
 from core import sessions, tmux
+from tests.helpers import make_window
 
 
-def _win(session_id: str, pid: int = 100, tty: str = "/dev/pts/3") -> sessions.Window:
-    return sessions.Window(
-        pid=pid, session_id=session_id, cwd="/tmp/proj", project_name="proj",
-        project_slug="-tmp-proj", name=None, status="busy", waiting_for=None,
-        started_at=0, updated_at=0, version="2.1.0", tty=tty,
-        transcript_path=None, alive=True, hidden=False,
-    )
+def _win(session_id: str, **over) -> sessions.Window:
+    return make_window(session_id=session_id, **over)
+
+
+@contextlib.contextmanager
+def _windows(claude=(), codex=(), hmz=()):
+    """Every source a lookup searches, each holding exactly these windows.
+
+    The process-backed ones (fresh Claude spawns, Codex, hmz) would otherwise
+    read this machine's real process table."""
+    with mock.patch.object(sessions, "list_windows", return_value=list(claude)), \
+            mock.patch.object(sessions, "list_claude_proc_windows", return_value=[]), \
+            mock.patch("core.codex.list_codex_windows", return_value=list(codex)), \
+            mock.patch("core.hmz.list_hmz_windows", return_value=list(hmz)):
+        yield
 
 
 class FindWindowBySessionTests(unittest.TestCase):
-    def _patch(self, windows, codex_windows=()):
-        return mock.patch.multiple(
-            sessions,
-            list_windows=mock.Mock(return_value=list(windows)),
-        ), mock.patch(
-            "core.codex.list_codex_windows", return_value=list(codex_windows),
-        )
-
     def test_exact_match(self):
         w = _win("8ce5b822-e854-4608-a668-a726e26e9256")
-        p1, p2 = self._patch([w])
-        with p1, p2:
+        with _windows([w]):
             got = sessions.find_window_by_session("8CE5B822-E854-4608-A668-A726E26E9256")
         self.assertIs(got, w)
 
     def test_unique_prefix_match(self):
         w1, w2 = _win("8ce5b822-aaaa"), _win("27996304-bbbb", pid=101)
-        p1, p2 = self._patch([w1, w2])
-        with p1, p2:
+        with _windows([w1, w2]):
             self.assertIs(sessions.find_window_by_session("8ce5b822"), w1)
 
     def test_short_prefix_rejected(self):
-        w = _win("8ce5b822-aaaa")
-        p1, p2 = self._patch([w])
-        with p1, p2:
+        with _windows([_win("8ce5b822-aaaa")]):
             self.assertIsNone(sessions.find_window_by_session("8ce5"))
 
     def test_ambiguous_prefix_returns_none(self):
         w1, w2 = _win("8ce5b822-aaaa"), _win("8ce5b822-bbbb", pid=101)
-        p1, p2 = self._patch([w1, w2])
-        with p1, p2:
+        with _windows([w1, w2]):
             self.assertIsNone(sessions.find_window_by_session("8ce5b822"))
 
     def test_codex_windows_searched_too(self):
         cw = _win("0199c00c-codex", pid=200)
-        p1, p2 = self._patch([], codex_windows=[cw])
-        with p1, p2:
+        with _windows(codex=[cw]):
             self.assertIs(sessions.find_window_by_session("0199c00c"), cw)
 
+    def test_hmz_windows_searched_too(self):
+        hw = _win("20261002T005030.513Z-a779c6", pid=300)
+        with _windows(hmz=[hw]):
+            self.assertIs(sessions.find_window_by_session("20261002T005030"), hw)
+
     def test_empty_id_returns_none(self):
-        p1, p2 = self._patch([_win("8ce5b822-aaaa")])
-        with p1, p2:
+        with _windows([_win("8ce5b822-aaaa")]):
             self.assertIsNone(sessions.find_window_by_session(""))
 
 
@@ -99,7 +99,3 @@ class PaneTargetTests(unittest.TestCase):
         with mock.patch.object(tmux, "_run", return_value={"ok": False, "stdout": "", "error": "x"}):
             self.assertIsNone(tmux.pane_target("%3"))
         self.assertIsNone(tmux.pane_target(""))
-
-
-if __name__ == "__main__":
-    unittest.main()

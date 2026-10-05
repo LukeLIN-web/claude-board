@@ -1,9 +1,10 @@
-"""Global skill catalog from ~/.claude/skills/ + ~/.codex/skills/ + usage stats."""
+"""Global skill catalog from ~/.claude/skills/ + ~/.codex/skills/."""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
 
+from .memory import split_frontmatter
 from .sessions import CLAUDE_HOME, HOME_BASE
 
 SKILLS_DIR = CLAUDE_HOME / "skills"
@@ -11,29 +12,26 @@ CODEX_SKILLS_DIR = HOME_BASE / ".codex" / "skills"
 
 
 def _parse_skill_md(path: Path) -> Optional[dict]:
+    """A skill's card: its directory name and a one-line description.
+
+    The description is the frontmatter's `description` — the text Claude Code
+    itself lists the skill by and matches requests against — else the body's
+    first `# ` heading, else the name. This used to skip the frontmatter and
+    stop at the first line that said "use when" or "trigger", keeping it as a
+    `trigger` nothing read; in most SKILL.md files that line is the
+    frontmatter's own `description: Use when…`, which comes before any heading,
+    so most skills showed their name a second time where the description goes.
+    """
     try:
-        text = path.read_text(errors="replace")[:4000]
+        text = path.read_text(errors="replace")
     except Exception:
         return None
-    lines = text.splitlines()
+    fm, body = split_frontmatter(text)
+    heading = next((ln.strip()[2:].strip() for ln in body.splitlines()
+                    if ln.strip().startswith("# ")), "")
     name = path.parent.name
-    description = ""
-    trigger = ""
-    for line in lines:
-        line_s = line.strip()
-        if line_s.lower().startswith("# ") and not description:
-            description = line_s[2:].strip()
-        if "trigger" in line_s.lower() or "use when" in line_s.lower():
-            trigger = line_s[:200]
-            break
-    if not description:
-        description = name
-    return {
-        "name": name,
-        "description": description[:200],
-        "trigger": trigger[:200],
-        "path": str(path),
-    }
+    description = fm.get("description") or heading or name
+    return {"name": name, "description": description[:200], "path": str(path)}
 
 
 def list_all_skills() -> list[dict]:
@@ -77,13 +75,4 @@ def list_all_skills() -> list[dict]:
                 skills.append(info)
                 seen_names.add(info["name"])
 
-    return skills
-
-
-def skills_with_usage(usage_counts: dict[str, int]) -> list[dict]:
-    """Merge skill catalog with usage counts from session transcripts."""
-    skills = list_all_skills()
-    for s in skills:
-        s["usage_count"] = usage_counts.get(s["name"], 0)
-    skills.sort(key=lambda s: (-s["usage_count"], s["name"]))
     return skills

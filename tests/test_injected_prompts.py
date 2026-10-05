@@ -12,14 +12,12 @@ These tests pin the split. The rule has to stay negative — a prompt typed on a
 older CLI carries no marker at all — so what's asserted is that every marked
 shape is caught and that an unmarked one is left alone.
 """
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
 from core import transcripts
 from core.history import _extract_first_user_text
 from core.textcap import META_CHARS
+from tests.helpers import queue_op, user_row, write_jsonl
 
 NOTIFICATION = (
     "<task-notification>\n"
@@ -34,18 +32,6 @@ NOTIFICATION = (
 )
 
 
-def _write(rows) -> Path:
-    d = Path(tempfile.mkdtemp())
-    p = d / "t.jsonl"
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    return p
-
-
-def _user(text, ts="2026-08-10T21:26:21Z", **row):
-    return dict({"type": "user", "timestamp": ts,
-                 "message": {"role": "user", "content": text}}, **row)
-
-
 def _last_prompt(events) -> str:
     """What the panel shows: newest user row nobody flagged as injected."""
     for ev in reversed(events):
@@ -58,10 +44,10 @@ class InjectedRowTests(unittest.TestCase):
     def test_a_task_notification_never_stands_in_for_the_prompt(self):
         # The shape the CLI writes today: no isMeta, so before this the newest
         # user row on the timeline was a background task, not a prompt.
-        p = _write([
-            _user("更新文档", ts="2026-08-10T21:00:00Z"),
-            _user(NOTIFICATION, promptSource="system",
-                  origin={"kind": "task-notification"}),
+        p = write_jsonl([
+            user_row("更新文档", ts="2026-08-10T21:00:00Z"),
+            user_row(NOTIFICATION, promptSource="system",
+                     origin={"kind": "task-notification"}),
         ])
         evs = transcripts.timeline(p)
         self.assertEqual(_last_prompt(evs), "更新文档")
@@ -70,17 +56,17 @@ class InjectedRowTests(unittest.TestCase):
     def test_promptSource_system_alone_is_enough(self):
         # Not every injected row carries an `origin`, and vice versa — either
         # marker on its own has to disqualify the row.
-        for row in (_user(NOTIFICATION, promptSource="system"),
-                    _user(NOTIFICATION, origin={"kind": "task-notification"}),
-                    _user(NOTIFICATION)):  # no marker at all: the envelope tells
-            evs = transcripts.timeline(_write([_user("真的 prompt"), row]))
+        for row in (user_row(NOTIFICATION, promptSource="system"),
+                    user_row(NOTIFICATION, origin={"kind": "task-notification"}),
+                    user_row(NOTIFICATION)):  # no marker at all: the envelope tells
+            evs = transcripts.timeline(write_jsonl([user_row("真的 prompt"), row]))
             self.assertEqual(_last_prompt(evs), "真的 prompt")
 
     def test_the_notification_reads_as_its_summary(self):
         # Injected rows are capped short, and the two fields worth reading are
         # the last two — left whole the row spends its budget on ids and cuts off
         # right before the summary.
-        ev = transcripts.timeline(_write([_user(NOTIFICATION, promptSource="system")]))[0]
+        ev = transcripts.timeline(write_jsonl([user_row(NOTIFICATION, promptSource="system")]))[0]
         self.assertEqual(
             ev["text"],
             '后台任务 completed：Background command "Re-arm watcher after reboot" '
@@ -92,19 +78,19 @@ class InjectedRowTests(unittest.TestCase):
     def test_a_monitor_event_has_no_status(self):
         notif = ("<task-notification>\n<task-id>bjx6oqcnd</task-id>\n"
                  "<summary>Monitor event: \"VO 文本臂收口\"</summary>\n</task-notification>")
-        ev = transcripts.timeline(_write([_user(notif, promptSource="system")]))[0]
+        ev = transcripts.timeline(write_jsonl([user_row(notif, promptSource="system")]))[0]
         self.assertEqual(ev["text"], "后台任务：Monitor event: \"VO 文本臂收口\"")
 
     def test_a_slash_commands_own_output_is_not_a_prompt(self):
         stdout = "<local-command-stdout>Set model to Fable 5 for this session only</local-command-stdout>"
-        evs = transcripts.timeline(_write([_user("换个模型试试"), _user(stdout)]))
+        evs = transcripts.timeline(write_jsonl([user_row("换个模型试试"), user_row(stdout)]))
         self.assertEqual(_last_prompt(evs), "换个模型试试")
         self.assertTrue(evs[-1]["extra"]["meta"])
 
     def test_an_unmarked_prompt_is_still_typed(self):
         # An older CLI writes no promptSource and no origin. Treating a bare row
         # as injected would empty the panel on every session running one.
-        ev = transcripts.timeline(_write([_user("go through the repo")]))[0]
+        ev = transcripts.timeline(write_jsonl([user_row("go through the repo")]))[0]
         self.assertEqual(ev["text"], "go through the repo")
         self.assertNotIn("meta", ev["extra"])
 
@@ -119,7 +105,7 @@ class QueuedNotificationTests(unittest.TestCase):
                 "attachment": {"type": "queued_command", "prompt": text}}
 
     def test_a_queued_notification_is_flagged(self):
-        evs = transcripts.timeline(_write([_user("更新文档"), self._queued(NOTIFICATION)]))
+        evs = transcripts.timeline(write_jsonl([user_row("更新文档"), self._queued(NOTIFICATION)]))
         self.assertTrue(evs[-1]["extra"]["meta"])
         self.assertTrue(evs[-1]["extra"]["queued"])
         self.assertEqual(_last_prompt(evs), "更新文档")
@@ -127,15 +113,15 @@ class QueuedNotificationTests(unittest.TestCase):
     def test_a_queued_prompt_is_still_a_prompt(self):
         # The whole point of the queued row: a prompt typed while the session was
         # busy is the one thing the timeline used to lose.
-        evs = transcripts.timeline(_write([self._queued("也落进 todo.md")]))
+        evs = transcripts.timeline(write_jsonl([self._queued("也落进 todo.md")]))
         self.assertEqual(_last_prompt(evs), "也落进 todo.md")
         self.assertNotIn("meta", evs[-1]["extra"])
 
 
 class TaskHintTests(unittest.TestCase):
     def test_the_card_hint_skips_injected_rows(self):
-        p = _write([_user("跑一下 eval"),
-                    _user(NOTIFICATION, promptSource="system")])
+        p = write_jsonl([user_row("跑一下 eval"),
+                         user_row(NOTIFICATION, promptSource="system")])
         self.assertEqual(transcripts.current_task_hint(p), "↳ 跑一下 eval")
 
 
@@ -146,29 +132,25 @@ class CardTitleTests(unittest.TestCase):
              "<command-message>clear</command-message>\n<command-args></command-args>")
 
     def test_the_title_is_the_first_thing_the_human_asked_for(self):
-        p = _write([
-            _user(self.CAVEAT, isMeta=True),
-            _user(self.CLEAR),
-            _user("<local-command-stdout>cleared</local-command-stdout>"),
-            _user(NOTIFICATION, promptSource="system"),
-            _user("go through the repo"),
+        p = write_jsonl([
+            user_row(self.CAVEAT, isMeta=True),
+            user_row(self.CLEAR),
+            user_row("<local-command-stdout>cleared</local-command-stdout>"),
+            user_row(NOTIFICATION, promptSource="system"),
+            user_row("go through the repo"),
         ])
         self.assertEqual(_extract_first_user_text(p), "go through the repo")
 
     def test_a_session_that_only_ran_a_command_keeps_the_command(self):
         # Opened, cleared, never used. "clear" says little, but it's what
         # happened — better than a blank card or the caveat.
-        p = _write([_user(self.CAVEAT, isMeta=True), _user(self.CLEAR)])
+        p = write_jsonl([user_row(self.CAVEAT, isMeta=True), user_row(self.CLEAR)])
         self.assertEqual(_extract_first_user_text(p), "clear")
 
     def test_a_transcript_with_no_prompt_at_all_has_no_title(self):
-        p = _write([_user(self.CAVEAT, isMeta=True),
-                    _user(NOTIFICATION, promptSource="system")])
+        p = write_jsonl([user_row(self.CAVEAT, isMeta=True),
+                         user_row(NOTIFICATION, promptSource="system")])
         self.assertEqual(_extract_first_user_text(p), "")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PendingNotificationTests(unittest.TestCase):
@@ -184,20 +166,16 @@ class PendingNotificationTests(unittest.TestCase):
     whole way; only the delivery is late.
     """
 
-    def _enqueue(self, text, ts):
-        return {"type": "queue-operation", "operation": "enqueue",
-                "timestamp": ts, "content": text}
-
     def _monitor(self, event):
         return ("<task-notification>\n<task-id>bur1u5hib</task-id>\n"
                 "<summary>Monitor event: \"TraceAV run\"</summary>\n"
                 f"<event>{event}</event>\n</task-notification>")
 
     def test_a_queued_notification_shows_when_it_fired(self):
-        evs = transcripts.timeline(_write([
-            _user("goal 2 开始", ts="2026-08-25T05:00:00Z"),
-            self._enqueue(self._monitor("progress 127/2200"), "2026-08-25T05:21:17Z"),
-            self._enqueue(self._monitor("progress 257/2200"), "2026-08-25T05:36:17Z"),
+        evs = transcripts.timeline(write_jsonl([
+            user_row("goal 2 开始", ts="2026-08-25T05:00:00Z"),
+            queue_op("enqueue", self._monitor("progress 127/2200"), "2026-08-25T05:21:17Z"),
+            queue_op("enqueue", self._monitor("progress 257/2200"), "2026-08-25T05:36:17Z"),
         ]))
         pending = [e for e in evs if e["extra"].get("pending")]
         self.assertEqual([e["ts"] for e in pending],
@@ -209,8 +187,8 @@ class PendingNotificationTests(unittest.TestCase):
     def test_the_event_payload_is_what_changed(self):
         # Every firing of one Monitor repeats the same <summary> — the progress
         # is in <event>, and without it the rows are indistinguishable.
-        evs = transcripts.timeline(_write([
-            self._enqueue(self._monitor("progress 1986/2200"), "2026-08-25T08:21:17Z"),
+        evs = transcripts.timeline(write_jsonl([
+            queue_op("enqueue", self._monitor("progress 1986/2200"), "2026-08-25T08:21:17Z"),
         ]))
         self.assertEqual(evs[0]["text"],
                          '后台任务：Monitor event: "TraceAV run" — progress 1986/2200')
@@ -219,11 +197,10 @@ class PendingNotificationTests(unittest.TestCase):
         # The dequeue spelling carries no content at all, so the queue is matched
         # by position. Left in, the same event would show up twice.
         notif = self._monitor("progress 127/2200")
-        evs = transcripts.timeline(_write([
-            self._enqueue(notif, "2026-08-25T05:21:17Z"),
-            {"type": "queue-operation", "operation": "dequeue",
-             "timestamp": "2026-08-25T08:23:43Z"},
-            _user(notif, ts="2026-08-25T08:23:43Z", promptSource="system"),
+        evs = transcripts.timeline(write_jsonl([
+            queue_op("enqueue", notif, "2026-08-25T05:21:17Z"),
+            queue_op("dequeue", ts="2026-08-25T08:23:43Z"),
+            user_row(notif, ts="2026-08-25T08:23:43Z", promptSource="system"),
         ]))
         self.assertEqual([e for e in evs if e["extra"].get("pending")], [])
         self.assertEqual(len(evs), 1)
@@ -232,11 +209,10 @@ class PendingNotificationTests(unittest.TestCase):
     def test_a_named_removal_retires_the_right_one(self):
         # The older spelling names what it took, and it needn't be the oldest.
         first, second = self._monitor("progress 127/2200"), self._monitor("progress 257/2200")
-        evs = transcripts.timeline(_write([
-            self._enqueue(first, "2026-08-25T05:21:17Z"),
-            self._enqueue(second, "2026-08-25T05:36:17Z"),
-            {"type": "queue-operation", "operation": "remove",
-             "timestamp": "2026-08-25T05:40:00Z", "content": second},
+        evs = transcripts.timeline(write_jsonl([
+            queue_op("enqueue", first, "2026-08-25T05:21:17Z"),
+            queue_op("enqueue", second, "2026-08-25T05:36:17Z"),
+            queue_op("remove", second, "2026-08-25T05:40:00Z"),
         ]))
         pending = [e for e in evs if e["extra"].get("pending")]
         self.assertEqual([e["ts"] for e in pending], ["2026-08-25T05:21:17Z"])
@@ -246,12 +222,10 @@ class PendingNotificationTests(unittest.TestCase):
         # here is fine; skipping them in the FIFO is not — the dequeue below
         # would then retire the notification instead of the prompt.
         notif = self._monitor("progress 127/2200")
-        evs = transcripts.timeline(_write([
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": "2026-08-25T05:20:00Z", "content": "先等等"},
-            self._enqueue(notif, "2026-08-25T05:21:17Z"),
-            {"type": "queue-operation", "operation": "dequeue",
-             "timestamp": "2026-08-25T05:22:00Z"},
+        evs = transcripts.timeline(write_jsonl([
+            queue_op("enqueue", "先等等", "2026-08-25T05:20:00Z"),
+            queue_op("enqueue", notif, "2026-08-25T05:21:17Z"),
+            queue_op("dequeue", ts="2026-08-25T05:22:00Z"),
         ]))
         pending = [e for e in evs if e["extra"].get("pending")]
         self.assertEqual([e["text"] for e in pending],
@@ -260,10 +234,9 @@ class PendingNotificationTests(unittest.TestCase):
     def test_a_removal_with_no_enqueue_in_the_tail_invents_nothing(self):
         # timeline() only reads a tail. A dequeue whose enqueue fell off the head
         # has nothing to retire, and must not retire the row after it.
-        evs = transcripts.timeline(_write([
-            {"type": "queue-operation", "operation": "dequeue",
-             "timestamp": "2026-08-25T05:00:00Z"},
-            self._enqueue(self._monitor("progress 127/2200"), "2026-08-25T05:21:17Z"),
+        evs = transcripts.timeline(write_jsonl([
+            queue_op("dequeue", ts="2026-08-25T05:00:00Z"),
+            queue_op("enqueue", self._monitor("progress 127/2200"), "2026-08-25T05:21:17Z"),
         ]))
         self.assertEqual(len(([e for e in evs if e["extra"].get("pending")])), 1)
 
@@ -273,7 +246,7 @@ class QueuedPromptShapeTests(unittest.TestCase):
         # A prompt with pasted images is logged as content blocks, not a string.
         # `.strip()` on that raised, and the AttributeError took timeline() down
         # for the whole session — a card ever sent a screenshot showed nothing.
-        evs = transcripts.timeline(_write([{
+        evs = transcripts.timeline(write_jsonl([{
             "type": "attachment", "timestamp": "2026-08-10T21:26:21Z",
             "attachment": {"type": "queued_command", "prompt": [
                 {"type": "text", "text": "你可以看下[Image #6]"},

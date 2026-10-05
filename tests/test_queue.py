@@ -1,13 +1,11 @@
 """Tests for queued-prompt parsing (core.actions.parse_pane_queue) and the
 reliable dashboard-sent tracker (core.promptqueue)."""
-import json
-import tempfile
 import time
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from core import actions, promptqueue, transcripts
+from tests.helpers import assistant_row, queue_op, user_row, write_jsonl
 
 
 # Real captures collected from a live Claude pane.
@@ -96,33 +94,33 @@ class PromptQueueTests(unittest.TestCase):
 
     def test_record_then_pending_no_transcript(self):
         promptqueue.record_sent(1, "do the thing")
-        out = promptqueue.pending(1, None, "busy")
-        self.assertEqual([o["text"] for o in out], ["do the thing"])
+        out = promptqueue.pending(1, None)
+        self.assertEqual(out, ["do the thing"])
 
     def test_blank_prompt_not_recorded(self):
         promptqueue.record_sent(1, "   \n  ")
-        self.assertEqual(promptqueue.pending(1, None, "busy"), [])
+        self.assertEqual(promptqueue.pending(1, None), [])
 
     def test_idle_clears_queue(self):
         promptqueue.record_sent(1, "x")
-        self.assertEqual(promptqueue.pending(1, None, "idle"), [])
+        promptqueue.clear(1)  # what the snapshot does once the session is idle
         # Tracker is wiped, so a later busy tick stays empty.
-        self.assertEqual(promptqueue.pending(1, None, "busy"), [])
+        self.assertEqual(promptqueue.pending(1, None), [])
 
     def test_consumed_when_seen_in_transcript(self):
         promptqueue.record_sent(1, "run tests")
         future = time.time() + 10
         with mock.patch.object(promptqueue.transcripts, "consumed_prompt_texts",
                                return_value=[(future, "run tests")]):
-            out = promptqueue.pending(1, "t.jsonl", "busy")
+            out = promptqueue.pending(1, "t.jsonl")
         self.assertEqual(out, [])
 
     def test_old_identical_message_does_not_consume(self):
         promptqueue.record_sent(1, "run tests")
         with mock.patch.object(promptqueue.transcripts, "consumed_prompt_texts",
                                return_value=[(0.0, "run tests")]):  # ts before send
-            out = promptqueue.pending(1, "t.jsonl", "busy")
-        self.assertEqual([o["text"] for o in out], ["run tests"])
+            out = promptqueue.pending(1, "t.jsonl")
+        self.assertEqual(out, ["run tests"])
 
     def test_duplicate_sends_clear_one_per_transcript_hit(self):
         promptqueue.record_sent(1, "ping")
@@ -130,8 +128,8 @@ class PromptQueueTests(unittest.TestCase):
         future = time.time() + 10
         with mock.patch.object(promptqueue.transcripts, "consumed_prompt_texts",
                                return_value=[(future, "ping")]):  # only one picked up
-            out = promptqueue.pending(1, "t.jsonl", "busy")
-        self.assertEqual([o["text"] for o in out], ["ping"])  # one still queued
+            out = promptqueue.pending(1, "t.jsonl")
+        self.assertEqual(out, ["ping"])  # one still queued
 
     def test_slash_command_reconciles_against_bare_label(self):
         # The dashboard sends "/clear"; the transcript logs it as the bare label
@@ -141,14 +139,14 @@ class PromptQueueTests(unittest.TestCase):
         future = time.time() + 10
         with mock.patch.object(promptqueue.transcripts, "consumed_prompt_texts",
                                return_value=[(future, "clear")]):
-            out = promptqueue.pending(1, "t.jsonl", "busy")
+            out = promptqueue.pending(1, "t.jsonl")
         self.assertEqual(out, [])
 
     def test_slash_command_display_text_keeps_slash(self):
         # Match is slash-insensitive, but the card label keeps the "/" the user typed.
         promptqueue.record_sent(1, "/clear")
-        out = promptqueue.pending(1, None, "busy")
-        self.assertEqual([o["text"] for o in out], ["/clear"])
+        out = promptqueue.pending(1, None)
+        self.assertEqual(out, ["/clear"])
 
     def test_aside_is_not_tracked(self):
         # A "/btw" aside is answered in an ephemeral overlay that never reaches
@@ -156,14 +154,14 @@ class PromptQueueTests(unittest.TestCase):
         # "Queued (1)" to the card until the session next goes idle.
         promptqueue.record_sent(1, "/btw R4 or R9 first?")
         promptqueue.record_sent(1, "/btw")
-        self.assertEqual(promptqueue.pending(1, None, "busy"), [])
+        self.assertEqual(promptqueue.pending(1, None), [])
 
     def test_prompt_merely_opening_with_btw_is_tracked(self):
         # Only the slash command is an aside; prose that starts with the word is
         # an ordinary prompt and has an ordinary transcript row to reconcile with.
         promptqueue.record_sent(1, "btw the eval finished, look at it")
-        out = promptqueue.pending(1, None, "busy")
-        self.assertEqual([o["text"] for o in out],
+        out = promptqueue.pending(1, None)
+        self.assertEqual(out,
                          ["btw the eval finished, look at it"])
 
     def test_fifo_sweep_drops_older_item_once_a_newer_one_is_consumed(self):
@@ -176,7 +174,7 @@ class PromptQueueTests(unittest.TestCase):
         future = time.time() + 10
         with mock.patch.object(promptqueue.transcripts, "consumed_prompt_texts",
                                return_value=[(future, "landed")]):
-            out = promptqueue.pending(1, "t.jsonl", "busy")
+            out = promptqueue.pending(1, "t.jsonl")
         self.assertEqual(out, [])
 
 
@@ -189,17 +187,7 @@ class ConsumedPromptTextsTests(unittest.TestCase):
     """transcripts.consumed_prompt_texts: every signal that Claude took a prompt."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = Path(self.tmp.name) / "t.jsonl"
         self.t0 = time.time()
-
-    def _write(self, rows: list[dict]) -> None:
-        self.path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-
-    def _user_row(self, ts: float, text: str) -> dict:
-        return {"type": "user", "timestamp": _iso(ts),
-                "message": {"role": "user", "content": text}}
 
     def _noise_row(self, ts: float) -> dict:
         return {"type": "assistant", "timestamp": _iso(ts),
@@ -210,35 +198,29 @@ class ConsumedPromptTextsTests(unittest.TestCase):
         # A prompt sent while Claude is busy never gets a type:"user" row — the
         # only trace is queue-operation enqueue then remove. `remove` is Claude
         # taking it off its queue, i.e. exactly the signal we reconcile against.
-        self._write([
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": _iso(self.t0 + 1), "content": "look at the loss first"},
-            {"type": "queue-operation", "operation": "remove",
-             "timestamp": _iso(self.t0 + 5), "content": "look at the loss first"},
+        p = write_jsonl([
+            queue_op("enqueue", "look at the loss first", _iso(self.t0 + 1)),
+            queue_op("remove", "look at the loss first", _iso(self.t0 + 5)),
         ])
-        got = transcripts.consumed_prompt_texts(self.path, since=self.t0)
+        got = transcripts.consumed_prompt_texts(p, since=self.t0)
         self.assertEqual([t for _, t in got], ["look at the loss first"])
 
     def test_enqueue_alone_is_not_consumed(self):
         # Still sitting in Claude's queue: the card SHOULD keep showing it.
-        self._write([
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": _iso(self.t0 + 1), "content": "still waiting"},
-        ])
-        self.assertEqual(transcripts.consumed_prompt_texts(self.path, since=self.t0), [])
+        p = write_jsonl([queue_op("enqueue", "still waiting", _iso(self.t0 + 1))])
+        self.assertEqual(transcripts.consumed_prompt_texts(p, since=self.t0), [])
 
     def test_user_row_far_beyond_the_old_100_line_window(self):
         # The old reconcile window was the last 100 raw rows; a busy session
         # buries the user row under tool noise, so it never reconciled.
-        rows = [self._user_row(self.t0 + 1, "update the docs")]
+        rows = [user_row("update the docs", _iso(self.t0 + 1))]
         rows += [self._noise_row(self.t0 + 2 + i) for i in range(300)]
-        self._write(rows)
-        got = transcripts.consumed_prompt_texts(self.path, since=self.t0)
+        got = transcripts.consumed_prompt_texts(write_jsonl(rows), since=self.t0)
         self.assertEqual([t for _, t in got], ["update the docs"])
 
     def test_rows_before_since_are_ignored(self):
-        self._write([self._user_row(self.t0 - 100, "ancient prompt")])
-        self.assertEqual(transcripts.consumed_prompt_texts(self.path, since=self.t0), [])
+        p = write_jsonl([user_row("ancient prompt", _iso(self.t0 - 100))])
+        self.assertEqual(transcripts.consumed_prompt_texts(p, since=self.t0), [])
 
     def test_missing_file(self):
         self.assertEqual(transcripts.consumed_prompt_texts("/nope.jsonl", since=0.0), [])
@@ -253,35 +235,20 @@ class QueuedPromptTimelineTests(unittest.TestCase):
     board used to show the answer with nothing it was answering.
     """
 
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = Path(self.tmp.name) / "t.jsonl"
-
-    def _write(self, rows: list[dict]) -> None:
-        self.path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-
     def _mid_turn_pickup(self, text: str) -> list[dict]:
         return [
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": "2026-08-10T10:52:36.610Z", "content": text},
-            {"type": "assistant", "timestamp": "2026-08-10T10:52:50.350Z",
-             "message": {"model": "claude-opus-5", "content": [
-                 {"type": "text", "text": "马上腾出那台机器。"}]}},
-            {"type": "queue-operation", "operation": "remove",
-             "timestamp": "2026-08-10T10:53:06.014Z", "content": text},
+            queue_op("enqueue", text, "2026-08-10T10:52:36.610Z"),
+            assistant_row("马上腾出那台机器。", "2026-08-10T10:52:50.350Z"),
+            queue_op("remove", text, "2026-08-10T10:53:06.014Z"),
             {"type": "attachment", "timestamp": "2026-08-10T10:52:36.609Z",
              "attachment": {"type": "queued_command", "prompt": text,
                             "commandMode": "prompt", "origin": {"kind": "human"},
                             "timestamp": "2026-08-10T10:52:36.609Z"}},
-            {"type": "assistant", "timestamp": "2026-08-10T10:53:27.447Z",
-             "message": {"model": "claude-opus-5", "content": [
-                 {"type": "text", "text": "收到,改 60-65。"}]}},
+            assistant_row("收到,改 60-65。", "2026-08-10T10:53:27.447Z"),
         ]
 
     def test_a_prompt_taken_mid_turn_shows_up_once(self):
-        self._write(self._mid_turn_pickup("说错了, 60-65"))
-        evs = transcripts.timeline(self.path)
+        evs = transcripts.timeline(write_jsonl(self._mid_turn_pickup("说错了, 60-65")))
         prompts = [e for e in evs if e["kind"] == "user_text"]
         self.assertEqual([e["text"] for e in prompts], ["说错了, 60-65"])
         # Sent at 10:52:36, read at 10:53:06: the row sits just above the answer
@@ -294,15 +261,11 @@ class QueuedPromptTimelineTests(unittest.TestCase):
         # The other delivery path: the queue drains at the end of a turn and
         # Claude logs a real user row. Only `dequeue` is written (no content, no
         # attachment), so there's nothing here to render twice.
-        self._write([
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": "2026-08-10T10:52:36.610Z", "content": "继续"},
-            {"type": "queue-operation", "operation": "dequeue",
-             "timestamp": "2026-08-10T10:53:06.014Z"},
-            {"type": "user", "timestamp": "2026-08-10T10:53:06.020Z",
-             "message": {"role": "user", "content": "继续"}},
-        ])
-        evs = transcripts.timeline(self.path)
+        evs = transcripts.timeline(write_jsonl([
+            queue_op("enqueue", "继续", "2026-08-10T10:52:36.610Z"),
+            queue_op("dequeue", ts="2026-08-10T10:53:06.014Z"),
+            user_row("继续", "2026-08-10T10:53:06.020Z"),
+        ]))
         self.assertEqual([e["text"] for e in evs if e["kind"] == "user_text"], ["继续"])
 
     def test_the_card_still_counts_one_pickup_as_one(self):
@@ -318,9 +281,8 @@ class QueuedPromptTimelineTests(unittest.TestCase):
             r["timestamp"] = _iso(t0 + 5)
             if r.get("type") == "attachment":
                 r["attachment"]["timestamp"] = _iso(t0 + 5)
-        self.path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        out = promptqueue.pending(1, str(self.path), "busy")
-        self.assertEqual([o["text"] for o in out], ["ping"])  # one still waiting
+        out = promptqueue.pending(1, str(write_jsonl(rows)))
+        self.assertEqual(out, ["ping"])  # one still waiting
 
 
 class QueueReconcileIntegrationTests(unittest.TestCase):
@@ -328,9 +290,6 @@ class QueueReconcileIntegrationTests(unittest.TestCase):
 
     def setUp(self):
         promptqueue._sent.clear()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = Path(self.tmp.name) / "t.jsonl"
 
     def test_busy_send_clears_once_claude_dequeues_it(self):
         t0 = time.time()
@@ -338,27 +297,18 @@ class QueueReconcileIntegrationTests(unittest.TestCase):
         # Claude is busy: the prompt is enqueued, then dequeued 5s later. Plenty
         # of tool noise follows, pushing the rows out of any fixed line window.
         rows = [
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": _iso(t0 + 1), "content": "run the eval"},
-            {"type": "queue-operation", "operation": "remove",
-             "timestamp": _iso(t0 + 5), "content": "run the eval"},
+            queue_op("enqueue", "run the eval", _iso(t0 + 1)),
+            queue_op("remove", "run the eval", _iso(t0 + 5)),
         ]
         rows += [{"type": "assistant", "timestamp": _iso(t0 + 6 + i),
                   "message": {"role": "assistant", "content": [
                       {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}}
                  for i in range(200)]
-        self.path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        self.assertEqual(promptqueue.pending(1, str(self.path), "busy"), [])
+        self.assertEqual(promptqueue.pending(1, str(write_jsonl(rows))), [])
 
     def test_still_enqueued_prompt_stays_on_the_card(self):
         t0 = time.time()
         promptqueue.record_sent(1, "run the eval", ts=t0)
-        self.path.write_text(json.dumps({
-            "type": "queue-operation", "operation": "enqueue",
-            "timestamp": _iso(t0 + 1), "content": "run the eval"}) + "\n")
-        out = promptqueue.pending(1, str(self.path), "busy")
-        self.assertEqual([o["text"] for o in out], ["run the eval"])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        p = write_jsonl([queue_op("enqueue", "run the eval", _iso(t0 + 1))])
+        out = promptqueue.pending(1, str(p))
+        self.assertEqual(out, ["run the eval"])

@@ -4,22 +4,14 @@ Claude logs a recap as a `system` row with subtype `away_summary`, and every
 `system` row used to flatten to one placeholder the client hides — so the board
 dropped exactly the summary written for someone who wasn't watching. These tests
 pin the recap to its own kind, and pin the other `system` subtypes (a
-turn_duration or stop_hook_summary lands after nearly every turn) to staying out.
+turn_duration or stop_hook_summary lands after nearly every turn) to making no
+row at all.
 """
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
 from core import transcripts
 from core.textcap import GOAL_CHARS, LOOP_CHARS
-
-
-def _write(rows) -> Path:
-    d = Path(tempfile.mkdtemp())
-    p = d / "t.jsonl"
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    return p
+from tests.helpers import assistant_row, user_row, write_jsonl
 
 
 def _recap(ts, content):
@@ -31,7 +23,7 @@ class RecapTests(unittest.TestCase):
     def test_recap_becomes_its_own_timeline_row(self):
         text = ("Goal: evaluate the pi0.5 checkpoint on 14 RoboTwin tasks. "
                 "Next: relaunch on the four stable GPUs.")
-        evs = transcripts.timeline(_write([_recap("2026-08-10T05:45:32Z", text)]))
+        evs = transcripts.timeline(write_jsonl([_recap("2026-08-10T05:45:32Z", text)]))
         self.assertEqual([e["kind"] for e in evs], ["recap"])
         self.assertEqual(evs[0]["text"], text)
         self.assertEqual(evs[0]["ts"], "2026-08-10T05:45:32Z")
@@ -40,19 +32,19 @@ class RecapTests(unittest.TestCase):
     def test_the_config_hint_is_dropped(self):
         # A TUI affordance appended to the recap. The board has no /config, so on
         # a card it is one line of noise repeated on every recap.
-        evs = transcripts.timeline(_write([
+        evs = transcripts.timeline(write_jsonl([
             _recap("2026-08-10T05:45:32Z", "Ran the suite. (disable recaps in /config)"),
         ]))
         self.assertEqual(evs[0]["text"], "Ran the suite.")
 
     def test_recap_without_the_hint_is_untouched(self):
-        evs = transcripts.timeline(_write([
+        evs = transcripts.timeline(write_jsonl([
             _recap("2026-08-10T05:45:32Z", "Ran the suite (twice) and it passed."),
         ]))
         self.assertEqual(evs[0]["text"], "Ran the suite (twice) and it passed.")
 
     def test_empty_recap_makes_no_row(self):
-        evs = transcripts.timeline(_write([
+        evs = transcripts.timeline(write_jsonl([
             _recap("2026-08-10T05:45:32Z", "  "),
             _recap("2026-08-10T05:46:00Z", "(disable recaps in /config)"),
         ]))
@@ -60,23 +52,22 @@ class RecapTests(unittest.TestCase):
 
     def test_other_system_subtypes_stay_hidden(self):
         # These land after nearly every turn; as recaps they would bury the real
-        # ones. They keep the placeholder `system` kind the client hides.
-        evs = transcripts.timeline(_write([
+        # ones, and as rows of their own they would eat the timeline's limit.
+        evs = transcripts.timeline(write_jsonl([
             {"type": "system", "subtype": "turn_duration",
              "timestamp": "2026-08-10T05:45:00Z", "content": "42s"},
             {"type": "system", "subtype": "stop_hook_summary",
              "timestamp": "2026-08-10T05:45:01Z", "content": "hook output"},
+            {"type": "permission-mode", "permissionMode": "plan",
+             "timestamp": "2026-08-10T05:45:02Z"},
         ]))
-        self.assertEqual({e["kind"] for e in evs}, {"system"})
+        self.assertEqual(evs, [])
 
     def test_recap_sits_between_the_turns_it_summarizes(self):
-        evs = transcripts.timeline(_write([
-            {"type": "user", "timestamp": "2026-08-10T05:40:00Z",
-             "message": {"content": [{"type": "text", "text": "go"}]}},
+        evs = transcripts.timeline(write_jsonl([
+            user_row("go", "2026-08-10T05:40:00Z", blocks=True),
             _recap("2026-08-10T05:45:00Z", "Working on it. Next: your call on GPUs."),
-            {"type": "assistant", "timestamp": "2026-08-10T05:50:00Z",
-             "message": {"model": "claude-opus-5",
-                         "content": [{"type": "text", "text": "done"}]}},
+            assistant_row("done", "2026-08-10T05:50:00Z"),
         ]))
         self.assertEqual([e["kind"] for e in evs],
                          ["user_text", "recap", "assistant_text"])
@@ -88,7 +79,7 @@ class SessionGoalTests(unittest.TestCase):
 
     def _goal(self, *contents):
         rows = [_recap(f"2026-08-10T0{i}:00:00Z", c) for i, c in enumerate(contents)]
-        return transcripts.session_goal(_write(rows))
+        return transcripts.session_goal(write_jsonl(rows))
 
     def test_colon_form(self):
         g = self._goal("Goal: run RoboTwin evaluation of the pi0.5 checkpoint "
@@ -166,28 +157,27 @@ class PromptGoalTests(unittest.TestCase):
     running today has."""
 
     def _rows(self, *prompts):
-        return [{"type": "user", "timestamp": f"2026-08-10T0{i}:00:00Z",
-                 "message": {"content": [{"type": "text", "text": t}]}}
+        return [user_row(t, f"2026-08-10T0{i}:00:00Z", blocks=True)
                 for i, t in enumerate(prompts)]
 
     def test_a_goal_prompt_is_the_goal(self):
-        g = transcripts.session_goal(_write(self._rows("goal 转写腿接 L3 做一下。")))
+        g = transcripts.session_goal(write_jsonl(self._rows("goal 转写腿接 L3 做一下。")))
         self.assertEqual(g["text"], "转写腿接 L3 做一下")
         self.assertEqual(g["source"], "prompt")
 
     def test_only_the_first_sentence_is_pinned(self):
         # These prompts run to a whole spec; the banner gets the headline.
-        g = transcripts.session_goal(_write(self._rows(
+        g = transcripts.session_goal(write_jsonl(self._rows(
             "goal  新增 `## E11 MiniCPM 换底座跑满主表四场` + 状态板一行。要点: 12 格 = 三臂。")))
         self.assertEqual(g["text"], "新增 `## E11 MiniCPM 换底座跑满主表四场` + 状态板一行")
 
     def test_an_ordinary_prompt_is_not_a_goal(self):
-        self.assertIsNone(transcripts.session_goal(_write(self._rows(
+        self.assertIsNone(transcripts.session_goal(write_jsonl(self._rows(
             "看一下这个 bug", "goals are unclear"))))  # needs the word on its own
 
     def test_a_queued_goal_prompt_still_counts(self):
         # Typed while the session was busy, so it never got a normal user row.
-        g = transcripts.session_goal(_write([{
+        g = transcripts.session_goal(write_jsonl([{
             "type": "attachment", "timestamp": "2026-08-10T05:00:00Z",
             "attachment": {"type": "queued_command", "prompt": "goal 把 board 发布"},
         }]))
@@ -195,24 +185,21 @@ class PromptGoalTests(unittest.TestCase):
 
     def test_an_injected_row_cannot_set_the_goal(self):
         # A skill body that happens to open with "goal …" is not the user's goal.
-        self.assertIsNone(transcripts.session_goal(_write([{
-            "type": "user", "isMeta": True, "timestamp": "2026-08-10T05:00:00Z",
-            "message": {"content": [{"type": "text", "text": "goal of this skill is X"}]},
-        }])))
+        self.assertIsNone(transcripts.session_goal(write_jsonl([
+            user_row("goal of this skill is X", "2026-08-10T05:00:00Z", blocks=True, isMeta=True),
+        ])))
 
     def test_newest_source_wins_across_both_kinds(self):
-        p = _write([
+        p = write_jsonl([
             _recap("2026-08-10T01:00:00Z", "Goal: the old plan. Next: something."),
-            *[{"type": "user", "timestamp": "2026-08-10T02:00:00Z",
-               "message": {"content": [{"type": "text", "text": "goal 新的计划"}]}}],
+            user_row("goal 新的计划", "2026-08-10T02:00:00Z", blocks=True),
         ])
         g = transcripts.session_goal(p)
         self.assertEqual((g["text"], g["source"]), ("新的计划", "prompt"))
 
     def test_a_recap_goal_beats_an_older_goal_prompt(self):
-        p = _write([
-            {"type": "user", "timestamp": "2026-08-10T01:00:00Z",
-             "message": {"content": [{"type": "text", "text": "goal 旧的计划"}]}},
+        p = write_jsonl([
+            user_row("goal 旧的计划", "2026-08-10T01:00:00Z", blocks=True),
             _recap("2026-08-10T02:00:00Z", "Goal: the newer plan. Next: something."),
         ])
         g = transcripts.session_goal(p)
@@ -224,12 +211,8 @@ class RecapPromptTests(unittest.TestCase):
         # A recap is written in the first person and often ends in a question, so
         # it reads like a prompt. Counting one would clear a pending send off the
         # card that Claude never actually took.
-        p = _write([_recap("2026-08-10T05:45:00Z", "Next: tell me which GPU to use.")])
+        p = write_jsonl([_recap("2026-08-10T05:45:00Z", "Next: tell me which GPU to use.")])
         self.assertEqual(transcripts.consumed_prompt_texts(p, 0.0), [])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 def _tool_use(ts, name, inp):
@@ -237,11 +220,6 @@ def _tool_use(ts, name, inp):
             "message": {"model": "claude-opus-5",
                         "content": [{"type": "tool_use", "id": "t1",
                                      "name": name, "input": inp}]}}
-
-
-def _typed(ts, text):
-    return {"type": "user", "timestamp": ts,
-            "message": {"content": [{"type": "text", "text": text}]}}
 
 
 class CronCadenceTests(unittest.TestCase):
@@ -285,16 +263,17 @@ class SessionLoopTests(unittest.TestCase):
 
     def test_no_loop_and_no_file(self):
         self.assertIsNone(transcripts.session_loop("/nope/nothing.jsonl"))
-        self.assertIsNone(transcripts.session_loop(_write([_typed("2026-08-22T08:00:00Z", "hi")])))
+        self.assertIsNone(transcripts.session_loop(write_jsonl([
+            user_row("hi", "2026-08-22T08:00:00Z", blocks=True)])))
 
     def test_a_registered_cron_beats_what_the_user_typed(self):
         # `/loop 30 mins, 检查文档` reaches the transcript as "loop 30 mins, …",
         # but CronCreate registers the interval separately and drops it from the
         # prompt. The registered pair is the one that describes what will run.
-        lp = transcripts.session_loop(_write([
-            _typed("2026-08-22T08:59:34Z",
-                   "<command-name>/loop</command-name>"
-                   "<command-args>30 mins, 检查一下文档, 保证事实正确.</command-args>"),
+        lp = transcripts.session_loop(write_jsonl([
+            user_row("<command-name>/loop</command-name>"
+                     "<command-args>30 mins, 检查一下文档, 保证事实正确.</command-args>",
+                     "2026-08-22T08:59:34Z", blocks=True),
             _tool_use("2026-08-22T09:00:06Z", "CronCreate",
                       {"cron": "7,37 * * * *", "prompt": "检查一下文档, 保证事实正确.",
                        "recurring": True}),
@@ -307,10 +286,10 @@ class SessionLoopTests(unittest.TestCase):
     def test_an_invocation_shows_before_anything_is_scheduled(self):
         # The minute between asking and scheduling, and the case where the model
         # never scheduled at all — hence no cadence to claim.
-        lp = transcripts.session_loop(_write([
-            _typed("2026-08-22T08:59:34Z",
-                   "<command-name>/loop</command-name>"
-                   "<command-args>check the deploy</command-args>"),
+        lp = transcripts.session_loop(write_jsonl([
+            user_row("<command-name>/loop</command-name>"
+                     "<command-args>check the deploy</command-args>",
+                     "2026-08-22T08:59:34Z", blocks=True),
         ]))
         self.assertEqual(lp["text"], "check the deploy")
         self.assertEqual(lp["source"], "prompt")
@@ -324,12 +303,13 @@ class SessionLoopTests(unittest.TestCase):
                      "loop 能不能也弄个横幅, 和 goal 一样",
                      "the loop is finally green"):
             self.assertIsNone(
-                transcripts.session_loop(_write([_typed("2026-08-22T08:00:00Z", text)])),
+                transcripts.session_loop(write_jsonl([
+                    user_row(text, "2026-08-22T08:00:00Z", blocks=True)])),
                 text)
 
     def test_a_model_invoking_the_skill_counts_too(self):
         # A model reaches /loop through the Skill tool, not by typing a slash.
-        lp = transcripts.session_loop(_write([
+        lp = transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T08:59:34Z", "Skill",
                       {"skill": "loop", "args": "5m check the deploy"}),
         ]))
@@ -337,31 +317,30 @@ class SessionLoopTests(unittest.TestCase):
         self.assertEqual(lp["source"], "prompt")
 
     def test_a_slash_command_envelope_is_unwrapped(self):
-        lp = transcripts.session_loop(_write([
-            _typed("2026-08-22T08:59:34Z",
-                   "<command-name>/loop</command-name>"
-                   "<command-args>5m run the tests</command-args>"),
+        lp = transcripts.session_loop(write_jsonl([
+            user_row("<command-name>/loop</command-name>"
+                     "<command-args>5m run the tests</command-args>",
+                     "2026-08-22T08:59:34Z", blocks=True),
         ]))
         self.assertEqual(lp["text"], "5m run the tests")
 
     def test_an_injected_skill_body_is_not_a_loop(self):
         # /loop's own SKILL.md opens with "# /loop — schedule a recurring …" and
         # lands as a user row nobody typed. It is not a task to pin.
-        self.assertIsNone(transcripts.session_loop(_write([
-            {"type": "user", "timestamp": "2026-08-22T08:59:34Z", "isMeta": True,
-             "message": {"content": [{"type": "text",
-                                      "text": "loop — schedule a recurring prompt"}]}},
+        self.assertIsNone(transcripts.session_loop(write_jsonl([
+            user_row("loop — schedule a recurring prompt", "2026-08-22T08:59:34Z",
+                     blocks=True, isMeta=True),
         ])))
 
     def test_cron_delete_takes_the_banner_down(self):
-        self.assertIsNone(transcripts.session_loop(_write([
+        self.assertIsNone(transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "CronCreate",
                       {"cron": "*/30 * * * *", "prompt": "check docs", "recurring": True}),
             _tool_use("2026-08-22T10:00:00Z", "CronDelete", {"id": "job-1"}),
         ])))
 
     def test_a_one_shot_cron_is_a_reminder_not_a_loop(self):
-        self.assertIsNone(transcripts.session_loop(_write([
+        self.assertIsNone(transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "CronCreate",
                       {"cron": "0 15 * * *", "prompt": "ping me", "recurring": False}),
         ])))
@@ -369,7 +348,7 @@ class SessionLoopTests(unittest.TestCase):
     def test_self_paced_mode_reads_the_wakeup(self):
         # ScheduleWakeup stores the /loop invocation it re-enters through; the
         # task is what's left after the wrapper.
-        lp = transcripts.session_loop(_write([
+        lp = transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
                       {"prompt": "/loop check the deploy", "delaySeconds": 1200,
                        "reason": "watching CI", "noop": True}),
@@ -379,21 +358,21 @@ class SessionLoopTests(unittest.TestCase):
         self.assertEqual(lp["source"], "wakeup")
 
     def test_the_autonomous_sentinel_is_not_shown_raw(self):
-        lp = transcripts.session_loop(_write([
+        lp = transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
                       {"prompt": "<<autonomous-loop-dynamic>>", "delaySeconds": 1800}),
         ]))
         self.assertEqual(lp["text"], "自主循环")
 
     def test_stopping_a_self_paced_loop_takes_the_banner_down(self):
-        self.assertIsNone(transcripts.session_loop(_write([
+        self.assertIsNone(transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
                       {"prompt": "/loop check the deploy", "delaySeconds": 1200}),
             _tool_use("2026-08-22T09:20:00Z", "ScheduleWakeup", {"stop": True}),
         ])))
 
     def test_a_re_armed_wakeup_tracks_the_latest_tick(self):
-        lp = transcripts.session_loop(_write([
+        lp = transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "ScheduleWakeup",
                       {"prompt": "/loop watch it", "delaySeconds": 1200}),
             _tool_use("2026-08-22T09:20:00Z", "ScheduleWakeup",
@@ -403,7 +382,7 @@ class SessionLoopTests(unittest.TestCase):
         self.assertEqual(lp["cadence"], "自定节奏 · 约 10 分钟")
 
     def test_a_second_loop_replaces_the_first(self):
-        lp = transcripts.session_loop(_write([
+        lp = transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "CronCreate",
                       {"cron": "*/30 * * * *", "prompt": "check docs", "recurring": True}),
             _tool_use("2026-08-22T10:00:00Z", "CronCreate",
@@ -413,7 +392,7 @@ class SessionLoopTests(unittest.TestCase):
         self.assertEqual(lp["cadence"], "每 2 小时")
 
     def test_a_long_task_is_capped_visibly(self):
-        lp = transcripts.session_loop(_write([
+        lp = transcripts.session_loop(write_jsonl([
             _tool_use("2026-08-22T09:00:06Z", "CronCreate",
                       {"cron": "*/30 * * * *", "prompt": "x" * (LOOP_CHARS + 500),
                        "recurring": True}),

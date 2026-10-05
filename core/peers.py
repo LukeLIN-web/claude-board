@@ -186,7 +186,6 @@ def _poll_once(label: str, base: str) -> None:
             "windows": wins,
             "ts": time.time(),
             "error": None,
-            "tmux_available": bool(payload.get("tmux_available")),
         }
 
 
@@ -194,7 +193,7 @@ def _record_error(label: str, msg: str) -> None:
     """Keep the last good windows, only note the failure — a peer that blips
     between polls shouldn't blank its cards. Age is what eventually drops them."""
     with _lock:
-        entry = _cache.setdefault(label, {"windows": [], "ts": 0.0, "tmux_available": False})
+        entry = _cache.setdefault(label, {"windows": [], "ts": 0.0})
         entry["error"] = msg
 
 
@@ -252,7 +251,7 @@ def status() -> list[dict]:
         out.append({
             "host": label,
             "url": _peers[label],
-            "online": bool(ts) and age is not None and age <= STALE_AFTER,
+            "online": bool(ts) and age <= STALE_AFTER,
             "age_seconds": round(age, 1) if age is not None else None,
             "windows": len(entry.get("windows", [])),
             "error": entry.get("error"),

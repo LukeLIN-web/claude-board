@@ -1,12 +1,16 @@
 """Parse ~/.claude/projects/{slug}/{sessionId}.jsonl transcripts."""
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
-from collections import deque
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 from .textcap import (
     GOAL_CHARS,
@@ -128,39 +132,137 @@ def clean_user_text(text: str) -> str:
 @dataclass
 class TurnEvent:
     ts: str
-    kind: str            # user_text | assistant_text | tool_use | tool_result | system
+    kind: str            # user_text | assistant_text | tool_use | tool_result | …
     text: str            # ≤ 4 KB excerpt
     tool: Optional[str]  # name of tool when kind == tool_use
     role: str            # user | assistant | system
     extra: dict          # small structured payload (e.g. tool input keys)
 
 
+# Room for every live card plus the recent sessions the History index enriches
+# (history._ENRICH_LIMIT). An LRU smaller than the set it cycles through evicts
+# each entry just before its next use, and then it caches nothing.
+_MEMO_SIZE = 256
+_memo_lock = threading.Lock()
+
+
+def memo_by_file(fn):
+    """Memoize `fn(path)` on the file's (mtime_ns, size).
+
+    The board runs half a dozen extractors over every live transcript on every
+    2 s refresh, and each is a full read and JSON parse — about 0.2 s apiece on
+    a 51 MB transcript, for a session that may not have written a byte since.
+    Only for functions whose answer depends on nothing but the file.
+
+    One entry per path (a new stamp replaces the old one), least recently used
+    dropped past _MEMO_SIZE. The result is shared by every caller that gets it,
+    so treat it as read-only.
+    """
+    cache: OrderedDict[str, tuple[tuple[int, int], object]] = OrderedDict()
+
+    @functools.wraps(fn)
+    def wrapper(path):
+        key = str(path)
+        try:
+            st = os.stat(key)
+        except OSError:
+            return fn(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+        with _memo_lock:
+            hit = cache.get(key)
+            if hit is not None and hit[0] == stamp:
+                cache.move_to_end(key)
+                return hit[1]
+        # Read outside the lock: a file that grows meanwhile is only ever newer
+        # than `stamp`, so the next call sees a new stamp and reads it again.
+        value = fn(path)
+        with _memo_lock:
+            cache[key] = (stamp, value)
+            cache.move_to_end(key)
+            if len(cache) > _MEMO_SIZE:
+                cache.popitem(last=False)
+        return value
+
+    return wrapper
+
+
+def _parse_rows(lines: Iterable[str]) -> Iterator[dict]:
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except Exception:
+            continue
+
+
 def _iter_lines(path: Path) -> Iterable[dict]:
     try:
         with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except Exception:
-                    continue
+            yield from _parse_rows(f)
     except FileNotFoundError:
         return
 
 
+_TAIL_BLOCK = 64 * 1024
+
+
+def tail_raw_lines(path: str | Path, n: int) -> list[str]:
+    """The last `n` lines of a file, oldest first, without reading the rest.
+
+    Reads backward from the end in 64 KB blocks until it holds n whole lines or
+    reaches the start. A transcript runs to tens of MB and a card only wants its
+    last few dozen rows, so walking it from the top on every refresh was nearly
+    all of what the read cost. A final line with no newline yet (a row still
+    being written) is kept — parsing it is the caller's call; the line a block
+    boundary cuts through at the head is not. [] if the file is missing.
+    """
+    if n <= 0:
+        return []
+    chunks: list[bytes] = []
+    newlines = 0
+    try:
+        with open(path, "rb") as f:
+            pos = f.seek(0, os.SEEK_END)
+            # n + 1 newlines: one may be the file's own trailing newline, and
+            # the text ahead of the first is a line cut short unless pos is 0.
+            while pos > 0 and newlines <= n:
+                step = min(_TAIL_BLOCK, pos)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+    except OSError:
+        return []
+    lines = b"".join(reversed(chunks)).split(b"\n")
+    if lines[-1] == b"":
+        lines.pop()
+    if pos > 0:
+        lines.pop(0)
+    return [ln.decode("utf-8", "replace") for ln in lines[-n:]]
+
+
 def _tail_lines(path: Path, n: int) -> list[dict]:
-    buf: deque[dict] = deque(maxlen=n)
-    for d in _iter_lines(path):
-        buf.append(d)
-    return list(buf)
+    return list(_parse_rows(tail_raw_lines(path, n)))
 
 
-def _flatten_assistant(msg: dict) -> list[TurnEvent]:
+def _tool_uses(d: dict) -> Iterator[tuple[str, dict, dict]]:
+    """Each tool call an assistant row makes, as (name, input, block)."""
+    if d.get("type") != "assistant":
+        return
+    content = (d.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    for c in content:
+        if isinstance(c, dict) and c.get("type") == "tool_use":
+            yield c.get("name", ""), c.get("input") or {}, c
+
+
+def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
     out: list[TurnEvent] = []
     content = msg.get("content") or []
-    ts = msg.get("timestamp") or ""
     if isinstance(content, str):
         out.append(TurnEvent(ts, "assistant_text", cap_text(content, MESSAGE_CHARS), None, "assistant", {}))
         return out
@@ -252,22 +354,29 @@ def _flatten_assistant(msg: dict) -> list[TurnEvent]:
     return out
 
 
-def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
+def _user_text_event(ts: str, raw: str, meta: bool, **extra) -> TurnEvent:
+    """A user-turn text as its timeline row.
+
+    A prompt someone typed is the point of the timeline, so it gets the
+    generous cap. Anything the harness wrote in the user's turn — a skill body, a
+    command caveat, a background task reporting back — is worth a trace, not a
+    wall, and is flagged `meta` so the board can tell the two apart.
+    """
+    if meta:
+        extra["meta"] = True
+    return TurnEvent(
+        ts, "user_text",
+        cap_text(clean_user_text(raw), META_CHARS if meta else MESSAGE_CHARS),
+        None, "user", extra,
+    )
+
+
+def _flatten_user(msg: dict, ts: str, is_meta: bool = False) -> list[TurnEvent]:
     out: list[TurnEvent] = []
     content = msg.get("content") or []
-    ts = msg.get("timestamp") or ""
 
     def user_row(raw: str) -> TurnEvent:
-        # A prompt someone typed is the point of the timeline, so it gets the
-        # generous cap. Anything the harness wrote in the user's turn — a skill
-        # body, a command caveat, a background task reporting back — is worth a
-        # trace, not a wall, and is flagged so the board can tell the two apart.
-        injected = is_meta or is_injected_text(raw)
-        return TurnEvent(
-            ts, "user_text",
-            cap_text(clean_user_text(raw), META_CHARS if injected else MESSAGE_CHARS),
-            None, "user", {"meta": True} if injected else {},
-        )
+        return _user_text_event(ts, raw, is_meta or is_injected_text(raw))
 
     if isinstance(content, str):
         out.append(user_row(content))
@@ -296,7 +405,8 @@ def _flatten_user(msg: dict, is_meta: bool = False) -> list[TurnEvent]:
 
 
 def _queued_prompt_text(value) -> str:
-    """A queued prompt as text, whatever shape the CLI logged it in.
+    """A queued prompt (or a user row's content) as text, whatever shape the CLI
+    logged it in.
 
     Usually a plain string. A prompt with pasted images is logged as content
     blocks instead, and this used to go straight to `.strip()` — one
@@ -337,14 +447,8 @@ def _flatten_queued_prompt(d: dict) -> list[TurnEvent]:
     text = _queued_prompt_text(a.get("prompt"))
     if not text.strip():
         return []
-    extra = {"queued": True}
-    if is_injected_text(text):
-        extra["meta"] = True
-    return [TurnEvent(
-        d.get("timestamp") or a.get("timestamp") or "", "user_text",
-        cap_text(clean_user_text(text), META_CHARS if extra.get("meta") else MESSAGE_CHARS),
-        None, "user", extra,
-    )]
+    return [_user_text_event(d.get("timestamp") or a.get("timestamp") or "", text,
+                             is_injected_text(text), queued=True)]
 
 
 def _flatten_recap(d: dict) -> list[TurnEvent]:
@@ -353,8 +457,8 @@ def _flatten_recap(d: dict) -> list[TurnEvent]:
     Claude logs it as `system`/`away_summary`: two or three sentences of where
     the session got to and what it needs next. The board is read by someone who
     was away by definition, and that summary is the single most useful row in the
-    transcript for them — but every `system` row currently flattens to the same
-    placeholder the client hides, so it was the one thing the timeline dropped.
+    transcript for them — and every other `system` row makes no timeline row,
+    so left with the rest it would be the one thing the timeline dropped.
 
     Its own `kind`, not `assistant_text`: nobody asked for it, it isn't part of
     the turn it sits in, and the client styles it as the standing "where we are"
@@ -395,6 +499,7 @@ def _first_sentence(text: str) -> str:
 _PROMPT_GOAL_RE = re.compile(r"^\s*goal\b[:：]?\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
 
+@memo_by_file
 def session_goal(path: str | Path) -> Optional[dict]:
     """What this session is for, as {text, ts, source} — None if it never said.
 
@@ -413,9 +518,6 @@ def session_goal(path: str | Path) -> Optional[dict]:
     then buried under a few hundred tool rows, which is exactly when someone
     opens the board to ask what a session is even doing.
     """
-    p = Path(path)
-    if not p.exists():
-        return None
     goal: Optional[dict] = None
 
     def offer(text: str, ts: str, source: str) -> None:
@@ -428,14 +530,19 @@ def session_goal(path: str | Path) -> Optional[dict]:
         if goal is None or _parse_ts(ts) >= _parse_ts(goal["ts"]):
             goal = {"text": cap_text(text, GOAL_CHARS), "ts": ts, "source": source}
 
-    for d in _iter_lines(p):
-        if d.get("type") == "system" and d.get("subtype") == "away_summary":
+    for d in _iter_lines(Path(path)):
+        t = d.get("type")
+        if t == "system" and d.get("subtype") == "away_summary":
             content = _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
             m = _GOAL_RE.match(content)
             if m:
                 offer(m.group(1), d.get("timestamp", ""), "recap")
             continue
         # Anything the user typed, including a prompt Claude took off its queue.
+        # No other row holds one, and normalizing an assistant row diffs every
+        # Edit in it.
+        if t not in ("user", "attachment"):
+            continue
         for ev in _normalize(d):
             if ev.kind != "user_text" or ev.extra.get("meta"):
                 continue
@@ -535,6 +642,7 @@ def _loop_task_text(prompt: str) -> str:
     return "自主循环" if text in _LOOP_SENTINELS else text
 
 
+@memo_by_file
 def session_loop(path: str | Path) -> Optional[dict]:
     """The prompt this session keeps re-running, as {text, ts, source, cadence}.
 
@@ -559,9 +667,6 @@ def session_loop(path: str | Path) -> Optional[dict]:
     cron, `ScheduleWakeup(stop=True)` ends a self-paced one, and either way
     there is nothing left to pin.
     """
-    p = Path(path)
-    if not p.exists():
-        return None
     loop: Optional[dict] = None
 
     def offer(text: str, ts: str, source: str, cadence: Optional[str]) -> None:
@@ -572,13 +677,10 @@ def session_loop(path: str | Path) -> Optional[dict]:
         loop = {"text": cap_text(text, LOOP_CHARS), "ts": ts,
                 "source": source, "cadence": cadence}
 
-    for d in _iter_lines(p):
+    for d in _iter_lines(Path(path)):
         if d.get("type") == "assistant":
             ts = d.get("timestamp", "")
-            for c in ((d.get("message") or {}).get("content") or []):
-                if not isinstance(c, dict) or c.get("type") != "tool_use":
-                    continue
-                name, inp = c.get("name", ""), (c.get("input") or {})
+            for name, inp, _ in _tool_uses(d):
                 if name == "Skill" and str(inp.get("skill", "")).lstrip("/") == "loop":
                     offer(str(inp.get("args") or ""), ts, "prompt", None)
                 elif name == "CronDelete":
@@ -597,37 +699,34 @@ def session_loop(path: str | Path) -> Optional[dict]:
         # only thing that distinguishes the command from a sentence about loops.
         if d.get("type") != "user" or is_injected_user_row(d):
             continue
-        raw = (d.get("message") or {}).get("content")
-        if isinstance(raw, list):
-            raw = "".join(b.get("text", "") for b in raw
-                          if isinstance(b, dict) and b.get("type") == "text")
-        if isinstance(raw, str) and _LOOP_CMD_RE.search(raw):
+        raw = _queued_prompt_text((d.get("message") or {}).get("content"))
+        if _LOOP_CMD_RE.search(raw):
             args = _CMD_ARGS_RE.search(raw)
             offer(args.group(1) if args else "", d.get("timestamp", ""), "prompt", None)
     return loop
 
 
 def _normalize(d: dict) -> list[TurnEvent]:
+    """One transcript row as its timeline events.
+
+    Every other `system` row (turn_duration, stop_hook_summary, …) and every
+    permission-mode row makes none: they land after nearly every turn and say
+    nothing a reader of the timeline wants, and as rows they would use up its
+    `limit` and pad its count of earlier events.
+    """
     t = d.get("type")
     msg = d.get("message") or {}
     # `timestamp` lives on the outer envelope, not inside `message`.
-    if msg and "timestamp" not in msg and d.get("timestamp"):
-        msg["timestamp"] = d.get("timestamp")
+    ts = d.get("timestamp") or ""
     if t == "assistant":
-        return _flatten_assistant(msg)
+        return _flatten_assistant(msg, ts)
     if t == "user":
         # The markers sit on the envelope, not on `message`.
-        return _flatten_user(msg, is_injected_user_row(d))
+        return _flatten_user(msg, ts, is_injected_user_row(d))
     if t == "attachment":
         return _flatten_queued_prompt(d)
     if t == "system" and d.get("subtype") == "away_summary":
         return _flatten_recap(d)
-    if t in {"system", "permission-mode"}:
-        return [TurnEvent(
-            d.get("timestamp", ""), "system",
-            t + (": " + str(d.get("permissionMode", "")) if d.get("permissionMode") else ""),
-            None, "system", {}
-        )]
     return []
 
 
@@ -644,15 +743,15 @@ def _row_model(d: dict) -> str:
     return "" if model.startswith("<") else model
 
 
+@memo_by_file
 def current_model(path: str | Path) -> str:
     """Model id of the session's most recent assistant turn ("" if none yet).
 
     The last row, not the first (history._extract_model): a session that switched
     model mid-run is *on* the new one, and that's what the board's card claims.
     """
-    p = Path(path)
     model = ""
-    for d in _iter_lines(p):
+    for d in _iter_lines(Path(path)):
         model = _row_model(d) or model
     return model
 
@@ -759,21 +858,14 @@ def _pending_notice_events(raw: list[dict]) -> dict[int, TurnEvent]:
         # "Queued" panel's business, and it already has one.
         if not content.lstrip().startswith("<task-notification>"):
             continue
-        out[i] = TurnEvent(
-            raw[i].get("timestamp", ""), "user_text",
-            cap_text(clean_user_text(content), META_CHARS),
-            None, "user", {"meta": True, "pending": True},
-        )
+        out[i] = _user_text_event(raw[i].get("timestamp", ""), content, True, pending=True)
     return out
 
 
 def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     """Return ≤ limit most recent flattened turn events for a transcript."""
-    p = Path(path)
-    if not p.exists():
-        return []
     # Read more lines than needed because one jsonl row can expand into several events.
-    raw = _tail_lines(p, max(limit * 2, 100))
+    raw = _tail_lines(Path(path), max(limit * 2, 100))
     switches = _model_change_events(raw)
     pending = _pending_notice_events(raw)
     events: list[TurnEvent] = []
@@ -791,7 +883,6 @@ def _parse_ts(ts: str) -> float:
     if not ts:
         return 0.0
     try:
-        from datetime import datetime
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except Exception:
         return 0.0
@@ -816,36 +907,34 @@ def consumed_prompt_texts(path: str | Path, since: float) -> list[tuple[float, s
     matchable until Claude gets to it. `since` (the oldest pending send) bounds
     the result, so an old identical prompt can't clear a freshly queued one.
     """
-    p = Path(path)
-    if not p.exists():
-        return []
+    return [(ts, text) for ts, text in _consumed_prompts(path) if ts >= since]
+
+
+@memo_by_file
+def _consumed_prompts(path: str | Path) -> list[tuple[float, str]]:
+    """consumed_prompt_texts for the whole transcript, before `since` cuts it."""
     out: list[tuple[float, str]] = []
-    for d in _iter_lines(p):
-        if d.get("type") == "queue-operation":
-            if d.get("operation") != "remove":
-                continue
-            ts, text = _parse_ts(d.get("timestamp", "")), d.get("content") or ""
-            if ts >= since and text.strip():
-                out.append((ts, text))
-            continue
-        for ev in _normalize(d):
-            # A queued prompt's `queued_command` attachment is the same delivery
-            # the `remove` row above already counted. Counting it twice would let
-            # one prompt clear two identical copies off the card, one of which is
-            # still waiting in Claude's queue.
-            if ev.kind == "user_text" and ev.text.strip() and not ev.extra.get("queued"):
-                ts = _parse_ts(ev.ts)
-                if ts >= since:
-                    out.append((ts, ev.text))
+    for d in _iter_lines(Path(path)):
+        t = d.get("type")
+        if t == "queue-operation":
+            text = d.get("content") or ""
+            if d.get("operation") == "remove" and text.strip():
+                out.append((_parse_ts(d.get("timestamp", "")), text))
+        # Only a user row: a queued prompt's `queued_command` attachment is the
+        # same delivery the `remove` row above already counted. Counting it twice
+        # would let one prompt clear two identical copies off the card, one of
+        # which is still waiting in Claude's queue.
+        elif t == "user":
+            for ev in _normalize(d):
+                if ev.kind == "user_text" and ev.text.strip():
+                    out.append((_parse_ts(ev.ts), ev.text))
     return out
 
 
+@memo_by_file
 def current_task_hint(path: str | Path) -> Optional[str]:
     """Best-effort one-liner of what this session is currently doing."""
-    p = Path(path)
-    if not p.exists():
-        return None
-    raw = _tail_lines(p, 30)
+    raw = _tail_lines(Path(path), 30)
     # Walk back to the most informative event.
     for d in reversed(raw):
         for ev in reversed(_normalize(d)):
@@ -863,54 +952,32 @@ def current_task_hint(path: str | Path) -> Optional[str]:
     return None
 
 
-def extract_skills_used(path: str | Path) -> list[str]:
-    """Extract unique skill names invoked via the Skill tool."""
-    counts = count_skill_invocations(path)
-    return list(counts.keys())
+_SKILL_PATH_RE = re.compile(r'/\.claude/skills/([^/]+)/')
 
 
-def count_skill_invocations(path: str | Path) -> dict[str, int]:
-    """Count total invocations per skill (not deduplicated)."""
-    activity = count_skill_activity(path)
-    return activity.get("per_skill_invokes", {})
-
-
-def count_skill_activity(path: str | Path) -> dict:
-    """Count all skill-related activity: invocations + file ops + bash refs.
+@memo_by_file
+def session_activity(path: str | Path) -> dict:
+    """Skill and memory activity of a session, in one pass over its transcript.
 
     Returns {
-        per_skill_invokes: {name: count},
-        per_skill_file_ops: {name: count},
-        per_skill_bash_refs: {name: count},
-        totals: {invoke, file_ops, bash_refs, total},
-    }
+        skills_used: [name] — invoked via the Skill tool, first use first,
+        memory_ops: [{name, operation, content_preview?}] — each (memory, op) once,
+        skill_breakdown: {per_skill_invokes, per_skill_reads, per_skill_writes,
+                          per_skill_bash_refs},
+        memory_breakdown: {per_memory_reads, per_memory_writes, per_memory_edits},
+    }, the shape codex and opencode sessions report too. Breakdown counts are
+    not deduplicated.
     """
-    import re
-    p = Path(path)
-    if not p.exists():
-        return {"per_skill_invokes": {}, "per_skill_file_ops": {},
-                "per_skill_reads": {}, "per_skill_writes": {},
-                "per_skill_bash_refs": {}, "totals": {"invoke": 0, "file_ops": 0, "reads": 0, "writes": 0, "bash_refs": 0, "total": 0}}
-
     invokes: dict[str, int] = {}
-    file_ops: dict[str, int] = {}
     skill_reads: dict[str, int] = {}
     skill_writes: dict[str, int] = {}
     bash_refs: dict[str, int] = {}
-    skill_path_re = re.compile(r'/\.claude/skills/([^/]+)/')
+    mem_counts: dict[str, dict[str, int]] = {"Read": {}, "Write": {}, "Edit": {}}
+    mem_ops: list[dict] = []
+    seen: set[tuple[str, str]] = set()
 
-    for d in _iter_lines(p):
-        if d.get("type") != "assistant":
-            continue
-        content = (d.get("message") or {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict) or c.get("type") != "tool_use":
-                continue
-            name = c.get("name", "")
-            inp = c.get("input") or {}
-
+    for d in _iter_lines(Path(path)):
+        for name, inp, _ in _tool_uses(d):
             if name == "Skill":
                 sk = inp.get("skill", "")
                 if sk:
@@ -918,117 +985,63 @@ def count_skill_activity(path: str | Path) -> dict:
 
             elif name in ("Read", "Write", "Edit"):
                 fp = str(inp.get("file_path", ""))
-                m = skill_path_re.search(fp)
+                m = _SKILL_PATH_RE.search(fp)
                 if m:
-                    sk = m.group(1)
-                    file_ops[sk] = file_ops.get(sk, 0) + 1
-                    if name == "Read":
-                        skill_reads[sk] = skill_reads.get(sk, 0) + 1
-                    else:
-                        skill_writes[sk] = skill_writes.get(sk, 0) + 1
-
-            elif name == "Bash":
-                cmd = str(inp.get("command", ""))
-                if "skills/" in cmd or "SKILL.md" in cmd:
-                    matches = skill_path_re.findall(cmd)
-                    if matches:
-                        for sk in set(matches):
-                            bash_refs[sk] = bash_refs.get(sk, 0) + 1
-                    else:
-                        bash_refs["_general"] = bash_refs.get("_general", 0) + 1
-
-    ti = sum(invokes.values())
-    tf = sum(file_ops.values())
-    tr = sum(skill_reads.values())
-    tw = sum(skill_writes.values())
-    tb = sum(bash_refs.values())
-    return {
-        "per_skill_invokes": invokes,
-        "per_skill_file_ops": file_ops,
-        "per_skill_reads": skill_reads,
-        "per_skill_writes": skill_writes,
-        "per_skill_bash_refs": bash_refs,
-        "totals": {"invoke": ti, "file_ops": tf, "reads": tr, "writes": tw, "bash_refs": tb, "total": ti + tf + tb},
-    }
-
-
-def count_memory_activity(path: str | Path) -> dict:
-    """Count per-memory read/write/edit counts (not deduplicated)."""
-    p = Path(path)
-    if not p.exists():
-        return {"per_memory_reads": {}, "per_memory_writes": {}, "per_memory_edits": {}}
-    reads: dict[str, int] = {}
-    writes: dict[str, int] = {}
-    edits: dict[str, int] = {}
-    for d in _iter_lines(p):
-        if d.get("type") != "assistant":
-            continue
-        content = (d.get("message") or {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict) or c.get("type") != "tool_use":
-                continue
-            tool_name = c.get("name", "")
-            if tool_name not in ("Read", "Write", "Edit"):
-                continue
-            inp = c.get("input") or {}
-            fp = str(inp.get("file_path", ""))
-            if "/memory/" not in fp:
-                continue
-            mem_name = fp.rsplit("/", 1)[-1].replace(".md", "")
-            if mem_name == "MEMORY":
-                continue
-            if tool_name == "Read":
-                reads[mem_name] = reads.get(mem_name, 0) + 1
-            elif tool_name == "Write":
-                writes[mem_name] = writes.get(mem_name, 0) + 1
-            elif tool_name == "Edit":
-                edits[mem_name] = edits.get(mem_name, 0) + 1
-    return {"per_memory_reads": reads, "per_memory_writes": writes, "per_memory_edits": edits}
-
-
-def extract_memory_ops(path: str | Path) -> list[dict]:
-    """Extract unique memory file operations: [{name, operation, content_preview?}]."""
-    p = Path(path)
-    if not p.exists():
-        return []
-    ops: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for d in _iter_lines(p):
-        if d.get("type") != "assistant":
-            continue
-        content = (d.get("message") or {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict) or c.get("type") != "tool_use":
-                continue
-            tool_name = c.get("name", "")
-            if tool_name not in ("Read", "Write", "Edit"):
-                continue
-            inp = c.get("input") or {}
-            file_path = str(inp.get("file_path", ""))
-            if "/memory/" not in file_path:
-                continue
-            mem_name = file_path.rsplit("/", 1)[-1].replace(".md", "")
-            if mem_name == "MEMORY":
-                continue
-            op = "read" if tool_name == "Read" else tool_name.lower()
-            key = (mem_name, op)
-            if key not in seen:
+                    counts = skill_reads if name == "Read" else skill_writes
+                    counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+                if "/memory/" not in fp:
+                    continue
+                mem_name = fp.rsplit("/", 1)[-1].replace(".md", "")
+                if mem_name == "MEMORY":
+                    continue
+                counts = mem_counts[name]
+                counts[mem_name] = counts.get(mem_name, 0) + 1
+                key = (mem_name, name.lower())
+                if key in seen:
+                    continue
                 seen.add(key)
-                entry: dict = {"name": mem_name, "operation": op}
-                if tool_name == "Write":
+                entry: dict = {"name": mem_name, "operation": name.lower()}
+                if name == "Write":
                     entry["content_preview"] = (inp.get("content") or "")[:300]
-                elif tool_name == "Edit":
+                elif name == "Edit":
                     # Same reason as the timeline card: a raw before/after pair
                     # spends the preview on the prefix both sides share.
                     entry["content_preview"] = edit_diff(
                         inp.get("old_string"), inp.get("new_string"), 300,
                     )
-                ops.append(entry)
-    return ops
+                mem_ops.append(entry)
+
+            elif name == "Bash":
+                cmd = str(inp.get("command", ""))
+                if "skills/" in cmd or "SKILL.md" in cmd:
+                    for sk in set(_SKILL_PATH_RE.findall(cmd)) or ("_general",):
+                        bash_refs[sk] = bash_refs.get(sk, 0) + 1
+
+    return {
+        "skills_used": list(invokes),
+        "memory_ops": mem_ops,
+        "skill_breakdown": {
+            "per_skill_invokes": invokes,
+            "per_skill_reads": skill_reads,
+            "per_skill_writes": skill_writes,
+            "per_skill_bash_refs": bash_refs,
+        },
+        "memory_breakdown": {
+            "per_memory_reads": mem_counts["Read"],
+            "per_memory_writes": mem_counts["Write"],
+            "per_memory_edits": mem_counts["Edit"],
+        },
+    }
+
+
+def extract_skills_used(path: str | Path) -> list[str]:
+    """Unique skill names invoked via the Skill tool, first use first."""
+    return session_activity(path)["skills_used"]
+
+
+def extract_memory_ops(path: str | Path) -> list[dict]:
+    """Unique memory file operations: [{name, operation, content_preview?}]."""
+    return session_activity(path)["memory_ops"]
 
 
 # The two task-notification fields the ledger below keys on (status and summary
@@ -1077,6 +1090,7 @@ def _note_finished(notified: dict[str, dict], body: str, ts: str) -> Optional[st
     return hit.group(1)
 
 
+@memo_by_file
 def extract_background_tasks(path: str | Path) -> list[dict]:
     """Async work this session started and has not finished with, as
     [{type, description, command, state, ts}].
@@ -1095,20 +1109,14 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
     notice delivered without queueing shows up only as that user row, or as a
     `queued_command` attachment, so those count as the report too.
     """
-    p = Path(path)
-    if not p.exists():
-        return []
     launched: dict[str, dict] = {}   # tool_use_id -> {type, description, command}
     notified: dict[str, dict] = {}   # task_id -> {tool_use_id, summary, ts}
     delivered: set[str] = set()      # task_ids the session has taken
-    for d in _iter_lines(p):
+    for d in _iter_lines(Path(path)):
         t = d.get("type")
         if t == "assistant":
-            for c in ((d.get("message") or {}).get("content") or []):
-                if not isinstance(c, dict) or c.get("type") != "tool_use":
-                    continue
-                inp = c.get("input") or {}
-                kind = _async_launch_kind(c.get("name", ""), inp)
+            for name, inp, c in _tool_uses(d):
+                kind = _async_launch_kind(name, inp)
                 if kind and c.get("id"):
                     launched[c["id"]] = {
                         "type": kind,
@@ -1167,37 +1175,21 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
     return out
 
 
+@memo_by_file
 def extract_plan_history(path: str | Path) -> list[dict]:
     """Extract chronological plan file mutations from a transcript.
 
     Returns [{ts, plan_file, operation, version_label, content, diff}].
     Write = full content snapshot. Edit = old_string/new_string diff.
     """
-    p = Path(path)
-    if not p.exists():
-        return []
     history: list[dict] = []
     write_count: dict[str, int] = {}
     edit_count: dict[str, int] = {}
-    for d in _iter_lines(p):
-        if d.get("type") != "assistant":
-            continue
-        ts = ""
-        msg = d.get("message") or {}
-        if "timestamp" not in msg and d.get("timestamp"):
-            ts = d["timestamp"]
-        else:
-            ts = msg.get("timestamp", "")
-        content_list = msg.get("content", [])
-        if not isinstance(content_list, list):
-            continue
-        for c in content_list:
-            if not isinstance(c, dict) or c.get("type") != "tool_use":
-                continue
-            tool_name = c.get("name", "")
+    for d in _iter_lines(Path(path)):
+        ts = d.get("timestamp") or ""
+        for tool_name, inp, _ in _tool_uses(d):
             if tool_name not in ("Write", "Edit"):
                 continue
-            inp = c.get("input") or {}
             fp = str(inp.get("file_path", ""))
             if "/.claude/plans/" not in fp or not fp.endswith(".md"):
                 continue

@@ -14,21 +14,15 @@
 # Exit codes: 0 ok · 2 usage/config
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# .env.local, then .env.local.<hostname>; sets PORT and RUN_DIR, defines wait_for.
+source scripts/env.sh
 
-if [ -f .env.local ]; then
-    set -a; source .env.local; set +a
-fi
-if [ -f ".env.local.$(hostname)" ]; then
-    set -a; source ".env.local.$(hostname)"; set +a
-fi
-
-PORT="${CLAUDE_FLEET_PORT:-7879}"
 RESTART_DELAY="${FLEET_BOARD_RESTART_DELAY:-3}"
-RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-fleet"
 PID_FILE="$RUN_DIR/board-supervisor.pid"
 LOCK_FILE="$RUN_DIR/board-supervisor.lock"
 LOG_FILE="uvicorn.$(hostname).log"
 
+# On success, $pid holds the supervisor's pid; callers use it as is.
 supervisor_running() {
     [ -s "$PID_FILE" ] || return 1
     pid="$(cat "$PID_FILE" 2>/dev/null)"
@@ -53,6 +47,29 @@ port_listening() {
     [ "$(board_code)" != "000" ]
 }
 
+pid_gone() {
+    ! kill -0 "$1" 2>/dev/null
+}
+
+# What `status` prints, and what `start` prints once the supervisor is up. $1 is
+# the wording for a running supervisor whose port is silent: just after `start`
+# the board is still booting; any other time it is between restarts.
+report() {
+    local code
+    code="$(board_code)"
+    if supervisor_running; then
+        if [ "$code" = "000" ]; then
+            echo "[board-supervisor] active (pid $pid); $1"
+        else
+            echo "[board-supervisor] active (pid $pid); board HTTP $code on 127.0.0.1:$PORT"
+        fi
+    elif [ "$code" != "000" ]; then
+        echo "[board-supervisor] NOT running; an unmanaged board answers HTTP $code on 127.0.0.1:$PORT" >&2
+    else
+        echo "[board-supervisor] not running; board is down"
+    fi
+}
+
 stop_supervisor() {
     if ! supervisor_running; then
         rm -f "$PID_FILE"
@@ -60,15 +77,10 @@ stop_supervisor() {
         return 0
     fi
 
-    pid="$(cat "$PID_FILE")"
     # `start` uses setsid, so this reaches both the loop and every uvicorn
     # reloader/worker it owns. TERM lets uvicorn finish in-flight requests.
     kill -TERM -- "-$pid" 2>/dev/null || true
-    for _ in $(seq 20); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.25
-    done
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! wait_for 20 0.25 pid_gone "$pid"; then
         echo "[board-supervisor] pid $pid did not stop after 5s" >&2
         return 1
     fi
@@ -110,19 +122,7 @@ restart)
     stop_supervisor || exit $?
     ;;
 status)
-    code="$(board_code)"
-    if supervisor_running; then
-        pid="$(cat "$PID_FILE")"
-        if [ "$code" = "000" ]; then
-            echo "[board-supervisor] active (pid $pid); board is between restarts"
-        else
-            echo "[board-supervisor] active (pid $pid); board HTTP $code on 127.0.0.1:$PORT"
-        fi
-    elif [ "$code" != "000" ]; then
-        echo "[board-supervisor] NOT running; an unmanaged board answers HTTP $code on 127.0.0.1:$PORT" >&2
-    else
-        echo "[board-supervisor] not running; board is down"
-    fi
+    report "board is between restarts"
     exit 0
     ;;
 start) ;;
@@ -138,7 +138,6 @@ exec 9>"$LOCK_FILE"
 flock 9
 
 if supervisor_running; then
-    pid="$(cat "$PID_FILE")"
     echo "[board-supervisor] already active (pid $pid)"
     exit 0
 fi
@@ -156,8 +155,4 @@ if ! supervisor_running; then
     exit 2
 fi
 
-if port_listening; then
-    echo "[board-supervisor] active (pid $pid); board HTTP $(board_code) on 127.0.0.1:$PORT"
-else
-    echo "[board-supervisor] active (pid $pid); board is starting, logs -> $LOG_FILE"
-fi
+report "board is starting, logs -> $LOG_FILE"

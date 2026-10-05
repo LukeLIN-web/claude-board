@@ -5,10 +5,7 @@ text can't go over the wire whole. What matters is that a cut is *visible*: a
 message that ends mid-sentence with no marker reads as a finished thought, which
 is exactly the bug these caps used to have.
 """
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
 from core import transcripts
 from core.textcap import (
@@ -19,13 +16,7 @@ from core.textcap import (
     cap_text,
     edit_diff,
 )
-
-
-def _write(rows) -> Path:
-    d = Path(tempfile.mkdtemp())
-    p = d / "t.jsonl"
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    return p
+from tests.helpers import assistant_row, user_row, write_jsonl
 
 
 class CapTextTests(unittest.TestCase):
@@ -45,17 +36,15 @@ class CapTextTests(unittest.TestCase):
 class TimelineCapTests(unittest.TestCase):
     def test_long_message_survives_far_past_the_old_4000_cap(self):
         text = "字" * 8000
-        p = _write([{"type": "assistant", "timestamp": "2026-08-05T10:00:00Z",
-                     "message": {"model": "claude-opus-5",
-                                 "content": [{"type": "text", "text": text}]}}])
+        p = write_jsonl([assistant_row(text, "2026-08-05T10:00:00Z")])
         ev = transcripts.timeline(p)[0]
         self.assertEqual(ev["kind"], "assistant_text")
         self.assertEqual(ev["text"], text)
 
     def test_tool_result_is_capped_with_a_marker(self):
         out = "y" * (TOOL_RESULT_CHARS + 500)
-        p = _write([{"type": "user", "timestamp": "2026-08-05T10:00:00Z",
-                     "message": {"content": [{"type": "tool_result", "content": out}]}}])
+        p = write_jsonl([{"type": "user", "timestamp": "2026-08-05T10:00:00Z",
+                          "message": {"content": [{"type": "tool_result", "content": out}]}}])
         ev = transcripts.timeline(p)[0]
         self.assertEqual(ev["kind"], "tool_result")
         self.assertTrue(ev["text"].startswith("y" * TOOL_RESULT_CHARS))
@@ -64,8 +53,8 @@ class TimelineCapTests(unittest.TestCase):
     def test_answer_echo_is_kept_whole(self):
         # Not tool output — the user's own selection, worth reading in full.
         out = "Your questions have been answered" + "z" * (TOOL_RESULT_CHARS + 500)
-        p = _write([{"type": "user", "timestamp": "2026-08-05T10:00:00Z",
-                     "message": {"content": [{"type": "tool_result", "content": out}]}}])
+        p = write_jsonl([{"type": "user", "timestamp": "2026-08-05T10:00:00Z",
+                          "message": {"content": [{"type": "tool_result", "content": out}]}}])
         ev = transcripts.timeline(p)[0]
         self.assertLessEqual(len(out), MESSAGE_CHARS)
         self.assertEqual(ev["text"], out)
@@ -74,8 +63,7 @@ class TimelineCapTests(unittest.TestCase):
         # Claude logs a skill's whole SKILL.md as an `isMeta` user row — 150k
         # chars for one /update-config. Nobody typed it, so it gets the short cap.
         body = "# Update Config Skill\n" + "说明" * 60000
-        p = _write([{"type": "user", "isMeta": True, "timestamp": "2026-08-05T10:00:00Z",
-                     "message": {"content": [{"type": "text", "text": body}]}}])
+        p = write_jsonl([user_row(body, "2026-08-05T10:00:00Z", blocks=True, isMeta=True)])
         ev = transcripts.timeline(p)[0]
         self.assertEqual(ev["kind"], "user_text")
         self.assertTrue(ev["text"].startswith("# Update Config Skill"))
@@ -85,8 +73,7 @@ class TimelineCapTests(unittest.TestCase):
 
     def test_a_typed_prompt_keeps_the_generous_cap(self):
         text = "字" * 8000
-        p = _write([{"type": "user", "timestamp": "2026-08-05T10:00:00Z",
-                     "message": {"content": [{"type": "text", "text": text}]}}])
+        p = write_jsonl([user_row(text, "2026-08-05T10:00:00Z", blocks=True)])
         ev = transcripts.timeline(p)[0]
         self.assertEqual(ev["text"], text)
         self.assertNotIn("meta", ev["extra"])
@@ -158,9 +145,9 @@ class EditDiffTests(unittest.TestCase):
 
 class EditRowTests(unittest.TestCase):
     def _edit_row(self, inp):
-        p = _write([{"type": "assistant", "timestamp": "2026-08-05T10:00:00Z",
-                     "message": {"content": [{"type": "tool_use", "name": "Edit",
-                                              "id": "t1", "input": inp}]}}])
+        p = write_jsonl([{"type": "assistant", "timestamp": "2026-08-05T10:00:00Z",
+                          "message": {"content": [{"type": "tool_use", "name": "Edit",
+                                                   "id": "t1", "input": inp}]}}])
         return transcripts.timeline(p)[0]
 
     def test_the_change_survives_the_arg_cap(self):
@@ -196,7 +183,3 @@ class EditRowTests(unittest.TestCase):
         ev = self._edit_row({"file_path": "/home/u/.claude/memory/foo.md",
                              "old_string": "a", "new_string": "b"})
         self.assertEqual(ev["kind"], "memory_write")
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -2,24 +2,52 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import sessions
-from .sessions import HOME_BASE, PROJECTS_DIR
+from .codex import CODEX_SESSIONS_DIR
+from .sessions import PROJECTS_DIR
 
-CODEX_HOME = HOME_BASE / ".codex"
-CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+# rg's --max-count. With context on, rg still prints a match that falls in the
+# last counted match's after-context, so the cap is applied again below.
+_HITS_PER_FILE = 5
+_CONTEXT_LINES = 3
+_TIMEOUT = 15  # seconds; a search still running then returns nothing
 
 
-def _project_slug_from_file(path: Path) -> str:
-    return path.parent.name
+def rg_command(query: str, *flags: str,
+               paths: Optional[list[str]] = None) -> Optional[list[str]]:
+    """ripgrep for `query` over every Claude and Codex transcript (or over just
+    `paths`), or None if neither directory exists. `flags` go after the
+    transcript globs, so a glob among them takes precedence over those.
+
+    The query is literal text (-F) handed over with -e. What gets typed into a
+    search box is words, not a regex: as a bare pattern `foo(` was a regex
+    parse error and found nothing, `a.b` also found `axb`, and `--resume` was
+    read as one of rg's own flags. Case is rg's smart case (-S), and `find`
+    places a match in the text by the same rule."""
+    dirs = [str(d) for d in (PROJECTS_DIR, CODEX_SESSIONS_DIR) if d.exists()]
+    if not dirs:
+        return None
+    return ["rg", "-S", "-F", "-g", "*.jsonl", "-g", "!*.wakatime", *flags,
+            "-e", query, *(dirs if paths is None else paths)]
 
 
-def _session_id_from_file(path: Path) -> str:
-    return path.stem
+def find(text: str, query: str) -> Optional[re.Match]:
+    """Where `query` first occurs in `text`, matched the way rg_command matches
+    it: as literal text, under rg's smart case — any case while the query is
+    all lower case, exactly once it has a capital in it. An excerpt located
+    ignoring case put a search for "Edit" on the first "edit" in the line, not
+    on the "Edit" rg had matched."""
+    flags = 0 if any(c.isupper() for c in query) else re.IGNORECASE
+    return re.search(re.escape(query), text, flags)
 
 
 def _extract_text(d: dict) -> str:
@@ -97,144 +125,186 @@ def _extract_type_label(d: dict) -> str:
     return t or "unknown"
 
 
-def _read_context(path: Path, center_line: int, radius: int = 3) -> list[dict]:
-    """Read ±radius lines around center_line, extract structured context."""
-    context: list[dict] = []
-    start = max(1, center_line - radius)
-    end = center_line + radius
-    try:
-        with path.open() as f:
-            for i, line in enumerate(f, start=1):
-                if i < start:
-                    continue
-                if i > end:
-                    break
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                text = _extract_text(d).strip()
-                if not text:
-                    continue
-                context.append({
-                    "line": i,
-                    "type": _extract_type_label(d),
-                    "text": text[:300],
-                    "is_match": i == center_line,
-                })
-    except Exception:
-        pass
-    return context
-
-
 def _detect_platform(path: Path) -> str:
     if str(CODEX_SESSIONS_DIR) in str(path):
         return "codex"
     return "claude"
 
 
-def search(query: str, limit: int = 60) -> list[dict]:
-    if not query.strip():
-        return []
-
-    search_dirs: list[str] = []
-    if PROJECTS_DIR.exists():
-        search_dirs.append(str(PROJECTS_DIR))
-    if CODEX_SESSIONS_DIR.exists():
-        search_dirs.append(str(CODEX_SESSIONS_DIR))
-    if not search_dirs:
-        return []
-
-    cmd = [
-        "rg", "--json", "-i", "-S",
-        "--max-count", "5",
-        "-g", "*.jsonl",
-        "-g", "!*.wakatime",
-        query,
-    ] + search_dirs
-
+def _row(raw: str) -> dict:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+        d = json.loads(raw)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
 
+
+def _file_hits(path: Path, lines: dict[int, str], matched: list[int], query: str) -> list[dict]:
+    """One file's hits, from the lines rg printed for it: each match plus the
+    context around it."""
+    platform = _detect_platform(path)
+    rows = {n: _row(raw) for n, raw in lines.items()}
     hits: list[dict] = []
-    seen: set[tuple[str, int]] = set()
-    for line in proc.stdout.splitlines():
-        try:
-            rec = json.loads(line)
-        except Exception:
-            continue
-        if rec.get("type") != "match":
-            continue
-        data = rec.get("data") or {}
-        path_info = data.get("path") or {}
-        text_info = data.get("lines") or {}
-        path = path_info.get("text")
-        line_no = data.get("line_number")
-        if not path or not line_no:
-            continue
-        key = (path, line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        p = Path(path)
-        # Hide hits from projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/
-        # EXCLUDE, judged on the cwd the transcript records (its projects/<slug>
-        # name is lossy); codex sessions aren't cwd-addressable, so they're left
-        # untouched.
-        if _detect_platform(p) == "claude" and not sessions.transcript_visible(p):
-            continue
-        raw = _read_line(p, line_no) or (text_info.get("text") or "")
-        try:
-            d = json.loads(raw)
-        except Exception:
-            d = {}
+    for line_no in matched:
+        d = rows[line_no]
         text = _extract_text(d).strip()
         if not text:
-            text = (text_info.get("text") or "").strip()[:200]
-
-        context = _read_context(p, line_no, radius=3)
-
+            text = lines[line_no].strip()[:200]
+        context: list[dict] = []
+        for i in range(max(1, line_no - _CONTEXT_LINES), line_no + _CONTEXT_LINES + 1):
+            ctx = _extract_text(rows.get(i) or {}).strip()
+            if ctx:
+                context.append({
+                    "line": i,
+                    "type": _extract_type_label(rows[i]),
+                    "text": ctx[:300],
+                    "is_match": i == line_no,
+                })
         hits.append({
-            "path": path,
+            "path": str(path),
             "line": line_no,
-            "project_slug": _project_slug_from_file(p),
-            "session_id": _session_id_from_file(p),
+            "project_slug": path.parent.name,
+            "session_id": path.stem,
             "ts": d.get("timestamp") or "",
-            "type": d.get("type") or "",
-            "excerpt": _excerpt(text, query),
-            "permission_mode": d.get("permissionMode"),
-            "platform": _detect_platform(p),
+            "excerpt": excerpt(text, query),
+            "platform": platform,
             "context": context,
         })
-        if len(hits) >= limit:
-            break
-    hits.sort(key=lambda h: h.get("ts") or "", reverse=True)
     return hits
 
 
-def _read_line(path: Path, line_no: int) -> Optional[str]:
+def _epoch(ts) -> float:
+    """A row's ISO `timestamp` in seconds since the epoch; 0 if it has none."""
     try:
-        with path.open() as f:
-            for i, line in enumerate(f, start=1):
-                if i == line_no:
-                    return line.rstrip("\n")
-    except Exception:
-        return None
-    return None
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
-def _excerpt(text: str, query: str, span: int = 120) -> str:
+def _newest_files(query: str, limit: int, deadline: float) -> dict[str, float]:
+    """The `limit` most recently written transcripts that hold `query` and that
+    the cwd filter shows, newest first, each with its mtime."""
+    cmd = rg_command(query, "-l", "--null")
+    if not cmd:
+        return {}
+    try:
+        out = subprocess.run(cmd, capture_output=True,
+                             timeout=max(0.0, deadline - time.monotonic())).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    mtimes: dict[str, float] = {}
+    for raw in out.split(b"\0"):
+        if raw:
+            path = os.fsdecode(raw)
+            try:
+                mtimes[path] = os.stat(path).st_mtime
+            except OSError:
+                continue
+    newest: dict[str, float] = {}
+    for path in sorted(mtimes, key=mtimes.__getitem__, reverse=True):
+        # Projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE are judged
+        # on the cwd the transcript records (its projects/<slug> name is
+        # lossy) — a Codex rollout's included, in its session_meta. Skipped
+        # here, before the cut, or a host that hides its busiest projects would
+        # fill all `limit` places with files that yield nothing.
+        if not sessions.transcript_visible(path):
+            continue
+        newest[path] = mtimes[path]
+        if len(newest) >= limit:
+            break
+    return newest
+
+
+def search(query: str, limit: int = 60) -> list[dict]:
+    """The `limit` newest hits for `query`, newest first, at most
+    _HITS_PER_FILE of them from any one transcript."""
+    if not query.strip():
+        return []
+    deadline = time.monotonic() + _TIMEOUT
+
+    # The newest hits, without reading every hit there is. rg searches files
+    # in parallel and prints each as its thread finishes, so the first
+    # `limit` hits it printed were an arbitrary set, and sorting them by time
+    # afterwards could not bring back the newer ones it had not reached. Two
+    # passes instead: `rg -l` names the files the query occurs in (still in
+    # parallel, and each file is dropped at its first match), they are put in
+    # order of last write, and a single-threaded rg — which keeps the order
+    # it is given — reads the newest of them first. A common word occurs in
+    # thousands of files, and collecting every hit and sorting them cost about
+    # a second for hits nobody would be shown. Each file holding the query has
+    # at least one hit, so the newest `limit` files always hold `limit` hits.
+    files = _newest_files(query, limit, deadline)
+    if not files:
+        return []
+    cmd = rg_command(query, "-j1", "--json", "--max-count", str(_HITS_PER_FILE),
+                     "-C", str(_CONTEXT_LINES), paths=list(files))
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return []
+    expired = threading.Event()
+    timer = threading.Timer(max(0.0, deadline - time.monotonic()),
+                            lambda: (expired.set(), proc.kill()))
+
+    # rg prints each file's records together, begin to end. Its match and
+    # context records carry the line itself, so a hit and the lines around it
+    # come straight from here rather than from reading the file again.
+    hits: list[dict] = []
+    lines: dict[int, str] = {}
+    matched: list[int] = []
+    with proc:
+        timer.start()
+        try:
+            for out in proc.stdout:
+                try:
+                    rec = json.loads(out)
+                except Exception:
+                    continue
+                kind, data = rec.get("type"), rec.get("data") or {}
+                if kind == "begin":
+                    # A row is never newer than its file's last write. Once
+                    # there are `limit` hits and the next file was last
+                    # written before the limit-th newest of them, neither it
+                    # nor any file after it has a hit that would make the cut.
+                    path = (data.get("path") or {}).get("text")
+                    if len(hits) >= limit:
+                        cutoff = sorted(h["ts"] for h in hits)[-limit]
+                        if files.get(path, 0.0) <= _epoch(cutoff):
+                            break
+                    lines, matched = {}, []
+                elif kind in ("match", "context"):
+                    line_no = data.get("line_number")
+                    if not line_no:
+                        continue
+                    lines[line_no] = (data.get("lines") or {}).get("text") or ""
+                    if kind == "match" and len(matched) < _HITS_PER_FILE:
+                        matched.append(line_no)
+                elif kind == "end" and matched:
+                    path = (data.get("path") or {}).get("text")
+                    if path:
+                        hits += _file_hits(Path(path), lines, matched, query)
+        finally:
+            timer.cancel()
+            proc.kill()
+    if expired.is_set():
+        return []
+    hits.sort(key=lambda h: h["ts"], reverse=True)
+    return hits[:limit]
+
+
+def excerpt(text: str, query: str, span: int = 120,
+            tidy: Callable[[str], str] = str) -> str:
+    """`text` cut to `span` chars around the first match of `query`, a "…"
+    marking each cut. `tidy` runs on the cut before the marks go on."""
     if not text:
         return ""
-    m = re.search(re.escape(query), text, re.IGNORECASE)
+    m = find(text, query)
     if not m:
         return text[: span * 2]
     start = max(0, m.start() - span // 2)
     end = min(len(text), m.end() + span // 2)
-    snippet = text[start:end]
+    snippet = tidy(text[start:end])
     if start > 0:
         snippet = "…" + snippet
     if end < len(text):

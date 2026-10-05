@@ -25,12 +25,16 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(got, {"b": "http://a:1"})
 
 
-class SplitKeyTests(unittest.TestCase):
+class _OnePeerTest(unittest.TestCase):
+    """This board is configured with one peer, "b"."""
+
     def setUp(self):
-        self._saved = dict(peers._peers)
-        peers._peers.clear()
-        peers._peers.update({"b": "http://127.0.0.1:7880"})
-        self.addCleanup(lambda: (peers._peers.clear(), peers._peers.update(self._saved)))
+        patch = mock.patch.dict(peers._peers, {"b": "http://127.0.0.1:7880"}, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+
+class SplitKeyTests(_OnePeerTest):
 
     def test_bare_pid_is_local(self):
         self.assertEqual(peers.split_key("1234"), (None, 1234))
@@ -48,14 +52,12 @@ class SplitKeyTests(unittest.TestCase):
             peers.split_key("b:notapid")
 
 
-class CacheTests(unittest.TestCase):
+class CacheTests(_OnePeerTest):
     def setUp(self):
-        self._saved = dict(peers._peers)
-        peers._peers.clear()
-        peers._peers.update({"b": "http://127.0.0.1:7880"})
-        peers._cache.clear()
-        self.addCleanup(lambda: (peers._peers.clear(), peers._peers.update(self._saved),
-                                 peers._cache.clear()))
+        super().setUp()
+        patch = mock.patch.dict(peers._cache, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _poll(self, payload, status=200):
         with mock.patch.object(peers, "_request", return_value=(status, payload)):
@@ -92,12 +94,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(row["host"], "b")
 
 
-class ForwardTests(unittest.TestCase):
-    def setUp(self):
-        self._saved = dict(peers._peers)
-        peers._peers.clear()
-        peers._peers.update({"b": "http://127.0.0.1:7880"})
-        self.addCleanup(lambda: (peers._peers.clear(), peers._peers.update(self._saved)))
+class ForwardTests(_OnePeerTest):
 
     def test_forward_calls_the_peer_and_returns_its_body(self):
         with mock.patch.object(peers, "_request",
@@ -146,14 +143,8 @@ class ForwardTests(unittest.TestCase):
         self.assertEqual(headers["authorization"], "Bearer tok")
 
 
-class RouteDispatchTests(unittest.TestCase):
+class RouteDispatchTests(_OnePeerTest):
     """The routes decide local-or-forward from the card key alone."""
-
-    def setUp(self):
-        self._saved = dict(peers._peers)
-        peers._peers.clear()
-        peers._peers.update({"b": "http://127.0.0.1:7880"})
-        self.addCleanup(lambda: (peers._peers.clear(), peers._peers.update(self._saved)))
 
     def test_peer_key_forwards_the_action_untouched(self):
         with mock.patch.object(peers, "forward",
@@ -229,7 +220,3 @@ class MergeTests(unittest.TestCase):
         with mock.patch.object(appmod, "_local_snapshot", return_value=local), \
              mock.patch.object(peers, "enabled", return_value=False):
             self.assertIs(appmod._enriched_snapshot(), local)
-
-
-if __name__ == "__main__":
-    unittest.main()

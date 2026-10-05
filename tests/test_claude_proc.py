@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from core import sessions
+from tests.helpers import make_window
 
 
 class ParseClaudeProcTests(unittest.TestCase):
@@ -66,19 +67,51 @@ class ProcArgvTests(unittest.TestCase):
         self.assertEqual(sessions._proc_argv(2 ** 22 + 7, "claude"), "claude")
 
 
+def _fresh_proc_table(test):
+    """Make the next process-table read run (the stubbed) `ps`, and keep the
+    stub's table from outliving the test."""
+    sessions._clear_caches()
+    test.addCleanup(sessions._clear_caches)
+
+
+class ProcTableTests(unittest.TestCase):
+    def test_names_and_command_lines_with_spaces(self):
+        ps = ("tmux: server         4242       1 Ss   ?        tmux -L x new -d\n"
+              "bash                 4300    4242 Ss+  pts/3    -bash\n"
+              "kworker/0:1-ev          9       2 I    ?        [kworker/0:1-events]\n")
+        _fresh_proc_table(self)
+        with mock.patch("core.sessions.subprocess.check_output", return_value=ps.encode()):
+            table = sessions.proc_table()
+        self.assertEqual(table[4242], sessions.Proc(1, "Ss", "?", "tmux: server",
+                                                    "tmux -L x new -d"))
+        self.assertEqual(table[4300], sessions.Proc(4242, "Ss+", "pts/3", "bash", "-bash"))
+        self.assertEqual(table[9].args, "[kworker/0:1-events]")
+
+    def test_read_once_within_a_tick(self):
+        _fresh_proc_table(self)
+        with mock.patch("core.sessions.subprocess.check_output",
+                        return_value=b"bash 1 0 S ? bash\n") as ps:
+            sessions.proc_table()
+            sessions.shell_descendant_counts([1])
+            sessions.proc_table(max_age=0)
+        self.assertEqual(ps.call_count, 2)
+
+
 @unittest.skipUnless(os.path.isdir("/proc"), "process-first detection is Linux-only")
 class ListClaudeProcWindowsTests(unittest.TestCase):
+    # `ps -eo ucomm=,pid=,ppid=,stat=,tty=,args=` (see sessions.proc_table).
     PS = (
-        "212704 pts/3 claude --resume f0eb279f-96d2\n"
-        "197794 pts/1 claude\n"            # already carded by its session file
-        "55501 ? node /n/bin/claude mcp\n"  # headless, no tty
-        "9001 pts/9 claude -p scripted\n"   # print mode → skip
-        "777 pts/8 vim file\n"              # not claude
+        "claude 212704 1 Sl+ pts/3 claude --resume f0eb279f-96d2\n"
+        "claude 197794 1 Sl+ pts/1 claude\n"         # already carded by its session file
+        "node 55501 1 Sl ? node /n/bin/claude mcp\n"  # headless, no tty
+        "claude 9001 1 Sl+ pts/9 claude -p scripted\n"  # print mode → skip
+        "vim 777 1 S+ pts/8 vim file\n"              # not claude
     )
 
     def _run(self, known_pids=frozenset(), known_ttys=frozenset()):
         # Relies on a real /proc (Linux); the transcript path resolves against
         # the real PROJECTS_DIR and simply won't exist, which is what we want.
+        _fresh_proc_table(self)
         with mock.patch("core.sessions.subprocess.check_output",
                         return_value=self.PS.encode()), \
              mock.patch("core.sessions._pid_alive", return_value=True), \
@@ -104,18 +137,27 @@ class ListClaudeProcWindowsTests(unittest.TestCase):
         wins = self._run(known_ttys={"/dev/pts/3"})
         self.assertNotIn(212704, {w.pid for w in wins})
 
+    def test_a_table_row_is_read_on_its_real_argv(self):
+        # The table's args are ps's, argv joined with spaces: `claude "explain
+        # what -p does"` reads there as print mode. The card goes by the argv
+        # /proc keeps apart (_proc_argv), and by ps's line only without one.
+        row = "claude 4040 1 Sl+ pts/4 claude explain what -p does\n"
+        real = {4040: ["claude", "explain what -p does"]}
+        with mock.patch.object(self, "PS", self.PS + row):
+            with mock.patch("core.sessions._proc_argv",
+                            side_effect=lambda pid, args: real.get(pid, args)):
+                self.assertIn(4040, {w.pid for w in self._run()})
+            with mock.patch("core.sessions._proc_argv", side_effect=lambda pid, args: args):
+                self.assertNotIn(4040, {w.pid for w in self._run()})
+
 
 class FindWindowProcFallbackTests(unittest.TestCase):
     """find_window / find_window_by_session must resolve process-first Claude
     cards too, or the card's actions (timeline, menu, prompt) 404."""
 
     def _fake(self, pid=999, sid="f0eb279f-aaaa"):
-        return sessions.Window(
-            pid=pid, session_id=sid, cwd="/w", project_name="w",
-            project_slug="-w", name=None, status="waiting",
-            waiting_for="dialog open", started_at=0, updated_at=0,
-            version="", tty="/dev/pts/3", transcript_path=None,
-            alive=True, hidden=False, platform="claude")
+        return make_window(pid=pid, session_id=sid, status="waiting",
+                           waiting_for="dialog open")
 
     def test_find_window_falls_back_to_proc(self):
         with mock.patch("core.sessions.list_windows", return_value=[]), \
@@ -211,6 +253,7 @@ class ResumeForkTests(unittest.TestCase):
         os.utime(f, (mtime, mtime))
 
     def _run(self, ps):
+        _fresh_proc_table(self)
         with mock.patch("core.sessions.subprocess.check_output", return_value=ps.encode()), \
              mock.patch("core.sessions._pid_alive", return_value=True), \
              mock.patch("core.sessions._cwd_visible", return_value=True), \
@@ -221,7 +264,7 @@ class ResumeForkTests(unittest.TestCase):
         self._touch("oldid", mtime=self.now - 3600)   # frozen at pre-resume point
         self._touch("newforkid", mtime=self.now)      # live forked continuation
         pid = os.getpid()
-        w = next(w for w in self._run(f"{pid} pts/3 claude --resume oldid\n")
+        w = next(w for w in self._run(f"claude {pid} 1 Sl+ pts/3 claude --resume oldid\n")
                  if w.pid == pid)
         self.assertEqual(w.session_id, "newforkid")
         self.assertTrue(w.transcript_path.endswith("newforkid.jsonl"))
@@ -231,10 +274,6 @@ class ResumeForkTests(unittest.TestCase):
         # there's no newer sibling and the card keeps the resume-arg id.
         self._touch("oldid", mtime=self.now)
         pid = os.getpid()
-        w = next(w for w in self._run(f"{pid} pts/3 claude --resume oldid\n")
+        w = next(w for w in self._run(f"claude {pid} 1 Sl+ pts/3 claude --resume oldid\n")
                  if w.pid == pid)
         self.assertEqual(w.session_id, "oldid")
-
-
-if __name__ == "__main__":
-    unittest.main()

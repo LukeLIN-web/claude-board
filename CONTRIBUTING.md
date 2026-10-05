@@ -57,4 +57,5 @@ never from real sessions — please keep it that way.
 ## Reporting issues
 
 Open a GitHub issue with your OS, Python version, and the relevant snippet from
-the terminal where you ran `bash run.sh`.
+the board's log: `bash run.sh` runs it detached, so its output goes to
+`uvicorn.<hostname>.log` in the repo root, not to your terminal.

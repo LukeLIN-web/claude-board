@@ -10,16 +10,14 @@ This is the reliable half of the card's "Queued (N)" list; the best-effort half
 """
 from __future__ import annotations
 
-import itertools
 import re
 import time
 from typing import Optional
 
 from . import transcripts
 
-# pid -> [{id, norm, text, ts}]  (ts = epoch seconds when we sent it)
+# pid -> [{norm, text, ts}]  (ts = epoch seconds when we sent it)
 _sent: dict[int, list[dict]] = {}
-_ids = itertools.count(1)
 
 # "/btw <question>" is an aside, not a prompt: Claude answers it in an ephemeral
 # TUI overlay that never reaches the transcript (see core.btwlog), so `pending`'s
@@ -72,22 +70,22 @@ def record_sent(pid: int, text: str, ts: Optional[float] = None) -> None:
     # typed so the card label still reads "/btw", not "btw".
     display = " ".join((text or "").split())
     _sent.setdefault(pid, []).append(
-        {"id": next(_ids), "norm": n, "text": display,
-         "ts": time.time() if ts is None else ts}
+        {"norm": n, "text": display, "ts": time.time() if ts is None else ts}
     )
 
 
 def clear(pid: int) -> None:
+    """Forget `pid`'s tracked prompts — the caller's call once the session is
+    idle, since a queue can't outlive an idle session."""
     _sent.pop(pid, None)
 
 
-def pending(pid: int, transcript_path: Optional[str], status: str) -> list[dict]:
-    """Tracked prompts Claude hasn't processed yet, as [{id, text}] (send order).
+def pending(pid: int, transcript_path: Optional[str]) -> list[str]:
+    """Texts of tracked prompts Claude hasn't processed yet, in send order.
 
     Reconciliation:
-      - status == "idle": the queue can't outlive an idle session -> clear all.
-      - else: drop one tracked item per matching consumed-prompt row (a user turn,
-        or Claude pulling the prompt off its own queue -- see
+      - drop one tracked item per matching consumed-prompt row (a user turn, or
+        Claude pulling the prompt off its own queue -- see
         transcripts.consumed_prompt_texts) whose timestamp is at/after the send,
         so an older identical prompt can't falsely consume a freshly queued one.
         Duplicates clear in send order.
@@ -96,20 +94,19 @@ def pending(pid: int, transcript_path: Optional[str], status: str) -> list[dict]
     items = _sent.get(pid)
     if not items:
         return []
-    if status == "idle":
-        clear(pid)
-        return []
 
     if transcript_path:
         oldest = min(it["ts"] for it in items)
-        seen = transcripts.consumed_prompt_texts(transcript_path, since=oldest)
+        # (ts, norm) per consumed row, normalized once rather than per item.
+        seen = [(ts, norm(txt)) for ts, txt in
+                transcripts.consumed_prompt_texts(transcript_path, since=oldest)]
         remaining: list[dict] = []
         newest_consumed = 0.0
         # Greedy match in send order: each transcript hit consumes one item.
         for it in items:
             hit = next(
-                (k for k, (ts, txt) in enumerate(seen)
-                 if ts >= it["ts"] and norm(txt) == it["norm"]),
+                (k for k, (ts, n) in enumerate(seen)
+                 if ts >= it["ts"] and n == it["norm"]),
                 None,
             )
             if hit is None:
@@ -125,4 +122,4 @@ def pending(pid: int, transcript_path: Optional[str], status: str) -> list[dict]
         items = [it for it in remaining if it["ts"] >= newest_consumed]
         _sent[pid] = items
 
-    return [{"id": it["id"], "text": it["text"]} for it in items]
+    return [it["text"] for it in items]

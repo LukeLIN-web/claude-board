@@ -4,12 +4,66 @@ httpx/TestClient is not a project dependency, so we exercise the route handler
 functions directly (FastAPI's decorator returns the original function) and the
 Pydantic request models at the model level.
 """
+import contextlib
+import os
+import types
 import unittest
 from unittest import mock
 
 import pydantic
 
 import app as appmod
+from tests.helpers import codex_rollout, scratch_dir, user_row, write_jsonl
+
+# Everything _enriched_snapshot reads besides the cards themselves, each at a
+# value that adds nothing to a card: no hmz runs, no shells, no permission
+# toasts, no pane text (banner, dialog, queue, /btw aside), nothing in the
+# transcript, no peers. Stubbed whole so no test here runs `ps` or `tmux` or
+# reads a transcript path it made up. patrol.classify stays real: the triage it
+# gives the card is what StaleDialogOpenTests is about.
+_NEUTRAL = {
+    "hmz_window_dicts": (appmod.hmz, []),
+    "shell_descendant_counts": (appmod.sessions, {}),
+    "pending_by_tty": (appmod.perms, {}),
+    "available": (appmod.tmux, True),
+    "codex_pane_model": (appmod.actions, ""),
+    "pane_model": (appmod.actions, ""),
+    "pane_dialog": (appmod.actions, None),
+    "get_pane_queue": (appmod.actions, []),
+    "current_task_hint": (appmod.transcripts, None),
+    "current_model": (appmod.transcripts, ""),
+    "extract_skills_used": (appmod.transcripts, []),
+    "extract_memory_ops": (appmod.transcripts, []),
+    "extract_background_tasks": (appmod.transcripts, []),
+    "session_loop": (appmod.transcripts, None),
+    "pending": (appmod.promptqueue, []),
+    "maybe_capture": (appmod.btwcapture, None),
+    "latest": (appmod.btwlog, None),
+    "enabled": (appmod.peers, False),
+}
+
+
+@contextlib.contextmanager
+def _snapshot(windows=(), codex=(), **overrides):
+    """Run _enriched_snapshot over `windows` (Claude cards, as sessions.snapshot
+    lists them) and `codex` (live Codex cards), with every other input at its
+    _NEUTRAL value unless named in `overrides` (attribute name → return value).
+    Yields the mocks by attribute name, for tests that assert on the calls."""
+    unknown = set(overrides) - set(_NEUTRAL)
+    if unknown:
+        raise TypeError(f"_snapshot: nothing named {sorted(unknown)} is stubbed")
+    with contextlib.ExitStack() as stack:
+        stubs = {
+            "snapshot": stack.enter_context(mock.patch.object(
+                appmod.sessions, "snapshot",
+                side_effect=lambda: {"windows": list(windows), "counts": {}, "ts": 0})),
+            "codex_window_dicts": stack.enter_context(mock.patch.object(
+                appmod.codex, "codex_window_dicts", side_effect=lambda: list(codex))),
+        }
+        for name, (module, value) in _NEUTRAL.items():
+            stubs[name] = stack.enter_context(mock.patch.object(
+                module, name, return_value=overrides.get(name, value)))
+        yield types.SimpleNamespace(**stubs)
 
 
 class RequestModelTests(unittest.TestCase):
@@ -82,14 +136,9 @@ class HistoryTimelineVisibilityTests(unittest.TestCase):
     projects/-shared-ws-proj-evil reads, by its slug, as inside /shared/ws/proj."""
 
     def setUp(self):
-        import json, tempfile
-        from pathlib import Path
-        self.root = Path(tempfile.mkdtemp())
-        d = self.root / "-shared-ws-proj-evil"
-        d.mkdir()
-        (d / "sid1.jsonl").write_text(json.dumps(
-            {"type": "user", "cwd": "/shared/ws/proj-evil", "timestamp": "2026-09-08T20:40:00Z",
-             "message": {"content": "secret plans"}}) + "\n")
+        self.root = scratch_dir()
+        write_jsonl([user_row("secret plans", "2026-09-08T20:40:00Z", cwd="/shared/ws/proj-evil")],
+                    self.root / "-shared-ws-proj-evil" / "sid1.jsonl")
         env = mock.patch.dict("os.environ", {"CLAUDE_FLEET_CWD_INCLUDE": "/shared/ws/proj",
                                              "CLAUDE_FLEET_CWD_EXCLUDE": ""})
         env.start()
@@ -99,15 +148,126 @@ class HistoryTimelineVisibilityTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.root, ignore_errors=True)
-
     def test_a_sibling_outside_the_allowlist_is_not_served(self):
         import fastapi
         with self.assertRaises(fastapi.HTTPException) as cm:
             appmod.api_history_timeline("sid1")
         self.assertEqual(cm.exception.status_code, 404)
+
+
+def _allow_only(test, include):
+    """Run `test` under CLAUDE_FLEET_CWD_INCLUDE=`include` and no exclude list,
+    with an empty ~/.claude/projects, so the archive timeline reaches past it."""
+    env = mock.patch.dict("os.environ", {"CLAUDE_FLEET_CWD_INCLUDE": include,
+                                         "CLAUDE_FLEET_CWD_EXCLUDE": ""})
+    env.start()
+    appmod.sessions._reload_cwd_filters()
+    test.addCleanup(lambda: (env.stop(), appmod.sessions._reload_cwd_filters()))
+    p = mock.patch.object(appmod.sessions, "PROJECTS_DIR", scratch_dir())
+    p.start()
+    test.addCleanup(p.stop)
+
+
+def _timeline_404(test, session_id):
+    import fastapi
+    with test.assertRaises(fastapi.HTTPException) as cm:
+        appmod.api_history_timeline(session_id)
+    test.assertEqual(cm.exception.status_code, 404)
+
+
+class CodexHistoryTimelineTests(unittest.TestCase):
+    """The archive timeline serves a Codex rollout by its whole id only, and
+    only while the cwd it records passes the filter."""
+
+    IN = "019a0001-0000-7000-8000-00000000aaaa"
+    EVIL = "019a0002-0000-7000-8000-00000000bbbb"
+
+    def setUp(self):
+        _allow_only(self, "/shared/ws/proj")
+        self.root = scratch_dir()
+        p = mock.patch.object(appmod.codex, "CODEX_SESSIONS_DIR", self.root)
+        p.start()
+        self.addCleanup(p.stop)
+        self.inside = codex_rollout(self.root, self.IN, "/shared/ws/proj/x",
+                                    [self._prompt("first page")])
+        self.evil = codex_rollout(self.root, self.EVIL, "/shared/ws/proj-evil",
+                                  [self._prompt("secret plans")])
+
+    @staticmethod
+    def _prompt(text):
+        return {"timestamp": "2026-10-05T08:00:01Z", "type": "event_msg",
+                "payload": {"type": "user_message", "message": text}}
+
+    def _prompts(self, session_id):
+        r = appmod.api_history_timeline(session_id)
+        self.assertEqual(r["platform"], "codex")
+        return [e["text"] for e in r["events"] if e["kind"] == "user_text"]
+
+    def test_a_rollout_outside_the_allowlist_is_not_served(self):
+        _timeline_404(self, self.EVIL)
+        _timeline_404(self, self.evil.stem)
+
+    def test_an_id_is_matched_whole(self):
+        # Any piece of a rollout's name used to find one: here, the hidden one.
+        for piece in ("2026", "019a", "rollout", self.EVIL[:8]):
+            _timeline_404(self, piece)
+
+    def test_found_by_its_session_id_or_its_file_stem(self):
+        # A history row names the id, a search hit the stem.
+        self.assertEqual(self._prompts(self.IN), ["first page"])
+        self.assertEqual(self._prompts(self.inside.stem), ["first page"])
+
+    def test_served_on_a_host_with_no_claude_projects(self):
+        # A host that runs only Codex has no ~/.claude/projects to look in first.
+        with mock.patch.object(appmod.sessions, "PROJECTS_DIR", self.root / "no-such-dir"):
+            self.assertEqual(self._prompts(self.IN), ["first page"])
+
+    def test_a_paginated_thread_opens_on_its_newest_page(self):
+        page = codex_rollout(self.root, self.IN, "/shared/ws/proj/x",
+                             [self._prompt("second page")],
+                             page="019a0009-0000-7000-8000-00000000cccc",
+                             time="2026-10-06T09-00-00")
+        os.utime(self.inside, (1000, 1000))
+        os.utime(page, (2000, 2000))
+        self.assertEqual(self._prompts(self.IN), ["second page"])
+        self.assertEqual(self._prompts(self.inside.stem), ["first page"])
+
+
+class OpenCodeHistoryTimelineTests(unittest.TestCase):
+    """The archive timeline serves an OpenCode session only while the directory
+    it records passes the filter."""
+
+    def setUp(self):
+        import sqlite3
+        _allow_only(self, "/shared/ws/proj")
+        db = scratch_dir() / "opencode.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE session (id TEXT, title TEXT, directory TEXT,
+                                  time_created INTEGER, time_updated INTEGER);
+            CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+            CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, data TEXT,
+                               time_created INTEGER);
+        """)
+        for sid, directory in (("ses_in", "/shared/ws/proj/x"),
+                               ("ses_evil", "/shared/ws/proj-evil")):
+            conn.execute("INSERT INTO session VALUES (?, '', ?, 1, 1)", (sid, directory))
+            conn.execute("INSERT INTO message VALUES (?, ?, ?, 1)",
+                         (f"m_{sid}", sid, '{"role": "user"}'))
+            conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, 1)",
+                         (f"p_{sid}", f"m_{sid}", sid, '{"type": "text", "text": "the plans"}'))
+        conn.commit()
+        conn.close()
+        p = mock.patch("core.opencode.OPENCODE_DB", db)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_session_outside_the_allowlist_is_not_served(self):
+        _timeline_404(self, "ses_evil")
+
+    def test_a_session_inside_it_is(self):
+        r = appmod.api_history_timeline("ses_in")
+        self.assertEqual([e["text"] for e in r["events"]], ["the plans"])
 
 
 class PromptRouteTests(unittest.TestCase):
@@ -156,19 +316,13 @@ class BtwDismissRouteTests(unittest.TestCase):
 
 class SnapshotFlagTests(unittest.TestCase):
     def test_tmux_available_present_with_zero_windows(self):
-        empty = {"windows": [], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=empty), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True):
+        with _snapshot(available=True):
             snap = appmod._enriched_snapshot()
         self.assertIn("tmux_available", snap)
         self.assertTrue(snap["tmux_available"])
 
     def test_tmux_available_reflects_false(self):
-        empty = {"windows": [], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=empty), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=False):
+        with _snapshot(available=False):
             snap = appmod._enriched_snapshot()
         self.assertFalse(snap["tmux_available"])
 
@@ -180,34 +334,24 @@ class CardModelTests(unittest.TestCase):
     def setUp(self):
         appmod._banner_models.clear()
 
+    @staticmethod
+    def _win(**over):
+        # A live, visible session with a transcript; each test changes what it is about.
+        return {"pid": 1, "status": "idle", "hidden": False, "alive": True,
+                "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
+                "name": "s", "updated_at": 0, **over}
+
     def _run(self, win, model="claude-fable-5", banner=""):
-        snap = {"windows": [win], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.patrol, "classify",
-                               return_value={"triage": "", "reason": "", "suggestion": ""}), \
-             mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
-             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
-             mock.patch.object(appmod.transcripts, "current_task_hint", return_value=None), \
-             mock.patch.object(appmod.transcripts, "current_model",
-                               return_value=model), \
-             mock.patch.object(appmod.actions, "pane_model", return_value=banner):
+        with _snapshot([win], current_model=model, pane_model=banner):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_card_reports_the_running_model(self):
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0})
+        w = self._run(self._win())
         self.assertEqual(w["model"], "claude-fable-5")
         self.assertEqual(w["model_label"], "Fable 5")
 
     def test_no_transcript_means_no_model(self):
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": None, "cwd": "/x",
-                       "name": "s", "updated_at": 0})
+        w = self._run(self._win(transcript_path=None))
         self.assertEqual(w["model"], "")
         self.assertEqual(w["model_label"], "")
 
@@ -215,27 +359,21 @@ class CardModelTests(unittest.TestCase):
         # The banner says what the session was on when it last started or was
         # cleared; the transcript says what actually answered since. When both
         # speak, the transcript is the one that can't be stale.
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0}, banner="Opus 5")
+        w = self._run(self._win(), banner="Opus 5")
         self.assertEqual(w["model_label"], "Fable 5")
         self.assertEqual(w["model_source"], "transcript")
 
     def test_cleared_session_falls_back_to_its_banner(self):
         # /clear starts a fresh transcript: no assistant row, hence no model —
         # which is exactly when the card used to go blank.
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0}, model="", banner="Opus 5")
+        w = self._run(self._win(), model="", banner="Opus 5")
         self.assertEqual(w["model_label"], "Opus 5")
         self.assertEqual(w["model_source"], "banner")
         # No id is invented for it — the raw field stays empty.
         self.assertEqual(w["model"], "")
 
     def test_unreadable_banner_leaves_the_readout_blank(self):
-        w = self._run({"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                       "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                       "name": "s", "updated_at": 0}, model="", banner="")
+        w = self._run(self._win(), model="", banner="")
         self.assertEqual(w["model_label"], "")
         self.assertEqual(w["model_source"], "")
 
@@ -245,9 +383,7 @@ class CardModelTests(unittest.TestCase):
         # must not spend a capture-pane on each card each time. Proven by the
         # cached answer surviving a pane that has since started saying something
         # else, which cannot happen for real within one session id.
-        win = {"pid": 1, "session_id": "abc", "status": "idle", "hidden": False,
-               "alive": True, "tty": "pts/1", "transcript_path": "/t.jsonl",
-               "cwd": "/x", "name": "s", "updated_at": 0}
+        win = self._win(session_id="abc")
         self.assertEqual(self._run(win, model="", banner="Opus 5")["model_label"],
                          "Opus 5")
         self.assertEqual(self._run(win, model="", banner="Fable 5.1")["model_label"],
@@ -256,46 +392,40 @@ class CardModelTests(unittest.TestCase):
     def test_a_clear_re_reads_the_banner(self):
         # The new session id is the signal that the banner has been reprinted —
         # and that the model may have changed with it.
-        base = {"pid": 1, "status": "idle", "hidden": False, "alive": True,
-                "tty": "pts/1", "transcript_path": "/t.jsonl", "cwd": "/x",
-                "name": "s", "updated_at": 0}
-        first = self._run({**base, "session_id": "abc"}, model="", banner="Opus 5")
-        second = self._run({**base, "session_id": "def"}, model="", banner="Fable 5.1")
+        first = self._run(self._win(session_id="abc"), model="", banner="Opus 5")
+        second = self._run(self._win(session_id="def"), model="", banner="Fable 5.1")
         self.assertEqual(first["model_label"], "Opus 5")
         self.assertEqual(second["model_label"], "Fable 5.1")
 
     def test_dead_window_is_not_scraped(self):
-        with mock.patch.object(appmod.actions, "pane_model") as pm:
-            w = self._run({"pid": 1, "status": "idle", "hidden": False,
-                           "alive": False, "tty": None, "transcript_path": None,
-                           "cwd": "/x", "name": "s", "updated_at": 0}, model="")
-        pm.assert_not_called()
+        with _snapshot([self._win(alive=False, tty=None, transcript_path=None)]) as stubs:
+            w = appmod._enriched_snapshot()["windows"][0]
+        stubs.pane_model.assert_not_called()
         self.assertEqual(w["model_label"], "")
 
     def test_hidden_agent_does_not_borrow_its_parents_banner(self):
         # A `.slock` sub-session shares the parent's tty, so the banner in that
         # pane names the parent's model — and sub-agents routinely run on
         # another one.
-        with mock.patch.object(appmod.actions, "pane_model") as pm:
-            w = self._run({"pid": 1, "status": "unknown", "hidden": True,
-                           "alive": True, "tty": "pts/1", "cwd": "/x/.slock/a",
-                           "transcript_path": "/t.jsonl", "name": "s",
-                           "updated_at": 0}, model="")
-        pm.assert_not_called()
+        with _snapshot([self._win(status="unknown", hidden=True,
+                                  cwd="/x/.slock/a")]) as stubs:
+            w = appmod._enriched_snapshot()["windows"][0]
+        stubs.pane_model.assert_not_called()
         self.assertEqual(w["model_label"], "")
 
     def test_cache_does_not_outlive_the_session(self):
-        win = {"pid": 1, "session_id": "abc", "status": "idle", "hidden": False,
-               "alive": True, "tty": "pts/1", "transcript_path": "/t.jsonl",
-               "cwd": "/x", "name": "s", "updated_at": 0}
-        self._run(win, model="", banner="Opus 5")
-        self.assertTrue(appmod._banner_models)
-        with mock.patch.object(appmod.sessions, "snapshot",
-                               return_value={"windows": [], "counts": {}, "ts": 0}), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True):
-            appmod._enriched_snapshot()
-        self.assertEqual(appmod._banner_models, {})
+        # A session that leaves the board takes its cached banner with it, so
+        # the cache tracks the board rather than growing an entry per session
+        # for the life of the process. Proven by the same pid and session id
+        # coming back to a fresh read — which, while cached, it would not get
+        # (test_banner_is_scraped_once_per_session_not_once_per_poll).
+        win = self._win(session_id="abc")
+        self.assertEqual(self._run(win, model="", banner="Opus 5")["model_label"],
+                         "Opus 5")
+        with _snapshot():
+            appmod._enriched_snapshot()  # the session is gone from this poll
+        self.assertEqual(self._run(win, model="", banner="Fable 5.1")["model_label"],
+                         "Fable 5.1")
 
 
 class HiddenAgentQueueTests(unittest.TestCase):
@@ -304,17 +434,7 @@ class HiddenAgentQueueTests(unittest.TestCase):
     render for them, not only for windows that report `status == "busy"`."""
 
     def _run(self, win):
-        snap = {"windows": [win], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.patrol, "classify",
-                               return_value={"triage": "", "reason": "", "suggestion": ""}), \
-             mock.patch.object(appmod.promptqueue, "pending",
-                               return_value=[{"id": 1, "text": "/btw"}]), \
-             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]):
+        with _snapshot([win], pending=["/btw"]):
             return appmod._enriched_snapshot()
 
     def test_queue_renders_for_hidden_agent_without_busy_status(self):
@@ -334,37 +454,147 @@ class HiddenAgentQueueTests(unittest.TestCase):
 
 
 class DiffSignatureTests(unittest.TestCase):
-    """The SSE watcher only broadcasts when `diff_signature` changes. A queued
-    prompt being consumed (or added) while status/updated_at stay the same must
-    still change the signature, or the card keeps showing a stale queue."""
+    """The SSE watcher only broadcasts when `diff_signature` changes, and the
+    page only redraws what it is sent. So any change to what the board shows
+    must change the signature — a field nobody thought to list included — and a
+    value that only moves with the clock must not, or a quiet board is re-sent
+    on every 2s tick."""
 
-    def _win(self, queued):
-        # `key` is the card's address (host-qualified pid); the signature is
-        # built on it, since pids only identify a card within one host.
-        return {"pid": 100, "key": "100", "status": "busy", "waiting_for": None,
-                "updated_at": 5, "queued": queued}
+    def _win(self, queued=(), **over):
+        # `key` is the card's address (host-qualified pid); pids only identify a
+        # card within one host.
+        w = {"pid": 100, "key": "100", "status": "busy", "waiting_for": None,
+             "updated_at": 5, "idle_seconds": 40, "queued": list(queued),
+             "triage": "working", "triage_reason": "正在工作", "triage_suggestion": "",
+             "permission_msg": None, "current_task": None, "background_tasks": []}
+        w.update(over)
+        return w
+
+    def _sig(self, *windows, **snap):
+        return appmod.State().diff_signature(
+            {"windows": list(windows), "counts": {}, "ts": 0, **snap})
 
     def test_queue_change_alone_changes_signature(self):
-        st = appmod.State()
-        before = {"windows": [self._win(
-            [{"text": "/btw", "source": "dashboard"}])], "counts": {}, "ts": 0}
-        after = {"windows": [self._win([])], "counts": {}, "ts": 0}
+        # The session stays busy, its updated_at unmoved, while it works through
+        # the queue: consuming a prompt must still re-broadcast.
         self.assertNotEqual(
-            st.diff_signature(before), st.diff_signature(after),
+            self._sig(self._win([{"text": "/btw", "source": "dashboard"}])),
+            self._sig(self._win([])),
             "consuming a queued prompt must change the broadcast signature")
 
     def test_btw_change_alone_changes_signature(self):
         # Archiving or dismissing an aside on an otherwise idle session must
         # still broadcast, or the card keeps showing a stale (or dismissed) aside.
-        st = appmod.State()
-        w_with = self._win([])
-        w_with["btw"] = {"id": 1, "ts": 0, "question": "q", "answer": "a"}
-        w_without = self._win([])
-        w_without["btw"] = None
         self.assertNotEqual(
-            st.diff_signature({"windows": [w_with], "counts": {}, "ts": 0}),
-            st.diff_signature({"windows": [w_without], "counts": {}, "ts": 0}),
+            self._sig(self._win(btw={"id": 1, "ts": 0, "question": "q", "answer": "a"})),
+            self._sig(self._win(btw=None)),
             "dismissing the card's aside must change the broadcast signature")
+
+    def test_triage_change_alone_changes_signature(self):
+        # A busy session that goes quiet keeps status "busy" and its updated_at;
+        # only patrol's verdict moves (QuietBoardTests has the header counts).
+        self.assertNotEqual(
+            self._sig(self._win()),
+            self._sig(self._win(triage="completed", triage_reason="已完成，空闲 {idle}。",
+                                triage_suggestion="建议 review")),
+            "a card turning completed must change the broadcast signature")
+
+    def test_permission_msg_change_alone_changes_signature(self):
+        # The pending bar names what the session wants; a new request on a card
+        # that was already waiting changes nothing else.
+        self.assertNotEqual(
+            self._sig(self._win(permission_msg="Claude needs your permission to use Bash")),
+            self._sig(self._win(permission_msg="Claude needs your permission to use Write")),
+            "a new permission message must change the broadcast signature")
+
+    def test_any_field_changes_signature(self):
+        # By construction, not by list: a field added after this test was
+        # written counts as soon as it changes.
+        for field, before, after in (
+                ("current_task", "running tests", "writing the fix"),
+                ("background_tasks", [], [{"type": "monitor", "state": "running"}]),
+                ("spend_label", "$0.07 · {elapsed}", "$0.08 · {elapsed}"),
+                ("a_field_added_later", 1, 2)):
+            with self.subTest(field=field):
+                self.assertNotEqual(self._sig(self._win(**{field: before})),
+                                    self._sig(self._win(**{field: after})))
+        with self.subTest(field="counts"):
+            self.assertNotEqual(self._sig(self._win(), counts={"busy": 1, "idle": 0}),
+                                self._sig(self._win(), counts={"busy": 0, "idle": 1}))
+        with self.subTest(field="peers[].online"):
+            peer = {"host": "b", "online": True, "age_seconds": 1.0, "error": None}
+            self.assertNotEqual(self._sig(self._win(), peers=[peer]),
+                                self._sig(self._win(), peers=[{**peer, "online": False}]))
+
+    def test_ticking_values_alone_do_not_change_signature(self):
+        # The page advances these on its own clock between snapshots; resending
+        # the board for them would mean every tick.
+        peer = {"host": "b", "online": True, "age_seconds": 1.0, "error": None}
+        self.assertEqual(
+            self._sig(self._win(idle_seconds=40, elapsed_s=125.0), ts=1000, peers=[peer]),
+            self._sig(self._win(idle_seconds=41, elapsed_s=127.0), ts=3000,
+                      peers=[{**peer, "age_seconds": 2.9}]))
+
+
+class QuietBoardTests(unittest.TestCase):
+    """The same through _enriched_snapshot and the real patrol: what time alone
+    decides is broadcast, and time alone otherwise is not. Each snapshot is a
+    tick of the watcher, the card's idle_seconds what sessions.snapshot would
+    have measured by then."""
+
+    def setUp(self):
+        done = {"type": "assistant", "timestamp": "2026-08-10T21:26:21Z",
+                "message": {"role": "assistant", "stop_reason": "end_turn",
+                            "content": [{"type": "text", "text": "Done."}]}}
+        stuck = {"type": "assistant", "timestamp": "2026-08-10T21:26:21Z",
+                 "message": {"role": "assistant", "stop_reason": "tool_use",
+                             "content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}
+        self.done, self.stuck = write_jsonl([done]), write_jsonl([stuck])
+
+    def _card(self, pid, transcript, idle, status="idle"):
+        return {"pid": pid, "status": status, "waiting_for": None, "hidden": False,
+                "alive": True, "tty": f"/dev/pts/{pid}", "transcript_path": str(transcript),
+                "name": f"w{pid}", "cwd": "/x", "session_id": "", "updated_at": 1_000,
+                "idle_seconds": idle}
+
+    def _tick(self, *cards):
+        with _snapshot(cards):
+            return appmod._enriched_snapshot()
+
+    def test_a_busy_session_going_quiet_is_broadcast(self):
+        # Five minutes after its last write a busy session counts as done:
+        # status, updated_at and everything else on the card stay as they were.
+        before = self._tick(self._card(1, self.done, 290, status="busy"))
+        after = self._tick(self._card(1, self.done, 302, status="busy"))
+        self.assertEqual((before["windows"][0]["triage"], after["windows"][0]["triage"]),
+                         ("working", "completed"))
+        self.assertEqual((before["counts"]["busy"], after["counts"]["busy"]), (1, 0))
+        st = appmod.State()
+        self.assertNotEqual(st.diff_signature(before), st.diff_signature(after),
+                            "working → completed must be broadcast")
+
+    def test_quiet_cards_are_not_rebroadcast_as_their_idle_time_grows(self):
+        # A completed and a stalled card over half an hour, a minute rolling over
+        # on the way: nothing to send, so the page must have nothing stale — the
+        # words stay put and the time is a number it advances itself.
+        ticks = [self._tick(self._card(1, self.done, 600 + dt), self._card(2, self.stuck, 600 + dt))
+                 for dt in (0, 2, 61, 1800)]
+        st = appmod.State()
+        self.assertEqual(len({st.diff_signature(t) for t in ticks}), 1)
+        for i in range(2):
+            with self.subTest(card=i):
+                self.assertEqual(len({t["windows"][i]["triage_reason"] for t in ticks}), 1)
+                self.assertIn(appmod.patrol.IDLE, ticks[0]["windows"][i]["triage_reason"])
+                self.assertEqual([t["windows"][i]["idle_seconds"] for t in ticks],
+                                 [600, 602, 661, 2400])
+
+    def test_a_quiet_card_turning_closeable_is_broadcast(self):
+        before = self._tick(self._card(1, self.done, 3599))
+        after = self._tick(self._card(1, self.done, 3601))
+        self.assertEqual((before["windows"][0]["triage"], after["windows"][0]["triage"]),
+                         ("completed", "closeable"))
+        st = appmod.State()
+        self.assertNotEqual(st.diff_signature(before), st.diff_signature(after))
 
 
 class StaleDialogOpenTests(unittest.TestCase):
@@ -380,15 +610,7 @@ class StaleDialogOpenTests(unittest.TestCase):
                "hidden": False, "alive": True, "tty": "/dev/pts/9",
                "transcript_path": None, "name": "w", "cwd": "/x",
                "updated_at": int(time.time() * 1000), "idle_seconds": 0}
-        snap = {"windows": [win], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.promptqueue, "pending", return_value=[]), \
-             mock.patch.object(appmod.actions, "get_pane_queue", return_value=[]), \
-             mock.patch.object(appmod.actions, "pane_dialog", return_value=dialog):
+        with _snapshot([win], pane_dialog=dialog):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_dialog_without_menu_is_not_waiting(self):
@@ -416,10 +638,6 @@ class StaleDialogOpenTests(unittest.TestCase):
         self.assertEqual(w["triage_reason"], "trust prompt")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CodexCardModelTests(unittest.TestCase):
     """A Codex card reads its model + effort off the pane's status line when it
     can, and off the rollout (what the last turn ran on) otherwise."""
@@ -432,15 +650,9 @@ class CodexCardModelTests(unittest.TestCase):
                 "model_label": "gpt-6-astra medium", "model_source": "transcript"}
 
     def _run(self, pane_label):
-        snap = {"windows": [], "counts": {}, "ts": 0}
-        with mock.patch.object(appmod.sessions, "snapshot", return_value=snap), \
-             mock.patch.object(appmod.codex, "codex_window_dicts", return_value=[self._card()]), \
-             mock.patch.object(appmod.tmux, "available", return_value=True), \
-             mock.patch.object(appmod.sessions, "shell_descendant_counts", return_value={}), \
-             mock.patch.object(appmod.perms, "pending_by_tty", return_value={}), \
-             mock.patch.object(appmod.actions, "codex_pane_model", return_value=pane_label) as pm:
+        with _snapshot(codex=[self._card()], codex_pane_model=pane_label) as stubs:
             w = appmod._enriched_snapshot()["windows"][0]
-        pm.assert_called_once_with("pts/7")
+        stubs.codex_pane_model.assert_called_once_with("pts/7")
         return w
 
     def test_status_line_wins(self):
@@ -465,3 +677,37 @@ class ModelRouteTests(unittest.TestCase):
                                return_value={"ok": True}) as sw:
             appmod.api_window_model("1234", appmod.ModelBody(model="gpt-5.6-sol", effort="high"))
         sw.assert_called_once_with(1234, "gpt-5.6-sol", "high")
+
+
+class HistoryLaunchRouteTests(unittest.TestCase):
+    """Resume and fork from History open the session the same way, and both
+    answer the resume picker the launch may stop on."""
+
+    def _launch(self, route, opened=None):
+        opened = opened or {"ok": True, "backend": "tmux", "pane_id": "%7"}
+        with mock.patch.object(appmod, "_history_cwd", return_value="/tmp/proj"), \
+             mock.patch.object(appmod.sessions, "find_window_by_session", return_value=None), \
+             mock.patch.object(appmod.actions, "open_claude_window",
+                               return_value=dict(opened)) as ocw, \
+             mock.patch.object(appmod.actions, "confirm_resume_picker",
+                               return_value={"confirmed": True, "waited": 0.4, "reason": ""}) as crp:
+            r = route("sessX")
+        return r, ocw, crp
+
+    def test_fork_answers_the_resume_picker(self):
+        r, ocw, crp = self._launch(appmod.api_history_fork)
+        ocw.assert_called_once_with("/tmp/proj", ["--resume", "sessX", "--fork-session"])
+        crp.assert_called_once_with("%7")
+        self.assertEqual(r["action"], "forked")
+        self.assertTrue(r["picker"]["confirmed"])
+
+    def test_resume_answers_the_resume_picker(self):
+        r, ocw, crp = self._launch(appmod.api_history_resume)
+        ocw.assert_called_once_with("/tmp/proj", ["--resume", "sessX"])
+        crp.assert_called_once_with("%7")
+        self.assertEqual(r["action"], "resumed")
+
+    def test_a_window_outside_tmux_has_no_pane_to_answer(self):
+        r, _, crp = self._launch(appmod.api_history_fork, {"ok": True, "backend": "iterm"})
+        crp.assert_not_called()
+        self.assertNotIn("picker", r)
