@@ -10,6 +10,7 @@ import os
 import shutil
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 from core import history, opencode, search, sessions
@@ -37,10 +38,14 @@ class _Transcripts(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def transcript(self, sid, *texts, ts="2026-08-10T21:26:21Z"):
-        """A Claude transcript `sid` with one user row per text, all at `ts`."""
-        return write_jsonl([user_row(t, ts=ts) for t in texts],
+    def transcript(self, sid, *texts, ts="2026-08-10T21:26:21Z", mtime=None, **row):
+        """A Claude transcript `sid` with one user row per text, all at `ts`,
+        last written at `mtime` if given. Extra keyword fields go on each row."""
+        path = write_jsonl([user_row(t, ts=ts, **row) for t in texts],
                            self.projects / "-tmp-proj" / f"{sid}.jsonl")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
 
 
 class LiteralQueryTests(_Transcripts):
@@ -81,6 +86,77 @@ class LiteralQueryTests(_Transcripts):
         self.assertEqual(list(history._rg_search_sessions("foo(")), ["s1"])
         self.assertEqual(list(history._rg_search_sessions("--resume")), ["s2"])
         self.assertEqual(history._rg_search_sessions("a.b"), {})
+
+
+T0 = 1_786_000_000  # an epoch second in August 2026
+
+
+def iso(epoch):
+    """`epoch` as a transcript row's timestamp."""
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class NewestHitsTests(_Transcripts):
+    """Search returns the newest hits there are, not the first ones rg printed."""
+
+    def written_at(self, sid, mtime, hits=5, rows_at=None, **row):
+        """`sid` with `hits` rows mentioning "needle", written at `rows_at`
+        (a second before `mtime` unless given), and last written at `mtime`."""
+        ts = iso(mtime - 1 if rows_at is None else rows_at)
+        return self.transcript(sid, *[f"needle {i}" for i in range(hits)],
+                               ts=ts, mtime=mtime, **row)
+
+    def sids(self, hits):
+        return {h["session_id"] for h in hits}
+
+    def test_newest_file_wins(self):
+        self.written_at("old", T0)
+        self.written_at("new", T0 + 3600)
+        hits = search.search("needle", limit=5)
+        self.assertEqual(self.sids(hits), {"new"})
+        self.assertEqual(len(hits), 5)
+
+    def test_newest_files_among_many(self):
+        # The newest five sit mid-way through both the names and the order the
+        # files were made in, so no walk order hands them over first.
+        for i in range(30):
+            self.written_at(f"s{i:02d}", T0 + i + (3600 if 12 <= i < 17 else 0), hits=1)
+        hits = search.search("needle", limit=5)
+        self.assertEqual(self.sids(hits), {f"s{i:02d}" for i in range(12, 17)})
+        self.assertEqual([h["ts"] for h in hits], sorted((h["ts"] for h in hits), reverse=True))
+
+    def test_newer_hit_in_an_older_file_still_makes_the_cut(self):
+        # "touched" was written to last, but only its first rows mention the
+        # query and they are a day old; "recent" was written an hour ago.
+        path = self.written_at("touched", T0 + 7200, rows_at=T0 - 86400)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(user_row("something else", ts=iso(T0 + 7199))) + "\n")
+        os.utime(path, (T0 + 7200, T0 + 7200))
+        self.written_at("recent", T0 + 3600)
+        self.assertEqual(self.sids(search.search("needle", limit=5)), {"recent"})
+
+    def test_stops_once_older_files_cannot_make_the_cut(self):
+        # No real row is newer than its file's last write; this one is, so a
+        # search that went on to read "older" would put it first.
+        self.written_at("newer", T0 + 3600)
+        self.written_at("older", T0, rows_at=T0 + 7200)
+        self.assertEqual(self.sids(search.search("needle", limit=5)), {"newer"})
+
+    def test_at_most_five_hits_per_file(self):
+        self.written_at("chatty", T0, hits=8)
+        self.written_at("quiet", T0 - 60, hits=1)
+        hits = search.search("needle", limit=40)
+        self.assertEqual(sorted(h["session_id"] for h in hits), ["chatty"] * 5 + ["quiet"])
+
+    def test_hidden_projects_do_not_use_up_the_limit(self):
+        for i in range(3):
+            self.written_at(f"hidden{i}", T0 + 3600 + i, cwd="/tmp/hidden/p")
+        self.written_at("shown", T0, hits=2, cwd="/tmp/proj")
+        with mock.patch.dict(os.environ, {"CLAUDE_FLEET_CWD_EXCLUDE": "/tmp/hidden"}):
+            sessions._reload_cwd_filters()
+            hits = search.search("needle", limit=2)
+        sessions._reload_cwd_filters()
+        self.assertEqual([h["session_id"] for h in hits], ["shown", "shown"])
 
 
 class ExcerptTests(unittest.TestCase):

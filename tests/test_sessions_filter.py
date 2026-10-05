@@ -185,9 +185,14 @@ class CodexSearchFilterTests(unittest.TestCase):
         shown = codex_rollout(root, "019a0006", "/shared/ws/proj", [row])
         lines = {2: json.dumps(row)}
         _load_filters(exclude="/shared/ws/secret")
-        with mock.patch.object(search, "CODEX_SESSIONS_DIR", root):
-            self.assertEqual(search._file_hits(secret, lines, [2], "plans"), [])
+        # Search drops hidden files when it lists the files rg matched (`rg -l`),
+        # before it reads any hits out of them; stand in for that listing.
+        listed = mock.Mock(stdout=f"{secret}\0{shown}\0".encode())
+        with mock.patch.object(search, "CODEX_SESSIONS_DIR", root), \
+             mock.patch.object(search.subprocess, "run", return_value=listed):
+            newest = search._newest_files("plans", 10, float("inf"))
             (hit,) = search._file_hits(shown, lines, [2], "plans")
+        self.assertEqual(list(newest), [str(shown)])
         self.assertEqual((hit["platform"], hit["excerpt"]), ("codex", "the plans"))
 
 
