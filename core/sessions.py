@@ -423,6 +423,8 @@ def list_windows(include_dead: bool = False) -> list[Window]:
 # Claude CLI subcommands / flags that are headless (no interactive TUI) and so
 # must never earn a card: `claude mcp …`, `claude -p/--print …` (scripted runs).
 _CLAUDE_BG_SUBCOMMANDS = {"mcp", "config", "doctor", "update", "install", "migrate-installer"}
+# The options whose value is the session id a resumed Claude is on.
+_CLAUDE_RESUME_FLAGS = frozenset({"--resume", "-r", "--continue", "-c"})
 
 
 def _exe_index(tokens: list[str], name: str) -> int:
@@ -435,34 +437,53 @@ def _exe_index(tokens: list[str], name: str) -> int:
     return -1
 
 
+def _cli_words(args: str | list[str], exe: str,
+               takes_value: frozenset[str]) -> Optional[tuple[str, list[tuple[str, str]]]]:
+    """How `exe` was run, read off a `ps` args string or the real argv (see
+    _proc_argv): (first word, options), or None when the command isn't `exe`.
+
+    The first word is the first argument that is neither an option nor the
+    value of one in `takes_value` — the subcommand, when it names one; "" when
+    there is none. Only that word can name a subcommand: past it is the opening
+    prompt, and `claude "fix the mcp config"` is a TUI like any other. Each
+    option comes with the value it took, "" for a flag. A value is the next
+    argument, unless that is an option itself (`--resume` alone opens a
+    picker); `--opt=value` and `-oVALUE` are one argument, so they read as a
+    flag."""
+    toks = args.split() if isinstance(args, str) else list(args)
+    i = _exe_index(toks, exe)
+    if i < 0:
+        return None
+    rest = toks[i + 1:]
+    first: Optional[str] = None
+    opts: list[tuple[str, str]] = []
+    j = 0
+    while j < len(rest):
+        t = rest[j]
+        j += 1
+        if t in takes_value and j < len(rest) and not rest[j].startswith("-"):
+            opts.append((t, rest[j]))
+            j += 1
+        elif t.startswith("-"):
+            opts.append((t, ""))
+        elif first is None:
+            first = t
+    return first or "", opts
+
+
 def _parse_claude_proc(args: str | list[str]) -> Optional[dict]:
     """Classify a process command line — a `ps` args string, or the real argv
     when there is one (see _proc_argv). Returns {session_id} for an interactive
     Claude TUI process (resume id parsed when present), or None otherwise."""
-    toks = args.split() if isinstance(args, str) else list(args)
-    i = _exe_index(toks, "claude")
-    if i < 0:
+    cli = _cli_words(args, "claude", _CLAUDE_RESUME_FLAGS)
+    if cli is None:
         return None
-    rest = toks[i + 1:]
-    session_id = ""
-    positional = False
-    j = 0
-    while j < len(rest):
-        t = rest[j]
-        if t in ("-p", "--print"):
-            return None  # headless scripted run, not a TUI
-        if t in ("--resume", "-r", "--continue", "-c"):
-            if j + 1 < len(rest) and not rest[j + 1].startswith("-"):
-                session_id = rest[j + 1]
-                j += 2
-                continue
-        elif not t.startswith("-"):
-            # Only the first word can name a subcommand; past it is the opening
-            # prompt, and `claude "fix the mcp config"` is a TUI like any other.
-            if not positional and t in _CLAUDE_BG_SUBCOMMANDS:
-                return None  # `claude mcp`, `claude config`, … → headless
-            positional = True
-        j += 1
+    first, opts = cli
+    if any(o in ("-p", "--print") for o, _ in opts):
+        return None  # headless scripted run, not a TUI
+    if first in _CLAUDE_BG_SUBCOMMANDS:
+        return None  # `claude mcp`, `claude config`, … → headless
+    session_id = next((v for o, v in reversed(opts) if o in _CLAUDE_RESUME_FLAGS and v), "")
     return {"session_id": session_id}
 
 

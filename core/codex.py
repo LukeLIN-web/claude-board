@@ -21,10 +21,12 @@ from .sessions import (
     HOME_BASE,
     Proc,
     Window,
+    _cli_words,
     _cwd_to_project_slug,
     _cwd_visible,
     _exe_index,
     _pid_alive,
+    _proc_argv,
     _proc_start_ms,
     proc_table,
     transcript_visible,
@@ -675,20 +677,25 @@ def _top_codex_ancestor(fd_pid: int, table: dict[int, Proc]) -> int:
 # Codex subcommands that run headless/background, not an interactive TUI — these
 # are spawned by editors or by Claude's codex MCP and shouldn't appear as cards.
 _BG_SUBCOMMANDS = {"mcp-server", "app-server", "exec"}
+# The options of `codex` itself that take a value, as `codex --help` lists them
+# (codex-cli 0.160.0). The value has to be stepped over to reach the subcommand:
+# the VS Code / Cursor extension runs `codex -c features.code_mode_host=true
+# app-server`, whose `-c` value was taken for the subcommand — no background
+# one, so the app server read as an interactive TUI. (`-i` takes one or more
+# files; a second one is taken for the first word, and names no subcommand.)
+_CODEX_VALUE_OPTS = frozenset({
+    "-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env",
+    "-i", "--image", "-m", "--model", "--local-provider", "-p", "--profile",
+    "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a", "--ask-for-approval",
+})
 
 
-def _is_interactive_codex(args: str) -> bool:
+def _is_interactive_codex(args: str | list[str]) -> bool:
     """True for an interactive Codex TUI process (`codex`, `codex --yolo`,
-    `codex resume …`); False for non-codex procs and background subcommands."""
-    toks = args.split()
-    i = _exe_index(toks, "codex")
-    if i < 0:
-        return False
-    for t in toks[i + 1:]:
-        if t.startswith("-"):
-            continue  # skip flags to reach the subcommand, if any
-        return t not in _BG_SUBCOMMANDS
-    return True  # bare `codex` with no subcommand → interactive TUI
+    `codex resume …`, `codex "a prompt"`); False for non-codex procs and
+    background subcommands. `args` is a `ps` args string or the real argv."""
+    cli = _cli_words(args, "codex", _CODEX_VALUE_OPTS)
+    return cli is not None and cli[0] not in _BG_SUBCOMMANDS
 
 
 def list_codex_windows() -> list[Window]:
@@ -719,7 +726,11 @@ def _discover() -> list[tuple[Window, list[dict]]]:
         tty = info.tty
         if not tty or tty in ("?", "??"):
             continue
-        if not _is_interactive_codex(info.args):
+        # On the real argv (see _proc_argv), read only for a codex: ps joins it
+        # with spaces, which splits a `-c` value that has one and makes a
+        # prompt that begins "exec …" read as the subcommand.
+        if (_exe_index(info.args.split(), "codex") < 0
+                or not _is_interactive_codex(_proc_argv(pid, info.args))):
             continue
         by_tty.setdefault(tty, []).append(pid)
 

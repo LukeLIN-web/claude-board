@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest import mock
 
-from core import codex, transcripts
+from core import codex, sessions, transcripts
 from tests.helpers import scratch_dir, write_jsonl
 
 
@@ -414,3 +414,90 @@ class TestTurnContextModel(unittest.TestCase):
     def test_no_turn_context_means_blank(self):
         act = codex.extract_codex_session_activity(_write_rollout(ROLLOUT_LINES))
         self.assertEqual((act["model"], act["effort"]), ("", ""))
+
+
+# The VS Code / Cursor extension's app server, as `ps -eo args` prints it.
+EDITOR_APP_SERVER = ("/home/u/.cursor-server/extensions/openai.chatgpt-26.908.40401-linux-x64/"
+                     "bin/linux-x86_64/codex -c features.code_mode_host=true app-server "
+                     "--analytics-default-enabled")
+
+
+class TestIsInteractiveCodex(unittest.TestCase):
+    """Only the first word that is neither an option nor an option's value can
+    name a subcommand; past it is the opening prompt."""
+
+    def test_a_config_value_is_not_the_subcommand(self):
+        self.assertFalse(codex._is_interactive_codex("codex -c features.x=true app-server"))
+        self.assertFalse(codex._is_interactive_codex(EDITOR_APP_SERVER))
+        # A value with a space in it only stays whole in the real argv.
+        self.assertFalse(codex._is_interactive_codex(
+            ["codex", "-c", "instructions=do this", "app-server"]))
+
+    def test_value_options_are_stepped_over(self):
+        self.assertFalse(codex._is_interactive_codex("codex -m gpt-5 exec fix the tests"))
+        self.assertTrue(codex._is_interactive_codex(["codex", "-m", "gpt-5", "fix the tests"]))
+        self.assertFalse(codex._is_interactive_codex(
+            "codex --model gpt-5 --sandbox read-only --cd /w exec x"))
+
+    def test_a_value_written_into_its_option_is_one_word(self):
+        self.assertFalse(codex._is_interactive_codex("codex --model=gpt-5 exec x"))
+        self.assertTrue(codex._is_interactive_codex("codex --model=gpt-5 fix it"))
+        self.assertFalse(codex._is_interactive_codex("codex -mgpt-5 exec x"))
+
+    def test_background_subcommands_are_not_interactive(self):
+        for sub in ("exec", "mcp-server", "app-server"):
+            self.assertFalse(codex._is_interactive_codex(f"codex {sub}"), sub)
+        self.assertFalse(codex._is_interactive_codex("node /n/bin/codex exec do it"))
+
+    def test_a_tui_is_interactive(self):
+        for args in ("codex", "codex --yolo", "codex resume --last",
+                     "node /n/bin/codex --yolo"):
+            self.assertTrue(codex._is_interactive_codex(args), args)
+
+    def test_a_prompt_that_names_a_subcommand_is_interactive(self):
+        self.assertTrue(codex._is_interactive_codex("codex please exec the tests"))
+        self.assertTrue(codex._is_interactive_codex(["codex", "exec the migration plan"]))
+        self.assertTrue(codex._is_interactive_codex(
+            ["codex", "-m", "gpt-5", "app-server is down, find out why"]))
+
+    def test_not_codex(self):
+        self.assertFalse(codex._is_interactive_codex("vim codex.py"))
+        self.assertFalse(codex._is_interactive_codex("python codex_helper.py"))
+
+
+@unittest.skipUnless(os.path.isdir("/proc"), "Codex discovery reads /proc")
+class TestCodexCardsFromProcesses(unittest.TestCase):
+    """Which codex processes on a terminal get a card, read off the real argv."""
+
+    def setUp(self):
+        # No cwd filter, whatever the environment running the suite sets.
+        env = mock.patch.dict(os.environ, {"CLAUDE_FLEET_CWD_INCLUDE": "",
+                                           "CLAUDE_FLEET_CWD_EXCLUDE": ""})
+        env.start()
+        sessions._reload_cwd_filters()
+        self.addCleanup(lambda: (env.stop(), sessions._reload_cwd_filters()))
+
+    def _carded(self, rows, argv=None):
+        """The pids carded from `rows` of (pid, tty, ps args); `argv` maps a pid
+        to its real argv, which is the ps args for any other."""
+        table = {pid: sessions.Proc(1, "Sl+", tty, "codex", args) for pid, tty, args in rows}
+        argv = argv or {}
+        with mock.patch.object(codex, "proc_table", return_value=table), \
+             mock.patch.object(codex, "_proc_argv", create=True,
+                               side_effect=lambda pid, args: argv.get(pid, args)), \
+             mock.patch.object(codex, "_pid_alive", return_value=True), \
+             mock.patch.object(codex, "_proc_start_ms", return_value=0), \
+             mock.patch.object(codex, "_rollout_fd", return_value=None), \
+             mock.patch.object(codex.os, "readlink", return_value="/tmp/proj"):
+            return {w.pid for w in codex.list_codex_windows()}
+
+    def test_an_editor_app_server_on_a_terminal_gets_no_card(self):
+        # Only its having no tty kept it off the board.
+        self.assertEqual(self._carded([(800, "pts/5", EDITOR_APP_SERVER),
+                                       (801, "pts/6", "codex")]), {801})
+
+    def test_a_prompt_beginning_with_a_subcommand_is_read_off_the_real_argv(self):
+        # ps prints `codex "exec the plan"` as `codex exec the plan`.
+        self.assertEqual(self._carded([(802, "pts/7", "codex exec the plan"),
+                                       (803, "pts/8", "codex exec the plan")],
+                                      argv={802: ["codex", "exec the plan"]}), {802})
