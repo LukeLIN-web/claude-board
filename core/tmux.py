@@ -160,6 +160,34 @@ def _resolve_cli(name: str) -> Optional[str]:
     return None
 
 
+def _pane_env_prefix(exe: str) -> list[str]:
+    """`env …` argv prefix for the pane command that runs `exe`; empty if none.
+
+    Two fixes ride on the pane command itself, in the order `env` takes them
+    (`-u` options before assignments):
+
+    1. the board's venv markers are force-unset (`_venv_unset_prefix`);
+    2. `exe`'s own directory is appended to the pane's PATH when that PATH lacks
+       it. Launching by absolute path gets `claude` running in a bare-PATH pane,
+       but not what runs inside it: the session's hooks and Bash calls still
+       could not find `jq`, `claude` or `codex` in ~/.local/bin, so a project's
+       goal-monitor hook died on "jq not on PATH" in every board-spawned card.
+       Appended, not prepended: it fills in what the pane could not find and
+       never shadows what it already resolves (a conda-base `hmz` must not hand
+       its pane conda's `python`).
+    """
+    prefix = _venv_unset_prefix()
+    # The pane's PATH is the board's spawn PATH: tmux gives a new pane the
+    # environment of the client that ran new-window (see _resolve_cli).
+    path = _spawn_env().get("PATH", "")
+    exe_dir = os.path.dirname(exe)
+    on_path = {os.path.normpath(p) for p in path.split(os.pathsep) if p}
+    if exe_dir and os.path.normpath(exe_dir) not in on_path:
+        prefix = (prefix or ["env"]) + [
+            f"PATH={path}{os.pathsep}{exe_dir}" if path else f"PATH={exe_dir}"]
+    return prefix
+
+
 def _run(*args: str, input: Optional[str] = None) -> dict:
     """Run `tmux <args>` and return {ok, rc, stdout, stderr, error}; never raise.
     `input` is fed to tmux's stdin (for `load-buffer -`); otherwise stdin is closed."""
@@ -375,8 +403,9 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
                          f"— install it there, or restart that board from a "
                          f"shell that can run {cmd[0]}"}
     # Force-unset the board's venv markers on the pane command itself so a stale
-    # tmux server can't re-inject VIRTUAL_ENV into the spawned session.
-    cmd = [*_venv_unset_prefix(), exe, *cmd[1:]]
+    # tmux server can't re-inject VIRTUAL_ENV into the spawned session, and give
+    # the pane the directory `exe` was found in if its PATH lacks it.
+    cmd = [*_pane_env_prefix(exe), exe, *cmd[1:]]
     target = _resolve_target()
     if target["exists"]:
         r = _run("new-window", "-P", "-F", "#{pane_id}",

@@ -266,7 +266,9 @@ class NewWindowTests(unittest.TestCase):
 
     def test_argv_uses_env_target(self):
         calls = []
-        with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "mysess"}, clear=True), \
+        # _EXE's dir already on the board's PATH: the pane needs no PATH fix.
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SESSION": "mysess",
+                                            "PATH": "/opt/bin"}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
             with _patch_run(_server(calls, sessions=["mysess", "other"], pane="%12")):
                 r = tmux.new_window("/home/u/proj")
@@ -291,7 +293,7 @@ class NewWindowTests(unittest.TestCase):
         # Zero sessions: must bootstrap a host session running cmd directly,
         # not dead-end. new-window has nothing to attach to.
         calls = []
-        with mock.patch.dict("os.environ", {}, clear=True), \
+        with mock.patch.dict("os.environ", {"PATH": "/opt/bin"}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
             with _patch_run(_server(calls, sessions=(), pane="%1")):
                 r = tmux.new_window("/tmp")
@@ -330,7 +332,7 @@ class NewWindowTests(unittest.TestCase):
         # the pane command must be wrapped in `env -u …` so the spawned session
         # can't inherit those markers regardless of the server's stale env.
         calls = []
-        with mock.patch.dict("os.environ", {}, clear=True), \
+        with mock.patch.dict("os.environ", {"PATH": "/opt/bin"}, clear=True), \
              mock.patch.object(tmux, "_venv_bin_dirs", return_value={"/board/.venv/bin"}):
             with _patch_run(_server(calls)):
                 r = tmux.new_window("/tmp")
@@ -341,6 +343,46 @@ class NewWindowTests(unittest.TestCase):
         self.assertEqual(new_win_argv[claude_idx - 7:claude_idx],
                          ["env", "-u", "VIRTUAL_ENV",
                           "-u", "VIRTUAL_ENV_PROMPT", "-u", "PYTHONHOME"])
+
+    def test_bare_path_pane_gets_the_cli_dir_appended(self):
+        # A board started with a bare PATH finds claude in ~/.local/bin by
+        # absolute path, but the pane inherits the bare PATH — so the session's
+        # hooks could not find jq or claude there. The pane's PATH gains that
+        # dir, appended so nothing the board's PATH already resolves is shadowed.
+        calls = []
+        with mock.patch.dict("os.environ", {"PATH": "/usr/bin:/bin"}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
+            with _patch_run(_server(calls)):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        self.assertEqual(_argv(calls, "new-window")[-4:],
+                         ["env", "PATH=/usr/bin:/bin:/opt/bin",
+                          _EXE, "--dangerously-skip-permissions"])
+
+    def test_cli_dir_follows_the_venv_unsets_on_the_board_path(self):
+        # `env` takes `-u` options before assignments, and the base is the
+        # spawn PATH — the board's own venv bin stays stripped.
+        calls = []
+        with mock.patch.dict("os.environ", {"PATH": "/board/.venv/bin:/usr/bin"},
+                             clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value={"/board/.venv/bin"}):
+            with _patch_run(_server(calls)):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        new_win_argv = _argv(calls, "new-window")
+        claude_idx = new_win_argv.index(_EXE)
+        self.assertEqual(new_win_argv[claude_idx - 8:claude_idx],
+                         ["env", "-u", "VIRTUAL_ENV", "-u", "VIRTUAL_ENV_PROMPT",
+                          "-u", "PYTHONHOME", "PATH=/usr/bin:/opt/bin"])
+
+    def test_empty_board_path_gets_just_the_cli_dir(self):
+        # No leading separator: an empty PATH entry means the cwd.
+        calls = []
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
+            with _patch_run(_server(calls)):
+                tmux.new_window("/tmp")
+        self.assertIn("PATH=/opt/bin", _argv(calls, "new-window"))
 
     def test_new_window_nonzero_exit_returns_error(self):
         with mock.patch.dict("os.environ", {}, clear=True):
