@@ -524,11 +524,14 @@ def _timeline(w, pid: int, limit: int) -> dict:
         # What was typed into it too: hmz takes a line it then refuses, and that
         # line is in no run.
         typed = hmz.typed(pid, w.cwd, w.started_at)
+        cleared = hmz.cleared_at_ms(typed, codex.cleared_at_ms(pid))
         crumb = hmz.menu(w)
+        events = hmz.hmz_timeline(tp or None, limit=limit, typed=typed, since_ms=cleared)
         out.update(
             platform="hmz",
-            events=hmz.hmz_timeline(tp or None, limit=limit, typed=typed),
-            note=(hmz.MENU_NOTE.format(crumb) if crumb else None if tp
+            events=events,
+            note=(hmz.MENU_NOTE.format(crumb) if crumb
+                  else hmz.CLEARED_NOTE if cleared and not events else None if tp
                   else hmz.TYPED_NO_RUN_NOTE if typed else hmz.NO_RUN_NOTE),
         )
         return out
@@ -643,10 +646,11 @@ def api_window_prompt(key: str, body: PromptBody) -> dict:
 def api_window_clear(key: str) -> dict:
     """Send /clear and blank the card's pre-clear preview.
 
-    Both Claude and Codex have /clear. Claude starts a fresh transcript so its
-    card empties on its own, but Codex's /clear leaves the rollout JSONL intact —
-    so we also stamp a per-pid clear time that hides older rollout events from the
-    card and timeline (see codex.mark_cleared)."""
+    Claude, Codex and hmz all have /clear. Claude starts a fresh transcript so
+    its card empties on its own, but Codex's /clear leaves the rollout JSONL
+    intact, and hmz's clears only its screen — so we also stamp a per-pid clear
+    time that hides older events from the card and timeline (see
+    codex.mark_cleared, hmz.cleared_at_ms)."""
     def clear(w, pid: int) -> dict:
         r = _send_recorded(pid, "/clear")
         if r.get("ok"):

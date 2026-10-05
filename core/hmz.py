@@ -37,6 +37,11 @@ cut off at once — "even mid-turn", as hmz's own budget menu words it.
 ~/.hmz is $HUMANIZE_HOME when the hmz was started with one, as hmz's own
 `home()` has it. It was ~/.humanize until hmz renamed it: a newer hmz moves the
 old one over the first time it runs, and an older one goes on using it.
+
+hmz's `/clear` clears its screen and nothing else: there is no context to clear,
+a run's agents being made for that run, and every run stays where it was. So
+the card, which reads the run rather than the screen, clears itself — from the
+newest `/clear` on it shows only what came after (see cleared_at_ms).
 """
 from __future__ import annotations
 
@@ -48,7 +53,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import patrol, tmux, transcripts
+from . import codex, patrol, tmux, transcripts
 from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
                        _proc_start_ms, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
@@ -64,6 +69,10 @@ NO_RUN_NOTE = ("这个 hmz 还没开始 run，没有可显示的内容。在它�
 # then answered each on its own screen only.
 TYPED_NO_RUN_NOTE = ("这个 hmz 还没开始 run：下面是输入给它的行，它收下了，但没有一行启动 flow。"
                      "它为什么不跑只写在它自己的屏幕上（比如 `hmz: no such flow: …`）。")
+# …and for one cleared since anything last happened in it.
+CLEARED_NOTE = ("已 /clear。hmz 的 /clear 只清它自己的屏幕，卡片也就只显示这之后的内容。"
+                "它没有上下文可清——每个 run 的 agent 都是为那个 run 新开的；之前的 run 没动，"
+                "在 hmz 里 /epics 能看，/resume 能接着跑。")
 
 # What the timeline says while hmz sits in a menu, which only its terminal can
 # answer. A `$flow` its directory hasn't set up lands in one, holding the line.
@@ -598,7 +607,15 @@ def hmz_window_dicts() -> list[dict]:
     for w, events in _discover():
         d = w.to_dict()
         began, end = _began(events), _ended(events)
+        first_input = str(began.get("task") or "").strip().split("\n")[0][:100]
         current_task = _current_task(events)
+        last_error = f"{began.get('flow', 'run')} failed" if end.get("how") == "failed" else None
+        cleared = cleared_at_ms(typed(w.pid, w.cwd, w.started_at), codex.cleared_at_ms(w.pid))
+        if end and _before(end.get("at", ""), cleared):
+            # Over by the clear, so off hmz's screen. A run still going stays on
+            # it, and on the card. Its models and its bill stay too, as they do
+            # on the lines round hmz's composer.
+            first_input, current_task, last_error = "", "", None
         tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
         crumb = menu(w)
         if crumb:
@@ -609,9 +626,9 @@ def hmz_window_dicts() -> list[dict]:
         d.update({
             "permission_msg": None,
             "permission_ts": None,
-            "first_input": str(began.get("task") or "").strip().split("\n")[0][:100],
+            "first_input": first_input,
             "current_task": current_task or None,
-            "last_error": f"{began.get('flow', 'run')} failed" if end.get("how") == "failed" else None,
+            "last_error": last_error,
             **tri,
             "skills_used": [],
             "memory_ops": [],
@@ -655,6 +672,34 @@ def typed(pid: int, cwd: str, since_ms: int) -> list[dict]:
             if d["workdir"] == cwd and transcripts._parse_ts(d["at"]) * 1000 >= since_ms]
 
 
+def _is_clear(text: str) -> bool:
+    """True for a line hmz runs as `/clear`, which it reads as a name up to
+    the first space."""
+    return text.startswith("/") and text[1:].partition(" ")[0] == "clear"
+
+
+def cleared_at_ms(typed: list[dict], stamped_ms: int = 0) -> float:
+    """When the hmz `typed` (see typed()) was typed into last cleared its
+    screen, in epoch ms, or 0 if it never did.
+
+    That is the newest `/clear` among the lines, or `stamped_ms`, the board's
+    stamp of a /clear it sent (codex.mark_cleared), whichever is later: hmz
+    doesn't write down a repeat of its last line, so a second /clear in a row
+    is in the stamp alone. In the lines' own float ms, so that the /clear line
+    itself falls at the cutoff rather than a fraction of a ms after it.
+    """
+    return max([float(stamped_ms)] + [transcripts._parse_ts(d["at"]) * 1000
+                                      for d in typed if _is_clear(d["text"])])
+
+
+def _before(ts: str, cleared_ms: float) -> bool:
+    """True if a line stamped `ts` is gone from the screen a clear at
+    `cleared_ms` cleared — the /clear itself included. A stamp that doesn't
+    parse is kept: better a stray line than a card blanked on a guess."""
+    t = transcripts._parse_ts(ts) * 1000
+    return 0 < t <= cleared_ms
+
+
 def _squeeze(s: str) -> str:
     return "".join(s.split())
 
@@ -683,6 +728,11 @@ def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]
     # newest anywhere when nothing was ever typed here.
     here = [d["text"] for d in said if d["workdir"] == cwd] or [d["text"] for d in said]
     if here and _squeeze(here[-1]) == want:
+        if _is_clear(text):
+            # …but a /clear wipes its own echo with the rest of the screen.
+            # The composer letting go of it is all there is to go on, and all
+            # a lost one would leave is a screen that wasn't cleared twice.
+            return lambda: not tmux._composer_has_tail(pane, text, _COMPOSER)
         return lambda: tmux._shown_above_composer(pane, text, _COMPOSER)
     return lambda: any(_squeeze(d["text"]) == want for d in _history(path, mark))
 
@@ -727,17 +777,21 @@ def refusal(pane: str, text: str) -> str:
 
 
 def hmz_timeline(path: str | Path | None, limit: int = 60,
-                 typed: list[dict] = ()) -> list[dict]:
+                 typed: list[dict] = (), since_ms: float = 0) -> list[dict]:
     """A run as TurnEvent-compatible dicts, off its epic: the task it began on,
     each session an agent opened (tagged `extra.agent` with whose), each flow it
     called and its return, and how it ended, in the order they happened.
 
     `typed` (see typed()) are the lines typed into the hmz; each one the run
     doesn't already show goes in where it was typed. A line hmz refused, or
-    one typed before there was any run (`path` None), shows nowhere else."""
+    one typed before there was any run (`path` None), shows nowhere else.
+
+    `since_ms` (see cleared_at_ms) drops what a /clear took off hmz's screen."""
     events: list[dict] = []
     for e in _events(Path(path)) if path else []:
         kind, ts, extra = e.get("event"), e.get("at", ""), {}
+        if _before(ts, since_ms):
+            continue
         if kind == "began":
             text = f"${e.get('flow', '')} {e.get('task', '')}".strip()
             events.append({"ts": ts, "kind": "user_text", "text": cap_text(text, MESSAGE_CHARS),
@@ -761,7 +815,7 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
     shown = [_squeeze(ev.get("text") or "") for ev in events if ev.get("kind") == "user_text"]
     for d in typed:
         line = _squeeze(cap_text(d["text"], MESSAGE_CHARS))
-        if line and not any(line in s for s in shown):
+        if line and not _before(d["at"], since_ms) and not any(line in s for s in shown):
             events.append({"ts": d["at"], "kind": "user_text", "text": cap_text(d["text"], MESSAGE_CHARS),
                            "tool": None, "role": "user", "extra": {}})
     # Stable: at one instant the run's own lines come first, in their order.
