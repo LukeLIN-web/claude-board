@@ -1903,6 +1903,10 @@ def switch_model(pid: int, alias: str, effort: str = "") -> dict:
 
     if _wait_pane(pane, lambda t: _MODEL_DIALOG_FOOTER in t,
                   _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL) is None:
+        # "/model" was sent, so a dialog that paints just after the wait gave
+        # up is ours, and nobody else will close it. The escape only presses
+        # while one of the dialogs is actually on screen.
+        _escape_model_dialogs(pane)
         return {"ok": False, "error": "the /model dialog never opened"}
 
     rows = _survey_model_rows(pane)

@@ -1160,6 +1160,42 @@ class SwitchModelTests(unittest.TestCase):
         # modal unless we keep going until the pane is clean.
         self.assertEqual(state["screen"], "closed")
 
+    def test_dialog_that_opens_after_the_wait_is_escaped(self):
+        # A slow pane paints the dialog a beat after the wait gave up on it. The
+        # error went back and the session stayed parked on the open modal — the
+        # one path out of switch_model that didn't escape.
+        state = {"screen": "prompt"}
+
+        def capture(pane, scrollback=0):
+            now = actions.time.time()
+            # The wait's own deadline, computed the way it computes it.
+            state.setdefault("gives_up", now + actions._MODEL_DIALOG_WAIT)
+            if state["screen"] == "prompt" and now >= state["gives_up"]:
+                state["screen"] = "dialog"
+            return {"ok": True, "text": MODEL_DIALOG if state["screen"] == "dialog" else "❯ /model\n"}
+
+        def send_keys(pane, *keys):
+            if "Escape" in keys:
+                state["screen"] = "closed"
+            return {"ok": True}
+
+        with _pane(window=_fake_window("/dev/pts/9"), pane="%1") as p, \
+             mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}):
+            p.capture_pane.side_effect = capture
+            p.send_keys.side_effect = send_keys
+            r = actions.switch_model(1234, "fable")
+        self.assertFalse(r["ok"])
+        self.assertIn("never opened", r["error"])
+        p.send_keys.assert_called_once_with("%1", "Escape")
+        self.assertEqual(state["screen"], "closed")
+
+    def test_dialog_that_never_opens_gets_no_keys(self):
+        with _pane("❯ /model\n", window=_fake_window("/dev/pts/9"), pane="%1") as p, \
+             mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}):
+            r = actions.switch_model(1234, "fable")
+        self.assertIn("never opened", r["error"])
+        p.send_keys.assert_not_called()
+
     def test_codex_takes_the_codex_path(self):
         # The Claude alias rules don't apply: "gpt-5.6-sol" is not alnum, and the
         # codex driver is what answers (here: rejected before any key, no tty).
