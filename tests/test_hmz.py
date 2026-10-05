@@ -477,5 +477,172 @@ class TestKeptSessions(unittest.TestCase):
         self.assertEqual(hmz._current_task(events), "rlar · scout")
 
 
+PRICES = {"models": {
+    "claude-opus-5-5": {"name": "Claude Opus 5.5", "per_million": {
+        "input": 4.0, "cache_write": 5.0, "cache_read": 0.2, "output": 20.0}},
+    "gpt-6-astra": {"name": "GPT-6 Astra", "per_million": {
+        "input": 10.0, "cache_read": 1.0, "cache_write": 12.5, "output": 50.0}},
+}}
+
+
+def _claude_turn(ident, model, **usage):
+    return {"type": "assistant", "timestamp": "2026-10-02T00:00:04.000Z", "requestId": "req_" + ident,
+            "message": {"id": "msg_" + ident, "model": model, "role": "assistant",
+                        "content": [{"type": "text", "text": "…"}], "usage": usage}}
+
+
+def _codex_count(**total):
+    return {"type": "event_msg", "timestamp": "2026-10-02T00:00:08.000Z",
+            "payload": {"type": "token_count", "info": {"total_token_usage": total}}}
+
+
+class TestSpending(unittest.TestCase):
+    """What a run spent: the session logs summed and priced off hmz's copy of
+    the price list while it runs, hmz's own total once it has ended."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / "prices.json").write_text(json.dumps(PRICES))
+        self.run = self.home / "epics" / "-p" / "20261002T000000.000Z-a1b2c3"
+        self.epic = _jsonl(self.run / "epic.jsonl", [
+            {"event": "began", "at": "2026-10-02T00:00:00.000Z", "flow": "rlar", "task": "fix",
+             "budget": {"duration": "PT15H", "cost": 150.0, "output_tokens": None, "graceful": True}},
+            {"event": "opened", "at": "2026-10-02T00:00:05.000Z", "agent": "writer",
+             "backend": "claude", "session": "c1", "where": "sessions/claude"},
+            {"event": "opened", "at": "2026-10-02T00:00:08.000Z", "agent": "reviewer",
+             "backend": "codex", "session": "x9", "where": "sessions/codex"},
+        ])
+        first = _claude_turn("1", "claude-opus-5-5", input_tokens=2, output_tokens=300,
+                             cache_read_input_tokens=10_000, cache_creation_input_tokens=5_000)
+        self.claude_log = _jsonl(self.run / "sessions/claude/projects/-p/c1.jsonl", [
+            # A message is a line per content block, each carrying the whole message's usage.
+            first, first,
+            _claude_turn("2", "claude-opus-5-5", input_tokens=100, output_tokens=700),
+        ])
+        self.codex_log = _jsonl(
+            self.run / "sessions/codex/sessions/2026/10/02/rollout-2026-10-02T00-00-07-x9.jsonl", [
+                {"type": "turn_context", "payload": {"model": "gpt-6-astra", "cwd": "/p"}},
+                # Running totals, the last of which is the session's; input includes the cached part.
+                _codex_count(input_tokens=1_000, cached_input_tokens=600, output_tokens=50),
+                _codex_count(input_tokens=3_000, cached_input_tokens=2_000, output_tokens=200),
+            ])
+        self.began = hmz.transcripts._parse_ts("2026-10-02T00:00:00.000Z")
+
+    def _spending(self, events=None, now=None):
+        return hmz._spending(self.epic, events if events is not None else hmz._events(self.epic),
+                             self.home, now=self.began + 125 if now is None else now)
+
+    def test_tokens_summed_once_per_message_and_priced_per_model(self):
+        s = self._spending()
+        self.assertEqual(s["tokens"], {"input": 1_102, "output": 1_200,
+                                       "cache_read": 12_000, "cache_write": 5_000})
+        # Opus: 102×4 + 1000×20 + 10000×0.2 + 5000×5; Astra: 1000×10 + 2000×1 + 200×50 — per million.
+        self.assertAlmostEqual(s["cost"], 0.047408 + 0.022)
+        self.assertFalse(s["cost_floor"])
+        self.assertEqual(s["spend_label"], "$0.07 · 1.2k out · 2m 5s")
+        self.assertEqual(s["budget_label"], "15h, $150")
+        self.assertFalse(s["over_budget"])
+        self.assertEqual(s["spend_title"],
+                         "input 1.1k · output 1.2k · cache_read 12.0k · cache_write 5.0k"
+                         " — claude-opus-5-5, gpt-6-astra")
+
+    def test_a_model_the_list_lacks_makes_the_bill_a_floor(self):
+        prices = {"models": {"claude-opus-5-5": PRICES["models"]["claude-opus-5-5"]}}
+        (self.home / "prices.json").write_text(json.dumps(prices))
+        os.utime(self.home / "prices.json", (2_000, 2_000))  # a changed list is re-read
+        s = self._spending()
+        self.assertAlmostEqual(s["cost"], 0.047408)
+        self.assertTrue(s["cost_floor"])
+        self.assertTrue(s["spend_label"].startswith("$0.05+ · "))
+        self.assertIn("counted, not billed", s["spend_title"])
+
+    def test_no_price_list_counts_tokens_only(self):
+        (self.home / "prices.json").unlink()
+        s = self._spending()
+        self.assertIsNone(s["cost"])
+        self.assertEqual(s["spend_label"], "1.2k out · 2m 5s")
+
+    def test_hmzs_own_total_once_the_run_ended(self):
+        events = hmz._events(self.epic) + [
+            {"event": "usage", "at": "2026-10-02T00:01:59.300Z", "cost": 0.8187342,
+             "output_tokens": 12697, "seconds": 119.227725},
+            {"event": "ended", "at": "2026-10-02T00:01:59.301Z", "how": "done"}]
+        s = self._spending(events)
+        self.assertAlmostEqual(s["cost"], 0.8187342)
+        self.assertEqual(s["output_tokens"], 12697)
+        self.assertEqual(s["spend_label"], "$0.82 · 12.7k out · 1m 59s")
+        self.assertTrue(s["spend_title"].startswith("hmz's own total"))
+
+    def test_a_run_from_before_usage_lines_ends_on_its_ended_line(self):
+        events = hmz._events(self.epic) + [
+            {"event": "ended", "at": "2026-10-02T00:03:00.000Z", "how": "stopped"}]
+        self.assertEqual(self._spending(events)["elapsed_s"], 180.0)
+
+    def test_log_is_read_on_from_where_the_last_poll_stopped(self):
+        before = self._spending()["tokens"]["output"]
+        with self.claude_log.open("a") as f:
+            f.write(json.dumps(_claude_turn("3", "claude-opus-5-5", output_tokens=5)) + "\n")
+            f.write('{"type": "assistant", "message": {"id": "msg_4", "usage": {"output_tok')  # mid-write
+        self.assertEqual(self._spending()["tokens"]["output"], before + 5)
+        # Rewritten shorter — a fresh session under the old name — it is read over.
+        _jsonl(self.claude_log, [_claude_turn("9", "claude-opus-5-5", output_tokens=1)])
+        self.assertEqual(self._spending()["tokens"]["output"], 201)
+
+    def test_a_sub_agents_tokens_are_the_runs(self):
+        # A sub-agent Claude starts logs under its session; the timeline leaves
+        # it out, the bill takes it in, as hmz's own does.
+        _jsonl(self.run / "sessions/claude/projects/-p/c1/subagents/agent-7.jsonl", [
+            {**_claude_turn("7", "claude-opus-5-5", output_tokens=40), "isSidechain": True}])
+        self.assertEqual(self._spending()["tokens"]["output"], 1_240)
+        self.assertEqual(len(hmz._logs(self.epic, hmz._opened(self.epic)[0])), 1)
+        self.assertNotIn("40", [e["text"] for e in hmz.hmz_timeline(self.epic)])
+
+    def test_over_budget(self):
+        events = hmz._events(self.epic)
+        events[0]["budget"] = {"duration": "PT2M", "cost": None, "output_tokens": None, "graceful": False}
+        s = self._spending(events)
+        self.assertTrue(s["over_budget"])
+        self.assertEqual(s["budget_label"], "2m, even mid-turn")
+
+    def test_budget_as_hmz_writes_it(self):
+        chat = hmz._budget({"budget": {"duration": None, "cost": "Infinity",
+                                       "output_tokens": None, "graceful": True}})
+        self.assertEqual(chat, {"cost": None, "duration_s": None, "output_tokens": None,
+                                "graceful": True})
+        self.assertEqual(hmz._budget_label(chat), "no limit")
+        self.assertEqual(hmz._budget_label(hmz._budget({"budget": {
+            "duration": "P1DT2H30M", "cost": 5, "output_tokens": 20_000, "graceful": False}})),
+            "1d 2h, 20.0k out, $5.00, even mid-turn")
+        self.assertIsNone(hmz._budget({}))
+        self.assertEqual(hmz._budget_label(None), "")
+
+    def test_durations(self):
+        self.assertEqual(hmz._seconds("PT15H"), 54_000)
+        self.assertEqual(hmz._seconds("PT0.5S"), 0.5)
+        self.assertEqual(hmz._seconds(90), 90.0)
+        self.assertIsNone(hmz._seconds(None))
+        self.assertIsNone(hmz._seconds("PT"))
+        self.assertEqual([hmz._clock(s) for s in (45, 125, 300, 4_320, 54_000, 95_400)],
+                         ["45s", "2m 5s", "5m", "1h 12m", "15h", "1d 2h"])
+
+    def test_prices_match_as_hmz_matches(self):
+        prices = hmz._prices(self.home)
+        opus = PRICES["models"]["claude-opus-5-5"]["per_million"]
+        for spelled in ("claude-opus-5-5", "anthropic/claude-opus-5-5", "Claude Opus 5.5",
+                        "us.anthropic.claude-opus-5-5-v1:0", "claude-opus-5-5-20260301",
+                        "bedrock-claude-opus-5-5"):
+            self.assertEqual(hmz._price(spelled, prices), opus, spelled)
+        self.assertIsNone(hmz._price("claude-opus-5", prices))  # a near miss is a miss
+        self.assertIsNone(hmz._price("<synthetic>", prices))
+
+    def test_money_and_counts_as_hmz_writes_them(self):
+        self.assertEqual([hmz._money(d) for d in (0, 0.0012, 0.47, 12.5, 150)],
+                         ["$0.00", "$0.0012", "$0.47", "$12.50", "$150"])
+        self.assertEqual([hmz._thousands(n) for n in (8, 12_697, 2_400_000)],
+                         ["8", "12.7k", "2.40M"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1047,6 +1047,32 @@ def _async_launch_kind(name: str, inp: dict) -> str:
     return ""
 
 
+def _note_finished(notified: dict[str, dict], body: str, ts: str) -> Optional[str]:
+    """Enter a <task-notification> that reports its task over into `notified`,
+    first report per task wins; return its task id, or None if `body` is not one.
+
+    Over means any <status> but "running". Reading only "completed" left every
+    task that `failed` (a background command exiting non-zero), was `killed` or
+    `stopped` listed as running for the rest of the session — the card said
+    "working" long after the session went idle. What does not end a task is a
+    progress report: a Monitor event carries an <event> and no <status> at all.
+    """
+    hit = _TN_TASK_ID_RE.search(body)
+    status = _TN_STATUS_RE.search(body)
+    if not hit or not status or status.group(1) == "running":
+        return None
+    summary = _TN_SUMMARY_RE.search(body)
+    entry = notified.setdefault(
+        hit.group(1),
+        {"tool_use_id": "", "ts": _parse_ts(ts),
+         "summary": summary.group(1) if summary else ""},
+    )
+    tool_use = _TN_TOOL_USE_RE.search(body)
+    if tool_use and not entry["tool_use_id"]:
+        entry["tool_use_id"] = tool_use.group(1)
+    return hit.group(1)
+
+
 def extract_background_tasks(path: str | Path) -> list[dict]:
     """Async work this session started and has not finished with, as
     [{type, description, command, state, ts}].
@@ -1061,7 +1087,9 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
     background"), so that test matched nothing on any transcript and this list
     was always empty. What actually tracks the work is the notification ledger —
     the task reports completion in a `queue-operation` row, and the session takes
-    delivery in a `remove` row or in a user row carrying the same <task-id>.
+    delivery in a `remove` row or in a user row carrying the same <task-id>. A
+    notice delivered without queueing shows up only as that user row, or as a
+    `queued_command` attachment, so those count as the report too.
     """
     p = Path(path)
     if not p.exists():
@@ -1095,27 +1123,29 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
             hit = _TN_TASK_ID_RE.search(body)
             if not hit:
                 continue
-            task_id = hit.group(1)
             if op != "enqueue":
-                delivered.add(task_id)
+                delivered.add(hit.group(1))
                 continue
-            status = _TN_STATUS_RE.search(body)
-            if not status or status.group(1) != "completed":
-                continue  # a progress event, not the task finishing
-            summary = _TN_SUMMARY_RE.search(body)
-            entry = notified.setdefault(
-                task_id,
-                {"tool_use_id": "", "ts": _parse_ts(d.get("timestamp", "")),
-                 "summary": summary.group(1) if summary else ""},
-            )
-            tool_use = _TN_TOOL_USE_RE.search(body)
-            if tool_use and not entry["tool_use_id"]:
-                entry["tool_use_id"] = tool_use.group(1)
+            _note_finished(notified, body, d.get("timestamp", ""))
         elif t == "user" and not d.get("isSidechain"):
-            body = json.dumps((d.get("message") or {}).get("content"), ensure_ascii=False)
+            content = (d.get("message") or {}).get("content")
+            body = json.dumps(content, ensure_ascii=False)
             hit = _TN_TASK_ID_RE.search(body)
             if hit:
                 delivered.add(hit.group(1))
+            # A notice handed straight to an idle session never passes the queue,
+            # so this row is the only trace that the task finished.
+            if isinstance(content, str):
+                _note_finished(notified, content, d.get("timestamp", ""))
+        elif t == "attachment" and not d.get("isSidechain"):
+            # The same handover, logged as the queued command it was delivered as —
+            # on some transcripts with no enqueue/remove pair around it at all.
+            a = d.get("attachment") or {}
+            body = a.get("prompt")
+            if a.get("type") == "queued_command" and isinstance(body, str):
+                task_id = _note_finished(notified, body, d.get("timestamp", ""))
+                if task_id:
+                    delivered.add(task_id)
 
     out: list[dict] = []
     settled: set[str] = set()  # tool_use_ids whose completion has been delivered

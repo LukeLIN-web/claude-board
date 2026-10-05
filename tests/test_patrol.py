@@ -59,6 +59,8 @@ class BackgroundLedgerTests(unittest.TestCase):
         shutil.rmtree(self.p.parent, ignore_errors=True)
 
     def _tasks(self, rows):
+        if getattr(self, "p", None):  # a subTest loop writes more than one
+            shutil.rmtree(self.p.parent, ignore_errors=True)
         self.p = _write(rows)
         return transcripts.extract_background_tasks(self.p)
 
@@ -131,6 +133,56 @@ class BackgroundLedgerTests(unittest.TestCase):
             _queue("enqueue", _notification("task1", "t1", status="running")),
         ])
         self.assertEqual([t["state"] for t in got], ["running"])
+
+    def test_a_monitor_event_is_not_a_completion(self):
+        # What a Monitor actually reports with: an <event>, and no <status> at all.
+        event = ("<task-notification>\n<task-id>task1</task-id>\n"
+                 "<summary>Monitor event: \"eval\"</summary>\n<event>PROG 8/50</event>\n"
+                 "</task-notification>")
+        got = self._tasks([
+            _launch("t1", "Monitor", {"description": "watch the eval", "persistent": True}),
+            _end_turn("盯着"),
+            _queue("enqueue", event),
+            _queue("remove", event, ts="2026-09-08T21:00:34Z"),
+        ])
+        self.assertEqual([t["state"] for t in got], ["running"])
+
+    def test_a_task_that_ended_any_other_way_is_over_too(self):
+        # A background command exiting non-zero reports `failed`; TaskStop and a
+        # dying session report `killed` / `stopped`. Each ends the task as surely
+        # as `completed` — read as a progress event, it stayed "running" for good.
+        for status in ("failed", "killed", "stopped"):
+            with self.subTest(status=status):
+                got = self._tasks([
+                    _launch("t1", "Bash", {"command": "make", "run_in_background": True}),
+                    _end_turn("等着"),
+                    _queue("enqueue", _notification("task1", "t1", status=status)),
+                    _queue("remove", _notification("task1", "t1", status=status),
+                           ts="2026-09-08T21:00:34Z"),
+                ])
+                self.assertEqual(got, [])
+                got = self._tasks([
+                    _launch("t1", "Bash", {"command": "make", "run_in_background": True}),
+                    _end_turn("等着"),
+                    _queue("enqueue", _notification("task1", "t1", status=status)),
+                ])
+                self.assertEqual([t["state"] for t in got], ["undelivered"])
+
+    def test_a_notice_handed_straight_to_the_session_settles_it(self):
+        # An idle session takes the notice at once: no enqueue/remove pair, just
+        # the user turn — or, on other transcripts, the queued_command attachment.
+        as_attachment = {"type": "attachment", "timestamp": "2026-09-08T21:16:11Z",
+                         "attachment": {"type": "queued_command",
+                                        "commandMode": "task-notification",
+                                        "prompt": _notification("task1", "t1")}}
+        for row in (_delivered(_notification("task1", "t1")), as_attachment):
+            with self.subTest(row=row["type"]):
+                got = self._tasks([
+                    _launch("t1", "Bash", {"command": "make", "run_in_background": True}),
+                    _end_turn("等着"),
+                    row,
+                ])
+                self.assertEqual(got, [])
 
     def test_a_flush_settles_what_it_cannot_name(self):
         # `dequeue` carries no content. It shows up alongside real deliveries, so
