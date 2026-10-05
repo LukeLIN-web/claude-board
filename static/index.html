@@ -349,7 +349,7 @@
                this line the card looks like the session simply never answered -->
           <div class="text-red-600 bg-red-50 rounded px-1.5 py-0.5" x-show="w.last_error"
                :title="w.last_error" x-text="'⚠ ' + w.last_error"></div>
-          <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
+          <div class="text-gray-500 italic" x-text="cardText(w, w.triage_reason)"></div>
           <!-- What an hmz run has spent — its bill, the tokens its agents wrote,
                how long it has run — against the budget it runs under, worded as
                hmz's own status bar and budget menu word them. The tooltip has
@@ -357,7 +357,7 @@
           <div x-show="w.spend_label || w.budget_label" class="text-[10px] rounded px-1.5 py-0.5 truncate"
                :class="w.over_budget ? 'text-amber-800 bg-amber-50' : 'text-violet-800 bg-violet-50'"
                :title="w.spend_title">
-            <span class="font-medium" x-show="w.spend_label" x-text="'💸 ' + w.spend_label"></span>
+            <span class="font-medium" x-show="w.spend_label" x-text="'💸 ' + cardText(w, w.spend_label)"></span>
             <span x-show="w.budget_label" :class="w.over_budget ? 'text-amber-600' : 'text-violet-500'"
                   x-text="(w.spend_label ? ' · ' : '') + 'budget ' + w.budget_label"></span>
           </div>
@@ -444,7 +444,7 @@
             </div>
           </div>
           <div class="text-gray-400">
-            <span x-text="formatIdle(w.idle_seconds)"></span> ·
+            <span x-text="formatIdle(liveSeconds(w.idle_seconds))"></span> ·
             pid <span x-text="w.pid"></span>
           </div>
         </div>
@@ -1016,8 +1016,8 @@
             <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
             <div class="text-red-600 truncate" x-show="w.last_error" :title="w.last_error"
                  x-text="'⚠ ' + w.last_error"></div>
-            <div class="text-gray-500 italic truncate" x-show="w.triage_reason" x-text="w.triage_reason"></div>
-            <div><span x-text="formatIdle(w.idle_seconds)"></span> · pid <span x-text="w.pid"></span></div>
+            <div class="text-gray-500 italic truncate" x-show="w.triage_reason" x-text="cardText(w, w.triage_reason)"></div>
+            <div><span x-text="formatIdle(liveSeconds(w.idle_seconds))"></span> · pid <span x-text="w.pid"></span></div>
           </div>
         </div>
       </template>
@@ -1068,6 +1068,13 @@ const byStartedAt = (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid
 function fleet() {
   return {
     windows: [],
+    // The page's clock, and its reading when the cards above arrived. A card's
+    // durations — its idle time, a running hmz run's clock — come as seconds as
+    // of the snapshot and are shown advanced by the difference (liveSeconds).
+    // The server sends a snapshot only when something on it changes, so a card
+    // that just sits there is never re-sent to move its "3m ago" along.
+    now: Date.now(),
+    _snapAt: Date.now(),
     counts: { total: 0, busy: 0, waiting: 0, idle: 0 },
     statusFilter: '',
     // Show only one machine's cards. '' = every machine.
@@ -1269,6 +1276,9 @@ function fleet() {
       setInterval(() => {
         if (this.expandedKey !== null && !document.hidden) this.refreshTimeline();
       }, 2500);
+      // Tick the card durations (see `now`). Not while the tab is hidden, for
+      // the same reason; the first tick back brings them current.
+      setInterval(() => { if (!document.hidden) this.now = Date.now(); }, 1000);
     },
 
     // Fetch the card snapshot over a plain request and draw it. A failure is
@@ -1356,6 +1366,7 @@ function fleet() {
 
     applySnapshot(snap) {
       this.windows = snap.windows || [];
+      this.now = this._snapAt = Date.now();
       if (snap.host) {
         this.localHost = snap.host;
         if (!this.spawnHost) this.spawnHost = snap.host;
@@ -1432,6 +1443,44 @@ function fleet() {
       if (seconds < 60) return seconds + 's ago';
       if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
       return Math.floor(seconds / 3600) + 'h ago';
+    },
+
+    // A card's duration — seconds as the server measured it building the
+    // snapshot — as of now on the page's clock. Counted from the snapshot's
+    // arrival here rather than from an absolute timestamp, so neither this
+    // browser's clock nor a peer host's has to agree with the server's.
+    liveSeconds(seconds) {
+      return Math.max(0, Math.floor((seconds || 0) + (this.now - this._snapAt) / 1000));
+    },
+    // Card text with the durations the server leaves out of it put back in
+    // (see _TICKING_CARD in app.py): {idle} is the card's idle time where a
+    // triage reason names it (core/patrol.py IDLE), {elapsed} a running hmz
+    // run's clock in its spend label (core/hmz.py ELAPSED). Text with neither
+    // comes back as it is, without reading the clock.
+    cardText(w, text) {
+      if (!text) return text;
+      return text
+        .replace('{idle}', () => this.idleShort(this.liveSeconds(w.idle_seconds)))
+        .replace('{elapsed}', () => this.runClock(this.liveSeconds(w.elapsed_s)));
+    },
+    // An idle time as a triage reason words it: 45s, 12m, 2h, 2h19m.
+    idleShort(s) {
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s / 60) + 'm';
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+      return m ? `${h}h${m}m` : `${h}h`;
+    },
+    // A run's clock as hmz words it (core/hmz.py _clock): 45s, 2m 5s, 1h 12m,
+    // 15h, 1d 2h — the largest two units, a zero one dropped.
+    runClock(seconds) {
+      const s = Math.floor(seconds);
+      for (const [big, small, b, l] of [[86400, 3600, 'd', 'h'], [3600, 60, 'h', 'm'], [60, 1, 'm', 's']]) {
+        if (s >= big) {
+          const rest = Math.floor((s % big) / small);
+          return Math.floor(s / big) + b + (rest ? ` ${rest}${l}` : '');
+        }
+      }
+      return s + 's';
     },
 
     // Render a YYYY-MM-DD date from either an epoch-ms number or an ISO string.

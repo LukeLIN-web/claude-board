@@ -16,6 +16,12 @@ CLOSEABLE_THRESHOLD = 3600  # 1 hour
 # threshold — it is wide enough that a snapshot can never catch a healthy
 # handover mid-flight and flash the card amber.
 DELIVERY_GRACE = 60
+# Where a reason names how long the card has been idle. The time itself is not
+# written in: it grows every second, and a reason that changes by itself would
+# have the board re-send every quiet card once a minute (see _TICKING_CARD in
+# app.py). The page puts it in from the card's idle_seconds, advanced on its own
+# clock, the same way it ticks the card's "3m ago" (cardText in index.html).
+IDLE = "{idle}"
 
 TRIAGE_PRIORITY = {
     "waiting_perm": 0,
@@ -147,19 +153,18 @@ def classify(window_dict: dict) -> dict:
         }
 
     stop = info["stop_reason"]
-    idle_str = _format_idle(idle)
 
     if stop == "end_turn":
         summary = info["last_text"].split("\n")[0][:80] if info["last_text"] else ""
         if idle >= CLOSEABLE_THRESHOLD:
             return {
                 "triage": "closeable",
-                "reason": f"已完成，空闲 {idle_str}。{summary}",
+                "reason": f"已完成，空闲 {IDLE}。{summary}",
                 "suggestion": "可以关闭",
             }
         return {
             "triage": "completed",
-            "reason": f"已完成，空闲 {idle_str}。{summary}",
+            "reason": f"已完成，空闲 {IDLE}。{summary}",
             "suggestion": "建议 review",
         }
 
@@ -173,7 +178,7 @@ def classify(window_dict: dict) -> dict:
             }
         return {
             "triage": "stalled",
-            "reason": f"停在 {tool}，空闲 {idle_str}" if tool else f"中途停止，空闲 {idle_str}",
+            "reason": f"停在 {tool}，空闲 {IDLE}" if tool else f"中途停止，空闲 {IDLE}",
             "suggestion": "需要用户介入",
         }
 
@@ -181,12 +186,12 @@ def classify(window_dict: dict) -> dict:
     if idle >= CLOSEABLE_THRESHOLD:
         return {
             "triage": "closeable",
-            "reason": f"空闲 {idle_str}",
+            "reason": f"空闲 {IDLE}",
             "suggestion": "可以关闭",
         }
     return {
         "triage": "completed" if idle >= IDLE_THRESHOLD else "working",
-        "reason": f"空闲 {idle_str}",
+        "reason": f"空闲 {IDLE}",
         "suggestion": "",
     }
 
@@ -198,15 +203,14 @@ def classify_idle(status: str, idle: int, task: str) -> dict:
     triage_suggestion fields."""
     if status == "busy":
         return {"triage": "working", "triage_reason": "正在工作", "triage_suggestion": ""}
-    idle_str = _format_idle(idle)
     tail = f"。{task}" if task else ""
     if idle >= CLOSEABLE_THRESHOLD:
-        return {"triage": "closeable", "triage_reason": f"空闲 {idle_str}{tail}",
+        return {"triage": "closeable", "triage_reason": f"空闲 {IDLE}{tail}",
                 "triage_suggestion": "可以关闭"}
     if idle >= IDLE_THRESHOLD:
-        return {"triage": "completed", "triage_reason": f"已完成，空闲 {idle_str}{tail}",
+        return {"triage": "completed", "triage_reason": f"已完成，空闲 {IDLE}{tail}",
                 "triage_suggestion": "建议 review"}
-    return {"triage": "completed", "triage_reason": f"空闲 {idle_str}{tail}",
+    return {"triage": "completed", "triage_reason": f"空闲 {IDLE}{tail}",
             "triage_suggestion": ""}
 
 
@@ -218,13 +222,3 @@ def _count(tasks: list) -> str:
 def _what(task: dict) -> str:
     """One line naming a background task, for the card's reason."""
     return (task.get("description") or task.get("command") or "").split("\n")[0][:80]
-
-
-def _format_idle(seconds: int) -> str:
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    return f"{h}h{m}m" if m else f"{h}h"

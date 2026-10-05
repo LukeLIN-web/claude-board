@@ -516,8 +516,18 @@ def _thousands(count: float) -> str:
     return f"{count / 1_000_000:.2f}M"
 
 
+# Where a running run's spend label names how long it has run. Its clock is not
+# written in: it changes every second, and the board would re-send the whole
+# snapshot every 2s for as long as the run goes (see _TICKING_CARD in app.py).
+# The page puts it in from the card's elapsed_s, advanced on its own clock, in
+# _clock's words (cardText in index.html). A run that is over keeps its clock
+# in the label, since it no longer moves.
+ELAPSED = "{elapsed}"
+
+
 def _clock(seconds: float) -> str:
-    """`45s`, `2m 5s`, `1h 12m`, `15h`: the largest two units, a zero one dropped."""
+    """`45s`, `2m 5s`, `1h 12m`, `15h`: the largest two units, a zero one dropped.
+    The page words a running run's clock the same way (runClock in index.html)."""
     s = int(seconds)
     for big, small, b, l in ((86400, 3600, "d", "h"), (3600, 60, "h", "m"), (60, 1, "m", "s")):
         if s >= big:
@@ -550,7 +560,8 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
     priced), `cost_floor` (some tokens went on a model the list has no price
     for), `tokens` by kind, `output_tokens`, `elapsed_s`, the `budget` and
     whether the run is `over_budget` — and `spend_label` / `spend_title` /
-    `budget_label`, the words the card puts them in."""
+    `budget_label`, the words the card puts them in (a running run's clock as
+    ELAPSED, for the page to fill in from `elapsed_s`)."""
     began, end = _began(events), _ended(events)
     usage = next((e for e in reversed(events) if e.get("event") == "usage"), None)
     prices = _prices(home)
@@ -573,6 +584,7 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
     out = tokens.get("output", 0)
     at = transcripts._parse_ts(str(began.get("at") or ""))
     elapsed: Optional[float] = None
+    running = False
     if usage:
         # hmz's own figures, written as the run ended: what it billed, whatever
         # the list prices, and the time its agents spent in turns.
@@ -584,6 +596,7 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
         elapsed = max(0.0, transcripts._parse_ts(str(end.get("at") or "")) - at)
     elif at:
         elapsed = max(0.0, (time.time() if now is None else now) - at)
+        running = True
     budget = _budget(began)
     over = budget is not None and (
         (budget["cost"] is not None and priced and cost >= budget["cost"])
@@ -596,7 +609,7 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
     if out:
         parts.append(f"{_thousands(out)} out")
     if elapsed is not None:
-        parts.append(_clock(elapsed))
+        parts.append(ELAPSED if running else _clock(elapsed))
     title = " · ".join(f"{k} {_thousands(tokens[k])}" for k in _KINDS if tokens.get(k))
     if models:
         title += (" — " if title else "") + ", ".join(models)

@@ -454,37 +454,147 @@ class HiddenAgentQueueTests(unittest.TestCase):
 
 
 class DiffSignatureTests(unittest.TestCase):
-    """The SSE watcher only broadcasts when `diff_signature` changes. A queued
-    prompt being consumed (or added) while status/updated_at stay the same must
-    still change the signature, or the card keeps showing a stale queue."""
+    """The SSE watcher only broadcasts when `diff_signature` changes, and the
+    page only redraws what it is sent. So any change to what the board shows
+    must change the signature — a field nobody thought to list included — and a
+    value that only moves with the clock must not, or a quiet board is re-sent
+    on every 2s tick."""
 
-    def _win(self, queued):
-        # `key` is the card's address (host-qualified pid); the signature is
-        # built on it, since pids only identify a card within one host.
-        return {"pid": 100, "key": "100", "status": "busy", "waiting_for": None,
-                "updated_at": 5, "queued": queued}
+    def _win(self, queued=(), **over):
+        # `key` is the card's address (host-qualified pid); pids only identify a
+        # card within one host.
+        w = {"pid": 100, "key": "100", "status": "busy", "waiting_for": None,
+             "updated_at": 5, "idle_seconds": 40, "queued": list(queued),
+             "triage": "working", "triage_reason": "正在工作", "triage_suggestion": "",
+             "permission_msg": None, "current_task": None, "background_tasks": []}
+        w.update(over)
+        return w
+
+    def _sig(self, *windows, **snap):
+        return appmod.State().diff_signature(
+            {"windows": list(windows), "counts": {}, "ts": 0, **snap})
 
     def test_queue_change_alone_changes_signature(self):
-        st = appmod.State()
-        before = {"windows": [self._win(
-            [{"text": "/btw", "source": "dashboard"}])], "counts": {}, "ts": 0}
-        after = {"windows": [self._win([])], "counts": {}, "ts": 0}
+        # The session stays busy, its updated_at unmoved, while it works through
+        # the queue: consuming a prompt must still re-broadcast.
         self.assertNotEqual(
-            st.diff_signature(before), st.diff_signature(after),
+            self._sig(self._win([{"text": "/btw", "source": "dashboard"}])),
+            self._sig(self._win([])),
             "consuming a queued prompt must change the broadcast signature")
 
     def test_btw_change_alone_changes_signature(self):
         # Archiving or dismissing an aside on an otherwise idle session must
         # still broadcast, or the card keeps showing a stale (or dismissed) aside.
-        st = appmod.State()
-        w_with = self._win([])
-        w_with["btw"] = {"id": 1, "ts": 0, "question": "q", "answer": "a"}
-        w_without = self._win([])
-        w_without["btw"] = None
         self.assertNotEqual(
-            st.diff_signature({"windows": [w_with], "counts": {}, "ts": 0}),
-            st.diff_signature({"windows": [w_without], "counts": {}, "ts": 0}),
+            self._sig(self._win(btw={"id": 1, "ts": 0, "question": "q", "answer": "a"})),
+            self._sig(self._win(btw=None)),
             "dismissing the card's aside must change the broadcast signature")
+
+    def test_triage_change_alone_changes_signature(self):
+        # A busy session that goes quiet keeps status "busy" and its updated_at;
+        # only patrol's verdict moves (QuietBoardTests has the header counts).
+        self.assertNotEqual(
+            self._sig(self._win()),
+            self._sig(self._win(triage="completed", triage_reason="已完成，空闲 {idle}。",
+                                triage_suggestion="建议 review")),
+            "a card turning completed must change the broadcast signature")
+
+    def test_permission_msg_change_alone_changes_signature(self):
+        # The pending bar names what the session wants; a new request on a card
+        # that was already waiting changes nothing else.
+        self.assertNotEqual(
+            self._sig(self._win(permission_msg="Claude needs your permission to use Bash")),
+            self._sig(self._win(permission_msg="Claude needs your permission to use Write")),
+            "a new permission message must change the broadcast signature")
+
+    def test_any_field_changes_signature(self):
+        # By construction, not by list: a field added after this test was
+        # written counts as soon as it changes.
+        for field, before, after in (
+                ("current_task", "running tests", "writing the fix"),
+                ("background_tasks", [], [{"type": "monitor", "state": "running"}]),
+                ("spend_label", "$0.07 · {elapsed}", "$0.08 · {elapsed}"),
+                ("a_field_added_later", 1, 2)):
+            with self.subTest(field=field):
+                self.assertNotEqual(self._sig(self._win(**{field: before})),
+                                    self._sig(self._win(**{field: after})))
+        with self.subTest(field="counts"):
+            self.assertNotEqual(self._sig(self._win(), counts={"busy": 1, "idle": 0}),
+                                self._sig(self._win(), counts={"busy": 0, "idle": 1}))
+        with self.subTest(field="peers[].online"):
+            peer = {"host": "b", "online": True, "age_seconds": 1.0, "error": None}
+            self.assertNotEqual(self._sig(self._win(), peers=[peer]),
+                                self._sig(self._win(), peers=[{**peer, "online": False}]))
+
+    def test_ticking_values_alone_do_not_change_signature(self):
+        # The page advances these on its own clock between snapshots; resending
+        # the board for them would mean every tick.
+        peer = {"host": "b", "online": True, "age_seconds": 1.0, "error": None}
+        self.assertEqual(
+            self._sig(self._win(idle_seconds=40, elapsed_s=125.0), ts=1000, peers=[peer]),
+            self._sig(self._win(idle_seconds=41, elapsed_s=127.0), ts=3000,
+                      peers=[{**peer, "age_seconds": 2.9}]))
+
+
+class QuietBoardTests(unittest.TestCase):
+    """The same through _enriched_snapshot and the real patrol: what time alone
+    decides is broadcast, and time alone otherwise is not. Each snapshot is a
+    tick of the watcher, the card's idle_seconds what sessions.snapshot would
+    have measured by then."""
+
+    def setUp(self):
+        done = {"type": "assistant", "timestamp": "2026-08-10T21:26:21Z",
+                "message": {"role": "assistant", "stop_reason": "end_turn",
+                            "content": [{"type": "text", "text": "Done."}]}}
+        stuck = {"type": "assistant", "timestamp": "2026-08-10T21:26:21Z",
+                 "message": {"role": "assistant", "stop_reason": "tool_use",
+                             "content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}
+        self.done, self.stuck = write_jsonl([done]), write_jsonl([stuck])
+
+    def _card(self, pid, transcript, idle, status="idle"):
+        return {"pid": pid, "status": status, "waiting_for": None, "hidden": False,
+                "alive": True, "tty": f"/dev/pts/{pid}", "transcript_path": str(transcript),
+                "name": f"w{pid}", "cwd": "/x", "session_id": "", "updated_at": 1_000,
+                "idle_seconds": idle}
+
+    def _tick(self, *cards):
+        with _snapshot(cards):
+            return appmod._enriched_snapshot()
+
+    def test_a_busy_session_going_quiet_is_broadcast(self):
+        # Five minutes after its last write a busy session counts as done:
+        # status, updated_at and everything else on the card stay as they were.
+        before = self._tick(self._card(1, self.done, 290, status="busy"))
+        after = self._tick(self._card(1, self.done, 302, status="busy"))
+        self.assertEqual((before["windows"][0]["triage"], after["windows"][0]["triage"]),
+                         ("working", "completed"))
+        self.assertEqual((before["counts"]["busy"], after["counts"]["busy"]), (1, 0))
+        st = appmod.State()
+        self.assertNotEqual(st.diff_signature(before), st.diff_signature(after),
+                            "working → completed must be broadcast")
+
+    def test_quiet_cards_are_not_rebroadcast_as_their_idle_time_grows(self):
+        # A completed and a stalled card over half an hour, a minute rolling over
+        # on the way: nothing to send, so the page must have nothing stale — the
+        # words stay put and the time is a number it advances itself.
+        ticks = [self._tick(self._card(1, self.done, 600 + dt), self._card(2, self.stuck, 600 + dt))
+                 for dt in (0, 2, 61, 1800)]
+        st = appmod.State()
+        self.assertEqual(len({st.diff_signature(t) for t in ticks}), 1)
+        for i in range(2):
+            with self.subTest(card=i):
+                self.assertEqual(len({t["windows"][i]["triage_reason"] for t in ticks}), 1)
+                self.assertIn(appmod.patrol.IDLE, ticks[0]["windows"][i]["triage_reason"])
+                self.assertEqual([t["windows"][i]["idle_seconds"] for t in ticks],
+                                 [600, 602, 661, 2400])
+
+    def test_a_quiet_card_turning_closeable_is_broadcast(self):
+        before = self._tick(self._card(1, self.done, 3599))
+        after = self._tick(self._card(1, self.done, 3601))
+        self.assertEqual((before["windows"][0]["triage"], after["windows"][0]["triage"]),
+                         ("completed", "closeable"))
+        st = appmod.State()
+        self.assertNotEqual(st.diff_signature(before), st.diff_signature(after))
 
 
 class StaleDialogOpenTests(unittest.TestCase):

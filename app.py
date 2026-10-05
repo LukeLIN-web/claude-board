@@ -23,6 +23,30 @@ STATIC_DIR = HERE / "static"
 
 # ---------- shared in-memory state ----------
 
+# What in a snapshot moves on every tick by itself. Each is left out of the
+# watcher's decision to broadcast, or it would re-send the whole board every 2s
+# with nothing on it having changed:
+#   ts                    when the snapshot was built; the page never shows it.
+#   windows[].idle_seconds, windows[].elapsed_s
+#                         a card's idle time and a running hmz run's clock, in
+#                         seconds as of the snapshot. The page shows each one
+#                         advanced by its own clock since the snapshot arrived
+#                         (liveSeconds in static/index.html), so a quiet card
+#                         goes "3m ago", "4m ago"… without a push.
+#   peers[].age_seconds   how long ago a peer last answered. The page shows only
+#                         whether it is online, which is a field of its own.
+# Everything else counts, whatever it is called. So a value that grows with the
+# clock must not be written into a card's text — "空闲 12m" in a reason would
+# re-send the board once a minute per quiet card, every second for a fresh one —
+# but go out as seconds in one of the fields above, the text holding a marker
+# where the page puts it in (patrol.IDLE, hmz.ELAPSED). What the time decides
+# stays on the server and does push: a card turning completed, stalled or
+# closeable changes its triage, and the header counts with it.
+_TICKING_SNAPSHOT = frozenset({"ts"})
+_TICKING_CARD = frozenset({"idle_seconds", "elapsed_s"})
+_TICKING_PEER = frozenset({"age_seconds"})
+
+
 class State:
     def __init__(self) -> None:
         self.last_snapshot: dict = {"windows": [], "counts": {}, "ts": 0}
@@ -31,37 +55,29 @@ class State:
         # recomputed: an aggregating peer polls every 2s, and enrichment walks
         # transcripts and scrapes panes.
         self.last_local_snapshot: dict = {"windows": [], "counts": {}, "ts": 0}
-        self.last_signature: tuple = ()
+        self.last_signature: str = ""
         self.subscribers: set[asyncio.Queue] = set()
 
-    def diff_signature(self, snap: dict) -> tuple:
-        # Tuple of (pid, status, waiting_for, updated_at, queued, btw) lets us
-        # tell whether anything dashboard-visible has changed. The queued list
-        # is included so consuming/adding a queued prompt re-broadcasts even
-        # when status and updated_at are otherwise unchanged (the session stays
-        # "busy" while Claude works through the queue). The /btw aside identity
-        # is included so archiving or dismissing one re-broadcasts on an
-        # otherwise idle session (a fuller stitched answer gets a new id, and a
-        # pending aside has no id yet — hence id+question+pending).
-        return tuple(
-            (
-                w["key"], w["status"], w["waiting_for"], w["updated_at"],
-                tuple((q.get("source"), q.get("text"))
-                      for q in w.get("queued", [])),
-                ((w.get("btw") or {}).get("id"),
-                 (w.get("btw") or {}).get("question"),
-                 (w.get("btw") or {}).get("pending")),
-                # A peer going quiet changes nothing about its cards' own
-                # fields, so without this the board would keep broadcasting
-                # them as live and never redraw them dimmed.
-                w.get("peer_stale"),
-                # The model readout can move on its own: a cleared session is
-                # idle, its updated_at frozen, and the banner that names its
-                # model is only picked up on a later poll (see _banner_model).
-                w.get("model_label"),
-            )
-            for w in snap["windows"]
-        )
+    def diff_signature(self, snap: dict) -> str:
+        """Everything the page can draw from `snap`, as one string the watcher
+        compares with the last one it broadcast.
+
+        The whole snapshot rather than a list of the fields that matter: that
+        list was kept by hand, and every field nobody remembered to add to it —
+        the triage and its reason, the permission message, the current task,
+        background tasks, the header counts — reached the page only once
+        something that was on it changed too (a busy session going quiet sat on
+        "working" until then). Only the ticking values above are left out, so a
+        new field pushes when it changes without anyone listing it here."""
+        view = {k: v for k, v in snap.items() if k not in _TICKING_SNAPSHOT}
+        view["windows"] = [{k: v for k, v in w.items() if k not in _TICKING_CARD}
+                           for w in snap["windows"]]
+        if "peers" in snap:
+            view["peers"] = [{k: v for k, v in p.items() if k not in _TICKING_PEER}
+                             for p in snap["peers"]]
+        # Sorted keys: the same content always reads the same, whatever order
+        # the enrichment happened to set a card's fields in.
+        return json.dumps(view, sort_keys=True)
 
 
 state = State()

@@ -518,7 +518,7 @@ class TestSpending(unittest.TestCase):
         # Opus: 102×4 + 1000×20 + 10000×0.2 + 5000×5; Astra: 1000×10 + 2000×1 + 200×50 — per million.
         self.assertAlmostEqual(s["cost"], 0.047408 + 0.022)
         self.assertFalse(s["cost_floor"])
-        self.assertEqual(s["spend_label"], "$0.07 · 1.2k out · 2m 5s")
+        self.assertEqual(s["spend_label"], "$0.07 · 1.2k out · " + hmz.ELAPSED)
         self.assertEqual(s["budget_label"], "15h, $150")
         self.assertFalse(s["over_budget"])
         self.assertEqual(s["spend_title"],
@@ -539,7 +539,16 @@ class TestSpending(unittest.TestCase):
         (self.home / "prices.json").unlink()
         s = self._spending()
         self.assertIsNone(s["cost"])
-        self.assertEqual(s["spend_label"], "1.2k out · 2m 5s")
+        self.assertEqual(s["spend_label"], "1.2k out · " + hmz.ELAPSED)
+
+    def test_a_running_runs_clock_is_left_to_the_page(self):
+        # It moves every second; written into the label, it would have the board
+        # re-send its snapshot on every tick for as long as the run goes. The
+        # label marks where the clock goes and elapsed_s says what it read.
+        early, late = self._spending(now=self.began + 125), self._spending(now=self.began + 4_325)
+        self.assertEqual(early["spend_label"], late["spend_label"])
+        self.assertTrue(early["spend_label"].endswith(" · " + hmz.ELAPSED))
+        self.assertEqual((early["elapsed_s"], late["elapsed_s"]), (125, 4_325))
 
     def test_hmzs_own_total_once_the_run_ended(self):
         events = hmz._events(self.epic) + [
@@ -687,7 +696,8 @@ class TestSessionsNotYetOpened(unittest.TestCase):
         # plan: 12×4 + 1000×20; lane: 100×4 + 40000×20 + 5M×0.2 — per million.
         self.assertAlmostEqual(s["cost"], 0.020048 + 1.8004)
         self.assertEqual(s["output_tokens"], 41_000)
-        self.assertEqual(s["spend_label"], "$1.82 · 41.0k out · 45m 53s")
+        self.assertEqual(s["spend_label"], "$1.82 · 41.0k out · " + hmz.ELAPSED)
+        self.assertEqual(s["elapsed_s"], 2753)
 
     def test_named_by_its_log_and_its_role_by_the_journal(self):
         self.assertEqual(
