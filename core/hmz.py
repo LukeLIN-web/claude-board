@@ -44,6 +44,10 @@ HMZ_HOME = HOME_BASE / ".humanize"
 # epic to read until the first line is submitted in it.
 NO_RUN_NOTE = ("这个 hmz 还没开始 run，没有可显示的内容。在它的输入框里提交一行后才会有："
                "普通的一行交给当前 flow（状态栏上 ◉ 后面那个），`$<flow> <任务>` 启动指定的 flow。")
+# …and for one that was typed into but started nothing: hmz wrote the lines down,
+# then answered each on its own screen only.
+TYPED_NO_RUN_NOTE = ("这个 hmz 还没开始 run：下面是输入给它的行，它收下了，但没有一行启动 flow。"
+                     "它为什么不跑只写在它自己的屏幕上（比如 `hmz: no such flow: …`）。")
 
 # Commands that are not the interface: `hmz exec` runs a flow headless, and
 # `hmz internal …` is the sandbox / credential plumbing under every turn.
@@ -295,9 +299,9 @@ def hmz_window_dicts() -> list[dict]:
     return out
 
 
-def _said(path: Path, start: int = 0) -> list[tuple[str, str]]:
-    """(workdir, text) of each line in hmz's history.jsonl from byte `start` on."""
-    out: list[tuple[str, str]] = []
+def _history(path: Path, start: int = 0) -> list[dict]:
+    """The lines in hmz's history.jsonl from byte `start` on, each {at, workdir, text}."""
+    out: list[dict] = []
     try:
         with path.open("rb") as f:
             f.seek(start)
@@ -310,8 +314,21 @@ def _said(path: Path, start: int = 0) -> list[tuple[str, str]]:
         except Exception:
             continue
         if isinstance(d, dict) and isinstance(d.get("text"), str):
-            out.append((str(d.get("workdir") or ""), d["text"]))
+            out.append({"at": str(d.get("at") or ""), "workdir": str(d.get("workdir") or ""),
+                        "text": d["text"]})
     return out
+
+
+def _said(path: Path, start: int = 0) -> list[tuple[str, str]]:
+    """(workdir, text) of each line in hmz's history.jsonl from byte `start` on."""
+    return [(d["workdir"], d["text"]) for d in _history(path, start)]
+
+
+def typed(pid: int, cwd: str, since_ms: int) -> list[dict]:
+    """The lines typed into hmz `pid` since it started, oldest first, as hmz
+    wrote them down — whether or not any of them started anything."""
+    return [d for d in _history(_home(pid) / "history.jsonl")
+            if d["workdir"] == cwd and transcripts._parse_ts(d["at"]) * 1000 >= since_ms]
 
 
 def _squeeze(s: str) -> str:
@@ -342,21 +359,65 @@ def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]
     return lambda: any(_squeeze(t) == want for _, t in _said(path, mark))
 
 
+# hmz's own lines are the interface's, not an agent's, and each begins "hmz: ".
+_REFUSAL = "hmz: "
+_RULE = re.compile(r"^[─━\s]+$")
+
+
+def refusal(pane: str, text: str) -> str:
+    """What hmz said instead of acting on `text` — `hmz: no such flow: x` — or "".
+
+    hmz writes a line down before reading it, so its history takes a line it then
+    refuses: a `$flow` it doesn't have, a `/command` it doesn't know, a flow
+    chosen while one runs. The refusal is only on its screen, the red line it
+    puts right under the echo of what was typed (both above the composer).
+    """
+    lines = tmux.capture_pane(pane).get("text", "").splitlines()
+    composer = next((i for i in range(len(lines) - 1, -1, -1)
+                     if lines[i].lstrip().startswith("❯")), -1)
+    needle = _squeeze(text)[-24:]
+    if composer < 0 or not needle:
+        return ""
+    # Where the echo ends, found on the screen with its wrapping squeezed out.
+    above = "\n".join(lines[:composer])
+    at = [i for i, ch in enumerate(above) if not ch.isspace()]
+    k = "".join(above[i] for i in at).rfind(needle)
+    if k < 0:
+        return ""
+    said: list[str] = []
+    for line in above[at[k + len(needle) - 1] + 1:].split("\n")[1:]:
+        if not line.strip() or _RULE.match(line):
+            if said:
+                break
+            continue
+        if not said and not line.lstrip().startswith(_REFUSAL):
+            return ""
+        said.append(line.strip())
+        if len(said) == 3:  # a long one wraps; the composer's own chrome follows it
+            break
+    return " ".join(said)
+
+
 def _session_timeline(log: Path, backend: str, limit: int) -> list[dict]:
     if backend == "codex":
         return codex.codex_timeline(log, limit=limit)
     return transcripts.timeline(log, limit=limit)
 
 
-def hmz_timeline(path: str | Path, limit: int = 60) -> list[dict]:
+def hmz_timeline(path: str | Path | None, limit: int = 60,
+                 typed: list[dict] = ()) -> list[dict]:
     """A run as TurnEvent-compatible dicts: the task it began on, every turn of
     every session its agents opened — read from where the run keeps them, each
     tagged `extra.agent` with whose it was — each flow it called, and how it
-    ended, in the order they happened."""
-    epic = Path(path)
+    ended, in the order they happened.
+
+    `typed` (see typed()) are the lines typed into the hmz; each one the run
+    doesn't already show goes in where it was typed. A line hmz refused, or
+    one typed before there was any run (`path` None), shows nowhere else."""
+    epic = Path(path) if path else None
     events: list[dict] = []
     task = ""
-    for e in _events(epic):
+    for e in _events(epic) if epic else []:
         kind, ts = e.get("event"), e.get("at", "")
         if kind == "began":
             task = _squeeze(cap_text(str(e.get("task") or ""), MESSAGE_CHARS))
@@ -377,7 +438,7 @@ def hmz_timeline(path: str | Path, limit: int = 60) -> list[dict]:
     # A forked session's log opens on a copy of the conversation it was cut
     # from, so a turn two sessions both hold is shown once.
     seen: set[tuple] = set()
-    for o in _opened(epic):
+    for o in _opened(epic) if epic else []:
         agent, backend = str(o.get("agent") or ""), str(o.get("backend") or "")
         said: list[dict] = []
         for log in _logs(epic, o):
@@ -401,6 +462,14 @@ def hmz_timeline(path: str | Path, limit: int = 60) -> list[dict]:
                 continue
             ev["extra"] = {**(ev.get("extra") or {}), "agent": agent}
             events.append(ev)
+    # A typed line the run took is already here, as the task it began on or as
+    # what an agent was told; hmz may wrap the latter, so it is looked for inside.
+    shown = [_squeeze(ev.get("text") or "") for ev in events if ev.get("kind") == "user_text"]
+    for d in typed:
+        line = _squeeze(cap_text(d["text"], MESSAGE_CHARS))
+        if line and not any(line in s for s in shown):
+            events.append({"ts": d["at"], "kind": "user_text", "text": cap_text(d["text"], MESSAGE_CHARS),
+                           "tool": None, "role": "user", "extra": {}})
     # Stable: the run's own lines keep their place among turns of the same instant.
     events.sort(key=lambda ev: transcripts._parse_ts(ev.get("ts") or ""))
     return events[-limit:]

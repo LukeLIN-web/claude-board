@@ -453,13 +453,16 @@ def api_timeline(key: str, limit: int = 2000) -> dict:
             "menu": None,
         }
     if w.platform == "hmz":
+        # What was typed into it too: hmz takes a line it then refuses, and that
+        # line is in no run.
+        typed = hmz.typed(pid, w.cwd, w.started_at)
         return {
             "pid": pid,
             "session_id": w.session_id,
             "project_name": w.project_name,
             "platform": "hmz",
-            "events": hmz.hmz_timeline(tp, limit=limit) if tp else [],
-            "note": None if tp else hmz.NO_RUN_NOTE,
+            "events": hmz.hmz_timeline(tp or None, limit=limit, typed=typed),
+            "note": None if tp else hmz.TYPED_NO_RUN_NOTE if typed else hmz.NO_RUN_NOTE,
             "skills_used": [],
             "memory_ops": [],
             "plan_history": [],

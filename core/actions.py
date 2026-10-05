@@ -1628,9 +1628,11 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
     elif platform == "hmz":
         # Same ❯ composer as Claude, but Claude's clear-and-retype races hmz's
         # slow per-key intake and loses the prompt while reporting it sent; this
-        # path pastes once and waits for hmz's own record of the line.
+        # path pastes once and waits for hmz's own record of the line — and for
+        # whatever hmz then says on screen instead of running it.
         res = tmux.send_text_confirmed(
             pane, collapsed, hmz.prompt_taken(pid, w.cwd, collapsed, pane),
+            refused=lambda: hmz.refusal(pane, collapsed),
         )
     else:
         res = tmux.send_text(
