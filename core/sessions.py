@@ -404,15 +404,17 @@ def _claude_exe_index(tokens: list[str]) -> int:
     return -1
 
 
-def _parse_claude_proc(args: str) -> Optional[dict]:
-    """Classify a process command line. Returns {session_id} for an interactive
+def _parse_claude_proc(args: str | list[str]) -> Optional[dict]:
+    """Classify a process command line — a `ps` args string, or the real argv
+    when there is one (see _proc_argv). Returns {session_id} for an interactive
     Claude TUI process (resume id parsed when present), or None otherwise."""
-    toks = args.split()
+    toks = args.split() if isinstance(args, str) else list(args)
     i = _claude_exe_index(toks)
     if i < 0:
         return None
     rest = toks[i + 1:]
     session_id = ""
+    positional = False
     j = 0
     while j < len(rest):
         t = rest[j]
@@ -424,10 +426,39 @@ def _parse_claude_proc(args: str) -> Optional[dict]:
                 j += 2
                 continue
         elif not t.startswith("-"):
-            if t in _CLAUDE_BG_SUBCOMMANDS:
+            # Only the first word can name a subcommand; past it is the opening
+            # prompt, and `claude "fix the mcp config"` is a TUI like any other.
+            if not positional and t in _CLAUDE_BG_SUBCOMMANDS:
                 return None  # `claude mcp`, `claude config`, … → headless
+            positional = True
         j += 1
     return {"session_id": session_id}
+
+
+def _proc_argv(pid: int, args: str) -> str | list[str]:
+    """`pid`'s real argv from /proc, or `args` back when it can't be had.
+
+    `ps -o args` joins argv with spaces, so an opening prompt reads as loose
+    words — and one of them can be `-p`, which made `claude "explain what -p
+    does"` look like a scripted run. /proc keeps the arguments apart. It is only
+    trusted while it still joins to exactly what ps printed: by now the pid may
+    have exited and been reused, and a process may have rewritten its own argv.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return args
+    argv = raw.decode("utf-8", "replace").split("\0")
+    if argv and argv[-1] == "":
+        argv.pop()
+    return argv if " ".join(argv) == args else args
+
+
+def _parse_ps_claude(pid: int, args: str) -> Optional[dict]:
+    """_parse_claude_proc for one `ps` row, on the real argv when it's a claude."""
+    if _claude_exe_index(args.split()) < 0:
+        return None  # not claude: no /proc read for every process on the host
+    return _parse_claude_proc(_proc_argv(pid, args))
 
 
 def _discover_proc_transcript(slug: str, start_ms: int, claimed_sids: set[str]):
@@ -503,8 +534,8 @@ def list_claude_proc_windows(
     # transcript (its file's mtime is refreshed by the resume itself).
     for _line in out.splitlines():
         _parts = _line.split(None, 2)
-        if len(_parts) >= 3:
-            _p = _parse_claude_proc(_parts[2])
+        if len(_parts) >= 3 and _parts[0].isdigit():
+            _p = _parse_ps_claude(int(_parts[0]), _parts[2])
             if _p and _p.get("session_id"):
                 claimed_sids.add(_p["session_id"])
     for line in out.splitlines():
@@ -520,7 +551,7 @@ def list_claude_proc_windows(
             continue  # no controlling terminal → background/daemon, not a window
         if pid in known_pids:
             continue  # already carded from its session file
-        parsed = _parse_claude_proc(args)
+        parsed = _parse_ps_claude(pid, args)
         if parsed is None:
             continue
         tty = f"/dev/{tty_raw}"
