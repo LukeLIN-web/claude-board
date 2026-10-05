@@ -6,11 +6,23 @@ shape as Claude Code's, so the board types into it on Claude's send path.
 
 What the card reports comes from the run, not the TUI. Every run of a flow is an
 epic, ~/.hmz/epics/<workspace>/<when>-<which>/epic.jsonl, one event a line:
-`began` (flow, task, the agent each role runs), `opened` (a session an agent
-opened), `called` / `returned` (a flow it called), and `ended` (`how`: done,
-failed or stopped). <workspace> is the cwd with every non-alphanumeric character
-turned into "-", and the TUI reopens on the newest run of its directory — so the
-card reads that one: begun and not ended means a flow is running.
+`began` (flow, task, the agent each role runs, the `budget`), `opened` (a
+session an agent opened), `called` / `returned` (a flow it called), `usage`
+(what the run came to, written as it ends) and `ended` (`how`: done, failed or
+stopped). <workspace> is the cwd with every non-alphanumeric character turned
+into "-", and the TUI reopens on the newest run of its directory — so the card
+reads that one: begun and not ended means a flow is running.
+
+What a run spends is on the card too. hmz's status bar bills a run as it goes
+off the logs its agents write — each turn's tokens by kind, priced per model
+from its copy of openllmprices.com, <home>/prices.json — and the card reads the
+same logs the same way (see _spending). A run that is over carries hmz's own
+figures instead, on its `usage` line: `cost` in USD, the `output_tokens` its
+agents wrote, the `seconds` they spent in turns. The `budget` caps what a run
+may spend (`duration`, `cost`, `output_tokens`; the chat flow runs under
+`cost: Infinity`, no cap), and its `graceful` says what happens to the turn
+under way when a cap is hit: let finish and the next refused (the default), or
+cut off at once — "even mid-turn", as hmz's own budget menu words it.
 
 What the agents said is not in the epic but beside it. A flow another flow
 called writes its own record, epic.<flow>_<id>.jsonl in the same directory, and
@@ -29,8 +41,10 @@ old one over the first time it runs, and an older one goes on using it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -72,6 +86,9 @@ _LOGS = {
     "claude": "projects/*/{}.jsonl",
     "codex": "sessions/**/rollout-*{}.jsonl",
 }
+# …except on the bill. A sub-agent Claude starts writes a transcript of its own
+# under its session, and hmz counts what it spends as the run's.
+_SUBAGENT_LOGS = {"claude": "projects/*/{}/subagents/*.jsonl"}
 
 
 def _is_interactive_hmz(args: str) -> bool:
@@ -154,11 +171,12 @@ def _opened(epic: Path) -> list[dict]:
     return sorted(lines, key=lambda e: str(e.get("at", "")))
 
 
-def _logs(epic: Path, opened: dict) -> list[Path]:
-    """The log files of the session an `opened` line names, or [] for a CLI the
-    board can't read or a log that has gone."""
+def _logs(epic: Path, opened: dict, of: dict = _LOGS) -> list[Path]:
+    """The log files of the session an `opened` line names — its own, or with
+    `of` those of what it started — or [] for a CLI the board can't read or a
+    log that has gone."""
     ident = str(opened["session"])
-    pattern = _LOGS.get(str(opened.get("backend") or ""))
+    pattern = of.get(str(opened.get("backend") or ""))
     if not pattern:
         return []
     where = str(opened.get("where") or "")
@@ -166,9 +184,11 @@ def _logs(epic: Path, opened: dict) -> list[Path]:
         # Relative to the epic for a session kept in the run, whole for one that
         # stayed in its CLI's home — and `/` keeps a whole path whole.
         at, pattern = epic.parent / where, pattern.format(ident)
-    else:
+    elif of is _LOGS:
         # A run from before sessions were kept: a directory of links per session.
         at, pattern = epic.parent / "sessions" / str(opened.get("name") or ""), f"*{ident}*.jsonl"
+    else:
+        return []
     try:
         return sorted(p for p in at.glob(pattern) if p.is_file())
     except (OSError, ValueError):
@@ -205,6 +225,311 @@ def _mtime(p: Path) -> float:
         return p.stat().st_mtime
     except OSError:
         return 0.0
+
+
+# ---- what a run spends ----
+#
+# hmz's status bar bills a run as it goes: the tokens each session's log reports,
+# summed by kind and priced per model. The card reads the same logs the same way,
+# and a run that is over carries hmz's own total, which wins.
+
+#: The kinds of token hmz counts, under the names its price list prices them by.
+_KINDS = ("input", "output", "cache_read", "cache_write")
+#: What a Claude transcript calls each, on the `usage` of every assistant message.
+_CLAUDE_USAGE = {"input": "input_tokens", "output": "output_tokens",
+                 "cache_read": "cache_read_input_tokens",
+                 "cache_write": "cache_creation_input_tokens"}
+
+# A session log is appended to for hours. It is read from where the last poll
+# left off, and what was found so far is kept here, per log.
+_READ: dict[str, dict] = {}
+
+
+def _spent_in(log: Path, backend: str) -> dict[str, dict[str, int]]:
+    """Tokens by model, then by kind, spent in one session log so far."""
+    key = str(log)
+    st = _READ.get(key)
+    try:
+        size = log.stat().st_size
+    except OSError:
+        return st["spent"] if st else {}
+    if st is None or size < st["pos"]:  # new, or rewritten shorter: start over
+        st = _READ[key] = {"pos": 0, "spent": {}, "seen": set(), "model": ""}
+    if size > st["pos"]:
+        try:
+            with log.open("rb") as f:
+                f.seek(st["pos"])
+                data = f.read()
+        except OSError:
+            return st["spent"]
+        whole = data.rfind(b"\n") + 1  # a line still being written waits for the next poll
+        fold = _fold_claude if backend == "claude" else _fold_codex
+        for line in data[:whole].splitlines():
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(d, dict):
+                fold(st, d)
+        st["pos"] += whole
+    return st["spent"]
+
+
+def _fold_claude(st: dict, d: dict) -> None:
+    """Counts one transcript line: an assistant message's usage, once per message.
+    Claude writes a line per content block, each carrying the whole message's."""
+    msg = d.get("message") if d.get("type") == "assistant" else None
+    if not isinstance(msg, dict):
+        return
+    usage, ident = msg.get("usage"), msg.get("id") or d.get("requestId")
+    if not isinstance(usage, dict) or not ident or ident in st["seen"]:
+        return
+    st["seen"].add(ident)
+    into = st["spent"].setdefault(str(msg.get("model") or ""), {})
+    for kind, name in _CLAUDE_USAGE.items():
+        n = usage.get(name)
+        if isinstance(n, (int, float)) and n > 0:
+            into[kind] = into.get(kind, 0) + int(n)
+
+
+def _fold_codex(st: dict, d: dict) -> None:
+    """Counts one rollout line: the running total Codex states after each
+    response, on the model its turn context last named. Codex's input count
+    includes the cached part, which is priced apart."""
+    p = d.get("payload")
+    if not isinstance(p, dict):
+        return
+    if d.get("type") == "turn_context" and p.get("model"):
+        st["model"] = str(p["model"])
+    elif d.get("type") == "event_msg" and p.get("type") == "token_count":
+        total = (p.get("info") or {}).get("total_token_usage")
+        if not isinstance(total, dict):
+            return
+        read = int(total.get("cached_input_tokens") or 0)
+        kinds = {"input": int(total.get("input_tokens") or 0) - read, "cache_read": read,
+                 "cache_write": int(total.get("cache_write_input_tokens") or 0),
+                 "output": int(total.get("output_tokens") or 0)}
+        st["spent"] = {st["model"] or "codex": {k: n for k, n in kinds.items() if n > 0}}
+
+
+# The price list, indexed per file and kept until the file changes.
+_PRICES: dict[str, tuple[float, dict]] = {}
+_SPELLING = re.compile(r"[^a-z0-9]")
+# Scraps that name a release rather than a model, cut the way hmz's own lookup
+# cuts them: `claude-haiku-4-5-20251001` is priced as `claude-haiku-4.5`.
+_DATED = re.compile(r"[-@_](?:19|20)\d{2}-?\d{2}-?\d{2}$")
+_VERSIONED = re.compile(r"[-@]v\d+$")
+_LATEST = re.compile(r"[-@](?:latest|stable)$")
+_ROUTED = re.compile(r"^(?:bedrock|vertex|azure|aws|gcp)-")
+_QUALIFIED = re.compile(r"^[a-z]+\.")
+
+
+def _spelled(model: str) -> str:
+    """One spelling of a model: the letters and digits two spellings share."""
+    return _SPELLING.sub("", model.lower())
+
+
+def _prices(home: Path) -> dict[str, dict[str, float]]:
+    """hmz's copy of the price list — USD per million tokens by kind, under every
+    spelling of each model it lists — or {} for a home without one."""
+    path = home / "prices.json"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    kept = _PRICES.get(str(path))
+    if kept and kept[0] == mtime:
+        return kept[1]
+    index: dict[str, dict[str, float]] = {}
+    try:
+        models = json.loads(path.read_text()).get("models") or {}
+    except Exception:
+        models = {}
+    for ident, m in (models.items() if isinstance(models, dict) else []):
+        per = m.get("per_million") if isinstance(m, dict) else None
+        if not isinstance(per, dict):
+            continue
+        per = {k: float(v) for k, v in per.items() if isinstance(v, (int, float))}
+        for name in (str(ident), str(m.get("name") or "")):
+            if _spelled(name):
+                index.setdefault(_spelled(name), per)
+    _PRICES[str(path)] = (mtime, index)
+    return index
+
+
+def _price(model: str, prices: dict) -> Optional[dict[str, float]]:
+    """The price of `model`, matched as hmz matches one: exact once the provider
+    in front, the release behind and the punctuation are stripped. A near miss
+    is a miss, and most models are not listed at all."""
+    said = re.sub(r":\d+$", "", model.strip().lower())
+    for whole in (said, said.rpartition("/")[2]):
+        bare = _QUALIFIED.sub("", _QUALIFIED.sub("", whole))
+        for one in (whole, bare, _ROUTED.sub("", bare)):
+            for cut in (one, _LATEST.sub("", one), _VERSIONED.sub("", one), _DATED.sub("", one),
+                        _DATED.sub("", _VERSIONED.sub("", _LATEST.sub("", one)))):
+                found = prices.get(_spelled(cut))
+                if found is not None:
+                    return found
+    return None
+
+
+def _cost(kinds: dict[str, int], per: dict[str, float]) -> Optional[float]:
+    """USD for `kinds` at `per` million, billed as hmz bills them: a cache write
+    not priced on its own is an input token, a cache read not priced is left
+    out, so the figure is never more than the truth. None when nothing was
+    priced at all."""
+    total, priced = 0.0, False
+    for kind, n in kinds.items():
+        rate = per.get(kind, per.get("input") if kind == "cache_write" else None)
+        if rate is not None and n > 0:
+            total, priced = total + n * rate / 1_000_000, True
+    return total if priced else None
+
+
+_ISO_DURATION = re.compile(r"^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?"
+                           r"(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$")
+
+
+def _seconds(duration) -> Optional[float]:
+    """Seconds of a budget's `duration`: ISO 8601 as hmz writes it (`PT15H`,
+    `P1DT2H30M`), or a bare number."""
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        return float(duration)
+    m = _ISO_DURATION.match(str(duration or ""))
+    if not m or not any(m.groups()):
+        return None
+    d, h, mi, s = (float(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
+
+
+def _budget(began: dict) -> Optional[dict]:
+    """The run's budget — `cost` (USD), `duration_s`, `output_tokens`, each None
+    for no cap, and `graceful` — or None for a run that wrote none down."""
+    b = began.get("budget")
+    if not isinstance(b, dict):
+        return None
+    cost, out = b.get("cost"), b.get("output_tokens")
+    # "Infinity" is how hmz writes no cap on money, the chat flow's budget.
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or math.isinf(cost):
+        cost = None
+    if isinstance(out, bool) or not isinstance(out, (int, float)):
+        out = None
+    return {"cost": float(cost) if cost is not None else None,
+            "duration_s": _seconds(b.get("duration")),
+            "output_tokens": int(out) if out is not None else None,
+            "graceful": b.get("graceful") is not False}
+
+
+def _money(dollars: float) -> str:
+    """A bill as hmz's status bar writes one: cents, or four places under a cent."""
+    if dollars >= 100:
+        return f"${dollars:,.0f}"
+    if dollars >= 0.01:
+        return f"${dollars:.2f}"
+    return f"${dollars:.4f}" if dollars > 0 else "$0.00"
+
+
+def _thousands(count: float) -> str:
+    """A token count as hmz's status bar writes one."""
+    if count < 1000:
+        return f"{count:.0f}"
+    if count < 1_000_000:
+        return f"{count / 1000:.1f}k"
+    return f"{count / 1_000_000:.2f}M"
+
+
+def _clock(seconds: float) -> str:
+    """`45s`, `2m 5s`, `1h 12m`, `15h`: the largest two units, a zero one dropped."""
+    s = int(seconds)
+    for big, small, b, l in ((86400, 3600, "d", "h"), (3600, 60, "h", "m"), (60, 1, "m", "s")):
+        if s >= big:
+            rest = s % big // small
+            return f"{s // big}{b}" + (f" {rest}{l}" if rest else "")
+    return f"{s}s"
+
+
+def _budget_label(budget: Optional[dict]) -> str:
+    """What the budget caps, as hmz's own menu row words it: `15h, $150`, `no
+    limit`, and `even mid-turn` for one that cuts a turn off rather than let it
+    finish."""
+    if budget is None:
+        return ""
+    caps: list[str] = []
+    if budget["duration_s"] is not None:
+        caps.append(_clock(budget["duration_s"]))
+    if budget["output_tokens"] is not None:
+        caps.append(f"{_thousands(budget['output_tokens'])} out")
+    if budget["cost"] is not None:
+        caps.append(_money(budget["cost"]))
+    if not caps:
+        return "no limit"
+    return ", ".join(caps) + ("" if budget["graceful"] else ", even mid-turn")
+
+
+def _spending(epic: Optional[Path], events: list[dict], home: Path,
+              now: Optional[float] = None) -> dict:
+    """What the run has spent, for the card: `cost` (USD; None while nothing is
+    priced), `cost_floor` (some tokens went on a model the list has no price
+    for), `tokens` by kind, `output_tokens`, `elapsed_s`, the `budget` and
+    whether the run is `over_budget` — and `spend_label` / `spend_title` /
+    `budget_label`, the words the card puts them in."""
+    began, end = _began(events), _ended(events)
+    usage = next((e for e in reversed(events) if e.get("event") == "usage"), None)
+    prices = _prices(home)
+    tokens: dict[str, int] = {}
+    models: list[str] = []
+    cost, priced, floor = 0.0, False, False
+    for o in (_opened(epic) if epic else []):
+        for log in _logs(epic, o) + _logs(epic, o, _SUBAGENT_LOGS):
+            for model, kinds in _spent_in(log, str(o.get("backend") or "")).items():
+                for kind, n in kinds.items():
+                    tokens[kind] = tokens.get(kind, 0) + n
+                if model and model not in models:
+                    models.append(model)
+                per = _price(model, prices) if prices else None
+                billed = _cost(kinds, per) if per else None
+                if billed is None:
+                    floor = floor or any(kinds.values())
+                else:
+                    cost, priced = cost + billed, True
+    out = tokens.get("output", 0)
+    at = transcripts._parse_ts(str(began.get("at") or ""))
+    elapsed: Optional[float] = None
+    if usage:
+        # hmz's own figures, written as the run ended: what it billed, whatever
+        # the list prices, and the time its agents spent in turns.
+        cost = float(usage.get("cost") or 0.0)
+        priced, floor = cost > 0, False
+        out = int(usage.get("output_tokens") or out)
+        elapsed = float(usage.get("seconds") or 0.0)
+    elif at and end:
+        elapsed = max(0.0, transcripts._parse_ts(str(end.get("at") or "")) - at)
+    elif at:
+        elapsed = max(0.0, (time.time() if now is None else now) - at)
+    budget = _budget(began)
+    over = budget is not None and (
+        (budget["cost"] is not None and priced and cost >= budget["cost"])
+        or (budget["duration_s"] is not None and elapsed is not None
+            and elapsed >= budget["duration_s"])
+        or (budget["output_tokens"] is not None and out >= budget["output_tokens"]))
+    parts: list[str] = []
+    if priced:
+        parts.append(_money(cost) + ("+" if floor else ""))
+    if out:
+        parts.append(f"{_thousands(out)} out")
+    if elapsed is not None:
+        parts.append(_clock(elapsed))
+    title = " · ".join(f"{k} {_thousands(tokens[k])}" for k in _KINDS if tokens.get(k))
+    if models:
+        title += (" — " if title else "") + ", ".join(models)
+    if floor:
+        title += " · + a model the price list lacks: its tokens are counted, not billed"
+    if usage:
+        title = "hmz's own total, written as the run ended" + (" · " + title if title else "")
+    return {"cost": cost if priced else None, "cost_floor": floor, "tokens": tokens,
+            "output_tokens": out, "elapsed_s": elapsed, "budget": budget, "over_budget": over,
+            "spend_label": " · ".join(parts), "spend_title": title,
+            "budget_label": _budget_label(budget)}
 
 
 def _current_task(events: list[dict], epic: Optional[Path] = None) -> str:
@@ -329,6 +654,7 @@ def hmz_window_dicts() -> list[dict]:
             "effort": "",
             "model_label": models,
             "model_source": "transcript" if models else "",
+            **_spending(epic, events, _home(w.pid)),
         })
         out.append(d)
     return out

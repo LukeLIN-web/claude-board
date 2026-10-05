@@ -350,6 +350,17 @@
           <div class="text-red-600 bg-red-50 rounded px-1.5 py-0.5" x-show="w.last_error"
                :title="w.last_error" x-text="'⚠ ' + w.last_error"></div>
           <div class="text-gray-500 italic" x-text="w.triage_reason"></div>
+          <!-- What an hmz run has spent — its bill, the tokens its agents wrote,
+               how long it has run — against the budget it runs under, worded as
+               hmz's own status bar and budget menu word them. The tooltip has
+               the tokens by kind and the models they went on. -->
+          <div x-show="w.spend_label || w.budget_label" class="text-[10px] rounded px-1.5 py-0.5 truncate"
+               :class="w.over_budget ? 'text-amber-800 bg-amber-50' : 'text-violet-800 bg-violet-50'"
+               :title="w.spend_title">
+            <span class="font-medium" x-show="w.spend_label" x-text="'💸 ' + w.spend_label"></span>
+            <span x-show="w.budget_label" :class="w.over_budget ? 'text-amber-600' : 'text-violet-500'"
+                  x-text="(w.spend_label ? ' · ' : '') + 'budget ' + w.budget_label"></span>
+          </div>
           <!-- Background shells / tasks -->
           <div x-show="w.shell_proc_count > 0 || w.background_tasks?.length" class="space-y-0.5">
             <div class="flex items-center gap-1 flex-wrap">
