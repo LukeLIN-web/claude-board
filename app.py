@@ -788,13 +788,10 @@ def api_history_resume(session_id: str) -> dict:
     cwd = _history_cwd(session_id)
     if cwd is None:
         return {"ok": False, "error": "session not found in index"}
-    r = actions.open_claude_window(cwd, ["--resume", session_id])
+    # Answers the "resume from summary?" picker a large/old session parks on
+    # (see actions.resume_claude), so the card isn't left stuck on a menu.
+    r = actions.resume_claude(cwd, session_id)
     r.update({"action": "resumed", "session_id": session_id, "cwd": cwd})
-    # A large/old session parks on Claude's "resume from summary?" picker. The
-    # fleet drives resumed sessions unattended, so auto-answer it (default:
-    # "Resume full session as-is") rather than leaving the card stuck on a menu.
-    if r.get("ok") and r.get("backend") == "tmux" and r.get("pane_id"):
-        r["picker"] = actions.confirm_resume_picker(r["pane_id"])
     return r
 
 
@@ -803,7 +800,7 @@ def api_history_fork(session_id: str) -> dict:
     cwd = _history_cwd(session_id)
     if cwd is None:
         return {"ok": False, "error": "session not found in index"}
-    r = actions.open_claude_window(cwd, ["--resume", session_id, "--fork-session"])
+    r = actions.resume_claude(cwd, session_id, fork=True)
     r.update({"action": "forked", "session_id": session_id, "cwd": cwd})
     return r
 

@@ -567,3 +567,37 @@ class ModelRouteTests(unittest.TestCase):
                                return_value={"ok": True}) as sw:
             appmod.api_window_model("1234", appmod.ModelBody(model="gpt-5.6-sol", effort="high"))
         sw.assert_called_once_with(1234, "gpt-5.6-sol", "high")
+
+
+class HistoryLaunchRouteTests(unittest.TestCase):
+    """Resume and fork from History open the session the same way, and both
+    answer the resume picker the launch may stop on."""
+
+    def _launch(self, route, opened=None):
+        opened = opened or {"ok": True, "backend": "tmux", "pane_id": "%7"}
+        with mock.patch.object(appmod, "_history_cwd", return_value="/tmp/proj"), \
+             mock.patch.object(appmod.sessions, "find_window_by_session", return_value=None), \
+             mock.patch.object(appmod.actions, "open_claude_window",
+                               return_value=dict(opened)) as ocw, \
+             mock.patch.object(appmod.actions, "confirm_resume_picker",
+                               return_value={"confirmed": True, "waited": 0.4, "reason": ""}) as crp:
+            r = route("sessX")
+        return r, ocw, crp
+
+    def test_fork_answers_the_resume_picker(self):
+        r, ocw, crp = self._launch(appmod.api_history_fork)
+        ocw.assert_called_once_with("/tmp/proj", ["--resume", "sessX", "--fork-session"])
+        crp.assert_called_once_with("%7")
+        self.assertEqual(r["action"], "forked")
+        self.assertTrue(r["picker"]["confirmed"])
+
+    def test_resume_answers_the_resume_picker(self):
+        r, ocw, crp = self._launch(appmod.api_history_resume)
+        ocw.assert_called_once_with("/tmp/proj", ["--resume", "sessX"])
+        crp.assert_called_once_with("%7")
+        self.assertEqual(r["action"], "resumed")
+
+    def test_a_window_outside_tmux_has_no_pane_to_answer(self):
+        r, _, crp = self._launch(appmod.api_history_fork, {"ok": True, "backend": "iterm"})
+        crp.assert_not_called()
+        self.assertNotIn("picker", r)
