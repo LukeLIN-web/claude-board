@@ -5,7 +5,7 @@ the claude / codex CLIs. Its composer is a ❯ prompt between two rules, the sam
 shape as Claude Code's, so the board types into it on Claude's send path.
 
 What the card reports comes from the run, not the TUI. Every run of a flow is an
-epic, ~/.humanize/epics/<workspace>/<when>-<which>/epic.jsonl, one event a line:
+epic, ~/.hmz/epics/<workspace>/<when>-<which>/epic.jsonl, one event a line:
 `began` (flow, task, the agent each role runs), `opened` (a session an agent
 opened), `called` / `returned` (a flow it called), and `ended` (`how`: done,
 failed or stopped). <workspace> is the cwd with every non-alphanumeric character
@@ -22,8 +22,9 @@ relative to the epic, or whole for a session that stayed in the CLI's own
 home). Not in ~/.claude or ~/.codex, so no card of its own: the hmz card is the
 only place those sessions show.
 
-~/.humanize is $HUMANIZE_HOME when the hmz was started with one, as hmz's own
-`home()` has it.
+~/.hmz is $HUMANIZE_HOME when the hmz was started with one, as hmz's own
+`home()` has it. It was ~/.humanize until hmz renamed it: a newer hmz moves the
+old one over the first time it runs, and an older one goes on using it.
 """
 from __future__ import annotations
 
@@ -38,7 +39,8 @@ from .codex import _classify_codex, _proc_start_ms, _proc_table
 from .sessions import HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive, get_tty
 from .textcap import MESSAGE_CHARS, cap_text
 
-HMZ_HOME = HOME_BASE / ".humanize"
+HMZ_HOME = HOME_BASE / ".hmz"
+HMZ_HOME_WAS = HOME_BASE / ".humanize"
 
 # What the timeline says for an hmz that hasn't run anything yet: there is no
 # epic to read until the first line is submitted in it.
@@ -83,12 +85,18 @@ def _home(pid: int) -> Path:
             v = kv.split(b"=", 1)[1].decode(errors="replace")
             if v:
                 return Path(v)
-    return HMZ_HOME
+    return _default_home()
+
+
+def _default_home() -> Path:
+    """~/.hmz once there is one — hmz uses it, and leaves the old one alone,
+    from then on — else ~/.humanize, which an hmz from before the rename keeps."""
+    return HMZ_HOME if HMZ_HOME.exists() or not HMZ_HOME_WAS.exists() else HMZ_HOME_WAS
 
 
 def _latest_epic(cwd: str, home: Optional[Path] = None) -> Optional[Path]:
     """epic.jsonl of the newest run in `cwd`, or None before the first one."""
-    runs = (home or HMZ_HOME) / "epics" / _PLAIN.sub("-", cwd)
+    runs = (home or _default_home()) / "epics" / _PLAIN.sub("-", cwd)
     try:
         names = sorted(n for n in os.listdir(runs) if (runs / n / "epic.jsonl").is_file())
     except OSError:

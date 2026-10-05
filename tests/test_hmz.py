@@ -69,6 +69,19 @@ class TestEpics(unittest.TestCase):
     def test_dir_without_runs(self):
         self.assertIsNone(hmz._latest_epic("/home/u/never.ran"))
 
+    def test_home_before_and_after_the_rename(self):
+        # hmz moved ~/.humanize to ~/.hmz; one from before the move keeps the old name.
+        base = Path(self.tmp.name)
+        with mock.patch.object(hmz, "HMZ_HOME", base / ".hmz"), \
+                mock.patch.object(hmz, "HMZ_HOME_WAS", base / ".humanize"):
+            (base / ".humanize").mkdir()
+            self.assertEqual(hmz._default_home(), base / ".humanize")
+            (base / ".humanize").rename(base / ".hmz")
+            self.assertEqual(hmz._default_home(), base / ".hmz")
+            # Both there: the new one is in use, the old one left as it was.
+            (base / ".humanize").mkdir()
+            self.assertEqual(hmz._default_home(), base / ".hmz")
+
     def test_humanize_home_of_the_process(self):
         # An hmz started with HUMANIZE_HOME keeps its runs there, not in ~/.humanize.
         other = Path(self.tmp.name) / "elsewhere"
