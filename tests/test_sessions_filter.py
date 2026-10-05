@@ -1,5 +1,9 @@
 """Tests for the machine-local cwd visibility filter in core/sessions.py."""
+import json
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from core import sessions
@@ -58,6 +62,15 @@ class CwdFilterTests(unittest.TestCase):
             self.assertTrue(sessions._cwd_visible(p))
         self.assertFalse(sessions._cwd_visible("/g/h"))
 
+    def test_root_prefix_covers_everything(self):
+        # normpath("/") is "/", and "/" + os.sep matched nothing at all.
+        _load_filters(include="/")
+        self.assertTrue(sessions._cwd_visible("/home/u/workspace/x"))
+        self.assertTrue(sessions.slug_visible("-home-u-workspace-x"))
+        _load_filters(exclude="/")
+        self.assertFalse(sessions._cwd_visible("/home/u/workspace/x"))
+        self.assertFalse(sessions.slug_visible("-home-u-workspace-x"))
+
 
 class SlugFilterTests(unittest.TestCase):
     def tearDown(self):
@@ -71,6 +84,46 @@ class SlugFilterTests(unittest.TestCase):
         self.assertFalse(sessions.slug_visible("-shared-ws-proj2-x"))
         # ...and an unrelated project is hidden.
         self.assertFalse(sessions.slug_visible("-home-u-other-lingbot-va"))
+
+
+class TranscriptFilterTests(unittest.TestCase):
+    """transcript_visible: the filter for a transcript, on the cwd it records."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        _load_filters()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _transcript(self, slug, cwd):
+        d = self.root / slug
+        d.mkdir()
+        p = d / "s.jsonl"
+        rows = [{"type": "queue-operation", "operation": "enqueue"}]
+        if cwd:
+            rows.append({"type": "user", "cwd": cwd, "message": {"content": "hi"}})
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return p
+
+    def test_a_sibling_that_extends_the_name_is_not_inside(self):
+        # The same boundary test_include_respects_path_boundary holds for a cwd.
+        # Its slug "-shared-ws-proj-evil" reads as under "-shared-ws-proj".
+        _load_filters(include="/shared/ws/proj")
+        evil = self._transcript("-shared-ws-proj-evil", "/shared/ws/proj-evil")
+        inside = self._transcript("-shared-ws-proj-evil2", "/shared/ws/proj/evil2")
+        self.assertTrue(sessions.slug_visible("-shared-ws-proj-evil"))  # the lossy one
+        self.assertFalse(sessions.transcript_visible(evil))
+        self.assertTrue(sessions.transcript_visible(inside))
+
+    def test_no_cwd_row_falls_back_to_the_slug(self):
+        _load_filters(exclude="/home/u/workspace")
+        p = self._transcript("-home-u-workspace-x", "")
+        self.assertFalse(sessions.transcript_visible(p))
+
+    def test_no_filter_reads_nothing(self):
+        _load_filters()
+        self.assertTrue(sessions.transcript_visible(self.root / "missing" / "s.jsonl"))
 
 
 class HistoryFilterTests(unittest.TestCase):
