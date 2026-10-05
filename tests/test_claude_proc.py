@@ -35,6 +35,36 @@ class ParseClaudeProcTests(unittest.TestCase):
         self.assertIsNone(sessions._parse_claude_proc("vim notes.md"))
         self.assertIsNone(sessions._parse_claude_proc("python claude_helper.py"))
 
+    def test_an_opening_prompt_is_not_a_subcommand(self):
+        # Only the first word names a subcommand: `claude "fix the mcp config"`
+        # is a TUI with an opening prompt, which ps prints as loose words.
+        self.assertEqual(sessions._parse_claude_proc("claude fix the mcp config"),
+                         {"session_id": ""})
+        self.assertEqual(sessions._parse_claude_proc(["claude", "please update the docs"]),
+                         {"session_id": ""})
+
+    def test_real_argv_keeps_a_prompt_mentioning_p_whole(self):
+        self.assertEqual(sessions._parse_claude_proc(["claude", "explain what -p does"]),
+                         {"session_id": ""})
+        self.assertIsNone(sessions._parse_claude_proc(["claude", "summarize", "-p"]))
+
+
+@unittest.skipUnless(os.path.isdir("/proc"), "reads /proc/<pid>/cmdline")
+class ProcArgvTests(unittest.TestCase):
+    def _own_argv(self):
+        with open(f"/proc/{os.getpid()}/cmdline", "rb") as f:
+            return f.read().decode("utf-8", "replace").split("\0")[:-1]
+
+    def test_argv_that_joins_to_the_ps_line_is_used(self):
+        argv = self._own_argv()
+        self.assertEqual(sessions._proc_argv(os.getpid(), " ".join(argv)), argv)
+
+    def test_a_stale_or_rewritten_argv_falls_back_to_the_ps_line(self):
+        # The pid was reused, or the process rewrote its argv: keep what ps said.
+        self.assertEqual(sessions._proc_argv(os.getpid(), "claude --resume abc"),
+                         "claude --resume abc")
+        self.assertEqual(sessions._proc_argv(2 ** 22 + 7, "claude"), "claude")
+
 
 @unittest.skipUnless(os.path.isdir("/proc"), "process-first detection is Linux-only")
 class ListClaudeProcWindowsTests(unittest.TestCase):
