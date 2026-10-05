@@ -646,3 +646,120 @@ class TestSpending(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSessionsNotYetOpened(unittest.TestCase):
+    """hmz writes a session's `opened` line once its first turn has landed. Until
+    then its log under the run's own session directory names it, and the
+    engine's journal says whose it is."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / "prices.json").write_text(json.dumps(PRICES))
+        self.run = self.home / "epics" / "-p" / "20261005T013920.331Z-3196f3"
+        self.epic = _jsonl(self.run / "epic.jsonl", [
+            {"event": "began", "at": "2026-10-05T01:39:20.331Z", "flow": "parallel_flame_chase",
+             "task": "lift", "budget": {"duration": "PT15H", "cost": 150.0,
+                                        "output_tokens": None, "graceful": True}},
+            {"event": "called", "at": "2026-10-05T01:39:22.428Z", "flow": "parallel_flame_chase:plan",
+             "epic": "epic.parallel_flame_chase-plan_1c830f.jsonl"},
+            {"event": "called", "at": "2026-10-05T01:41:03.628Z",
+             "flow": "parallel_flame_chase:lane_turn",
+             "epic": "epic.parallel_flame_chase-lane_turn_5dbd4d.jsonl"},
+        ])
+        # The plan's session: its one turn landed, so it is written down.
+        _jsonl(self.run / "epic.parallel_flame_chase-plan_1c830f.jsonl", [
+            {"event": "began", "at": "2026-10-05T01:39:22.429Z", "flow": "parallel_flame_chase:plan"},
+            {"event": "opened", "at": "2026-10-05T01:41:03.167Z", "agent": "coordinator",
+             "backend": "claude", "session": "0056c5ba-0692-40cf-98e2-bb016be18722",
+             "where": "sessions/claude"},
+            {"event": "ended", "at": "2026-10-05T01:41:03.169Z", "how": "done"},
+        ])
+        # The lane's: an hour into its first turn, nothing but `began` on its record.
+        _jsonl(self.run / "epic.parallel_flame_chase-lane_turn_5dbd4d.jsonl", [
+            {"event": "began", "at": "2026-10-05T01:41:03.628Z",
+             "flow": "parallel_flame_chase:lane_turn"},
+        ])
+        # The engine's journal named both as their CLI announced the id, seconds in.
+        self.journal = _jsonl(self.run / "resume.jsonl", [
+            {"t": "journal", "v": 1},
+            {"t": "session", "id": 2, "role": "coordinator", "harness": "claude",
+             "model": "claude-opus-5-5", "session": "0056c5ba-0692-40cf-98e2-bb016be18722"},
+            {"t": "session", "id": 4, "role": "actor", "harness": "claude",
+             "model": "claude-opus-5-5", "session": "3eb6cb8d-3c12-499f-b67c-54515abd8495"},
+        ])
+        projects = self.run / "sessions" / "claude" / "projects"
+        _jsonl(projects / "-planning" / "0056c5ba-0692-40cf-98e2-bb016be18722.jsonl", [
+            {"type": "user", "timestamp": "2026-10-05T01:39:23.603Z",
+             "message": {"role": "user", "content": "plan it"}},
+            _claude_turn("p", "claude-opus-5-5", input_tokens=12, output_tokens=1_000),
+        ])
+        self.lane_log = _jsonl(projects / "-lane-2" / "3eb6cb8d-3c12-499f-b67c-54515abd8495.jsonl", [
+            # Claude's first lines are its queue's, stamped before the turn itself.
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-10-05T01:41:04.766Z", "sessionId": "3eb6cb8d"},
+            {"type": "user", "timestamp": "2026-10-05T01:41:04.797Z",
+             "message": {"role": "user", "content": "You are lane-2-actor-a"}},
+            _claude_turn("l1", "claude-opus-5-5", input_tokens=100, output_tokens=40_000,
+                         cache_read_input_tokens=5_000_000),
+        ])
+        self.began = hmz.transcripts._parse_ts("2026-10-05T01:39:20.331Z")
+
+    def _spending(self):
+        return hmz._spending(self.epic, hmz._events(self.epic), self.home, now=self.began + 2753)
+
+    def test_a_session_in_its_first_turn_is_on_the_bill(self):
+        s = self._spending()
+        # plan: 12×4 + 1000×20; lane: 100×4 + 40000×20 + 5M×0.2 — per million.
+        self.assertAlmostEqual(s["cost"], 0.020048 + 1.8004)
+        self.assertEqual(s["output_tokens"], 41_000)
+        self.assertEqual(s["spend_label"], "$1.82 · 41.0k out · 45m 53s")
+
+    def test_named_by_its_log_and_its_role_by_the_journal(self):
+        self.assertEqual(
+            [(o["agent"], o["session"][:8], o["at"], o["where"]) for o in hmz._opened(self.epic)],
+            [("coordinator", "0056c5ba", "2026-10-05T01:41:03.167Z", "sessions/claude"),
+             # Since the first line of its log, which is before the `opened` above:
+             # that one says when the plan's turn landed, not when it began.
+             ("actor", "3eb6cb8d", "2026-10-05T01:41:04.766Z", "sessions/claude")])
+
+    def test_without_a_journal_the_role_is_unknown(self):
+        self.journal.unlink()
+        self.assertEqual([(o["agent"], o["session"][:8]) for o in hmz._opened(self.epic)],
+                         [("coordinator", "0056c5ba"), ("", "3eb6cb8d")])
+        self.assertEqual(self._spending()["output_tokens"], 41_000)
+
+    def test_its_subagents_are_billed_too(self):
+        _jsonl(self.lane_log.parent / "3eb6cb8d-3c12-499f-b67c-54515abd8495" / "subagents"
+               / "agent-a1.jsonl", [_claude_turn("sub", "claude-opus-5-5", output_tokens=1_000)])
+        self.assertEqual(self._spending()["output_tokens"], 42_000)
+
+    def test_a_codex_session_is_named_by_its_rollout(self):
+        ident = "01a0a14f-363a-76d2-a800-1f0dc14da2e0"
+        with self.journal.open("a") as f:
+            f.write(json.dumps({"t": "session", "id": 5, "role": "reviewer", "harness": "codex",
+                                "model": "gpt-6-astra", "session": ident}) + "\n")
+        _jsonl(self.run / "sessions" / "codex" / "sessions" / "2026" / "10" / "05"
+               / f"rollout-2026-10-05T01-41-05-{ident}.jsonl", [
+            {"type": "session_meta", "timestamp": "2026-10-05T01:41:05.000Z", "payload": {"id": ident}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-astra", "cwd": "/p"}},
+            _codex_count(input_tokens=1_000, cached_input_tokens=0, output_tokens=200),
+        ])
+        last = hmz._opened(self.epic)[-1]
+        self.assertEqual((last["agent"], last["backend"], last["session"], last["at"]),
+                         ("reviewer", "codex", ident, "2026-10-05T01:41:05.000Z"))
+        self.assertEqual(self._spending()["output_tokens"], 41_200)
+
+    def test_activity_and_the_task_follow_the_lane(self):
+        for p in self.run.rglob("*.jsonl"):
+            os.utime(p, (1_000, 1_000))
+        os.utime(self.lane_log, (5_000, 5_000))
+        self.assertEqual(hmz._last_logged(self.epic), 5_000_000)
+        self.assertTrue(hmz._current_task(hmz._events(self.epic), self.epic)
+                        .startswith("parallel_flame_chase · actor"))
+
+    def test_the_timeline_shows_what_the_lane_was_told(self):
+        said = [(e["extra"].get("agent"), e["text"]) for e in hmz.hmz_timeline(self.epic)]
+        self.assertIn(("actor", "You are lane-2-actor-a"), said)

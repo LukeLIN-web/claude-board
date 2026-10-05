@@ -34,6 +34,12 @@ relative to the epic, or whole for a session that stayed in the CLI's own
 home). Not in ~/.claude or ~/.codex, so no card of its own: the hmz card is the
 only place those sessions show.
 
+An `opened` line is written once the session's first turn has landed, which is
+when its CLI hands the id back: a lane an hour into its first turn is on no
+record yet, though its log has been filling all along. So the card also reads
+the run's own session directories for logs no `opened` line names, and the
+engine's journal, resume.jsonl, for whose they are (see _named).
+
 ~/.hmz is $HUMANIZE_HOME when the hmz was started with one, as hmz's own
 `home()` has it. It was ~/.humanize until hmz renamed it: a newer hmz moves the
 old one over the first time it runs, and an older one goes on using it.
@@ -165,10 +171,77 @@ def _records(epic: Path) -> list[Path]:
 
 
 def _opened(epic: Path) -> list[dict]:
-    """Every `opened` line of the run, across all its records, oldest first."""
+    """Every session of the run, oldest first: each `opened` line across all its
+    records, and each session the run keeps that no line names yet (_named)."""
     lines = [e for r in _records(epic) for e in _events(r)
              if e.get("event") == "opened" and e.get("session")]
+    known = {str(e["session"]) for e in lines}
+    lines += [n for n in _named(epic) if n["session"] not in known]
     return sorted(lines, key=lambda e: str(e.get("at", "")))
+
+
+# Where a CLI logs each session under the run's own directory for it, and which
+# session a log's name says it is: its stem for Claude, the id Codex ends the
+# name with.
+_KEPT = {
+    "claude": ("projects/*/*.jsonl", re.compile(r"^(.+)$")),
+    "codex": ("sessions/**/rollout-*.jsonl",
+              re.compile(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$")),
+}
+# The journal the engine keeps for a flow that can be picked up again.
+_JOURNAL = "resume.jsonl"
+# The first timestamp in each session log, kept once read: it never changes.
+_FIRST_TS: dict[str, str] = {}
+
+
+def _named(epic: Path) -> list[dict]:
+    """The run's sessions as `opened` lines, found without one.
+
+    hmz writes `opened` once a session's first turn has landed — the moment its
+    CLI hands the id back — so a lane an hour into its first turn is on no
+    record while its log fills. The log itself names it: it is under the run's
+    own directory for that CLI (`where` is that), and its first timestamp says
+    since when. Whose it is, the engine's journal says, for a flow that can be
+    picked up: a `{"t": "session", "role", "harness", "session"}` line, written
+    as the CLI announces the id."""
+    run = epic.parent
+    roles = {str(d["session"]): str(d.get("role") or "") for d in _events(run / _JOURNAL)
+             if d.get("t") == "session" and d.get("session")}
+    found: dict[str, dict] = {}
+    for backend, (pattern, named) in _KEPT.items():
+        where = run / "sessions" / backend
+        try:
+            logs = sorted(p for p in where.glob(pattern) if p.is_file())
+        except (OSError, ValueError):
+            continue
+        for log in logs:
+            m = named.search(log.stem)
+            if not m or m.group(1) in found:
+                continue
+            found[m.group(1)] = {"event": "opened", "at": _first_ts(log),
+                                 "agent": roles.get(m.group(1), ""), "backend": backend,
+                                 "session": m.group(1), "where": f"sessions/{backend}"}
+    return list(found.values())
+
+
+def _first_ts(log: Path) -> str:
+    """The timestamp on the first line of `log` that carries one, or ""."""
+    key = str(log)
+    if key in _FIRST_TS:
+        return _FIRST_TS[key]
+    try:
+        with log.open("rb") as f:
+            for _ in range(8):
+                try:
+                    d = json.loads(f.readline())
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("timestamp"):
+                    _FIRST_TS[key] = ts = str(d["timestamp"])
+                    return ts
+    except OSError:
+        pass
+    return ""
 
 
 def _logs(epic: Path, opened: dict, of: dict = _LOGS) -> list[Path]:
