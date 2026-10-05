@@ -146,6 +146,18 @@ class TestPromptTaken(_HmzHomeTest):
             self.assertTrue(taken())
         shown.assert_called_once_with("%1", "again", "❯")
 
+    def test_a_repeated_clear_is_taken_once_the_composer_lets_go(self):
+        # …which a /clear wipes with the rest of the screen. The live miss: a
+        # second Clear on the card said "the composer emptied but the prompt
+        # was never taken".
+        self._say("/clear")
+        taken = hmz.prompt_taken(1, self.CWD, "/clear", "%1")
+        with mock.patch.object(hmz.tmux, "_composer_has_tail", return_value=True) as held:
+            self.assertFalse(taken())
+        held.assert_called_once_with("%1", "/clear", "❯")
+        with mock.patch.object(hmz.tmux, "_composer_has_tail", return_value=False):
+            self.assertTrue(taken())
+
 
 class TestRefusal(unittest.TestCase):
     """hmz writes a line down before reading it, so a line it refuses is taken;
@@ -333,6 +345,90 @@ class TestNoRunNote(_HmzHomeTest):
             r = app.api_timeline("7")
         self.assertIsNone(r["note"])
         self.assertEqual(r["events"][0]["kind"], "user_text")
+
+
+class TestClear(_HmzHomeTest):
+    """hmz's /clear clears its screen and leaves every run where it was, so the
+    card drops what came before the newest one itself."""
+
+    CWD = "/home/u/proj"
+    # When the live miss's Clear was written down, to the microsecond.
+    CLEARED = "2026-10-05T15:29:44.001872Z"
+
+    def setUp(self):
+        super().setUp()
+        pane = mock.patch.object(hmz.tmux, "pane_for_tty", return_value=None)
+        pane.start()
+        self.addCleanup(pane.stop)
+        stamps = mock.patch.dict(hmz.codex._cleared_at_ms, clear=True)
+        stamps.start()
+        self.addCleanup(stamps.stop)
+
+    def _say(self, text, at=CLEARED):
+        with (self.home / "history.jsonl").open("a") as f:
+            f.write(json.dumps({"at": at, "workdir": self.CWD, "text": text}) + "\n")
+
+    @staticmethod
+    def _ms(at):
+        return hmz.transcripts._parse_ts(at) * 1000
+
+    def test_the_newest_clear_it_wrote_down(self):
+        typed = [{"at": "2026-10-02T01:00:00Z", "text": "/clear"},
+                 {"at": "2026-10-02T01:05:00Z", "text": "/clear now"},  # run all the same
+                 {"at": "2026-10-02T01:06:00Z", "text": " /clear"},  # said to the flow
+                 {"at": "2026-10-02T01:07:00Z", "text": "/clears"}]  # no such command
+        self.assertEqual(hmz.cleared_at_ms(typed), self._ms("2026-10-02T01:05:00Z"))
+        self.assertEqual(hmz.cleared_at_ms([]), 0)
+
+    def test_the_boards_stamp_when_later(self):
+        # hmz doesn't write down a /clear that repeats its last line.
+        typed = [{"at": "2026-10-02T01:00:00Z", "text": "/clear"}]
+        later = int(self._ms("2026-10-02T02:00:00Z"))
+        self.assertEqual(hmz.cleared_at_ms(typed, later), later)
+
+    def test_the_timeline_starts_after_it(self):
+        typed = [{"at": "2026-10-02T00:51:00Z", "workdir": self.CWD, "text": "/clear"},
+                 {"at": "2026-10-02T00:55:00Z", "workdir": self.CWD, "text": "$nosuch x"}]
+        ev = hmz.hmz_timeline(write_jsonl(ENDED), typed=typed,
+                              since_ms=hmz.cleared_at_ms(typed))
+        self.assertEqual([e["text"] for e in ev],
+                         ["worker opened a claude session", "$nosuch x", "run ended: done"])
+
+    def test_a_cleared_card_says_why_it_is_empty(self):
+        # The live miss: Clear on a card whose run had stopped hours before
+        # cleared hmz's screen, and the card went on showing the run.
+        import app
+        self._say("/clear")
+        w = _window(transcript_path=str(write_jsonl(ENDED)))
+        with mock.patch.object(app.sessions, "find_window", return_value=w):
+            r = app.api_timeline("7")
+        self.assertEqual(r["events"], [])
+        self.assertEqual(r["note"], hmz.CLEARED_NOTE)
+
+    def test_a_clear_hmz_did_not_write_down(self):
+        import app
+        hmz.codex.mark_cleared(7)
+        w = _window(transcript_path=str(write_jsonl(ENDED)))
+        with mock.patch.object(app.sessions, "find_window", return_value=w):
+            r = app.api_timeline("7")
+        self.assertEqual(r["note"], hmz.CLEARED_NOTE)
+
+    def test_the_card_forgets_a_run_over_by_then(self):
+        failed = ENDED[:-1] + [{**ENDED[-1], "how": "failed"}]
+        w = _window(transcript_path=str(write_jsonl(failed)))
+        self._say("/clear")
+        with mock.patch.object(hmz, "_discover", return_value=[(w, failed)]):
+            d = hmz.hmz_window_dicts()[0]
+        self.assertEqual((d["first_input"], d["current_task"], d["last_error"]), ("", None, None))
+        self.assertEqual(d["model"], "claude/claude-opus-5-5")  # as hmz's status bar keeps it
+
+    def test_a_run_still_going_stays(self):
+        w = _window(transcript_path=str(write_jsonl(RUN)), status="busy")
+        self._say("/clear")
+        with mock.patch.object(hmz, "_discover", return_value=[(w, RUN)]):
+            d = hmz.hmz_window_dicts()[0]
+        self.assertEqual(d["first_input"], "split todo.md across workers")
+        self.assertEqual(d["current_task"], "commander_delegate · worker")
 
 
 class TestRun(unittest.TestCase):
