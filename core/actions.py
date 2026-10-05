@@ -7,7 +7,6 @@ import signal
 import shlex
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -387,24 +386,7 @@ def export_to_feishu(pid: int) -> dict:
 
 
 def close_session(pid: int) -> dict:
-    """Gracefully terminate a Claude Code session by PID."""
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-    if not w.alive:
-        return {"ok": True, "already_dead": True}
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return {"ok": True, "already_dead": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True, "pid": pid, "name": w.name or w.project_name}
-
-
-def close_session(pid: int) -> dict:
     """Send SIGTERM to a Claude Code session for graceful shutdown."""
-    import signal
     w = find_window(pid)
     if not w:
         return {"ok": False, "error": f"no window pid={pid}"}
@@ -1667,7 +1649,7 @@ def _send_prompt_inner(pid: int, text: str) -> dict:
 #
 #      ▐▛███▛█   Claude Code v2.1.259
 #     ▝▜██████▀  Opus 5 (1M context) with xhigh effort · Claude Max
-#       ▝▝ ▝▝    /shared/user75/workspace/juyi/claude-board
+#       ▝▝ ▝▝    /home/u/work/claude-board
 #
 # Its middle line is the only place a session that hasn't answered yet says which
 # model it is on. The transcript names a model on assistant rows and nowhere

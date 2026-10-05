@@ -32,14 +32,27 @@ never from real sessions — please keep it that way.
 
 ## Before opening a PR
 
-- Make sure the code still compiles:
+- Run what CI runs (`.github/workflows/ci.yml`):
   ```bash
-  python -m py_compile app.py core/*.py
+  pip install -e '.[dev]'
+  ruff check .                     # pyflakes-level: unused/undefined names
+  python scripts/secrets-audit.py  # credentials and machine-specific strings
+  pytest                           # runs against an empty temporary HOME
+  bash scripts/smoke.sh            # boots the board on demo data, renders it in headless Chrome
   ```
+- If you changed how the board reads or drives a Claude Code screen (spawn, send,
+  menus, overlays, the model picker), also run the live tests on a machine with
+  `claude` and `tmux`. They spawn a haiku session on a private tmux server and
+  cost two short turns:
+  ```bash
+  pytest tests/live --run-live -v
+  ```
+  A failure leaves the pane in `.live-captures/`; cut a unit-test fixture from it.
 - Keep the frontend dependency-free (Alpine.js + Tailwind via CDN, no npm build).
 - Don't commit anything machine-specific: home paths, usernames, internal
-  hostnames, API keys, or org-internal identifiers. CI and the project's
-  `scripts/secrets-audit.py` will flag these.
+  hostnames, API keys, or org-internal identifiers. `scripts/secrets-audit.py`
+  flags these, in CI and locally. Names private to your setup go in
+  `SECRETS_AUDIT_PATTERNS` (one regex per line) rather than in the script.
 
 ## Reporting issues
 

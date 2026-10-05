@@ -28,14 +28,14 @@ class CwdFilterTests(unittest.TestCase):
 
     def test_no_env_shows_everything(self):
         _load_filters()
-        self.assertTrue(sessions._cwd_visible("/home/user1/workspace/x"))
+        self.assertTrue(sessions._cwd_visible("/home/u/workspace/x"))
         self.assertTrue(sessions._cwd_visible("/anything"))
 
     def test_include_allowlist(self):
         _load_filters(include="/shared/ws/proj/")
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj/board"))
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj"))
-        self.assertFalse(sessions._cwd_visible("/home/user1/workspace/x"))
+        self.assertFalse(sessions._cwd_visible("/home/u/workspace/x"))
 
     def test_include_respects_path_boundary(self):
         _load_filters(include="/shared/ws/proj")
@@ -43,8 +43,8 @@ class CwdFilterTests(unittest.TestCase):
         self.assertFalse(sessions._cwd_visible("/shared/ws/proj-evil"))
 
     def test_exclude_denylist(self):
-        _load_filters(exclude="/home/user1/workspace")
-        self.assertFalse(sessions._cwd_visible("/home/user1/workspace/x"))
+        _load_filters(exclude="/home/u/workspace")
+        self.assertFalse(sessions._cwd_visible("/home/u/workspace/x"))
         self.assertTrue(sessions._cwd_visible("/shared/ws/proj/board"))
 
     def test_exclude_wins_over_include(self):
@@ -70,7 +70,7 @@ class SlugFilterTests(unittest.TestCase):
         # ...a sibling sharing the string prefix is not (boundary on "-")...
         self.assertFalse(sessions.slug_visible("-shared-ws-proj2-x"))
         # ...and an unrelated project is hidden.
-        self.assertFalse(sessions.slug_visible("-home-user1-arman-lingbot-va"))
+        self.assertFalse(sessions.slug_visible("-home-u-other-lingbot-va"))
 
 
 class HistoryFilterTests(unittest.TestCase):
@@ -92,7 +92,7 @@ class HistoryFilterTests(unittest.TestCase):
 
         fake = [
             mk("a", "/shared/ws/proj/board"),
-            mk("b", "/home/user1/arman/lingbot-va"),
+            mk("b", "/home/u/other/lingbot-va"),
         ]
         _load_filters(include="/shared/ws/proj")
         with mock.patch.object(history, "_build_index", return_value=fake), \

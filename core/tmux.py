@@ -85,7 +85,7 @@ def _spawn_env() -> dict:
 def _socket_args() -> list[str]:
     """`-L <name>` server selector, or empty for the default tmux server.
 
-    `FLEET_TMUX_SOCKET=juyi` makes every call `tmux -L juyi …`, pinning the board
+    `FLEET_TMUX_SOCKET=board` makes every call `tmux -L board …`, pinning the board
     to an isolated server (its own socket + server process) instead of the shared
     default one — so spawned cards never land next to unrelated sessions. `-L` is
     a server option and must precede the tmux command. The session within that
