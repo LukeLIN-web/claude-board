@@ -1113,6 +1113,8 @@ function fleet() {
     // polling fallback it turns on. See _openEvents.
     _streamWatchdog: null,
     _snapshotPoll: null,
+    // The timeline request out now, if any. See refreshTimeline.
+    _timelineFetch: null,
     historySessions: [],
     historyTotal: 0,
     historyQuery: '',
@@ -1387,12 +1389,32 @@ function fleet() {
       }
     },
 
-    // Re-fetch the open live timeline in place, preserving the user's scroll:
-    // only snap to the bottom if they were already near it (so reading older
-    // events isn't interrupted, but new replies stay visible by default).
-    async refreshTimeline() {
+    // Re-fetch the open live timeline, one request per card at a time. The
+    // 2.5s poll, every snapshot that moves the card and a key press all ask for
+    // it; against a host that answers slower than that (a peer's card is
+    // forwarded, and a long hmz run is slow to read) each extra request only
+    // queued more work behind the last, until that board answered nothing — its
+    // own cards' poll included. An ask made while one is out is answered by one
+    // more fetch once it is back.
+    refreshTimeline() {
       const key = this.expandedKey;
-      if (key === null) return;
+      if (key === null) return Promise.resolve();
+      const out = this._timelineFetch;
+      if (out && out.key === key) { out.again = true; return out.done; }
+      const f = { key, again: false };
+      f.done = this._loadTimeline(key).finally(() => {
+        // Compared by promise: Alpine hands back the object behind a proxy.
+        if (this._timelineFetch?.done === f.done) this._timelineFetch = null;
+        if (f.again && this.expandedKey === key) this.refreshTimeline();
+      });
+      this._timelineFetch = f;
+      return f.done;
+    },
+
+    // Fetch `key`'s timeline and redraw it in place, preserving the user's
+    // scroll: only snap to the bottom if they were already near it (so reading
+    // older events isn't interrupted, but new replies stay visible by default).
+    async _loadTimeline(key) {
       try {
         const r = await fetch(`/api/windows/${key}/timeline`);
         if (!r.ok) return;

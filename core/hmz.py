@@ -13,32 +13,26 @@ stopped). <workspace> is the cwd with every non-alphanumeric character turned
 into "-", and the TUI reopens on the newest run of its directory — so the card
 reads that one: begun and not ended means a flow is running.
 
+The run's course on the card — its timeline, and what it is on now — comes
+from that epic alone: what it began on, each session opened, each flow it called
+and when that returned, how it ended. Beside it hmz keeps far more: a record per
+called flow (epic.<flow>_<id>.jsonl), every session its agents opened
+(sessions/), the engine's journal (resume.jsonl). A long run piles up hundreds of
+those and tens of MB, and reading them all on every refresh once kept a host's
+board from answering at all; what the agents said is for hmz's own screen.
+
 What a run spends is on the card too. hmz's status bar bills a run as it goes
 off the logs its agents write — each turn's tokens by kind, priced per model
 from its copy of openllmprices.com, <home>/prices.json — and the card reads the
-same logs the same way (see _spending). A run that is over carries hmz's own
-figures instead, on its `usage` line: `cost` in USD, the `output_tokens` its
-agents wrote, the `seconds` they spent in turns. The `budget` caps what a run
-may spend (`duration`, `cost`, `output_tokens`; the chat flow runs under
+same logs the same way while the run is on: every log under its sessions/,
+<cli>/ laid out as that CLI lays out its home, each read on from where the last
+poll stopped (see _spending). A run that is over carries hmz's own figures
+instead, on its `usage` line: `cost` in USD, the `output_tokens` its agents
+wrote, the `seconds` they spent in turns — and then no log is read at all. The
+`budget` caps what a run may spend (`duration`, `cost`, `output_tokens`; the chat flow runs under
 `cost: Infinity`, no cap), and its `graceful` says what happens to the turn
 under way when a cap is hit: let finish and the next refused (the default), or
 cut off at once — "even mid-turn", as hmz's own budget menu words it.
-
-What the agents said is not in the epic but beside it. A flow another flow
-called writes its own record, epic.<flow>_<id>.jsonl in the same directory, and
-the sessions opened inside it are written down there. Each session an agent
-opens is kept in the run too, under <epic>/sessions/<cli>/ laid out as that CLI
-lays out its home — projects/<dir>/<id>.jsonl for Claude, sessions/<y>/<m>/<d>/
-rollout-…-<id>.jsonl for Codex — and its `opened` line says where (`where`,
-relative to the epic, or whole for a session that stayed in the CLI's own
-home). Not in ~/.claude or ~/.codex, so no card of its own: the hmz card is the
-only place those sessions show.
-
-An `opened` line is written once the session's first turn has landed, which is
-when its CLI hands the id back: a lane an hour into its first turn is on no
-record yet, though its log has been filling all along. So the card also reads
-the run's own session directories for logs no `opened` line names, and the
-engine's journal, resume.jsonl, for whose they are (see _named).
 
 ~/.hmz is $HUMANIZE_HOME when the hmz was started with one, as hmz's own
 `home()` has it. It was ~/.humanize until hmz renamed it: a newer hmz moves the
@@ -54,7 +48,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import codex, patrol, tmux, transcripts
+from . import patrol, tmux, transcripts
 from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
                        _proc_start_ms, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
@@ -84,17 +78,6 @@ _CRUMB = re.compile(r"^\s*hmz › (.+?)(?:\s{2,}●.*)?\s*$")
 # `hmz internal …` is the sandbox / credential plumbing under every turn.
 _HEADLESS = {"exec", "internal"}
 _PLAIN = re.compile(r"[^A-Za-z0-9]")
-
-# Where a CLI logs one session under the directory hmz keeps it in, as hmz's own
-# backend profiles have it (hmz.coganchor.backends, `logs=`). Claude's subagent
-# logs are left out: the card follows the agents the flow drove.
-_LOGS = {
-    "claude": "projects/*/{}.jsonl",
-    "codex": "sessions/**/rollout-*{}.jsonl",
-}
-# …except on the bill. A sub-agent Claude starts writes a transcript of its own
-# under its session, and hmz counts what it spends as the run's.
-_SUBAGENT_LOGS = {"claude": "projects/*/{}/subagents/*.jsonl"}
 
 
 def _is_interactive_hmz(args: str) -> bool:
@@ -137,6 +120,10 @@ def _latest_epic(cwd: str, home: Optional[Path] = None) -> Optional[Path]:
                 None)
 
 
+# The epic of a long run is tens of MB — every `called` line carries the task it
+# handed over — and is read on every 2 s refresh and every timeline poll, though
+# it changes only as a flow is called or returns.
+@transcripts.memo_by_file
 def _events(path: Path) -> list[dict]:
     out: list[dict] = []
     try:
@@ -154,137 +141,6 @@ def _began(events: list[dict]) -> dict:
 
 def _ended(events: list[dict]) -> dict:
     return next((e for e in reversed(events) if e.get("event") == "ended"), {})
-
-
-def _records(epic: Path) -> list[Path]:
-    """The run's own record, then one per flow it called: the sessions opened
-    inside a called flow are written down in that flow's record."""
-    try:
-        called = sorted(p for p in epic.parent.glob("epic.*.jsonl") if p.is_file())
-    except OSError:
-        called = []
-    return [epic] + called
-
-
-def _opened(epic: Path) -> list[dict]:
-    """Every session of the run, oldest first: each `opened` line across all its
-    records, and each session the run keeps that no line names yet (_named)."""
-    lines = [e for r in _records(epic) for e in _events(r)
-             if e.get("event") == "opened" and e.get("session")]
-    known = {str(e["session"]) for e in lines}
-    lines += [n for n in _named(epic) if n["session"] not in known]
-    return sorted(lines, key=lambda e: str(e.get("at", "")))
-
-
-# Where a CLI logs each session under the run's own directory for it, and which
-# session a log's name says it is: its stem for Claude, the id Codex ends the
-# name with.
-_KEPT = {
-    "claude": ("projects/*/*.jsonl", re.compile(r"^(.+)$")),
-    "codex": ("sessions/**/rollout-*.jsonl",
-              re.compile(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$")),
-}
-# The journal the engine keeps for a flow that can be picked up again.
-_JOURNAL = "resume.jsonl"
-# The first timestamp in each session log, kept once read: it never changes.
-_FIRST_TS: dict[str, str] = {}
-
-
-def _named(epic: Path) -> list[dict]:
-    """The run's sessions as `opened` lines, found without one.
-
-    hmz writes `opened` once a session's first turn has landed — the moment its
-    CLI hands the id back — so a lane an hour into its first turn is on no
-    record while its log fills. The log itself names it: it is under the run's
-    own directory for that CLI (`where` is that), and its first timestamp says
-    since when. Whose it is, the engine's journal says, for a flow that can be
-    picked up: a `{"t": "session", "role", "harness", "session"}` line, written
-    as the CLI announces the id."""
-    run = epic.parent
-    roles = {str(d["session"]): str(d.get("role") or "") for d in _events(run / _JOURNAL)
-             if d.get("t") == "session" and d.get("session")}
-    found: dict[str, dict] = {}
-    for backend, (pattern, named) in _KEPT.items():
-        where = run / "sessions" / backend
-        try:
-            logs = sorted(p for p in where.glob(pattern) if p.is_file())
-        except (OSError, ValueError):
-            continue
-        for log in logs:
-            m = named.search(log.stem)
-            if not m or m.group(1) in found:
-                continue
-            found[m.group(1)] = {"event": "opened", "at": _first_ts(log),
-                                 "agent": roles.get(m.group(1), ""), "backend": backend,
-                                 "session": m.group(1), "where": f"sessions/{backend}"}
-    return list(found.values())
-
-
-def _first_ts(log: Path) -> str:
-    """The timestamp on the first line of `log` that carries one, or ""."""
-    key = str(log)
-    if key in _FIRST_TS:
-        return _FIRST_TS[key]
-    try:
-        with log.open("rb") as f:
-            for _ in range(8):
-                try:
-                    d = json.loads(f.readline())
-                except Exception:
-                    continue
-                if isinstance(d, dict) and d.get("timestamp"):
-                    _FIRST_TS[key] = ts = str(d["timestamp"])
-                    return ts
-    except OSError:
-        pass
-    return ""
-
-
-def _logs(epic: Path, opened: dict, of: dict = _LOGS) -> list[Path]:
-    """The log files of the session an `opened` line names — its own, or with
-    `of` those of what it started — or [] for a CLI the board can't read or a
-    log that has gone."""
-    ident = str(opened["session"])
-    pattern = of.get(str(opened.get("backend") or ""))
-    if not pattern:
-        return []
-    where = str(opened.get("where") or "")
-    if where:
-        # Relative to the epic for a session kept in the run, whole for one that
-        # stayed in its CLI's home — and `/` keeps a whole path whole.
-        at, pattern = epic.parent / where, pattern.format(ident)
-    elif of is _LOGS:
-        # A run from before sessions were kept: a directory of links per session.
-        at, pattern = epic.parent / "sessions" / str(opened.get("name") or ""), f"*{ident}*.jsonl"
-    else:
-        return []
-    try:
-        return sorted(p for p in at.glob(pattern) if p.is_file())
-    except (OSError, ValueError):
-        return []
-
-
-def _activity(epic: Path) -> tuple[int, Optional[dict], Optional[Path]]:
-    """(newest, at_work, log) of a run, from one look at its files.
-
-    `newest` is the epoch ms of the newest write to any of the run's records or
-    session logs. The epic itself is written only when a session opens or the
-    run ends, so a turn hours long leaves it untouched.
-
-    `at_work` is the `opened` line of the agent at work, `log` its session log:
-    the agent whose session log was written last — agents that take turns resume
-    their sessions rather than open new ones — or, with no log to go by, the
-    last to open one (log None; at_work None before any session opened)."""
-    opened = _opened(epic)
-    newest = max((_mtime(r) for r in _records(epic)), default=0.0)
-    at_work, log, newest_log = (opened[-1] if opened else None), None, -1.0
-    for o in opened:
-        for p in _logs(epic, o):
-            m = _mtime(p)
-            newest = max(newest, m)
-            if m >= newest_log:
-                at_work, log, newest_log = o, p, m
-    return int(newest * 1000), at_work, log
 
 
 def _models(began: dict) -> str:
@@ -317,6 +173,24 @@ _KINDS = ("input", "output", "cache_read", "cache_write")
 _CLAUDE_USAGE = {"input": "input_tokens", "output": "output_tokens",
                  "cache_read": "cache_read_input_tokens",
                  "cache_write": "cache_creation_input_tokens"}
+
+# Where each CLI logs a session under the run's own directory for it: Claude's
+# projects/<dir>/<id>.jsonl, and the transcript a sub-agent it starts writes under
+# that session's directory (hmz bills it as the run's); Codex's rollouts.
+_BILLED = {"claude": "sessions/claude/projects/**/*.jsonl",
+           "codex": "sessions/codex/sessions/**/rollout-*.jsonl"}
+
+
+def _billed(epic: Path) -> list[tuple[Path, str]]:
+    """Every session log the run keeps, with the CLI that wrote it."""
+    out: list[tuple[Path, str]] = []
+    for backend, pattern in _BILLED.items():
+        try:
+            out += [(p, backend) for p in sorted(epic.parent.glob(pattern)) if p.is_file()]
+        except (OSError, ValueError):
+            continue
+    return out
+
 
 # A session log is appended to for hours. It is read from where the last poll
 # left off, and what was found so far is kept here, per log.
@@ -568,19 +442,19 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
     tokens: dict[str, int] = {}
     models: list[str] = []
     cost, priced, floor = 0.0, False, False
-    for o in (_opened(epic) if epic else []):
-        for log in _logs(epic, o) + _logs(epic, o, _SUBAGENT_LOGS):
-            for model, kinds in _spent_in(log, str(o.get("backend") or "")).items():
-                for kind, n in kinds.items():
-                    tokens[kind] = tokens.get(kind, 0) + n
-                if model and model not in models:
-                    models.append(model)
-                per = _price(model, prices) if prices else None
-                billed = _cost(kinds, per) if per else None
-                if billed is None:
-                    floor = floor or any(kinds.values())
-                else:
-                    cost, priced = cost + billed, True
+    # Once the run has ended its own total is on the `usage` line: no log to read.
+    for log, backend in (_billed(epic) if epic and not usage else []):
+        for model, kinds in _spent_in(log, backend).items():
+            for kind, n in kinds.items():
+                tokens[kind] = tokens.get(kind, 0) + n
+            if model and model not in models:
+                models.append(model)
+            per = _price(model, prices) if prices else None
+            billed = _cost(kinds, per) if per else None
+            if billed is None:
+                floor = floor or any(kinds.values())
+            else:
+                cost, priced = cost + billed, True
     out = tokens.get("output", 0)
     at = transcripts._parse_ts(str(began.get("at") or ""))
     elapsed: Optional[float] = None
@@ -622,38 +496,43 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
             "spend_label": " · ".join(parts), "spend_title": title,
             "budget_label": _budget_label(budget)}
 
-
-def _current_task(events: list[dict], at_work: Optional[dict], log: Optional[Path]) -> str:
-    """`<flow> · <agent at work>: <what its session is doing>`, or how the run
-    ended. `at_work` and `log` are _activity's."""
+def _current_task(events: list[dict]) -> str:
+    """`<flow> · <what it is on>`, off the run's own lines: the flows it called
+    that have not returned (`lane_turn ×3` for three of one at once), else the
+    agent that opened a session last — or how the run ended."""
     flow = _began(events).get("flow", "")
     end = _ended(events)
     if end:
         return f"{flow} {end.get('how', 'ended')}"
-    if not at_work:
-        return flow
-    task = f"{flow} · {at_work.get('agent', '')}"
-    hint = ""
-    if log and at_work.get("backend") == "claude":
-        hint = transcripts.current_task_hint(log) or ""
-    elif log and at_work.get("backend") == "codex":
-        hint = codex._last_assistant_text(codex._read_tail_events(log))
-    return f"{task}: {hint}" if hint else task
+    calls: dict[str, str] = {}  # each call not yet returned: its record → the flow
+    agent = ""
+    for e in events:
+        kind = e.get("event")
+        if kind == "called":
+            calls[str(e.get("epic") or e.get("flow"))] = str(e.get("flow") or "")
+        elif kind == "returned":
+            calls.pop(str(e.get("epic") or e.get("flow")), None)
+        elif kind == "opened":
+            agent = str(e.get("agent") or "")
+    out: dict[str, int] = {}
+    for called in calls.values():
+        out[called] = out.get(called, 0) + 1
+    on = ", ".join(f + (f" ×{n}" if n > 1 else "") for f, n in out.items()) or agent
+    return f"{flow} · {on}" if on else flow
 
 
 def list_hmz_windows() -> list[Window]:
     """Running hmz interfaces, one Window per tty, minus those the machine-local
     cwd filter hides. Linux-only (/proc)."""
-    return [w for w, *_ in _discover()]
+    return [w for w, _ in _discover()]
 
 
-def _discover() -> list[tuple[Window, list[dict], Optional[dict], Optional[Path]]]:
-    """list_hmz_windows, each window with its latest run's events and the agent
-    at work there with its log (see _activity) — read once, for the card's
-    status and time here and its details in hmz_window_dicts."""
+def _discover() -> list[tuple[Window, list[dict]]]:
+    """list_hmz_windows, each window with its latest run's events — read once,
+    for the card's status and time here and its details in hmz_window_dicts."""
     if not Path("/proc").is_dir():
         return []
-    windows: list[tuple[Window, list[dict], Optional[dict], Optional[Path]]] = []
+    windows: list[tuple[Window, list[dict]]] = []
     for pid, info in proc_table().items():
         tty = info.tty
         if not tty or tty in ("?", "??") or not _is_interactive_hmz(info.args):
@@ -669,12 +548,13 @@ def _discover() -> list[tuple[Window, list[dict], Optional[dict], Optional[Path]
         started_at = _proc_start_ms(pid)
         epic = _latest_epic(cwd, _home(pid))
         status, updated_at, session_id = "idle", started_at, f"hmz-{pid}"
-        events, at_work, log = [], None, None
+        events: list[dict] = []
         if epic:
             events = _events(epic)
-            newest, at_work, log = _activity(epic)
             status = "busy" if _began(events) and not _ended(events) else "idle"
-            updated_at = max(started_at, newest)
+            # The epic is written as sessions open and flows are called and
+            # return; a long turn leaves it untouched, and `busy` says enough.
+            updated_at = max(started_at, int(_mtime(epic) * 1000))
             session_id = epic.parent.name
         windows.append((Window(
             pid=pid,
@@ -693,7 +573,7 @@ def _discover() -> list[tuple[Window, list[dict], Optional[dict], Optional[Path]
             alive=True,
             hidden=False,
             platform="hmz",
-        ), events, at_work, log))
+        ), events))
     windows.sort(key=lambda found: (-found[0].updated_at, found[0].pid))
     return windows
 
@@ -715,10 +595,10 @@ def hmz_window_dicts() -> list[dict]:
     """Live hmz windows as dashboard dicts, the shape codex_window_dicts gives.
     Shell-process counts are filled in by the caller."""
     out: list[dict] = []
-    for w, events, at_work, log in _discover():
+    for w, events in _discover():
         d = w.to_dict()
         began, end = _began(events), _ended(events)
-        current_task = _current_task(events, at_work, log)
+        current_task = _current_task(events)
         tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
         crumb = menu(w)
         if crumb:
@@ -741,8 +621,6 @@ def hmz_window_dicts() -> list[dict]:
             "effort": "",
             "model_label": models,
             "model_source": "transcript" if models else "",
-            # The bill walks the run's sessions again, sub-agents' logs too (which
-            # _activity leaves out); each log is read on from where it stopped.
             **_spending(Path(w.transcript_path) if w.transcript_path else None,
                         events, _home(w.pid)),
         })
@@ -848,34 +726,27 @@ def refusal(pane: str, text: str) -> str:
     return " ".join(said)
 
 
-def _session_timeline(log: Path, backend: str, limit: int) -> list[dict]:
-    if backend == "codex":
-        return codex.codex_timeline(log, limit=limit)
-    return transcripts.timeline(log, limit=limit)
-
-
 def hmz_timeline(path: str | Path | None, limit: int = 60,
                  typed: list[dict] = ()) -> list[dict]:
-    """A run as TurnEvent-compatible dicts: the task it began on, every turn of
-    every session its agents opened — read from where the run keeps them, each
-    tagged `extra.agent` with whose it was — each flow it called, and how it
-    ended, in the order they happened.
+    """A run as TurnEvent-compatible dicts, off its epic: the task it began on,
+    each session an agent opened (tagged `extra.agent` with whose), each flow it
+    called and its return, and how it ended, in the order they happened.
 
     `typed` (see typed()) are the lines typed into the hmz; each one the run
     doesn't already show goes in where it was typed. A line hmz refused, or
     one typed before there was any run (`path` None), shows nowhere else."""
-    epic = Path(path) if path else None
     events: list[dict] = []
-    task = ""
-    for e in _events(epic) if epic else []:
-        kind, ts = e.get("event"), e.get("at", "")
+    for e in _events(Path(path)) if path else []:
+        kind, ts, extra = e.get("event"), e.get("at", ""), {}
         if kind == "began":
-            task = _squeeze(cap_text(str(e.get("task") or ""), MESSAGE_CHARS))
             text = f"${e.get('flow', '')} {e.get('task', '')}".strip()
             events.append({"ts": ts, "kind": "user_text", "text": cap_text(text, MESSAGE_CHARS),
                            "tool": None, "role": "user", "extra": {}})
             continue
-        if kind == "called":
+        if kind == "opened":
+            agent = str(e.get("agent") or "")
+            text, extra = f"{agent} opened a {e.get('backend', '')} session", {"agent": agent}
+        elif kind == "called":
             text = f"called flow {e.get('flow', '')}"
         elif kind == "returned":
             text = f"flow {e.get('flow', '')} returned"
@@ -884,42 +755,15 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
         else:
             continue
         events.append({"ts": ts, "kind": "assistant_text", "text": text,
-                       "tool": None, "role": "assistant", "extra": {}})
-    # A forked session's log opens on a copy of the conversation it was cut
-    # from, so a turn two sessions both hold is shown once.
-    seen: set[tuple] = set()
-    for o in _opened(epic) if epic else []:
-        agent, backend = str(o.get("agent") or ""), str(o.get("backend") or "")
-        said: list[dict] = []
-        for log in _logs(epic, o):
-            said += _session_timeline(log, backend, limit)
-        if not said:
-            # A CLI the board can't read, or a log that has gone: say the session
-            # was opened, which is all the run itself knows.
-            events.append({"ts": o.get("at", ""), "kind": "assistant_text",
-                           "text": f"{agent} opened a {backend} session",
-                           "tool": None, "role": "assistant", "extra": {"agent": agent}})
-            continue
-        for ev in said:
-            key = (ev.get("ts"), ev.get("kind"), ev.get("tool"), ev.get("text"))
-            if key in seen:
-                continue
-            seen.add(key)
-            # The task the run began on, handed to its first agent word for
-            # word, is already the run's own first line.
-            if ev.get("kind") == "user_text" and task and _squeeze(ev.get("text") or "") == task:
-                task = ""
-                continue
-            ev["extra"] = {**(ev.get("extra") or {}), "agent": agent}
-            events.append(ev)
-    # A typed line the run took is already here, as the task it began on or as
-    # what an agent was told; hmz may wrap the latter, so it is looked for inside.
+                       "tool": None, "role": "assistant", "extra": extra})
+    # A typed line the run took is already here, in the line it began on —
+    # `$<flow> <task>`, so a line typed without its `$<flow>` is looked for inside.
     shown = [_squeeze(ev.get("text") or "") for ev in events if ev.get("kind") == "user_text"]
     for d in typed:
         line = _squeeze(cap_text(d["text"], MESSAGE_CHARS))
         if line and not any(line in s for s in shown):
             events.append({"ts": d["at"], "kind": "user_text", "text": cap_text(d["text"], MESSAGE_CHARS),
                            "tool": None, "role": "user", "extra": {}})
-    # Stable: the run's own lines keep their place among turns of the same instant.
+    # Stable: at one instant the run's own lines come first, in their order.
     events.sort(key=lambda ev: transcripts._parse_ts(ev.get("ts") or ""))
     return events[-limit:]
