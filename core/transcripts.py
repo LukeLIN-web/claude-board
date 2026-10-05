@@ -457,11 +457,15 @@ def _cron_every(field: str, period: int) -> Optional[int]:
     firing them all on the same minute, and it is still every 30 minutes. A list
     only counts when it wraps evenly too: `0,10` fires twice an hour, fifty
     minutes apart, and has no single cadence worth printing.
+
+    The same holds for a step, since `*/n` restarts at 0 every period: `*/45`
+    fires at :00 and :45 — 45 minutes apart, then 15 — so only a step that
+    divides the period is a cadence, exactly as its spelled-out list would be.
     """
     m = _CRON_STEP_RE.match(field)
     if m:
         step = int(m.group(1))
-        return step if 0 < step < period else None
+        return step if 0 < step < period and period % step == 0 else None
     if not _CRON_LIST_RE.match(field):
         return None
     vals = sorted({int(v) for v in field.split(",")})

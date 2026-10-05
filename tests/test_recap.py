@@ -264,6 +264,15 @@ class CronCadenceTests(unittest.TestCase):
         # Fires at :00 and :10 — twice an hour, but never "every 10 minutes".
         self.assertEqual(transcripts._cron_cadence("0,10 * * * *"), "0,10 * * * *")
 
+    def test_a_step_that_does_not_divide_the_period_is_not_a_cadence(self):
+        # `*/n` restarts at 0 each period: */45 fires at :00 and :45 (45 then 15
+        # minutes apart), */5 hours at 0,5,…,20 then 4 hours to midnight. Each
+        # must read like its own spelled-out list, which is already refused.
+        for expr in ("*/45 * * * *", "*/7 * * * *", "0 */5 * * *"):
+            self.assertEqual(transcripts._cron_cadence(expr), expr)
+        self.assertEqual(transcripts._cron_cadence("0,7,14,21,28,35,42,49,56 * * * *"),
+                         "0,7,14,21,28,35,42,49,56 * * * *")
+
     def test_shapes_loop_never_emits_come_back_verbatim(self):
         for expr in ("15 9 * * 1", "* * * * *", "weird", "0 0 1 1 *"):
             self.assertEqual(transcripts._cron_cadence(expr), expr)
