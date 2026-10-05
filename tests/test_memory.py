@@ -49,6 +49,22 @@ class FrontmatterFieldTests(unittest.TestCase):
         text = "---\nname: a\nmetadata:\n  extra:\n    type: deep\n  type: project\n---\n"
         self.assertEqual(_fields(text)["type"], "project")
 
+    def test_quoted_values_lose_their_quotes(self):
+        text = ('---\nname: a\ndescription: "Say \\"why\\" first: then how"\n'
+                "metadata:\n  type: 'feedback'\n---\n")
+        fm = _fields(text)
+        self.assertEqual(fm["description"], 'Say "why" first: then how')
+        self.assertEqual(fm["type"], "feedback")
+
+    def test_a_list_or_mapping_is_no_text_value(self):
+        text = "---\nname: a\ntags:\n  - one\n  - two\nhooks:\n  stop: x\n---\n"
+        fm = _fields(text)
+        self.assertEqual((fm["tags"], fm["hooks"]), ("", ""))
+
+    def test_literal_block_keeps_its_lines(self):
+        text = "---\nname: a\ndescription: |\n  first line\n  second line\n---\n"
+        self.assertEqual(_fields(text)["description"], "first line\nsecond line")
+
     def test_crlf_line_endings(self):
         text = "---\r\nname: a\r\nmetadata:\r\n  type: user\r\n---\r\n\r\nbody line\r\n"
         fm, body = memory.split_frontmatter(text)

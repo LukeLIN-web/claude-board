@@ -1,4 +1,7 @@
-"""Parse ~/.claude/projects/*/memory/*.md files with YAML frontmatter."""
+"""Parse ~/.claude/projects/*/memory/*.md files with YAML frontmatter.
+
+split_frontmatter is also how core/skills.py reads a SKILL.md, which opens with
+the same kind of block."""
 from __future__ import annotations
 
 import re
@@ -35,6 +38,39 @@ def _entries(block: str) -> list[tuple[str, str, list[str]]]:
     return entries
 
 
+# The first line under a key whose value is empty, when it makes that key a list
+# (`- item`) or a mapping (`child: …`) rather than text continued from the key.
+_CONTAINER_LINE = re.compile(r"(-|[\w-]+:)(\s|$)")
+_ESCAPES = {"n": "\n", "t": "\t"}
+
+
+def _value(value: str, lines: list[str]) -> str:
+    """A field's text, read the way YAML reads the shapes these files use.
+
+    A SKILL.md writes its `description` plain, in double quotes with `\\"`
+    escapes (a memory too, often), folded over several lines with `>-`, or
+    quoted on the lines below an empty `description:`. So: a `>` block is
+    folded into one line and a `|` block keeps its lines; a plain or quoted
+    value continues on the indented lines below its key, joined by spaces, as
+    YAML folds them; then the quotes and escapes come off. A key whose lines are
+    a list or a mapping has no text value. (A ` #` is kept, not read as a
+    comment: memory descriptions write `#123` and mean it as text.)
+    """
+    rest = [ln.strip() for ln in lines]
+    if value[:1] == "|":
+        return "\n".join(rest).strip()
+    if value[:1] == ">":
+        return " ".join(ln for ln in rest if ln)
+    if not value and _CONTAINER_LINE.match(next((ln for ln in rest if ln), "")):
+        return ""
+    text = " ".join([value, *(ln for ln in rest if ln)]).strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return re.sub(r"\\(.)", lambda m: _ESCAPES.get(m[1], m[1]), text[1:-1])
+    if len(text) >= 2 and text[0] == text[-1] == "'":
+        return text[1:-1].replace("''", "'")
+    return text
+
+
 def _parse_frontmatter(block: str) -> dict:
     """The fields of a frontmatter block, as {key: value}.
 
@@ -52,20 +88,21 @@ def _parse_frontmatter(block: str) -> dict:
     under_metadata: dict = {}
     for key, value, lines in _entries(block):
         if key != "metadata" or value:
-            top[key] = value
+            top[key] = _value(value, lines)
             continue
         depth = min((_indent(ln) for ln in lines if ln.strip()), default=0)
         for ln in lines:
             k, sep, v = ln.partition(":")
             if sep and ln.strip() and _indent(ln) == depth:
-                under_metadata[k.strip()] = v.strip()
+                under_metadata[k.strip()] = _value(v.strip(), [])
     return {**under_metadata, **top}
 
 
 def split_frontmatter(text: str) -> tuple[dict, str]:
-    """(frontmatter fields, body) of a memory file. The body is what follows the
-    closing `---`; a file that doesn't open with a frontmatter block is all body
-    (it used to be cut at its first horizontal rule, as if that closed one)."""
+    """(frontmatter fields, body) of a memory file or a SKILL.md. The body is
+    what follows the closing `---`; a file that doesn't open with a frontmatter
+    block is all body (it used to be cut at its first horizontal rule, as if
+    that closed one)."""
     m = _FRONTMATTER.match(text)
     if not m:
         return {}, text
