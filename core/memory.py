@@ -8,32 +8,68 @@ from typing import Optional
 from .sessions import PROJECTS_DIR
 
 
-def _parse_frontmatter(text: str) -> dict:
-    """Minimal YAML frontmatter parser for memory files."""
-    if not text.startswith("---"):
-        return {}
-    end = text.find("\n---", 3)
-    if end < 0:
-        return {}
-    block = text[4:end]
-    result: dict = {}
+# Frontmatter is a `---` line that opens the file, the fields, and the next line
+# that is `---` alone. Only a fence on the very first line opens it: further
+# down, `---` is a markdown horizontal rule, and a file that starts with
+# anything else has no frontmatter however many rules its body draws. `\r?`
+# because a file saved on Windows ends its lines in CRLF.
+_FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)^---[ \t]*\r?$", re.S | re.M)
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _entries(block: str) -> list[tuple[str, str, list[str]]]:
+    """(key, value, lines under it) for each top-level `key: value` line of a
+    frontmatter block. The lines under a key are the indented and blank ones
+    that follow it, up to the next top-level key."""
+    entries: list[tuple[str, str, list[str]]] = []
     for line in block.splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            key = key.strip()
-            val = val.strip()
-            if key == "metadata":
-                continue
-            result[key] = val
-    return result
+        if entries and (not line.strip() or _indent(line)):
+            entries[-1][2].append(line)
+            continue
+        key, sep, value = line.partition(":")
+        if sep:
+            entries.append((key.strip(), value.strip(), []))
+    return entries
+
+
+def _parse_frontmatter(block: str) -> dict:
+    """The fields of a frontmatter block, as {key: value}.
+
+    Claude Code has written a memory's fields in two shapes: all at the top
+    level (`type: user`), and, in newer files, `name` and `description` at the
+    top with `type`, `node_type`, `originSessionId` … indented under
+    `metadata:`. A field under `metadata:` stands in for a top-level one the
+    file lacks and never replaces one it has, whichever comes first; keys
+    indented under any other parent, or deeper under `metadata`, are not fields
+    of the file at all. (Every key used to lose its indent, so a `metadata.type`
+    written after a top-level `type` overwrote it and the memory was filed
+    under the wrong group.)
+    """
+    top: dict = {}
+    under_metadata: dict = {}
+    for key, value, lines in _entries(block):
+        if key != "metadata" or value:
+            top[key] = value
+            continue
+        depth = min((_indent(ln) for ln in lines if ln.strip()), default=0)
+        for ln in lines:
+            k, sep, v = ln.partition(":")
+            if sep and ln.strip() and _indent(ln) == depth:
+                under_metadata[k.strip()] = v.strip()
+    return {**under_metadata, **top}
 
 
 def split_frontmatter(text: str) -> tuple[dict, str]:
     """(frontmatter fields, body) of a memory file. The body is what follows the
-    closing `---`; a file without one is all body."""
-    body_start = text.find("\n---", 3)
-    body = text[body_start + 4:].strip() if body_start > 0 else text
-    return _parse_frontmatter(text), body
+    closing `---`; a file that doesn't open with a frontmatter block is all body
+    (it used to be cut at its first horizontal rule, as if that closed one)."""
+    m = _FRONTMATTER.match(text)
+    if not m:
+        return {}, text
+    return _parse_frontmatter(m.group(1)), text[m.end():].strip()
 
 
 def find_memory(name: str) -> Optional[Path]:
