@@ -1,9 +1,11 @@
 """Tests for the machine-local cwd visibility filter in core/sessions.py."""
+import json
+import os
 import unittest
 from unittest import mock
 
-from core import sessions
-from tests.helpers import queue_op, scratch_dir, user_row, write_jsonl
+from core import codex, search, sessions
+from tests.helpers import codex_rollout, queue_op, scratch_dir, user_row, write_jsonl
 
 
 def _load_filters(include: str = "", exclude: str = "") -> None:
@@ -116,6 +118,77 @@ class TranscriptFilterTests(unittest.TestCase):
     def test_no_filter_reads_nothing(self):
         _load_filters()
         self.assertTrue(sessions.transcript_visible(self.root / "missing" / "s.jsonl"))
+
+    def test_a_codex_rollout_is_judged_on_the_cwd_its_session_meta_records(self):
+        # Its rows carry no top-level cwd, and its dir is a date: read as a
+        # slug, an allowlist hid every rollout and an exclude list none.
+        inside = codex_rollout(self.root, "019a0001", "/shared/ws/proj/x")
+        evil = codex_rollout(self.root, "019a0002", "/shared/ws/proj-evil")
+        _load_filters(include="/shared/ws/proj")
+        self.assertTrue(sessions.transcript_visible(inside))
+        self.assertFalse(sessions.transcript_visible(evil))
+        _load_filters(exclude="/shared/ws/proj")
+        self.assertFalse(sessions.transcript_visible(inside))
+        self.assertTrue(sessions.transcript_visible(evil))
+
+
+@unittest.skipUnless(os.path.isdir("/proc"), "Codex discovery reads /proc")
+class CodexCardFilterTests(unittest.TestCase):
+    """Live Codex cards obey the cwd filter, as Claude's and hmz's do — on the
+    cwd the card shows and on the one its rollout records."""
+
+    def setUp(self):
+        self.root = scratch_dir()
+
+    def tearDown(self):
+        _load_filters()
+
+    def _cards(self, cwd, rollout=None):
+        """The Codex cards for one `codex` TUI on pts/4 running in `cwd` and
+        writing `rollout` (None: no turn yet)."""
+        table = {700: sessions.Proc(1, "Sl+", "pts/4", "codex", "codex --yolo")}
+        with mock.patch.object(codex, "proc_table", return_value=table), \
+             mock.patch.object(codex, "_pid_alive", return_value=True), \
+             mock.patch.object(codex, "_proc_start_ms", return_value=0), \
+             mock.patch.object(codex, "_rollout_fd",
+                               return_value=str(rollout) if rollout else None), \
+             mock.patch.object(codex.os, "readlink", return_value=cwd):
+            return codex.list_codex_windows()
+
+    def test_a_card_outside_the_allowlist_is_hidden(self):
+        _load_filters(include="/shared/ws/proj")
+        self.assertEqual([w.cwd for w in self._cards("/shared/ws/proj/x")],
+                         ["/shared/ws/proj/x"])
+        self.assertEqual(self._cards("/shared/ws/proj-evil"), [])
+
+    def test_a_card_whose_rollout_records_a_hidden_cwd_is_hidden(self):
+        # `codex resume --all` run in a shown dir, on a hidden dir's session:
+        # the card would serve that rollout's timeline.
+        _load_filters(exclude="/shared/ws/secret")
+        secret = codex_rollout(self.root, "019a0003", "/shared/ws/secret")
+        shown = codex_rollout(self.root, "019a0004", "/shared/ws/proj")
+        self.assertEqual(self._cards("/shared/ws/proj", secret), [])
+        (w,) = self._cards("/shared/ws/proj", shown)
+        self.assertEqual(w.session_id, "019a0004")
+
+
+class CodexSearchFilterTests(unittest.TestCase):
+    """Search hits from a Codex rollout obey the cwd filter on the cwd it records."""
+
+    def tearDown(self):
+        _load_filters()
+
+    def test_hits_from_a_hidden_rollout_are_dropped(self):
+        root = scratch_dir()
+        row = {"type": "event_msg", "payload": {"type": "user_message", "content": "the plans"}}
+        secret = codex_rollout(root, "019a0005", "/shared/ws/secret", [row])
+        shown = codex_rollout(root, "019a0006", "/shared/ws/proj", [row])
+        lines = {2: json.dumps(row)}
+        _load_filters(exclude="/shared/ws/secret")
+        with mock.patch.object(search, "CODEX_SESSIONS_DIR", root):
+            self.assertEqual(search._file_hits(secret, lines, [2], "plans"), [])
+            (hit,) = search._file_hits(shown, lines, [2], "plans")
+        self.assertEqual((hit["platform"], hit["excerpt"]), ("codex", "the plans"))
 
 
 class HistoryFilterTests(unittest.TestCase):

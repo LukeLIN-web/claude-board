@@ -62,6 +62,17 @@ def queue_op(op, content=None, ts=TS) -> dict:
     return row
 
 
+def codex_rollout(root, sid, cwd, rows=(), *, page="", time="2026-10-05T08-00-00") -> Path:
+    """A Codex rollout under `root`, named and opened the way Codex writes one:
+    `<y>/<m>/<d>/rollout-<time>-<sid>.jsonl` — `_<page>` after the id for a
+    further page of a paginated thread — whose first line is the session_meta
+    recording `cwd`, followed by `rows`."""
+    day = Path(root, *time[:10].split("-"))
+    name = f"rollout-{time}-{sid}" + (f"_{page}" if page else "")
+    meta = {"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "timestamp": TS}}
+    return write_jsonl([meta, *rows], day / f"{name}.jsonl")
+
+
 def make_window(**over) -> sessions.Window:
     """A live, visible Claude window on /dev/pts/3; override any field."""
     fields = dict(pid=100, session_id="", cwd="/tmp/proj", project_name="proj",

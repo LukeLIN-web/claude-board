@@ -77,6 +77,22 @@ def list_opencode_sessions() -> list[dict]:
     return sessions
 
 
+def session_directory(session_id: str) -> Optional[str]:
+    """The directory OpenCode session `session_id` ran in ("" if it records
+    none), or None when there is no such session."""
+    conn = _get_conn()
+    if not conn:
+        return None
+    try:
+        row = conn.execute("SELECT directory FROM session WHERE id = ?",
+                           (session_id,)).fetchone()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    return (row[0] or "") if row else None
+
+
 def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
     conn = _get_conn()
     if not conn:

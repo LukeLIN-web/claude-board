@@ -113,7 +113,9 @@ _TRANSCRIPT_CWD: dict[str, str] = {}
 
 
 def _transcript_cwd(path: Path) -> str:
-    """The cwd a Claude transcript was written from, "" if no row names one yet."""
+    """The cwd a transcript was written from, "" if no row names one yet. Claude
+    puts it on its rows; a Codex rollout, in the payload of the session_meta it
+    opens with."""
     key = str(path)
     if key in _TRANSCRIPT_CWD:
         return _TRANSCRIPT_CWD[key]
@@ -125,6 +127,8 @@ def _transcript_cwd(path: Path) -> str:
                     d = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(d, dict) and d.get("type") == "session_meta":
+                    d = d.get("payload")
                 c = d.get("cwd") if isinstance(d, dict) else None
                 if isinstance(c, str) and c:
                     cwd = c
@@ -137,12 +141,15 @@ def _transcript_cwd(path: Path) -> str:
 
 
 def transcript_visible(path: str | Path) -> bool:
-    """Whether a Claude transcript's session passes the machine-local filter.
+    """Whether a Claude transcript's or Codex rollout's session passes the
+    machine-local filter.
 
     Decided on the cwd the transcript records, so it is exactly `_cwd_visible`:
     the slug of its projects/ dir cannot tell /w/proj-evil from /w/proj/evil,
     and an allowlist read off the slug served /w/proj-evil's whole timeline.
-    The slug is only the fallback for a file whose rows name no cwd yet."""
+    The slug is only the fallback for a file whose rows name no cwd yet — for a
+    rollout that is a date dir, which no prefix covers, so an allowlist hides it
+    and an exclude list alone does not."""
     if not (_CWD_INCLUDE or _CWD_EXCLUDE):
         return True
     p = Path(path)

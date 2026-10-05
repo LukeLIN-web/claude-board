@@ -5,6 +5,7 @@ functions directly (FastAPI's decorator returns the original function) and the
 Pydantic request models at the model level.
 """
 import contextlib
+import os
 import types
 import unittest
 from unittest import mock
@@ -12,7 +13,7 @@ from unittest import mock
 import pydantic
 
 import app as appmod
-from tests.helpers import scratch_dir, user_row, write_jsonl
+from tests.helpers import codex_rollout, scratch_dir, user_row, write_jsonl
 
 # Everything _enriched_snapshot reads besides the cards themselves, each at a
 # value that adds nothing to a card: no hmz runs, no shells, no permission
@@ -152,6 +153,116 @@ class HistoryTimelineVisibilityTests(unittest.TestCase):
         with self.assertRaises(fastapi.HTTPException) as cm:
             appmod.api_history_timeline("sid1")
         self.assertEqual(cm.exception.status_code, 404)
+
+
+def _allow_only(test, include):
+    """Run `test` under CLAUDE_FLEET_CWD_INCLUDE=`include` and no exclude list,
+    with an empty ~/.claude/projects, so the archive timeline reaches past it."""
+    env = mock.patch.dict("os.environ", {"CLAUDE_FLEET_CWD_INCLUDE": include,
+                                         "CLAUDE_FLEET_CWD_EXCLUDE": ""})
+    env.start()
+    appmod.sessions._reload_cwd_filters()
+    test.addCleanup(lambda: (env.stop(), appmod.sessions._reload_cwd_filters()))
+    p = mock.patch.object(appmod.sessions, "PROJECTS_DIR", scratch_dir())
+    p.start()
+    test.addCleanup(p.stop)
+
+
+def _timeline_404(test, session_id):
+    import fastapi
+    with test.assertRaises(fastapi.HTTPException) as cm:
+        appmod.api_history_timeline(session_id)
+    test.assertEqual(cm.exception.status_code, 404)
+
+
+class CodexHistoryTimelineTests(unittest.TestCase):
+    """The archive timeline serves a Codex rollout by its whole id only, and
+    only while the cwd it records passes the filter."""
+
+    IN = "019a0001-0000-7000-8000-00000000aaaa"
+    EVIL = "019a0002-0000-7000-8000-00000000bbbb"
+
+    def setUp(self):
+        _allow_only(self, "/shared/ws/proj")
+        self.root = scratch_dir()
+        p = mock.patch.object(appmod.codex, "CODEX_SESSIONS_DIR", self.root)
+        p.start()
+        self.addCleanup(p.stop)
+        self.inside = codex_rollout(self.root, self.IN, "/shared/ws/proj/x",
+                                    [self._prompt("first page")])
+        self.evil = codex_rollout(self.root, self.EVIL, "/shared/ws/proj-evil",
+                                  [self._prompt("secret plans")])
+
+    @staticmethod
+    def _prompt(text):
+        return {"timestamp": "2026-10-05T08:00:01Z", "type": "event_msg",
+                "payload": {"type": "user_message", "message": text}}
+
+    def _prompts(self, session_id):
+        r = appmod.api_history_timeline(session_id)
+        self.assertEqual(r["platform"], "codex")
+        return [e["text"] for e in r["events"] if e["kind"] == "user_text"]
+
+    def test_a_rollout_outside_the_allowlist_is_not_served(self):
+        _timeline_404(self, self.EVIL)
+        _timeline_404(self, self.evil.stem)
+
+    def test_an_id_is_matched_whole(self):
+        # Any piece of a rollout's name used to find one: here, the hidden one.
+        for piece in ("2026", "019a", "rollout", self.EVIL[:8]):
+            _timeline_404(self, piece)
+
+    def test_found_by_its_session_id_or_its_file_stem(self):
+        # A history row names the id, a search hit the stem.
+        self.assertEqual(self._prompts(self.IN), ["first page"])
+        self.assertEqual(self._prompts(self.inside.stem), ["first page"])
+
+    def test_a_paginated_thread_opens_on_its_newest_page(self):
+        page = codex_rollout(self.root, self.IN, "/shared/ws/proj/x",
+                             [self._prompt("second page")],
+                             page="019a0009-0000-7000-8000-00000000cccc",
+                             time="2026-10-06T09-00-00")
+        os.utime(self.inside, (1000, 1000))
+        os.utime(page, (2000, 2000))
+        self.assertEqual(self._prompts(self.IN), ["second page"])
+        self.assertEqual(self._prompts(self.inside.stem), ["first page"])
+
+
+class OpenCodeHistoryTimelineTests(unittest.TestCase):
+    """The archive timeline serves an OpenCode session only while the directory
+    it records passes the filter."""
+
+    def setUp(self):
+        import sqlite3
+        _allow_only(self, "/shared/ws/proj")
+        db = scratch_dir() / "opencode.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE session (id TEXT, title TEXT, directory TEXT,
+                                  time_created INTEGER, time_updated INTEGER);
+            CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+            CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, data TEXT,
+                               time_created INTEGER);
+        """)
+        for sid, directory in (("ses_in", "/shared/ws/proj/x"),
+                               ("ses_evil", "/shared/ws/proj-evil")):
+            conn.execute("INSERT INTO session VALUES (?, '', ?, 1, 1)", (sid, directory))
+            conn.execute("INSERT INTO message VALUES (?, ?, ?, 1)",
+                         (f"m_{sid}", sid, '{"role": "user"}'))
+            conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, 1)",
+                         (f"p_{sid}", f"m_{sid}", sid, '{"type": "text", "text": "the plans"}'))
+        conn.commit()
+        conn.close()
+        p = mock.patch("core.opencode.OPENCODE_DB", db)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_session_outside_the_allowlist_is_not_served(self):
+        _timeline_404(self, "ses_evil")
+
+    def test_a_session_inside_it_is(self):
+        r = appmod.api_history_timeline("ses_in")
+        self.assertEqual([e["text"] for e in r["events"]], ["the plans"])
 
 
 class PromptRouteTests(unittest.TestCase):

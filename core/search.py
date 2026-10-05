@@ -121,13 +121,12 @@ def _row(raw: str) -> dict:
 def _file_hits(path: Path, lines: dict[int, str], matched: list[int], query: str) -> list[dict]:
     """One file's hits, from the lines rg printed for it: each match plus the
     context around it."""
-    platform = _detect_platform(path)
     # Hide hits from projects filtered out by CLAUDE_FLEET_CWD_INCLUDE/
     # EXCLUDE, judged on the cwd the transcript records (its projects/<slug>
-    # name is lossy); codex sessions aren't cwd-addressable, so they're left
-    # untouched.
-    if platform == "claude" and not sessions.transcript_visible(path):
+    # name is lossy) — a Codex rollout's included, in its session_meta.
+    if not sessions.transcript_visible(path):
         return []
+    platform = _detect_platform(path)
     rows = {n: _row(raw) for n, raw in lines.items()}
     hits: list[dict] = []
     for line_no in matched:

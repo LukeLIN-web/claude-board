@@ -749,21 +749,23 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
                 "events": events, "platform": "claude",
                 **_claude_panels(fp),
             }
-    # Codex transcripts
-    from core.codex import CODEX_SESSIONS_DIR
-    if CODEX_SESSIONS_DIR.exists():
-        for f in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
-            if session_id in f.stem:
-                events = codex.codex_timeline(str(f), limit=limit)
-                return {"session_id": session_id, "project_slug": "codex", "events": events, "platform": "codex"}
-    # OpenCode sessions (SQLite)
+    # Codex rollouts, judged like Claude's on the cwd they record.
+    f = codex.find_rollout(session_id)
+    if f:
+        if not sessions.transcript_visible(f):
+            raise HTTPException(404, "session not found")
+        events = codex.codex_timeline(str(f), limit=limit)
+        return {"session_id": session_id, "project_slug": "codex", "events": events, "platform": "codex"}
+    # OpenCode sessions (SQLite), judged on the directory the session records.
     try:
-        from core.opencode import opencode_timeline
-        events = opencode_timeline(session_id, limit=limit)
-        if events:
-            return {"session_id": session_id, "project_slug": "opencode", "events": events, "platform": "opencode"}
+        from core import opencode
+        directory = opencode.session_directory(session_id)
+        events = (opencode.opencode_timeline(session_id, limit=limit)
+                  if directory is not None and sessions._cwd_visible(directory) else [])
     except Exception:
-        pass
+        events = []
+    if events:
+        return {"session_id": session_id, "project_slug": "opencode", "events": events, "platform": "opencode"}
     raise HTTPException(404, "transcript not found")
 
 

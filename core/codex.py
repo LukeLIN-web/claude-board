@@ -22,10 +22,12 @@ from .sessions import (
     Proc,
     Window,
     _cwd_to_project_slug,
+    _cwd_visible,
     _exe_index,
     _pid_alive,
     _proc_start_ms,
     proc_table,
+    transcript_visible,
 )
 
 CODEX_HOME = HOME_BASE / ".codex"
@@ -371,6 +373,38 @@ def _codex_session(f: Path, st: os.stat_result) -> Optional[dict]:
     }
 
 
+def find_rollout(session_id: str) -> Optional[Path]:
+    """The rollout an archived session's id names, or None.
+
+    The id is one of two things: a search hit's is the rollout's file stem, and
+    a history row's the id its session_meta records (see _codex_session). Both
+    are matched whole — a substring match handed any short id, "2026" say, an
+    arbitrary rollout. The file is named `rollout-<time>-<id>.jsonl`, and a
+    thread kept as paginated history (`history_mode: paginated` in its meta)
+    goes on in further pages `rollout-<time>-<id>_<page>.jsonl`, each opening
+    with that same session_meta: the newest of them is where it stands now.
+    """
+    if not session_id or not CODEX_SESSIONS_DIR.exists():
+        return None
+    best: Optional[Path] = None
+    best_mtime = -1.0
+    for f in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
+        if f.stem == session_id:
+            return f
+        # The name says which files could be its pages; the meta settles it.
+        if not (f.stem.endswith("-" + session_id) or f"-{session_id}_" in f.stem):
+            continue
+        if (_parse_session_meta(f) or {}).get("id") != session_id:
+            continue
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = f, mtime
+    return best
+
+
 def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list[dict]:
     """Parse Codex JSONL into TurnEvent-compatible dicts.
 
@@ -713,6 +747,15 @@ def _discover() -> list[tuple[Window, list[dict]]]:
                 break
             except Exception:
                 continue
+        meta = (_parse_session_meta(Path(rollout)) or {}) if rollout else {}
+        cwd = cwd or meta.get("cwd", "") or ""
+        # The machine-local filter (CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE), as every
+        # other card has it — on both cwds a Codex card has: the one it shows,
+        # and the one its rollout records, whose timeline the card serves. They
+        # need not agree (`codex resume --all` picks up a session started in any
+        # dir), and the archive judges that rollout on the cwd it records.
+        if not _cwd_visible(cwd) or (rollout and not transcript_visible(rollout)):
+            continue
 
         # Anchor the card's ordering to the immutable process start time, NOT the
         # rollout meta timestamp. The two clocks disagree (e.g. `codex resume`
@@ -732,8 +775,6 @@ def _discover() -> list[tuple[Window, list[dict]]]:
                 mtime = rp.stat().st_mtime
             except Exception:
                 mtime = None
-            meta = _parse_session_meta(rp) or {}
-            cwd = cwd or meta.get("cwd", "") or ""
             events = _read_tail_events(rp)
             status = _infer_codex_status(events, mtime) if mtime else "idle"
             updated_at = int(mtime * 1000) if mtime else started_at
