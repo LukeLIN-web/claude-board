@@ -252,7 +252,6 @@ def _rg_search_sessions(query: str) -> dict[str, list[str]]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return {}
     result: dict[str, list[str]] = {}
-    ql = query.lower()
     for raw_line in proc.stdout.splitlines():
         # format: /path/to/sid.jsonl:jsonl_content
         colon = raw_line.find(".jsonl:")
@@ -260,9 +259,6 @@ def _rg_search_sessions(query: str) -> dict[str, list[str]]:
             continue
         sid = Path(raw_line[:colon + 6]).stem
         content = raw_line[colon + 7:]
-        # rg took the query as a pattern; only a literal hit has a snippet.
-        if ql not in content.lower():
-            continue
         snippets = result.setdefault(sid, [])
         if len(snippets) < 3:
             snippets.append(excerpt(content, query, tidy=_one_line))

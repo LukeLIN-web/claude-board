@@ -5,7 +5,7 @@ import json
 import sqlite3
 from typing import Optional
 
-from .search import excerpt
+from .search import excerpt, find
 from .sessions import HOME_BASE
 from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
 from .transcripts import _SKILL_PATH_RE
@@ -174,7 +174,9 @@ def search_opencode(query: str) -> dict[str, list[str]]:
             text = pd.get("text", "")
         elif pd.get("type") == "tool":
             text = json.dumps((pd.get("state") or {}).get("input") or {})
-        if query.lower() not in text.lower():
+        # LIKE ignores case (and reads % and _ as wildcards); a hit is one
+        # the transcript search would have made too.
+        if not find(text, query):
             continue
         snippets = result.setdefault(sid, [])
         if len(snippets) < 3:

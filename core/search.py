@@ -22,11 +22,28 @@ _TIMEOUT = 15  # seconds; a search still running then returns nothing
 def rg_command(query: str, *flags: str) -> Optional[list[str]]:
     """ripgrep for `query` over every Claude and Codex transcript, or None if
     neither directory exists. `flags` go after the transcript globs, so a glob
-    among them takes precedence over those."""
+    among them takes precedence over those.
+
+    The query is literal text (-F) handed over with -e. What gets typed into a
+    search box is words, not a regex: as a bare pattern `foo(` was a regex
+    parse error and found nothing, `a.b` also found `axb`, and `--resume` was
+    read as one of rg's own flags. Case is rg's smart case (-S), and `find`
+    places a match in the text by the same rule."""
     dirs = [str(d) for d in (PROJECTS_DIR, CODEX_SESSIONS_DIR) if d.exists()]
     if not dirs:
         return None
-    return ["rg", "-S", "-g", "*.jsonl", "-g", "!*.wakatime", *flags, query, *dirs]
+    return ["rg", "-S", "-F", "-g", "*.jsonl", "-g", "!*.wakatime", *flags,
+            "-e", query, *dirs]
+
+
+def find(text: str, query: str) -> Optional[re.Match]:
+    """Where `query` first occurs in `text`, matched the way rg_command matches
+    it: as literal text, under rg's smart case — any case while the query is
+    all lower case, exactly once it has a capital in it. An excerpt located
+    ignoring case put a search for "Edit" on the first "edit" in the line, not
+    on the "Edit" rg had matched."""
+    flags = 0 if any(c.isupper() for c in query) else re.IGNORECASE
+    return re.search(re.escape(query), text, flags)
 
 
 def _extract_text(d: dict) -> str:
@@ -223,7 +240,7 @@ def excerpt(text: str, query: str, span: int = 120,
     marking each cut. `tidy` runs on the cut before the marks go on."""
     if not text:
         return ""
-    m = re.search(re.escape(query), text, re.IGNORECASE)
+    m = find(text, query)
     if not m:
         return text[: span * 2]
     start = max(0, m.start() - span // 2)
