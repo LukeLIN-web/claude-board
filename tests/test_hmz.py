@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from core import hmz
+from core import hmz, sessions
 from tests.helpers import make_window, scratch_dir, write_jsonl
 
 # Copied from `ps` while a flow ran: the interface, the headless run, and the
@@ -414,13 +414,43 @@ class TestClear(_HmzHomeTest):
         self.assertEqual(r["note"], hmz.CLEARED_NOTE)
 
     def test_the_card_forgets_a_run_over_by_then(self):
-        failed = ENDED[:-1] + [{**ENDED[-1], "how": "failed"}]
+        budget = {"duration": "PT15H", "cost": 150.0, "output_tokens": None, "graceful": True}
+        failed = [{**RUN[0], "budget": budget}] + RUN[1:] + [
+            {"event": "usage", "at": "2026-10-02T01:10:00.000Z", "cost": 151.27,
+             "output_tokens": 1_673_610, "seconds": 77_163.9},
+            {**ENDED[-1], "how": "failed"}]
         w = _window(transcript_path=str(write_jsonl(failed)))
         self._say("/clear")
         with mock.patch.object(hmz, "_discover", return_value=[(w, failed)]):
             d = hmz.hmz_window_dicts()[0]
         self.assertEqual((d["first_input"], d["current_task"], d["last_error"]), ("", None, None))
+        # Its bill too. The live miss: a card cleared an hour before still read
+        # "💸 $151 · 1.67M out · 21h 26m · budget 15h, $150".
+        self.assertEqual((d["cost"], d["spend_label"], d["budget_label"], d["over_budget"]),
+                         (None, "", "", False))
         self.assertEqual(d["model"], "claude/claude-opus-5-5")  # as hmz's status bar keeps it
+
+    def test_the_card_is_idle_from_the_clear(self):
+        # …not from when the run last wrote, seven hours before: the live miss
+        # read "空闲 7h21m" and closeable an hour after its Clear.
+        epic = write_jsonl(ENDED)
+        os.utime(epic, (1_000, 1_000))
+        table = {7: sessions.Proc(1, "Sl+", "pts/1", "hmz", TUI)}
+        env = {"CLAUDE_FLEET_CWD_INCLUDE": "", "CLAUDE_FLEET_CWD_EXCLUDE": ""}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(hmz, "proc_table", return_value=table), \
+             mock.patch.object(hmz, "_pid_alive", return_value=True), \
+             mock.patch.object(hmz, "_proc_start_ms", return_value=0), \
+             mock.patch.object(hmz, "_latest_epic", return_value=epic), \
+             mock.patch.object(hmz.os, "readlink", return_value=self.CWD):
+            sessions._reload_cwd_filters()
+            self.addCleanup(sessions._reload_cwd_filters)
+            self.assertEqual(hmz.list_hmz_windows()[0].updated_at, 1_000_000)
+            self._say("/clear")
+            self.assertEqual(hmz.list_hmz_windows()[0].updated_at, int(self._ms(self.CLEARED)))
+            # A repeat hmz didn't write down is on the board's stamp of it.
+            hmz.codex._cleared_at_ms[7] = int(self._ms(self.CLEARED)) + 60_000
+            self.assertEqual(hmz.list_hmz_windows()[0].updated_at, int(self._ms(self.CLEARED)) + 60_000)
 
     def test_a_run_still_going_stays(self):
         w = _window(transcript_path=str(write_jsonl(RUN)), status="busy")
