@@ -51,6 +51,15 @@ NO_RUN_NOTE = ("这个 hmz 还没开始 run，没有可显示的内容。在它�
 TYPED_NO_RUN_NOTE = ("这个 hmz 还没开始 run：下面是输入给它的行，它收下了，但没有一行启动 flow。"
                      "它为什么不跑只写在它自己的屏幕上（比如 `hmz: no such flow: …`）。")
 
+# What the timeline says while hmz sits in a menu, which only its terminal can
+# answer. A `$flow` its directory hasn't set up lands in one, holding the line.
+MENU_NOTE = ("hmz 停在菜单「{}」上，要在它的终端里操作。第一次用某个 flow 时会先弹它的配置菜单"
+             "（各角色用什么 agent、参数、预算），填完 Save 才会用你输入的那一行开跑。")
+
+# The breadcrumb hmz tops each menu with — `hmz › parallel_flame_chase › Set
+# budget for parallel_flame_chase` — and `● unsaved` beside it mid-edit.
+_CRUMB = re.compile(r"^\s*hmz › (.+?)(?:\s{2,}●.*)?\s*$")
+
 # Commands that are not the interface: `hmz exec` runs a flow headless, and
 # `hmz internal …` is the sandbox / credential plumbing under every turn.
 _HEADLESS = {"exec", "internal"}
@@ -272,6 +281,19 @@ def list_hmz_windows() -> list[Window]:
     return windows
 
 
+def menu(w: Window) -> str:
+    """Where in a menu hmz `w` stands — "parallel_flame_chase › Set budget for
+    parallel_flame_chase" — or "" when it isn't in one or is running a flow."""
+    if w.status == "busy" or not w.tty:
+        return ""
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return ""
+    lines = [l for l in tmux.capture_pane(pane).get("text", "").splitlines() if l.strip()]
+    m = _CRUMB.match(lines[0]) if lines else None
+    return m.group(1).strip() if m else ""
+
+
 def hmz_window_dicts() -> list[dict]:
     """Live hmz windows as dashboard dicts, the shape codex_window_dicts gives.
     Shell-process counts are filled in by the caller."""
@@ -283,6 +305,11 @@ def hmz_window_dicts() -> list[dict]:
         began, end = _began(events), _ended(events)
         current_task = _current_task(events, epic)
         tri = _classify_codex(w.status, d.get("idle_seconds", 0), current_task)
+        crumb = menu(w)
+        if crumb:
+            # Not waiting_perm: that card's Quick Approve would type "1" into it.
+            tri = {"triage": "stalled", "reason": f"停在菜单：{crumb}",
+                   "suggestion": "去终端填完并 Save"}
         models = _models(began)
         d.update({
             "shell_proc_count": 0,
