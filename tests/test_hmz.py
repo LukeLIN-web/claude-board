@@ -131,7 +131,106 @@ class TestPromptTaken(unittest.TestCase):
         shown.assert_called_once_with("%1", "again")
 
 
+class TestRefusal(unittest.TestCase):
+    """hmz writes a line down before reading it, so a line it refuses is taken;
+    the refusal is only on its screen, under the echo of the line."""
+
+    TYPED = "$parallel_flame_chase , bear, 帮我把 codeworld   - qwen 上 分数提高, 越高越好"
+
+    # Copied from the pane after the live miss: the echo wraps, the refusal is
+    # the next line, and the composer's own chrome sits under it.
+    def _screen(self, after_echo):
+        return "\n".join([
+            "    The agent flow system for token maxxing.",
+            "",
+            "❯ $parallel_flame_chase , bear, 帮我把 codeworld   - qwen 上 分数提高,",
+            "越高越好",
+            *after_echo,
+            "",
+            "",
+            "                                        assistant · claude/claude-opus-5-5:high",
+            "─" * 60,
+            "❯ ",
+            "─" * 60,
+            "  ◉ chat · /home/u/robot         ← monitor · ctrl+c exit",
+        ])
+
+    def _refusal(self, screen, text=TYPED):
+        with mock.patch.object(hmz.tmux, "capture_pane", return_value={"ok": True, "text": screen}):
+            return hmz.refusal("%1", text)
+
+    def test_the_red_line_under_the_echo(self):
+        self.assertEqual(self._refusal(self._screen(["hmz: no such flow: parallel_flame_chase"])),
+                         "hmz: no such flow: parallel_flame_chase")
+
+    def test_a_wrapped_refusal_is_read_whole(self):
+        self.assertEqual(
+            self._refusal(self._screen(["hmz: /monitor is only available on a run, not on",
+                                        "the chat transcript"])),
+            "hmz: /monitor is only available on a run, not on the chat transcript")
+
+    def test_nothing_said_yet(self):
+        # The composer's chrome under the echo is not hmz answering.
+        self.assertEqual(self._refusal(self._screen([])), "")
+
+    def test_what_follows_is_not_a_refusal(self):
+        self.assertEqual(self._refusal(self._screen(["● writer is working"])), "")
+
+    def test_a_refusal_of_an_earlier_line_is_not_this_ones(self):
+        screen = "\n".join(["❯ $nosuch x", "hmz: no such flow: nosuch", ""]) + "\n" + self._screen([])
+        self.assertEqual(self._refusal(screen), "")
+
+    def test_no_echo(self):
+        self.assertEqual(self._refusal(self._screen(["hmz: no such flow: x"]), "never typed"), "")
+
+
+class TestTyped(unittest.TestCase):
+    """The lines typed into one hmz, read off the history it shares with every
+    other hmz of its home."""
+
+    CWD = "/home/u/robot"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = mock.patch.object(hmz, "_home", return_value=Path(self.tmp.name))
+        home.start()
+        self.addCleanup(home.stop)
+        _jsonl(Path(self.tmp.name) / "history.jsonl", [
+            {"at": "2026-10-02T20:51:06Z", "workdir": self.CWD, "text": "before it started"},
+            {"at": "2026-10-05T00:34:40Z", "workdir": "/home/u/other", "text": "another hmz"},
+            {"at": "2026-10-05T00:34:42.806383Z", "workdir": self.CWD,
+             "text": "$parallel_flame_chase do it"},
+        ])
+        self.since = int(hmz.transcripts._parse_ts("2026-10-05T00:12:16Z") * 1000)
+
+    def test_since_it_started_in_its_directory(self):
+        self.assertEqual([d["text"] for d in hmz.typed(1, self.CWD, self.since)],
+                         ["$parallel_flame_chase do it"])
+
+    def test_a_refused_line_with_no_run_is_on_the_timeline(self):
+        ev = hmz.hmz_timeline(None, typed=hmz.typed(1, self.CWD, self.since))
+        self.assertEqual([(e["kind"], e["text"]) for e in ev],
+                         [("user_text", "$parallel_flame_chase do it")])
+
+    def test_a_line_the_run_shows_is_not_repeated(self):
+        epic = _jsonl(Path(self.tmp.name) / "run" / "epic.jsonl", [
+            {"event": "began", "at": "2026-10-05T00:35:00Z", "flow": "rlar", "task": "fix  it"},
+        ])
+        typed = [{"at": "2026-10-05T00:34:42Z", "workdir": self.CWD, "text": "$nosuch x"},
+                 {"at": "2026-10-05T00:34:59Z", "workdir": self.CWD, "text": "$rlar fix it"}]
+        self.assertEqual([e["text"] for e in hmz.hmz_timeline(epic, typed=typed)],
+                         ["$nosuch x", "$rlar fix  it"])
+
+
 class TestNoRunNote(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = mock.patch.object(hmz, "_home", return_value=Path(self.tmp.name))
+        home.start()
+        self.addCleanup(home.stop)
+
     def _window(self, transcript_path):
         return hmz.Window(pid=7, session_id="hmz-7", cwd="/home/u/proj", project_name="proj",
                           project_slug="-home-u-proj", name=None, status="idle",
@@ -145,6 +244,17 @@ class TestNoRunNote(unittest.TestCase):
             r = app.api_timeline("7")
         self.assertEqual(r["events"], [])
         self.assertEqual(r["note"], hmz.NO_RUN_NOTE)
+
+    def test_typed_into_but_no_run(self):
+        # The live miss: hmz took `$parallel_flame_chase …`, had no such flow,
+        # and the card said nothing had been typed.
+        import app
+        _jsonl(Path(self.tmp.name) / "history.jsonl", [
+            {"at": "2026-10-05T00:34:42Z", "workdir": "/home/u/proj", "text": "$nosuch x"}])
+        with mock.patch.object(app.sessions, "find_window", return_value=self._window(None)):
+            r = app.api_timeline("7")
+        self.assertEqual([e["text"] for e in r["events"]], ["$nosuch x"])
+        self.assertEqual(r["note"], hmz.TYPED_NO_RUN_NOTE)
 
     def test_no_note_once_a_run_exists(self):
         import app

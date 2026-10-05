@@ -831,12 +831,12 @@ class SendTextConfirmedTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "time", side_effect=lambda: self.now[0]),
                 mock.patch.object(tmux, "_clear_composer"), *extra]
 
-    def _send(self, landed, took, text="hello"):
+    def _send(self, landed, took, text="hello", refused=None):
         patches = self._run(mock.patch.object(tmux, "_composer_has_tail", side_effect=landed))
         for p in patches:
             p.start()
         try:
-            return tmux.send_text_confirmed("%5", text, took)
+            return tmux.send_text_confirmed("%5", text, took, refused=refused)
         finally:
             for p in reversed(patches):
                 p.stop()
@@ -902,6 +902,20 @@ class SendTextConfirmedTests(unittest.TestCase):
         self.assertIn("never landed", r["error"])
         self.assertEqual(self._enters(), [])
         self.assertEqual(len(self._literals()), 1)
+
+    def test_taken_then_refused_is_not_sent(self):
+        # The live miss: hmz wrote `$parallel_flame_chase …` to its history, then
+        # had no such flow, and the board said sent.
+        said = iter(["", "", "hmz: no such flow: parallel_flame_chase"])
+        r = self._send(lambda *a: True, took=lambda: True, refused=lambda: next(said))
+        self.assertFalse(r["ok"])
+        self.assertIn("hmz: no such flow: parallel_flame_chase", r["error"])
+        self.assertEqual(len(self._enters()), 1)
+
+    def test_taken_and_not_refused_waits_out_the_window(self):
+        r = self._send(lambda *a: True, took=lambda: True, refused=lambda: "")
+        self.assertTrue(r["ok"])
+        self.assertGreaterEqual(self.now[0] - 1000.0, tmux._CONFIRMED_REFUSAL_WAIT)
 
     def test_landing_wait_grows_with_length_and_is_capped(self):
         for n, wait in ((10, 3.03), (1000, 6.0), (100000, tmux._CONFIRMED_LANDED_MAX)):

@@ -746,6 +746,9 @@ _CONFIRMED_POLL = 0.1
 # After each Enter, how long to look for the TUI's own record of the line before
 # deciding the Enter didn't take.
 _CONFIRMED_TOOK_WAIT = 3.0
+# Once taken, how long to watch for the TUI refusing it on screen (hmz answers
+# a `$flow` it doesn't have from a worker, a moment after writing the line down).
+_CONFIRMED_REFUSAL_WAIT = 1.5
 
 
 def _shown_above_composer(pane: str, text: str, marker: str = "❯") -> bool:
@@ -783,9 +786,11 @@ def send_text_confirmed(
     text: str,
     took: Callable[[], bool],
     marker: str = "❯",
+    refused: Optional[Callable[[], str]] = None,
 ) -> dict:
     """Paste `text` into `pane` once, Enter, and succeed only when `took()` says
-    the TUI actually took the line.
+    the TUI actually took the line — and, given `refused`, didn't then answer it
+    with a refusal (what `refused()` returns) instead of acting on it.
 
     For hmz, where _send_until_landed + verify_submit lose prompts and report
     them sent (seen live: a 621-char prompt, ok returned, nothing ran). Typed a
@@ -823,7 +828,7 @@ def send_text_confirmed(
         while time.time() < until:
             time.sleep(_CONFIRMED_POLL)
             if took():
-                return {"ok": True}
+                return _not_refused(refused)
         if not _composer_has_tail(pane, text, marker):
             break  # the composer let go of it and nothing took it; Enter won't help
     stranded = _composer_has_tail(pane, text, marker)
@@ -832,3 +837,19 @@ def send_text_confirmed(
         return {"ok": False, "error": "prompt still unsent after retries"}
     return {"ok": False,
             "error": "the composer emptied but the prompt was never taken — not sent"}
+
+
+def _not_refused(refused: Optional[Callable[[], str]]) -> dict:
+    """The outcome of a line the TUI took: ok, unless it says no to it on screen.
+    Taken and refused is no send: nothing runs, and the draft is kept."""
+    if refused is None:
+        return {"ok": True}
+    until = time.time() + _CONFIRMED_REFUSAL_WAIT
+    while True:
+        said = refused()
+        if said:
+            _send_debug(f"confirmed taken, then refused: {said!r}")
+            return {"ok": False, "error": f"taken but not run — {said}"}
+        if time.time() >= until:
+            return {"ok": True}
+        time.sleep(_CONFIRMED_POLL)
