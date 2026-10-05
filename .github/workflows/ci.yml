@@ -6,8 +6,8 @@ name: CI
 #   smoke  bash scripts/smoke.sh
 # GitHub-hosted runners: this repository is public, so they cost no minutes, and a
 # self-hosted runner on a public repository would run any fork's pull request.
-# Pinned to ubuntu-24.04 rather than ubuntu-latest, which moves to Ubuntu 26 on
-# 2026-10-19: a new image is a change of its own, made here when it is wanted.
+# Each job names its Ubuntu release rather than ubuntu-latest: moving to a new
+# release is a change of its own, made here when it is wanted.
 
 on:
   push:
