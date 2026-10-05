@@ -565,6 +565,13 @@ def _discover() -> list[tuple[Window, list[dict]]]:
             # return; a long turn leaves it untouched, and `busy` says enough.
             updated_at = max(started_at, int(_mtime(epic) * 1000))
             session_id = epic.parent.name
+        # A line typed into it happens in it too, a /clear among them, and
+        # hmz writes no run for one that starts none: the card is idle from
+        # the newest of those, the board's stamp of a /clear it sent
+        # (codex.mark_cleared) included, or from the run's own last write.
+        updated_at = max([updated_at, codex.cleared_at_ms(pid)]
+                         + [int(transcripts._parse_ts(d["at"]) * 1000)
+                            for d in typed(pid, cwd, started_at)])
         windows.append((Window(
             pid=pid,
             session_id=session_id,
@@ -610,12 +617,16 @@ def hmz_window_dicts() -> list[dict]:
         first_input = str(began.get("task") or "").strip().split("\n")[0][:100]
         current_task = _current_task(events)
         last_error = f"{began.get('flow', 'run')} failed" if end.get("how") == "failed" else None
+        epic = Path(w.transcript_path) if w.transcript_path else None
         cleared = cleared_at_ms(typed(w.pid, w.cwd, w.started_at), codex.cleared_at_ms(w.pid))
         if end and _before(end.get("at", ""), cleared):
-            # Over by the clear, so off hmz's screen. A run still going stays on
-            # it, and on the card. Its models and its bill stay too, as they do
-            # on the lines round hmz's composer.
+            # Over by the clear, so off hmz's screen and off the card, its bill
+            # with it: a cleared card starts again from nothing, as a cleared
+            # Claude card does. hmz keeps the run, under /epics. A run still
+            # going stays on its screen, and on the card. The models stay, as
+            # they do on the lines round hmz's composer.
             first_input, current_task, last_error = "", "", None
+            epic, events = None, []
         tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
         crumb = menu(w)
         if crumb:
@@ -638,8 +649,7 @@ def hmz_window_dicts() -> list[dict]:
             "effort": "",
             "model_label": models,
             "model_source": "transcript" if models else "",
-            **_spending(Path(w.transcript_path) if w.transcript_path else None,
-                        events, _home(w.pid)),
+            **_spending(epic, events, _home(w.pid)),
         })
         out.append(d)
     return out
