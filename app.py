@@ -731,9 +731,10 @@ def api_history(q: str = "", page: int = 1, limit: int = 30) -> dict:
 
 @app.get("/api/history/{session_id}/timeline")
 def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
-    # Claude Code transcripts
+    # Claude Code transcripts — none at all on a host that runs only Codex or
+    # OpenCode, where there is no projects/ dir to list.
     from core.sessions import PROJECTS_DIR
-    for proj_dir in PROJECTS_DIR.iterdir():
+    for proj_dir in (PROJECTS_DIR.iterdir() if PROJECTS_DIR.is_dir() else ()):
         if not proj_dir.is_dir():
             continue
         f = proj_dir / f"{session_id}.jsonl"

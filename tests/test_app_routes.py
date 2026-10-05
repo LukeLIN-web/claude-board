@@ -217,6 +217,11 @@ class CodexHistoryTimelineTests(unittest.TestCase):
         self.assertEqual(self._prompts(self.IN), ["first page"])
         self.assertEqual(self._prompts(self.inside.stem), ["first page"])
 
+    def test_served_on_a_host_with_no_claude_projects(self):
+        # A host that runs only Codex has no ~/.claude/projects to look in first.
+        with mock.patch.object(appmod.sessions, "PROJECTS_DIR", self.root / "no-such-dir"):
+            self.assertEqual(self._prompts(self.IN), ["first page"])
+
     def test_a_paginated_thread_opens_on_its_newest_page(self):
         page = codex_rollout(self.root, self.IN, "/shared/ws/proj/x",
                              [self._prompt("second page")],
