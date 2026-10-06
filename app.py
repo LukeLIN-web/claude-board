@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, history, hmz, memory, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux
+from core import actions, auth, btwcapture, btwlog, codex, history, hmz, memory, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -621,6 +621,20 @@ def api_spawn_dirs(body: SpawnDirsBody) -> dict:
     ok = [p for p in body.paths[:200]
           if sessions._cwd_visible(p) and os.path.isdir(os.path.expanduser(p))]
     return {"ok": True, "paths": ok}
+
+
+class UsageBody(BaseModel):
+    host: str = ""
+
+
+@app.post("/api/usage")
+def api_usage(body: UsageBody) -> dict:
+    """Claude plan usage on `host`: how much of the session and weekly limits is
+    gone and when each resets (core/usage.py). Each machine has its own login,
+    so a peer's is read by the peer's board."""
+    if body.host and body.host in peers.configured():
+        return peers.forward(body.host, "POST", "/api/usage", {})
+    return usage.read_usage()
 
 
 def _send_recorded(pid: int, text: str) -> dict:

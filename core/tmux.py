@@ -11,7 +11,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 _TIMEOUT = 10
@@ -98,9 +100,39 @@ def _socket_args() -> list[str]:
     default one — so spawned cards never land next to unrelated sessions. `-L` is
     a server option and must precede the tmux command. The session within that
     server is still chosen by `_resolve_target`; the socket only picks the server.
+    A thread inside `private_server` goes to that server instead.
     """
-    name = (os.environ.get("FLEET_TMUX_SOCKET") or "").strip()
+    name = getattr(_private, "server", None) or (os.environ.get("FLEET_TMUX_SOCKET") or "").strip()
     return ["-L", name] if name else []
+
+
+# The server a thread's calls go to while it is inside `private_server`. Per
+# thread, because the board answers requests on a thread pool: one request's
+# private pane must not pull another request's send onto its server.
+_private = threading.local()
+
+
+@contextmanager
+def private_server(name: str):
+    """Send this thread's tmux calls to server `name` for the block, then kill it.
+
+    For a pane the board opens for its own use: it sits in no session a user
+    attaches to, and whatever runs in it goes with the server when the block
+    exits, however it exits. tmux leaves the socket file behind on kill-server,
+    so that goes too.
+    """
+    prev = getattr(_private, "server", None)
+    _private.server = name
+    try:
+        yield
+    finally:
+        _run("kill-server")
+        _private.server = prev
+        sock = os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}", name)
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
 
 
 # Env vars that mark the board's own virtualenv. `_spawn_env()` drops them, but a
@@ -440,6 +472,13 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
     # drive. Leave the mode now, before anyone types into it.
     exit_copy_mode(pane_id)
     return {"ok": True, "pane_id": pane_id}
+
+
+def resize_window(pane: str, cols: int, rows: int) -> dict:
+    """Size the window holding `pane`. A detached session's window is 80x24, and
+    nothing attached will ever widen it."""
+    r = _run("resize-window", "-t", pane, "-x", str(cols), "-y", str(rows))
+    return {"ok": True} if r["ok"] else {"ok": False, "error": r["error"]}
 
 
 def capture_pane(pane: str, scrollback: int = 0) -> dict:
