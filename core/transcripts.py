@@ -47,18 +47,21 @@ _TN_EVENT_RE = re.compile(r"<event>\s*(.*?)\s*</event>", re.DOTALL)
 def is_injected_user_row(d: dict) -> bool:
     """True when a `user` row is the harness talking, not a person typing.
 
-    Three row-level markers, because the CLI added them at different times and a
+    Four row-level markers, because the CLI added them at different times and a
     fleet runs several versions at once:
 
       - `isMeta` — a skill's SKILL.md body, a local-command caveat.
       - `promptSource: "system"` — the harness speaking in the user's turn.
       - `origin.kind == "task-notification"` — a background task reporting back.
+      - `isCompactSummary` — the summary a compact leaves in place of the
+        conversation ("This session is being continued from a previous
+        conversation…"), written as the next user turn.
 
-    A prompt typed on an older CLI carries none of the three, so the test has to
+    A prompt typed on an older CLI carries none of them, so the test has to
     stay negative: unmarked means typed. `is_injected_text` catches the rows
     that arrive with no marker at all.
     """
-    if d.get("isMeta") or d.get("promptSource") == "system":
+    if d.get("isMeta") or d.get("promptSource") == "system" or d.get("isCompactSummary"):
         return True
     origin = d.get("origin")
     return isinstance(origin, dict) and origin.get("kind") == "task-notification"

@@ -135,11 +135,12 @@ available.
 | Fork | `claude --resume <sid> --fork-session` — new session inherits the history |
 | Resume | `claude --resume <sid>` — continue the original session (from the history list) |
 | Review | send `/humanize:ask-codex review` into the session (Linux + tmux) |
+| Compact | send `/compact` — the session swaps its conversation for a summary of it and carries on from there, unlike Clear (Linux + tmux; not on hmz cards) |
 | Close | SIGTERM — available on every card |
 
 On **Codex** cards the platform-agnostic controls (Close, Send a prompt, Esc,
-Commit, Clear) work the same way — Codex has its own `/clear` ("clear the
-terminal and start a new chat"), so the same command serves both. The
+Commit, Clear, Compact) work the same way — Codex has its own `/clear` ("clear the
+terminal and start a new chat") and `/compact`, so the same commands serve both. The
 Claude-specific controls (Fork, Review, and the permission quick-approve) are
 hidden, since they rely on Claude slash commands or the `claude` binary.
 
@@ -292,7 +293,7 @@ Single-file frontend (Alpine.js + Tailwind via CDN — no npm). The Python backe
 never writes to the stored harness data under `~/.claude/` and `~/.codex/` — that
 data stays read-only. It is read-only **by default**: a few explicit,
 user-triggered actions (fork, close, and the tmux-backed session spawn /
-single-prompt injection on Linux, including the Clear/Commit/Review prompt
+single-prompt injection on Linux, including the Clear/Compact/Commit/Review prompt
 shortcuts) act on live sessions, never on the stored data.
 
 ```

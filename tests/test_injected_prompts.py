@@ -95,6 +95,26 @@ class InjectedRowTests(unittest.TestCase):
         self.assertNotIn("meta", ev["extra"])
 
 
+    def test_a_compact_summary_is_not_a_prompt(self):
+        # What a /compact leaves behind, as the CLI writes it (seen on v2.1.263):
+        # the summary as the next user turn, flagged only by isCompactSummary.
+        # Until the session answered again, the card read "↳ This session is
+        # being continued from a previous conversation…" as what it was asked.
+        summary = ("This session is being continued from a previous conversation "
+                   "that ran out of context. The summary below covers the earlier "
+                   "portion of the conversation.\n\nSummary:\n1. Primary Request")
+        p = write_jsonl([
+            user_row("跑一下 eval"),
+            {"type": "system", "subtype": "compact_boundary",
+             "content": "Conversation compacted", "timestamp": "2026-09-07T01:01:16Z"},
+            user_row(summary, isCompactSummary=True, isVisibleInTranscriptOnly=True),
+        ])
+        evs = transcripts.timeline(p)
+        self.assertEqual(_last_prompt(evs), "跑一下 eval")
+        self.assertTrue(evs[-1]["extra"]["meta"])
+        self.assertEqual(transcripts.current_task_hint(p), "↳ 跑一下 eval")
+
+
 class QueuedNotificationTests(unittest.TestCase):
     """Claude queues its own notifications, and they outnumber typed prompts
     there about four to one. The attachment carries no marker — the envelope in
