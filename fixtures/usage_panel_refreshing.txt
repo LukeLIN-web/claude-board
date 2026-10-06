@@ -1,0 +1,30 @@
+ ▝▝   ▝▝   /work/claude-board/.usage-probe
+
+ tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus trac… ▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0000
+   Total duration (API):  0s
+   Total duration (wall): 1s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+   Current session
+   ██                                                 4% used
+   Resets 1:20pm (America/Los_Angeles)
+
+   Current week (all models)
+   ███████████▌                                       23% used
+   Resets Oct 11, 7pm (America/Los_Angeles)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or
+   claude.ai
+
+   Scanning local sessions…
+
+   Refreshing…
+
+   Esc to cancel

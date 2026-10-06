@@ -1,0 +1,50 @@
+ ▝▝   ▝▝   /work/claude-board/.usage-probe
+
+ tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus trac… ▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0000
+   Total duration (API):  0s
+   Total duration (wall): 1s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+   Current session
+   ██▌                                                5% used
+   Resets 1:19pm (America/Los_Angeles)
+
+   Current week (all models)
+   ███████████▌                                       23% used
+   Resets Oct 11, 6:59pm (America/Los_Angeles)
+
+   Current week (Fable)
+   ███████                                            14% used
+   Resets Oct 11, 6:59pm (America/Los_Angeles)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or
+   claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   83% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   71% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   62% of your usage came from sessions active for 8+ hours
+    These are often background/loop sessions. Continuous usage can add up quickly
+    so make sure it is intentional.
+
+   25% of your usage was while 4+ sessions ran in parallel
+    All sessions share one limit. If you don't need them all at once, queueing uses
+    it more evenly.
+
+   12% of your usage came from subagents under "general-purpose"
+    If this runs frequently, consider configuring its subagents with a cheaper
+    model or tightening their prompts.                                                            ↓

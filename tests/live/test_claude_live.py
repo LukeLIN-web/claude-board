@@ -9,12 +9,14 @@ text. These tests take sessions through the board's own code paths:
   a spawn into a never-trusted directory gets its trust prompt answered;
   then one session, in file order: card found → banner read → prompt lands and
   is answered → a prompt sent over an open Rewind panel lands → the /model
-  dialog commits a pick.
+  dialog commits a pick. Apart from those, the usage probe starts a throwaway
+  session of its own and reads /status and /usage off it.
 
 Per CLAUDE.md, sessions run on haiku and every prompt here goes to one of them.
 They run on a tmux server of their own (`tmux -L claude-board-live-<pid>`), so
 nothing here can type into a pane someone is working in, and that server is
-killed at the end. The run costs two short haiku turns.
+killed at the end. The run costs two short haiku turns; the usage probe's
+commands reach no model.
 
     pytest tests/live --run-live -v
 
@@ -34,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from core import actions, sessions, tmux, transcripts
+from core import actions, sessions, tmux, transcripts, usage
 
 pytestmark = [pytest.mark.live, pytest.mark.timeout(300)]
 
@@ -215,3 +217,13 @@ def test_model_dialog_commits_a_pick(live):
     assert r.get("ok"), f"switch failed: {r}"
     assert "haiku" in r["model"].lower()
     assert actions._model_dialogs_closed(_pane_text(live))
+
+
+def test_usage_probe_reads_the_limits(version):
+    # Its own session on its own tmux server, so it needs neither fixture.
+    r = usage.read_usage()
+    if not r.get("ok") and "no limits on Claude's /usage panel" in r.get("error", ""):
+        pytest.skip(f"this login has no plan limits: {r['error']}")
+    assert r.get("ok"), f"usage probe failed: {r}"
+    assert r["limits"] and all(0 <= lim["used"] <= 100 for lim in r["limits"])
+    assert r["account"].get("login"), "the /status tab gave no login method"

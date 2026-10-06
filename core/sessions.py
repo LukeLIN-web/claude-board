@@ -22,6 +22,12 @@ CLAUDE_HOME = HOME_BASE / ".claude"
 SESSIONS_DIR = CLAUDE_HOME / "sessions"
 PROJECTS_DIR = CLAUDE_HOME / "projects"
 
+# Where core/usage.py runs the throwaway claude it reads /usage from. It is a
+# live claude with a session file like any other, so discovery would card it for
+# the seconds it lives; `_cwd_visible` keeps it off the board instead. Inside the
+# repo so it inherits whatever folder trust the board's own directory has.
+PROBE_CWD = Path(__file__).resolve().parents[1] / ".usage-probe"
+
 
 def _cwd_to_project_slug(cwd: str) -> str:
     """Mirror Claude Code's project-dir naming: / _ . all become -"""
@@ -81,7 +87,10 @@ def _under(cwd: str, prefix: str) -> bool:
 
 
 def _cwd_visible(cwd: str) -> bool:
-    """Whether a session with this working dir passes the machine-local filter."""
+    """Whether a session with this working dir passes the machine-local filter.
+    The board's own usage probe (core/usage.py) never does, whatever the filter."""
+    if cwd and _under(cwd, str(PROBE_CWD)):
+        return False
     if _CWD_EXCLUDE and any(_under(cwd, p) for p in _CWD_EXCLUDE):
         return False
     if _CWD_INCLUDE and not any(_under(cwd, p) for p in _CWD_INCLUDE):

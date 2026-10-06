@@ -81,6 +81,48 @@
             class="text-xs border px-2 py-1 rounded hover:bg-purple-50 transition"
             :class="showMemory ? 'border-purple-400 text-purple-600 bg-purple-50' : 'border-gray-200 text-gray-600'">
       Memory</button>
+    <!-- Plan usage: each machine's board opens a throwaway claude, reads
+         /status and /usage, and closes it (core/usage.py). Per machine because
+         each has its own login. -->
+    <div class="relative" @click.outside="showUsage = false">
+      <button @click="showUsage = !showUsage; if (showUsage) loadUsage()"
+              class="text-xs border px-2 py-1 rounded hover:bg-amber-50 transition"
+              :class="showUsage ? 'border-amber-400 text-amber-700 bg-amber-50' : 'border-gray-200 text-gray-600'">
+        Usage</button>
+      <div x-show="showUsage" x-cloak
+           class="absolute left-0 mt-1 w-96 bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-3">
+        <template x-for="h in usageHosts" :key="h">
+          <div class="text-xs">
+            <div class="flex items-center gap-2 mb-1.5">
+              <span class="font-semibold shrink-0" x-show="usageHosts.length > 1" x-text="h"></span>
+              <span class="text-gray-500 truncate" x-text="usageAccount(h)"></span>
+              <span class="ml-auto text-gray-400 shrink-0" x-text="usageStamp(h)"></span>
+            </div>
+            <div x-show="usage[h]?.loading && !usage[h]?.data" class="text-gray-400">Opening claude → /usage…</div>
+            <div x-show="usage[h]?.error" class="text-red-600 break-words" x-text="usage[h]?.error"></div>
+            <template x-for="l in (usage[h]?.data?.limits || [])" :key="l.label">
+              <div class="mb-2" :class="usage[h]?.loading ? 'opacity-50' : ''">
+                <div class="flex justify-between gap-2">
+                  <span class="text-gray-700" x-text="l.label"></span>
+                  <span class="font-medium shrink-0" :class="usageTone(l.used).text"
+                        x-text="l.used + '% used · ' + (100 - l.used) + '% left'"></span>
+                </div>
+                <div class="h-1.5 bg-gray-100 rounded overflow-hidden my-0.5">
+                  <div class="h-full rounded" :class="usageTone(l.used).bar"
+                       :style="`width:${Math.min(100, l.used)}%`"></div>
+                </div>
+                <div class="text-[10px] text-gray-400" x-show="l.resets" x-text="'resets ' + l.resets"></div>
+              </div>
+            </template>
+            <div class="text-[10px] text-amber-600" x-show="usage[h]?.data?.refreshing">
+              Claude was still refreshing: these are the numbers it had cached.</div>
+          </div>
+        </template>
+        <div class="flex justify-end">
+          <button @click="loadUsage()" class="text-xs text-gray-500 hover:text-gray-800">↻ Refresh</button>
+        </div>
+      </div>
+    </div>
     <!-- New session (tmux spawn) — hidden when tmux is unavailable -->
     <div class="relative" x-show="tmuxAvailable" @click.outside="showSpawn = false">
       <button @click="showSpawn = !showSpawn; if (showSpawn) refreshSpawnDirs()"
@@ -1143,6 +1185,9 @@ function fleet() {
     // another. Only meaningful when peers are configured (see `hosts`).
     spawnHost: '',
     spawnOtherDirs: { host: '', paths: [] },
+    showUsage: false,
+    // Plan usage per machine (POST /api/usage): host -> {loading, data, error}.
+    usage: {},
     promptDrafts: {},
     promptSending: {},
     permSending: {},
@@ -1213,6 +1258,37 @@ function fleet() {
       if (d.ok && host === (this.spawnHost || this.localHost)) {
         this.spawnOtherDirs = { host, paths: d.paths || [] };
       }
+    },
+
+    // Every machine's usage is read on its own board, all at once. A refresh
+    // keeps the last numbers on screen, dimmed, until the new ones are in.
+    get usageHosts() {
+      return this.hosts.length ? this.hosts.map(h => h.host) : [this.localHost];
+    },
+    loadUsage() {
+      for (const host of this.usageHosts) this._loadUsageFor(host);
+    },
+    async _loadUsageFor(host) {
+      const prev = this.usage[host] || {};
+      if (prev.loading) return;
+      this.usage[host] = { ...prev, loading: true, error: '' };
+      const d = await this.apiPost('/api/usage', { host });
+      this.usage[host] = d.ok ? { data: d, loading: false, error: '' }
+                              : { data: prev.data, loading: false, error: d.error || 'failed' };
+    },
+    usageAccount(host) {
+      const a = this.usage[host]?.data?.account || {};
+      return [a.login, a.email].filter(Boolean).join(' · ');
+    },
+    usageStamp(host) {
+      const u = this.usage[host] || {};
+      if (u.loading) return 'reading…';
+      return u.data ? new Date(u.data.at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    },
+    usageTone(used) {
+      return used >= 90 ? { bar: 'bg-red-500', text: 'text-red-600' }
+           : used >= 70 ? { bar: 'bg-amber-500', text: 'text-amber-600' }
+           : { bar: 'bg-emerald-500', text: 'text-gray-700' };
     },
 
     get waitingWindows() {

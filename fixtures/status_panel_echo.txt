@@ -1,0 +1,27 @@
+ ▐▛███▛█   Claude Code v2.1.291
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /work/claude-board/.usage-probe
+
+
+❯ /status
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Settings  Status   Config   Usage   Stats
+
+  Version:           2.1.291
+  Session name:      /rename to add a name
+  Session ID:        00000000-0000-4000-8000-000000000000
+  Session kind:      interactive
+  Peer address:      uds:/run/user/1000/cc-socks/1000.sock
+  cwd:               /work/claude-board/.usage-probe
+  Login method:      Claude Max account
+  Organization:      someone@example.com's Organization
+  Email:             someone@example.com
+  Cloud sessions:    GitHub connected
+
+  Model:             haiku (claude-haiku-4-5-20251001)
+  MCP servers:       3 connected, 8 need auth, 4 failed · /mcp
+  Setting sources:   User settings
+  Auto mode server:  Disabled
+
+  Esc to cancel
