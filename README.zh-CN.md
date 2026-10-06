@@ -108,6 +108,7 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 | Fork | `claude --resume <sid> --fork-session`，新 session 继承对话历史 |
 | Resume | `claude --resume <sid>`，继续原 session（在历史列表里）|
 | Review | 向 session 发送 `/humanize:ask-codex review`（Linux + tmux）|
+| Compact | 发送 `/compact`：session 把之前的对话换成一份摘要，在摘要上接着做；和 Clear 不同，上下文不丢（Linux + tmux；hmz 卡片没有）|
 | Close | SIGTERM——每张卡片都有 |
 
 **Codex** 卡片上，平台无关的操作（Close、发 prompt、Esc、Commit）照常工作；Claude 专属的（Fork、Review、Clear、快速批准 permission）会隐藏，因为它们依赖 Claude 的斜杠命令或 `claude` 二进制。
@@ -239,7 +240,7 @@ Skills / Memory 目前仍然只显示聚合机本身的数据。
 
 ## 架构
 
-单文件前端（Alpine.js + Tailwind CDN，不需要 npm）。Python 后端从不写入 `~/.claude/` 和 `~/.codex/` 中存储的 harness 数据——这些数据保持只读。它**默认只读**：少数显式的、用户触发的操作（fork、close，以及 Linux 上基于 tmux 的新建会话 / 单条 prompt 注入，包括 Clear/Commit/Review 这几个 prompt 快捷按钮）作用于运行中的会话，而非存储的数据。
+单文件前端（Alpine.js + Tailwind CDN，不需要 npm）。Python 后端从不写入 `~/.claude/` 和 `~/.codex/` 中存储的 harness 数据——这些数据保持只读。它**默认只读**：少数显式的、用户触发的操作（fork、close，以及 Linux 上基于 tmux 的新建会话 / 单条 prompt 注入，包括 Clear/Compact/Commit/Review 这几个 prompt 快捷按钮）作用于运行中的会话，而非存储的数据。
 
 ```
 app.py                FastAPI + SSE (2s 轮询)

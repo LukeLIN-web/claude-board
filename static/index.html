@@ -463,6 +463,11 @@
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
             Clear</button>
+          <!-- hmz has nothing to compact: each run's agents are made for that run. -->
+          <button x-show="tmuxAvailable && w.platform !== 'hmz'" @click="sendCanned(w.key, '/compact', 'Compact')" :disabled="!!promptSending[w.key]"
+                  class="text-xs border border-sky-200 text-sky-600 px-2 py-1 rounded hover:bg-sky-50 transition disabled:opacity-50 disabled:cursor-wait"
+                  title="Send /compact: replace the conversation with a summary of it, freeing context. Unlike Clear, the session keeps the thread">
+            Compact</button>
           <button x-show="tmuxAvailable" @click="sendCanned(w.key, 'commit and push', 'Commit')" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Ask this session to commit and push">
@@ -1700,7 +1705,7 @@ function fleet() {
                       { ok: 'Sent /clear', fail: 'Clear failed: ', busy: this.promptSending, key });
     },
 
-    // A card button's canned prompt (Commit, Review), held under the same
+    // A card button's canned prompt (Commit, Review, Compact), held under the same
     // per-card flag as Send so it can't interleave with a typed prompt.
     sendCanned(key, text, what) {
       return this.act(`/api/windows/${key}/prompt`,
