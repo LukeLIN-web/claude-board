@@ -36,7 +36,7 @@ The everyday pain of multi-window vibe coding:
 - **You can't find that session from last week** → full-text search returns in ~50ms with VS Code–style match context.
 - **You don't know how much a skill actually gets used** → 3-dimensional stats (invokes + file read/write + bash references).
 - **You don't know who touched a memory** → in-degree (↓ sessions that read it) + out-degree (↑ sessions that wrote it).
-- **You don't know how much of your plan is left** → the **Usage** button opens a throwaway `claude` on each machine, reads `/status` and `/usage`, and shows how much of the session and weekly limits is used and when each resets. Neither command calls the model (Linux + tmux).
+- **You don't know how much of your plan is left** → the **Usage** button opens a throwaway `claude` on each machine, reads `/status` and `/usage`, and shows how much of the session and weekly limits is used and when each resets. Neither command calls the model (Linux + tmux). Where codex is installed, Codex's account and limits sit next to Claude's, read off `codex app-server` without a turn either.
 
 ## Core features
 
@@ -307,7 +307,7 @@ core/
   search.py           cross-platform ripgrep search
   actions.py          focus / fork / close / spawn / send-prompt
   peers.py            multi-host: poll peer boards, forward card actions
-  usage.py            plan usage: read /status + /usage off a throwaway claude
+  usage.py            plan usage: /status + /usage off a throwaway claude; Codex's off codex app-server
   tmux.py             tmux backend: spawn window + inject prompt (Linux)
   history.py          unified index + full-text rg search
   skills.py           skill directory scan

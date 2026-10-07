@@ -625,16 +625,17 @@ def api_spawn_dirs(body: SpawnDirsBody) -> dict:
 
 class UsageBody(BaseModel):
     host: str = ""
+    cli: str = "claude"
 
 
 @app.post("/api/usage")
 def api_usage(body: UsageBody) -> dict:
-    """Claude plan usage on `host`: how much of the session and weekly limits is
-    gone and when each resets (core/usage.py). Each machine has its own login,
+    """`cli`'s plan usage on `host`, Claude's or Codex's: how much of each limit
+    is gone and when it resets (core/usage.py). Each machine has its own login,
     so a peer's is read by the peer's board."""
     if body.host and body.host in peers.configured():
-        return peers.forward(body.host, "POST", "/api/usage", {})
-    return usage.read_usage()
+        return peers.forward(body.host, "POST", "/api/usage", {"cli": body.cli})
+    return usage.read_usage(body.cli)
 
 
 def _send_recorded(pid: int, text: str) -> dict:

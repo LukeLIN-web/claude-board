@@ -82,40 +82,45 @@
             :class="showMemory ? 'border-purple-400 text-purple-600 bg-purple-50' : 'border-gray-200 text-gray-600'">
       Memory</button>
     <!-- Plan usage: each machine's board opens a throwaway claude, reads
-         /status and /usage, and closes it (core/usage.py). Per machine because
-         each has its own login. -->
+         /status and /usage, and closes it, and asks codex app-server for
+         Codex's (core/usage.py). Per machine because each has its own login. -->
     <div class="relative" @click.outside="showUsage = false">
       <button @click="showUsage = !showUsage; if (showUsage) loadUsage()"
               class="text-xs border px-2 py-1 rounded hover:bg-amber-50 transition"
               :class="showUsage ? 'border-amber-400 text-amber-700 bg-amber-50' : 'border-gray-200 text-gray-600'">
         Usage</button>
       <div x-show="showUsage" x-cloak
-           class="absolute left-0 mt-1 w-96 bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-3">
+           class="absolute left-0 mt-1 w-96 max-h-[80vh] overflow-y-auto bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-3">
         <template x-for="h in usageHosts" :key="h">
-          <div class="text-xs">
-            <div class="flex items-center gap-2 mb-1.5">
-              <span class="font-semibold shrink-0" x-show="usageHosts.length > 1" x-text="h"></span>
-              <span class="text-gray-500 truncate" x-text="usageAccount(h)"></span>
-              <span class="ml-auto text-gray-400 shrink-0" x-text="usageStamp(h)"></span>
-            </div>
-            <div x-show="usage[h]?.loading && !usage[h]?.data" class="text-gray-400">Opening claude → /usage…</div>
-            <div x-show="usage[h]?.error" class="text-red-600 break-words" x-text="usage[h]?.error"></div>
-            <template x-for="l in (usage[h]?.data?.limits || [])" :key="l.label">
-              <div class="mb-2" :class="usage[h]?.loading ? 'opacity-50' : ''">
-                <div class="flex justify-between gap-2">
-                  <span class="text-gray-700" x-text="l.label"></span>
-                  <span class="font-medium shrink-0" :class="usageTone(l.used).text"
-                        x-text="l.used + '% used · ' + (100 - l.used) + '% left'"></span>
+          <div class="text-xs flex flex-col gap-2">
+            <div class="font-semibold" x-show="usageHosts.length > 1" x-text="h"></div>
+            <template x-for="c in USAGE_CLIS" :key="c.cli">
+              <div x-show="!usageOf(h, c.cli).missing">
+                <div class="flex items-center gap-2 mb-1.5">
+                  <span class="font-medium shrink-0" x-text="c.name"></span>
+                  <span class="text-gray-500 truncate" x-text="usageAccount(h, c.cli)"></span>
+                  <span class="ml-auto text-gray-400 shrink-0" x-text="usageStamp(h, c.cli)"></span>
                 </div>
-                <div class="h-1.5 bg-gray-100 rounded overflow-hidden my-0.5">
-                  <div class="h-full rounded" :class="usageTone(l.used).bar"
-                       :style="`width:${Math.min(100, l.used)}%`"></div>
-                </div>
-                <div class="text-[10px] text-gray-400" x-show="l.resets" x-text="'resets ' + l.resets"></div>
+                <div x-show="usageOf(h, c.cli).loading && !usageOf(h, c.cli).data" class="text-gray-400" x-text="c.reading"></div>
+                <div x-show="usageOf(h, c.cli).error" class="text-red-600 break-words" x-text="usageOf(h, c.cli).error"></div>
+                <template x-for="l in (usageOf(h, c.cli).data?.limits || [])" :key="l.label">
+                  <div class="mb-2" :class="usageOf(h, c.cli).loading ? 'opacity-50' : ''">
+                    <div class="flex justify-between gap-2">
+                      <span class="text-gray-700" x-text="l.label"></span>
+                      <span class="font-medium shrink-0" :class="usageTone(l.used).text"
+                            x-text="l.used + '% used · ' + (100 - l.used) + '% left'"></span>
+                    </div>
+                    <div class="h-1.5 bg-gray-100 rounded overflow-hidden my-0.5">
+                      <div class="h-full rounded" :class="usageTone(l.used).bar"
+                           :style="`width:${Math.min(100, l.used)}%`"></div>
+                    </div>
+                    <div class="text-[10px] text-gray-400" x-show="l.resets" x-text="'resets ' + l.resets"></div>
+                  </div>
+                </template>
+                <div class="text-[10px] text-amber-600" x-show="usageOf(h, c.cli).data?.refreshing">
+                  Claude was still refreshing: these are the numbers it had cached.</div>
               </div>
             </template>
-            <div class="text-[10px] text-amber-600" x-show="usage[h]?.data?.refreshing">
-              Claude was still refreshing: these are the numbers it had cached.</div>
           </div>
         </template>
         <div class="flex justify-end">
@@ -1183,7 +1188,8 @@ function fleet() {
     spawnHost: '',
     spawnOtherDirs: { host: '', paths: [] },
     showUsage: false,
-    // Plan usage per machine (POST /api/usage): host -> {loading, data, error}.
+    // Plan usage per machine and CLI (POST /api/usage):
+    // 'host/cli' -> {loading, data, error} or {missing}.
     usage: {},
     promptDrafts: {},
     promptSending: {},
@@ -1257,28 +1263,49 @@ function fleet() {
       }
     },
 
-    // Every machine's usage is read on its own board, all at once. A refresh
-    // keeps the last numbers on screen, dimmed, until the new ones are in.
+    // Every machine's usage is read on its own board, Claude's and Codex's at
+    // once. A refresh keeps the last numbers on screen, dimmed, until the new
+    // ones are in. A machine without codex shows no Codex block, and neither
+    // does one whose board predates reading it: that board answers for Claude
+    // whatever it was asked, so a reading is taken only for the CLI it names.
+    // An error names none (a peer that could not be reached), and is shown.
+    USAGE_CLIS: [
+      { cli: 'claude', name: 'Claude', reading: 'Opening claude → /usage…' },
+      { cli: 'codex', name: 'Codex', reading: 'Asking codex app-server…' },
+    ],
     get usageHosts() {
       return this.hosts.length ? this.hosts.map(h => h.host) : [this.localHost];
     },
-    loadUsage() {
-      for (const host of this.usageHosts) this._loadUsageFor(host);
+    // This board's own readings are filed under '' whatever it is called: a
+    // #usage deep link reads before the first snapshot has named it.
+    _usageKey(host, cli) {
+      return (host === this.localHost ? '' : host) + '/' + cli;
     },
-    async _loadUsageFor(host) {
-      const prev = this.usage[host] || {};
+    usageOf(host, cli) {
+      return this.usage[this._usageKey(host, cli)] || {};
+    },
+    // `unread`: only the machines not read yet, for one a snapshot just showed.
+    loadUsage(unread = false) {
+      for (const host of this.usageHosts)
+        for (const c of this.USAGE_CLIS)
+          if (!unread || !this.usage[this._usageKey(host, c.cli)]) this._loadUsageFor(host, c.cli);
+    },
+    async _loadUsageFor(host, cli) {
+      const key = this._usageKey(host, cli);
+      const prev = this.usage[key] || {};
       if (prev.loading) return;
-      this.usage[host] = { ...prev, loading: true, error: '' };
-      const d = await this.apiPost('/api/usage', { host });
-      this.usage[host] = d.ok ? { data: d, loading: false, error: '' }
-                              : { data: prev.data, loading: false, error: d.error || 'failed' };
+      this.usage[key] = { ...prev, loading: true, error: '' };
+      const d = await this.apiPost('/api/usage', { host, cli });
+      this.usage[key] = d.missing || (d.ok && (d.cli || 'claude') !== cli) ? { missing: true }
+                      : d.ok ? { data: d, loading: false, error: '' }
+                      : { data: prev.data, loading: false, error: d.error || 'failed' };
     },
-    usageAccount(host) {
-      const a = this.usage[host]?.data?.account || {};
+    usageAccount(host, cli) {
+      const a = this.usageOf(host, cli).data?.account || {};
       return [a.login, a.email].filter(Boolean).join(' · ');
     },
-    usageStamp(host) {
-      const u = this.usage[host] || {};
+    usageStamp(host, cli) {
+      const u = this.usageOf(host, cli);
       if (u.loading) return 'reading…';
       return u.data ? new Date(u.data.at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
     },
@@ -1434,12 +1461,13 @@ function fleet() {
       }, ms);
     },
 
-    // Deep-link panels via URL hash: #skills, #memory, #search=<q>, #timeline=<sid>
+    // Deep-link panels via URL hash: #skills, #memory, #usage, #search=<q>, #timeline=<sid>
     _applyHashRoute() {
       const h = decodeURIComponent((location.hash || '').replace(/^#/, ''));
       if (!h) return;
       if (h === 'skills') { this.showSkills = true; this.loadSkills(); }
       else if (h === 'memory') { this.showMemory = true; this.loadMemory(); }
+      else if (h === 'usage') { this.showUsage = true; this.loadUsage(); }
       else if (h.startsWith('search=')) { this.searchQuery = h.slice(7); this.doSearch(); }
       else if (h.startsWith('timeline=')) { this.openHistoryTimeline(h.slice(9)); }
     },
@@ -1453,6 +1481,7 @@ function fleet() {
       }
       this.peers = snap.peers || [];
       this.hosts = this._hostRows();
+      if (this.showUsage) this.loadUsage(true);
       this.counts = snap.counts || this.counts;
       if ('tmux_available' in snap) this.tmuxAvailable = !!snap.tmux_available;
       // If a live session's timeline is open and its activity advanced (the
