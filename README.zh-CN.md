@@ -29,7 +29,7 @@ cd claude-board && bash run.sh
 - **想找上周某个 session** → 全文搜索 50ms 返回，带 VS Code 风格匹配上下文
 - **Skill 用了多少次不知道** → 三维统计（invoke + file read/write + bash 引用）
 - **Memory 被谁改过** → 入度（↓被几个 session 参考）+ 出度（↑被几个 session 修改）
-- **不知道套餐额度还剩多少** → 点 **Usage**，每台机器各开一个临时 `claude`，读 `/status` 和 `/usage`，显示 session 和每周额度用了多少、剩多少、几点重置；这两个命令不调用模型（Linux + tmux）
+- **不知道套餐额度还剩多少** → 点 **Usage**，每台机器各开一个临时 `claude`，读 `/status` 和 `/usage`，显示 session 和每周额度用了多少、剩多少、几点重置；这两个命令不调用模型（Linux + tmux）。装了 codex 的机器同时问 `codex app-server` 要 Codex 的账号和额度，同样不调用模型
 
 ## 核心功能
 
@@ -253,7 +253,7 @@ core/
   search.py           ripgrep 跨平台搜索
   actions.py          focus / fork / close / 新建 / 发 prompt
   peers.py            多机：轮询对端 board、转发卡片操作
-  usage.py            套餐用量：开临时 claude 读 /status + /usage
+  usage.py            套餐用量：开临时 claude 读 /status + /usage；codex app-server 读 Codex 额度
   tmux.py             tmux 后端：新建窗口 + 注入 prompt（Linux）
   history.py          统一索引 + 全文 rg 搜索
   skills.py           skill 目录扫描
