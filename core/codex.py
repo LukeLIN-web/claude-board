@@ -407,18 +407,22 @@ def find_rollout(session_id: str) -> Optional[Path]:
     return best
 
 
-def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0) -> list[dict]:
+def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
+                   tail: int = 0) -> list[dict]:
     """Parse Codex JSONL into TurnEvent-compatible dicts.
 
     `since_ms` (set after a card's Clear) drops events older than the clear, so
     the timeline reflects the cleared session rather than the untouched rollout.
+    `tail`, when set, reads only the rollout's last that many lines.
     """
     p = Path(path)
     if not p.exists():
         return []
     events: list[dict] = []
     try:
-        for d in _records(p):
+        rows = (d for d in transcripts._tail_lines(p, tail) if isinstance(d, dict)) if tail \
+            else _records(p)
+        for d in rows:
             t = d.get("type")
             ts = d.get("timestamp", "")
             if _before_clear(ts, since_ms):

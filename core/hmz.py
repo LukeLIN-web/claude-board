@@ -13,17 +13,21 @@ stopped). <workspace> is the cwd with every non-alphanumeric character turned
 into "-", and the TUI reopens on the newest run of its directory — so the card
 reads that one: begun and not ended means a flow is running.
 
-The run's course on the card — its timeline, and what it is on now — comes
-from that epic alone: what it began on, each session opened, each flow it called
-and when that returned, how it ended. Beside it hmz keeps far more: a record per
-called flow (epic.<flow>_<id>.jsonl), every session its agents opened
-(sessions/), the engine's journal (resume.jsonl). A long run piles up hundreds of
-those and tens of MB, and reading them all on every refresh once kept a host's
-board from answering at all; what the agents said is for hmz's own screen.
+The run's course on the card — what it is on now, and the run's own lines on
+its timeline — comes from that epic: what it began on, each session opened, each
+flow it called and when that returned, how it ended. Beside it hmz keeps far
+more: a record per called flow (epic.<flow>_<id>.jsonl), every session its agents
+opened (sessions/), the engine's journal (resume.jsonl). A long run piles up
+hundreds of those and tens of MB, and reading them all on every refresh once
+kept a host's board from answering at all. The records and the journal are not
+read. What the agents said is, but only the newest of it: the tails of the
+session logs written last (see _said). An `opened` line is written once a
+session's first turn has landed, so a flow an hour into its first turn has
+nothing on the epic past `began`, while its log has been filling all along.
 
 What a run spends is on the card too. hmz's status bar bills a run as it goes
 off the logs its agents write — each turn's tokens by kind, priced per model
-from its copy of openllmprices.com, <home>/prices.json — and the card reads the
+from its copy of openllmprices.com (see _price_list) — and the card reads the
 same logs the same way while the run is on: every log under its sessions/,
 <cli>/ laid out as that CLI lays out its home, each read on from where the last
 poll stopped (see _spending). A run that is over carries hmz's own figures
@@ -113,18 +117,19 @@ def _is_interactive_hmz(args: str) -> bool:
     return False
 
 
-def _home(pid: int) -> Path:
-    """Where hmz `pid` keeps its runs and its history."""
+def _environ(pid: int) -> dict[str, str]:
+    """The environment hmz `pid` was started with, or {} where it can't be read."""
     try:
         env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
     except OSError:
-        env = []
-    for kv in env:
-        if kv.startswith(b"HUMANIZE_HOME="):
-            v = kv.split(b"=", 1)[1].decode(errors="replace")
-            if v:
-                return Path(v)
-    return _default_home()
+        return {}
+    return dict(kv.decode(errors="replace").split("=", 1) for kv in env if b"=" in kv)
+
+
+def _home(pid: int) -> Path:
+    """Where hmz `pid` keeps its runs and its history."""
+    v = _environ(pid).get("HUMANIZE_HOME")
+    return Path(v) if v else _default_home()
 
 
 def _default_home() -> Path:
@@ -183,6 +188,27 @@ def _mtime(p: Path) -> float:
         return p.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _machine(pid: int) -> Path:
+    """Where hmz `pid` keeps what is this machine's alone, as hmz's own
+    `machine()` has it: humanize-<uid> in its temporary directory — the first
+    of $TMPDIR, $TEMP and $TMP that is a directory, else /tmp, as Python's
+    tempfile looks for one."""
+    env = _environ(pid)
+    tmp = next((v for v in (env.get(k) for k in ("TMPDIR", "TEMP", "TMP"))
+                if v and os.path.isdir(v)), "/tmp")
+    return Path(tmp) / f"humanize-{os.getuid()}"
+
+
+def _price_list(pid: int) -> Path:
+    """hmz `pid`'s copy of the price list. hmz keeps it in its machine's
+    directory now (_machine) — a copy of what anybody can fetch again, nothing
+    for the machines sharing a home to share — and kept it in its home before:
+    the newer place wins where there is a list in both."""
+    newer = _machine(pid) / "prices.json"
+    older = _home(pid) / "prices.json"
+    return older if not newer.is_file() and older.is_file() else newer
 
 
 # ---- what a run spends ----
@@ -305,10 +331,10 @@ def _spelled(model: str) -> str:
     return _SPELLING.sub("", model.lower())
 
 
-def _prices(home: Path) -> dict[str, dict[str, float]]:
-    """hmz's copy of the price list — USD per million tokens by kind, under every
-    spelling of each model it lists — or {} for a home without one."""
-    path = home / "prices.json"
+def _prices(path: Path) -> dict[str, dict[str, float]]:
+    """hmz's copy of the price list at `path` (see _price_list) — USD per
+    million tokens by kind, under every spelling of each model it lists — or {}
+    where there is none."""
     try:
         mtime = path.stat().st_mtime
     except OSError:
@@ -452,7 +478,7 @@ def _budget_label(budget: Optional[dict]) -> str:
     return ", ".join(caps) + ("" if budget["graceful"] else ", even mid-turn")
 
 
-def _spending(epic: Optional[Path], events: list[dict], home: Path,
+def _spending(epic: Optional[Path], events: list[dict], prices_at: Path,
               now: Optional[float] = None) -> dict:
     """What the run has spent, for the card: `cost` (USD; None while nothing is
     priced), `cost_floor` (some tokens went on a model the list has no price
@@ -462,7 +488,7 @@ def _spending(epic: Optional[Path], events: list[dict], home: Path,
     ELAPSED, for the page to fill in from `elapsed_s`)."""
     began, end = _began(events), _ended(events)
     usage = next((e for e in reversed(events) if e.get("event") == "usage"), None)
-    prices = _prices(home)
+    prices = _prices(prices_at)
     tokens: dict[str, int] = {}
     models: list[str] = []
     cost, priced, floor = 0.0, False, False
@@ -717,7 +743,7 @@ def hmz_window_dicts() -> list[dict]:
             "effort": "",
             "model_label": models,
             "model_source": "transcript" if models else "",
-            **_spending(epic, events, _home(w.pid)),
+            **_spending(epic, events, _price_list(w.pid)),
         })
         out.append(d)
     return out
@@ -897,11 +923,68 @@ def refusal(pane: str, text: str) -> str:
     return " ".join(said)
 
 
+# What the agents said, for the timeline: each CLI's own sessions under the
+# run's directory for it. Not Claude's sub-agents (projects/*/<id>/subagents/),
+# billed as the run's but not the agents the flow drove.
+_SAID = ("sessions/claude/projects/*/*.jsonl", "sessions/codex/sessions/**/rollout-*.jsonl")
+# How much of each log: its newest this many events.
+_SAID_TAIL = 200
+
+
+@transcripts.memo_by_file
+def _said_in(log: Path) -> list[dict]:
+    """The newest of what one session log says, as timeline events. Kept until
+    the log grows: a long run's older sessions are done with and never change."""
+    if "/sessions/codex/" in str(log):
+        if codex._is_subagent_rollout(str(log)):
+            return []
+        return codex.codex_timeline(log, limit=_SAID_TAIL, tail=_SAID_TAIL * 2)
+    return transcripts.timeline(log, limit=_SAID_TAIL)
+
+
+def _said(epic: Path, events: list[dict], limit: int) -> list[dict]:
+    """What the run's agents said, newest `limit` events or so, each tagged
+    `extra.agent` with whose it was where an `opened` line says.
+
+    Off the logs written last, until what is found covers everything the rest
+    could add: a log's events are none of them newer than the log, so once
+    `limit` are in hand from after the next log was last written, it and every
+    log older than it are left unread. A run of hundreds of sessions has a few
+    going at once; the others' tails are kept (_said_in).
+
+    What hmz handed an agent in its turn is `meta`: nobody typed it, and it is
+    no prompt of the person's (lastUserPrompt on the page)."""
+    whose = {str(e["session"]): str(e.get("agent") or "") for e in events
+             if e.get("event") == "opened" and e.get("session")}
+    logs: list[tuple[float, Path]] = []
+    for pattern in _SAID:
+        try:
+            logs += [(_mtime(p), p) for p in epic.parent.glob(pattern) if p.is_file()]
+        except (OSError, ValueError):
+            continue
+    logs.sort(key=lambda found: -found[0])
+    out: list[dict] = []
+    for mtime, log in logs:
+        if len(out) >= limit and mtime < transcripts._parse_ts(out[-limit]["ts"] or ""):
+            break
+        agent = next((a for ident, a in whose.items() if a and log.stem.endswith(ident)), "")
+        for ev in _said_in(log):
+            extra = dict(ev.get("extra") or {})
+            if agent:
+                extra["agent"] = agent
+            if ev.get("kind") == "user_text":
+                extra["meta"] = True
+            out.append({**ev, "extra": extra})
+        out.sort(key=lambda ev: transcripts._parse_ts(ev.get("ts") or ""))
+    return out[-limit:]
+
+
 def hmz_timeline(path: str | Path | None, limit: int = 60,
                  typed: list[dict] = (), since_ms: float = 0) -> list[dict]:
-    """A run as TurnEvent-compatible dicts, off its epic: the task it began on,
+    """A run as TurnEvent-compatible dicts: off its epic, the task it began on,
     each session an agent opened (tagged `extra.agent` with whose), each flow it
-    called and its return, and how it ended, in the order they happened.
+    called and its return, and how it ended; and the newest of what its agents
+    said in their sessions (see _said) — in the order they happened.
 
     `typed` (see typed()) are the lines typed into the hmz; each one the run
     doesn't already show goes in where it was typed. A line hmz refused, or
@@ -909,7 +992,8 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
 
     `since_ms` (see cleared_at_ms) drops what a /clear took off hmz's screen."""
     events: list[dict] = []
-    for e in _events(Path(path)) if path else []:
+    run = _events(Path(path)) if path else []
+    for e in run:
         kind, ts, extra = e.get("event"), e.get("at", ""), {}
         if _before(ts, since_ms):
             continue
@@ -939,6 +1023,8 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
         if line and not _before(d["at"], since_ms) and not any(line in s for s in shown):
             events.append({"ts": d["at"], "kind": "user_text", "text": cap_text(d["text"], MESSAGE_CHARS),
                            "tool": None, "role": "user", "extra": {}})
+    if path:
+        events += [ev for ev in _said(Path(path), run, limit) if not _before(ev.get("ts") or "", since_ms)]
     # Stable: at one instant the run's own lines come first, in their order.
     events.sort(key=lambda ev: transcripts._parse_ts(ev.get("ts") or ""))
     return events[-limit:]
