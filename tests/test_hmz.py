@@ -4,6 +4,7 @@ billing the sessions it keeps.
 """
 import json
 import os
+import sys
 import unittest
 from unittest import mock
 
@@ -382,6 +383,85 @@ class TestQuestion(unittest.TestCase):
         self.assertIn("enter yes · esc ask again next time", r["error"])
         keys.assert_not_called()  # no Esc: what it asks is the user's to answer
         paste.assert_not_called()
+
+
+# Stands in for hmz's own Settings: what answer_reports runs in hmz's Python is
+# hmz's code, so the test gives that Python an hmz whose settings are a JSON file.
+_SETTINGS_STUB = '''
+import json, os
+F = os.environ["STUB_SETTINGS"]
+class Settings:
+    def __init__(self):
+        self._held = json.load(open(F)) if os.path.exists(F) else {}
+    @property
+    def enable_sentry(self):
+        said = self._held.get("enable_sentry")
+        return said if isinstance(said, bool) else None
+    def answers(self, *, enable_sentry):
+        self._held["enable_sentry"] = enable_sentry
+        json.dump(self._held, open(F, "w"))
+'''
+
+
+class TestAnswerReports(unittest.TestCase):
+    """A board-spawned hmz must not open on its "Report errors to humanize?"
+    box: the board answers yes first, where nobody has answered."""
+
+    def setUp(self):
+        self.dir = scratch_dir()
+        pkg = self.dir / "lib" / "hmz" / "runtime"
+        pkg.mkdir(parents=True)
+        for d in (pkg.parent, pkg):
+            (d / "__init__.py").write_text("")
+        (pkg / "settings.py").write_text(_SETTINGS_STUB)
+        self.settings = self.dir / "settings.json"
+        env = mock.patch.dict(os.environ, {"PYTHONPATH": str(self.dir / "lib"),
+                                           "STUB_SETTINGS": str(self.settings)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _script(self, shebang):
+        exe = self.dir / "hmz"
+        exe.write_text(f"{shebang}\nfrom hmz.cli import main\n")
+        return str(exe)
+
+    def _said(self):
+        return json.loads(self.settings.read_text()).get("enable_sentry")
+
+    def test_unanswered_is_answered_yes(self):
+        self.assertTrue(hmz.answer_reports(self._script(f"#!{sys.executable}"), str(self.dir)))
+        self.assertIs(self._said(), True)
+
+    def test_a_no_stays_a_no(self):
+        self.settings.write_text(json.dumps({"enable_sentry": False}))
+        self.assertTrue(hmz.answer_reports(self._script(f"#!{sys.executable}"), str(self.dir)))
+        self.assertIs(self._said(), False)
+
+    def test_an_env_shebang_is_looked_up(self):
+        # On the PATH a spawned pane gets, which is not the board's venv.
+        bin_dir = self.dir / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "python3").symlink_to(sys.executable)
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
+            self.assertEqual(hmz._python_of(self._script("#!/usr/bin/env -S python3")),
+                             str(bin_dir / "python3"))
+
+    def test_no_python_to_run_it_in(self):
+        for script in (self._script("\x7fELF"), str(self.dir / "missing")):
+            self.assertFalse(hmz.answer_reports(script, str(self.dir)))
+        self.assertFalse(self.settings.exists())
+
+    def test_a_spawn_answers_before_it_opens_the_window(self):
+        from core import actions
+        order = []
+        with mock.patch.object(actions.tmux, "_resolve_cli", return_value="/x/bin/hmz"), \
+                mock.patch.object(actions.hmz, "answer_reports",
+                                  side_effect=lambda *a: order.append(("answer", *a))), \
+                mock.patch.object(actions.tmux, "new_window",
+                                  side_effect=lambda *a: order.append(("spawn", *a)) or {"ok": True}):
+            actions.create_session(str(self.dir), platform="hmz")
+        self.assertEqual(order, [("answer", "/x/bin/hmz", str(self.dir)),
+                                 ("spawn", str(self.dir), ["hmz"])])
 
 
 class TestTyped(_HmzHomeTest):
