@@ -503,9 +503,6 @@
           <button @click="if(confirm('Close ' + (w.name||w.project_name) + '?')) closeWindow(w.key)"
                   class="text-xs border border-gray-300 text-gray-500 px-2 py-1 rounded hover:bg-gray-100 transition">
             Close</button>
-          <button x-show="w.platform !== 'codex' && w.platform !== 'hmz'" @click="forkWindow(w.key)"
-                  class="text-xs border border-green-200 text-green-600 px-2 py-1 rounded hover:bg-green-50 transition">
-            Fork</button>
           <button x-show="tmuxAvailable" @click="sendClear(w.key)" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
@@ -1715,11 +1712,6 @@ function fleet() {
       const d = await this.apiPost(`/api/windows/${w.key}/btw/dismiss`, { id });
       if (d.ok) w.btw = null;  // optimistic; the next snapshot agrees
       else this.toast('Dismiss failed: ' + (d.error || ''));
-    },
-
-    forkWindow(key) {
-      return this.act(`/api/windows/${key}/fork`,
-                      { ok: 'Forked → new session (inherits history)', fail: 'Fork failed: ' });
     },
 
     async spawnSession() {
