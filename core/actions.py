@@ -1412,6 +1412,17 @@ def _send_prompt_inner(pid: int, w, pane: str, text: str) -> dict:
     # Copy-mode intercepts every key we're about to send (including the aside
     # Escapes below), so leave it before touching the pane at all.
     tmux.exit_copy_mode(pane)
+    # hmz takes no line while it asks something in a box, and the box draws over
+    # its ❯ row — the paste lands nowhere and reads as "the composer holds other
+    # text ('│')". Name the question instead. Not Esc'd away like Claude's
+    # overlays: what it asks (whether to send error reports, whether to save) is
+    # the user's to answer.
+    if w.platform == "hmz":
+        asked, keys = hmz.question(w)
+        if asked:
+            return {"ok": False,
+                    "error": f"send blocked: hmz is asking “{asked}” ({keys}) — "
+                             "answer it in its terminal, then resend."}
     # A /btw aside from a prior send may still be open over the pane; archive it
     # (its answer lives nowhere else), then clear it so this prompt isn't
     # swallowed by the overlay.
