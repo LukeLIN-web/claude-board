@@ -277,6 +277,12 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
     if platform == "codex":
         return tmux.new_window(resolved, ["codex", "--yolo"])
     if platform == "hmz":
+        # Its first start would otherwise hold the new card on a question in a
+        # box over the composer: whether to send error reports. Answered yes
+        # here, where nobody has answered it (see hmz.answer_reports).
+        exe = tmux._resolve_cli("hmz")
+        if exe:
+            hmz.answer_reports(exe, resolved)
         return tmux.new_window(resolved, ["hmz"])
     r = tmux.new_window(resolved)
     # First spawn into a directory raises Claude's folder-trust prompt, which no

@@ -49,6 +49,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -719,6 +721,49 @@ def hmz_window_dicts() -> list[dict]:
         })
         out.append(d)
     return out
+
+
+# Its first start asks "Report errors to humanize?" in a box over the composer,
+# and an hmz the board spawned takes nothing until somebody answers it in its
+# terminal. So the board answers yes before it spawns one — only where nobody
+# has answered yet, so a no given since in /settings stays a no — by running
+# hmz's own Settings in hmz's own Python, the write the box's yes makes:
+# $HUMANIZE_HOME, the lock, and the move from ~/.humanize stay hmz's business.
+_ANSWER_REPORTS = ("from hmz.runtime.settings import Settings\n"
+                   "s = Settings()\n"
+                   "if s.enable_sentry is None:\n"
+                   "    s.answers(enable_sentry=True)\n")
+_ANSWER_TIMEOUT = 15
+
+
+def _python_of(script: str) -> Optional[str]:
+    """The Python on the #! line of the `hmz` script `script`, or None."""
+    try:
+        with open(script, "rb") as f:
+            first = f.readline(1024).decode("utf-8", "replace")
+    except OSError:
+        return None
+    argv = first[2:].split() if first.startswith("#!") else []
+    if argv and os.path.basename(argv[0]) == "env":
+        argv = [a for a in argv[1:] if not a.startswith("-")]
+        return shutil.which(argv[0], path=tmux._spawn_env().get("PATH")) if argv else None
+    return argv[0] if argv else None
+
+
+def answer_reports(exe: str, cwd: str) -> bool:
+    """Answer yes, for every hmz of `exe`'s home, to the error-report question
+    where it hasn't been answered. False when that couldn't be done, which only
+    leaves the question for the terminal, as it was."""
+    python = _python_of(exe)
+    if python is None:
+        return False
+    try:
+        r = subprocess.run([python, "-c", _ANSWER_REPORTS], cwd=cwd, env=tmux._spawn_env(),
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=_ANSWER_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
 
 
 def _history(path: Path, start: int = 0) -> list[dict]:
