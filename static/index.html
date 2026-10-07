@@ -491,6 +491,11 @@
           </div>
         </div>
         <div class="px-4 pb-3 pt-1 flex gap-2 flex-wrap" @click.stop>
+          <!-- hmz has nothing to compact: each run's agents are made for that run. -->
+          <button x-show="tmuxAvailable && w.platform !== 'hmz'" @click="sendCanned(w.key, '/compact', 'Compact')" :disabled="!!promptSending[w.key]"
+                  class="text-xs border border-pink-200 text-pink-600 px-2 py-1 rounded hover:bg-pink-50 transition disabled:opacity-50 disabled:cursor-wait"
+                  title="Send /compact: replace the conversation with a summary of it, freeing context. Unlike Clear, the session keeps the thread">
+            Compact</button>
           <button x-show="tmuxAvailable && w.platform !== 'codex' && w.platform !== 'hmz'" @click="sendCanned(w.key, '/humanize:ask-codex review', 'Review')" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /humanize:ask-codex review to this session">
@@ -505,11 +510,6 @@
                   class="text-xs border border-amber-200 text-amber-600 px-2 py-1 rounded hover:bg-amber-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /clear to this session">
             Clear</button>
-          <!-- hmz has nothing to compact: each run's agents are made for that run. -->
-          <button x-show="tmuxAvailable && w.platform !== 'hmz'" @click="sendCanned(w.key, '/compact', 'Compact')" :disabled="!!promptSending[w.key]"
-                  class="text-xs border border-sky-200 text-sky-600 px-2 py-1 rounded hover:bg-sky-50 transition disabled:opacity-50 disabled:cursor-wait"
-                  title="Send /compact: replace the conversation with a summary of it, freeing context. Unlike Clear, the session keeps the thread">
-            Compact</button>
           <button x-show="tmuxAvailable" @click="sendCanned(w.key, 'commit and push', 'Commit')" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Ask this session to commit and push">
