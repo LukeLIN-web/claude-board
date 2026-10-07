@@ -97,9 +97,10 @@ class _HmzHomeTest(unittest.TestCase):
 
     def setUp(self):
         self.home = scratch_dir()
-        home = mock.patch.object(hmz, "_home", return_value=self.home)
-        home.start()
-        self.addCleanup(home.stop)
+        for name, at in (("_home", self.home), ("_machine", scratch_dir())):
+            patched = mock.patch.object(hmz, name, return_value=at)
+            patched.start()
+            self.addCleanup(patched.stop)
 
 
 class TestPromptTaken(_HmzHomeTest):
@@ -667,6 +668,31 @@ class TestRun(unittest.TestCase):
         self.assertTrue(ev[0]["text"].startswith("$commander_delegate split todo.md"))
         self.assertEqual(ev[-1]["text"], "run ended: done")
 
+    def test_what_the_agents_said_and_whose(self):
+        run = scratch_dir() / "20261002T005030.513Z-a779c6"
+        epic = write_jsonl(RUN, run / "epic.jsonl")
+        write_jsonl(path=run / "sessions/claude/projects/-home-u-proj/9c03.jsonl", rows=[
+            {"type": "assistant", "timestamp": "2026-10-02T00:52:10.000Z",
+             "message": {"id": "m1", "role": "assistant", "content": [
+                 {"type": "text", "text": "worker on it"}]}}])
+        # A sub-agent of the worker's is billed, but is not one of the flow's agents.
+        write_jsonl(path=run / "sessions/claude/projects/-home-u-proj/9c03/subagents/agent-1.jsonl",
+                    rows=[{"type": "assistant", "timestamp": "2026-10-02T00:52:20.000Z",
+                           "message": {"id": "m2", "role": "assistant", "content": [
+                               {"type": "text", "text": "sub-agent"}]}}])
+        write_jsonl(path=run / "sessions/codex/sessions/2026/10/02"
+                    / "rollout-2026-10-02T00-52-30-01a0a14f-363a-76d2-a800-1f0dc14da2e0.jsonl", rows=[
+            {"type": "response_item", "timestamp": "2026-10-02T00:52:30.000Z",
+             "payload": {"type": "message", "content": [
+                 {"type": "output_text", "text": "codex in its first turn"}]}}])
+        said = [(e["extra"].get("agent"), e["text"]) for e in hmz.hmz_timeline(epic)]
+        self.assertEqual(said[-2:], [("worker", "worker on it"), (None, "codex in its first turn")])
+        self.assertNotIn((None, "sub-agent"), said)
+        # A /clear takes what came before it off the timeline, the agents' lines with it.
+        cleared = hmz.transcripts._parse_ts("2026-10-02T00:52:15.000Z") * 1000
+        self.assertEqual([e["text"] for e in hmz.hmz_timeline(epic, since_ms=cleared)],
+                         ["codex in its first turn"])
+
 
 PRICES = {"models": {
     "claude-opus-5-5": {"name": "Claude Opus 5.5", "per_million": {
@@ -721,7 +747,7 @@ class TestSpending(unittest.TestCase):
 
     def _spending(self, events=None, now=None):
         return hmz._spending(self.epic, events if events is not None else hmz._events(self.epic),
-                             self.home, now=self.began + 125 if now is None else now)
+                             self.home / "prices.json", now=self.began + 125 if now is None else now)
 
     def test_tokens_summed_once_per_message_and_priced_per_model(self):
         s = self._spending()
@@ -824,7 +850,7 @@ class TestSpending(unittest.TestCase):
                          ["45s", "2m 5s", "5m", "1h 12m", "15h", "1d 2h"])
 
     def test_prices_match_as_hmz_matches(self):
-        prices = hmz._prices(self.home)
+        prices = hmz._prices(self.home / "prices.json")
         opus = PRICES["models"]["claude-opus-5-5"]["per_million"]
         for spelled in ("claude-opus-5-5", "anthropic/claude-opus-5-5", "Claude Opus 5.5",
                         "us.anthropic.claude-opus-5-5-v1:0", "claude-opus-5-5-20260301",
@@ -832,6 +858,29 @@ class TestSpending(unittest.TestCase):
             self.assertEqual(hmz._price(spelled, prices), opus, spelled)
         self.assertIsNone(hmz._price("claude-opus-5", prices))  # a near miss is a miss
         self.assertIsNone(hmz._price("<synthetic>", prices))
+
+    def test_the_price_list_where_hmz_keeps_it(self):
+        # hmz moved its copy from its home to its machine's directory, humanize-<uid>
+        # in the temporary directory; an hmz from before the move keeps the old one.
+        machine = scratch_dir()
+        with mock.patch.object(hmz, "_home", return_value=self.home), \
+                mock.patch.object(hmz, "_machine", return_value=machine):
+            self.assertEqual(hmz._price_list(7), self.home / "prices.json")
+            (machine / "prices.json").write_text(json.dumps(PRICES))
+            self.assertEqual(hmz._price_list(7), machine / "prices.json")
+            (self.home / "prices.json").unlink()
+            self.assertEqual(hmz._price_list(7), machine / "prices.json")
+
+    def test_the_machines_directory_is_in_hmzs_temporary_one(self):
+        tmp = scratch_dir()
+        uid = f"humanize-{os.getuid()}"
+        with mock.patch.object(hmz, "_environ", return_value={"TMPDIR": str(tmp)}):
+            self.assertEqual(hmz._machine(7), tmp / uid)
+        with mock.patch.object(hmz, "_environ", return_value={"TMPDIR": str(tmp / "gone"),
+                                                              "TMP": str(tmp)}):
+            self.assertEqual(hmz._machine(7), tmp / uid)
+        with mock.patch.object(hmz, "_environ", return_value={}):
+            self.assertEqual(hmz._machine(7), hmz.Path("/tmp") / uid)
 
     def test_money_and_counts_as_hmz_writes_them(self):
         self.assertEqual([hmz._money(d) for d in (0, 0.0012, 0.47, 12.5, 150)],
@@ -877,7 +926,8 @@ class TestRunOfCalledFlows(unittest.TestCase):
         write_jsonl(path=projects / "-planning" / "0056c5ba-0692-40cf-98e2-bb016be18722.jsonl", rows=[
             {"type": "user", "timestamp": "2026-10-05T01:39:23.603Z",
              "message": {"role": "user", "content": "plan it"}},
-            _claude_turn("p", "claude-opus-5-5", input_tokens=12, output_tokens=1_000),
+            {**_claude_turn("p", "claude-opus-5-5", input_tokens=12, output_tokens=1_000),
+             "timestamp": "2026-10-05T01:41:02.000Z"},
         ])
         self.lane_log = write_jsonl(path=projects / "-lane-2"
                                     / "3eb6cb8d-3c12-499f-b67c-54515abd8495.jsonl", rows=[
@@ -886,13 +936,15 @@ class TestRunOfCalledFlows(unittest.TestCase):
              "timestamp": "2026-10-05T01:41:04.766Z", "sessionId": "3eb6cb8d"},
             {"type": "user", "timestamp": "2026-10-05T01:41:04.797Z",
              "message": {"role": "user", "content": "You are lane-2-actor-a"}},
-            _claude_turn("l1", "claude-opus-5-5", input_tokens=100, output_tokens=40_000,
-                         cache_read_input_tokens=5_000_000),
+            {**_claude_turn("l1", "claude-opus-5-5", input_tokens=100, output_tokens=40_000,
+                            cache_read_input_tokens=5_000_000),
+             "timestamp": "2026-10-05T02:20:00.000Z"},
         ])
         self.began = hmz.transcripts._parse_ts("2026-10-05T01:39:20.331Z")
 
     def _spending(self):
-        return hmz._spending(self.epic, hmz._events(self.epic), self.home, now=self.began + 2753)
+        return hmz._spending(self.epic, hmz._events(self.epic), self.home / "prices.json",
+                             now=self.began + 2753)
 
     def test_a_session_in_its_first_turn_is_on_the_bill(self):
         s = self._spending()
@@ -941,9 +993,34 @@ class TestRunOfCalledFlows(unittest.TestCase):
         self.assertEqual(hmz._current_task(hmz._events(self.epic)),
                          "parallel_flame_chase · parallel_flame_chase:lane_turn ×2")
 
-    def test_the_timeline_is_the_runs_own_lines(self):
-        # Neither the sessions opened inside the called flows nor what they said.
-        self.assertEqual([(e["extra"].get("agent"), e["text"]) for e in hmz.hmz_timeline(self.epic)],
-                         [(None, "$parallel_flame_chase lift"),
-                          (None, "called flow parallel_flame_chase:plan"),
-                          (None, "called flow parallel_flame_chase:lane_turn")])
+    def test_the_timeline_is_the_runs_lines_and_what_its_agents_said(self):
+        # The run's own lines, and its sessions' — the lane's in its first turn
+        # too, which no record names yet. Whose they are is the run's `opened`
+        # lines' to say, and these sessions were opened in the flows it called.
+        self.assertEqual([(e["kind"], e["extra"].get("agent"), e["text"])
+                          for e in hmz.hmz_timeline(self.epic)],
+                         [("user_text", None, "$parallel_flame_chase lift"),
+                          ("assistant_text", None, "called flow parallel_flame_chase:plan"),
+                          ("user_text", None, "plan it"),
+                          ("assistant_text", None, "…"),
+                          ("assistant_text", None, "called flow parallel_flame_chase:lane_turn"),
+                          ("user_text", None, "You are lane-2-actor-a"),
+                          ("assistant_text", None, "…")])
+
+    def test_what_hmz_handed_an_agent_is_no_prompt_of_the_persons(self):
+        handed = [e for e in hmz.hmz_timeline(self.epic)
+                  if e["kind"] == "user_text" and e["extra"].get("meta")]
+        self.assertEqual([e["text"] for e in handed], ["plan it", "You are lane-2-actor-a"])
+
+    def test_a_log_older_than_what_it_could_add_is_not_read(self):
+        # The lane was written last: its two newest events are all a limit of 2
+        # wants, and the plan's log stopped before either.
+        os.utime(self.lane_log, (3_000_000_000, 3_000_000_000))
+        plan = next(self.run.glob("sessions/claude/projects/-planning/*.jsonl"))
+        os.utime(plan, (1_790_000_000, 1_790_000_000))  # 2026-09-21, before the run
+        seen = []
+        real = hmz._said_in.__wrapped__
+        with mock.patch.object(hmz, "_said_in", side_effect=lambda log: seen.append(log) or real(log)):
+            said = hmz._said(self.epic, hmz._events(self.epic), 2)
+        self.assertEqual(seen, [self.lane_log])
+        self.assertEqual([e["text"] for e in said], ["You are lane-2-actor-a", "…"])
