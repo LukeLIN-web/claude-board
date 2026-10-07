@@ -106,13 +106,13 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 | Focus | 跳到那个终端 tab |
 | Timeline | 展开完整对话时间线 + plan 历史 |
 | Send | 往 session 的 tmux pane 注入一行 prompt（Linux + tmux）|
-| Fork | `claude --resume <sid> --fork-session`，新 session 继承对话历史 |
+| Fork | `claude --resume <sid> --fork-session`，新 session 继承对话历史（在历史列表里）|
 | Resume | `claude --resume <sid>`，继续原 session（在历史列表里）|
 | Review | 向 session 发送 `/humanize:ask-codex review`（Linux + tmux）|
 | Compact | 发送 `/compact`：session 把之前的对话换成一份摘要，在摘要上接着做；和 Clear 不同，上下文不丢（Linux + tmux；hmz 卡片没有）|
 | Close | SIGTERM——每张卡片都有 |
 
-**Codex** 卡片上，平台无关的操作（Close、发 prompt、Esc、Commit）照常工作；Claude 专属的（Fork、Review、Clear、快速批准 permission）会隐藏，因为它们依赖 Claude 的斜杠命令或 `claude` 二进制。
+**Codex** 卡片上，平台无关的操作（Close、发 prompt、Esc、Commit）照常工作；Claude 专属的（Review、Clear、快速批准 permission）会隐藏，因为它们依赖 Claude 的斜杠命令或 `claude` 二进制。
 
 ### 按 session id 反查
 

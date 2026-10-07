@@ -230,7 +230,7 @@ def resume_claude(cwd: str, session_id: str, fork: bool = False) -> dict:
     picker comes).
 
     Every board launch of an existing Claude session comes through here: a
-    resume from History, a fork from History, a fork of a live card. A fork
+    resume from History, a fork from History. A fork
     stops on the picker just as a resume does: Claude decides as it mounts the
     history it loaded — last turn over an hour old and past ~100k tokens, as of
     v2.1.289 — and that check never looks at --fork-session, which only changes
@@ -240,24 +240,6 @@ def resume_claude(cwd: str, session_id: str, fork: bool = False) -> dict:
     r = open_claude_window(cwd, args)
     if r.get("ok") and r.get("backend") == "tmux" and r.get("pane_id"):
         r["picker"] = confirm_resume_picker(r["pane_id"])
-    return r
-
-
-def fork_session(pid: int) -> dict:
-    """Open a new window and fork the session (new ID, inherits history).
-
-    Codex has no `--fork-session`; the closest is resuming the rollout into a
-    fresh window, so codex sessions branch to `codex resume <session_id>`.
-    """
-    w = find_window(pid)
-    if not w:
-        return {"ok": False, "error": f"no window pid={pid}"}
-
-    if w.platform == "codex":
-        r = _open_cli_window("codex", w.cwd, ["resume", w.session_id])
-    else:
-        r = resume_claude(w.cwd, w.session_id, fork=True)
-    r.setdefault("session_id", w.session_id)
     return r
 
 

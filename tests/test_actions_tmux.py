@@ -9,7 +9,6 @@ import unittest
 from unittest import mock
 
 from core import actions, btwcapture
-from tests.helpers import make_window
 
 
 def _fake_window(tty, platform="claude", session_id=None):
@@ -688,40 +687,6 @@ class ConfirmResumePickerTests(unittest.TestCase):
         self.assertFalse(r["confirmed"])
         self.assertEqual(r["reason"], "no picker")
         p.send_keys.assert_not_called()
-
-
-class ForkSessionTests(unittest.TestCase):
-    """A live card's fork launches `claude --resume <id> --fork-session`, which
-    loads the same history a resume does and stops on the same picker."""
-
-    def _fork(self, *screens, platform="claude"):
-        card = make_window(session_id="sessX", platform=platform)
-        with _pane(*screens, window=card) as p, \
-             mock.patch.object(actions.tmux, "available", return_value=True), \
-             mock.patch.object(actions.tmux, "new_window",
-                               return_value={"ok": True, "pane_id": "%7"}) as nw, \
-             mock.patch.object(actions, "confirm_trust_prompt",
-                               return_value={"answered": False, "reason": "already trusted"}):
-            r = actions.fork_session(1234)
-        return r, p, nw
-
-    def test_fork_answers_the_resume_picker(self):
-        r, p, nw = self._fork(_PICKER_TEXT, _PICKER_TEXT, _LIVE_TEXT)
-        nw.assert_called_once_with("/tmp/proj", [
-            "claude", "--dangerously-skip-permissions", "--resume", "sessX", "--fork-session"])
-        self.assertEqual(p.sent, [("2",), ("Enter",)])
-        self.assertTrue(r["picker"]["confirmed"])
-
-    def test_fork_without_a_picker_sends_nothing(self):
-        r, p, _ = self._fork(_LIVE_TEXT)
-        self.assertEqual(p.sent, [])
-        self.assertEqual(r["picker"]["reason"], "no picker")
-
-    def test_codex_fork_has_no_picker_to_answer(self):
-        r, p, nw = self._fork(_CODEX_LIVE_TEXT, platform="codex")
-        nw.assert_called_once_with("/tmp/proj", ["codex", "resume", "sessX"])
-        p.capture_pane.assert_not_called()
-        self.assertNotIn("picker", r)
 
 
 class ParsePaneMenuTests(unittest.TestCase):

@@ -711,11 +711,6 @@ def api_window_keys(key: str, body: MenuKeysBody) -> dict:
                     lambda w, pid: actions.send_menu_keys(pid, body.keys), body)
 
 
-@app.post("/api/windows/{key}/fork")
-def api_fork(key: str) -> dict:
-    return _on_card(key, "POST", "fork", lambda w, pid: actions.fork_session(pid))
-
-
 @app.post("/api/windows/{key}/close")
 def api_close(key: str) -> dict:
     return _on_card(key, "POST", "close", lambda w, pid: actions.close_session(pid))
