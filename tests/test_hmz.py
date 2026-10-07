@@ -277,6 +277,113 @@ class TestMenu(unittest.TestCase):
         self.assertEqual(r["note"], hmz.MENU_NOTE.format("parallel_flame_chase"))
 
 
+def _popup_over(under, rows, width=30, indent=15):
+    """`under` with hmz's question box drawn below it, `rows` its lines."""
+    pad = " " * indent
+    return "\n".join([*under,
+                      pad + "╭" + "─" * width + "╮",
+                      *(pad + "│" + r.ljust(width) + "│" for r in rows),
+                      pad + "╰" + "─" * width + "╯"])
+
+
+class TestQuestion(unittest.TestCase):
+    """hmz asks some things in a box over its screen — its composer included —
+    and takes no line until it is answered. The live miss: a Send into a fresh
+    hmz failed "the composer holds other text ('│')", the card saying only that
+    no run had started."""
+
+    # Copied from the pane of that hmz, on its first start.
+    REPORTS = "\n".join([
+        '╭─ humanize v0.1.0b1 ─────────────────────────────────────────────────────╮',
+        '│      ╭────────────────────────────────────────────────────────────────╮ │',
+        '│    ██│                                                                │ │',
+        '│    ██│  Report errors to humanize?                                    │ │',
+        '│    ██│  Send error reports to help fix bugs. Sent: the error and      │ │',
+        '│    ██│  where in humanize it occurred; which flow was running, and    │ │',
+        '│    ██│  what each agent was configured to run; which coding agents    │ │',
+        '│    ╚═│  are installed, and account names; which skills and            │ │',
+        '│      │  flowverses are active, by name; what humanize did that you    │ │',
+        '│    Th│  undid, refused, or canceled; the version of humanize, of      │ │',
+        '│      │  Python, and the operating system and architecture. Never      │ │',
+        '╰──────│  sent: nothing you typed: no task, prompt, or command; no      │─╯',
+        '       │  agent output, and nothing from any transcript or session      │',
+        '       │  log; no files, directory names, or paths outside humanize     │',
+        '       │  itself; no keys, tokens, or account credentials -- not even   │',
+        '       │  environment variable names. You can change this later in      │',
+        '       │  /settings.                                                    │',
+        '       │                                                                │',
+        '       │     Yes       No                                               │',
+        '       │                                                                │5:high',
+        '───────│  enter yes   esc ask again next time                           │───────',
+        '❯      │                                                                │',
+        '───────╰────────────────────────────────────────────────────────────────╯───────',
+        '  ◉ chat · /home/u/robot       ctrl+c exit',
+    ])
+    ASKED = ("Report errors to humanize?", "enter yes · esc ask again next time")
+    # hmz's Save? as a menu is walked out of: the box over the menu, whose
+    # breadcrumb is still drawn above it.
+    SAVE = _popup_over(TestMenu.SETUP.splitlines(),
+                       ["", "  Save?", "", "     save      discard", "", "  enter save   esc back"])
+
+    def _screen(self, screen):
+        return mock.patch.object(hmz.tmux, "capture_pane",
+                                 return_value={"ok": True, "text": screen})
+
+    def _ask(self, screen, status="idle"):
+        with mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), self._screen(screen):
+            return hmz.question(_window(status=status))
+
+    def test_the_first_start_question(self):
+        self.assertEqual(self._ask(self.REPORTS), self.ASKED)
+
+    def test_a_question_over_a_menu(self):
+        self.assertEqual(self._ask(self.SAVE), ("Save?", "enter save · esc back"))
+
+    def test_a_menu_and_the_composer_ask_nothing(self):
+        # The setup sheet's rows are a box too, but its keys are outside it.
+        for screen in (TestMenu.SETUP, TestMenu.CHAT):
+            self.assertEqual(self._ask(screen), ("", ""))
+
+    def test_a_running_flow_is_not_read(self):
+        self.assertEqual(self._ask(self.REPORTS, status="busy"), ("", ""))
+
+    def test_the_card_says_what_it_asks(self):
+        w = _window()
+        with mock.patch.object(hmz, "_discover", return_value=[(w, [])]), \
+                mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
+                self._screen(self.REPORTS):
+            d = hmz.hmz_window_dicts()[0]
+        self.assertEqual(d["triage"], "stalled")
+        self.assertEqual(d["triage_reason"], "在问：Report errors to humanize?")
+
+    def test_the_timeline_says_the_question_not_the_menu_under_it(self):
+        import app
+        for screen, asked in ((self.REPORTS, self.ASKED), (self.SAVE, ("Save?", "enter save · esc back"))):
+            with self.subTest(asked[0]), \
+                    mock.patch.object(app.sessions, "find_window", return_value=_window()), \
+                    mock.patch.object(hmz, "_home", return_value=scratch_dir() / "no-hmz"), \
+                    mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
+                    self._screen(screen):
+                r = app.api_timeline("7")
+            self.assertEqual(r["note"], hmz.QUESTION_NOTE.format(*asked))
+
+    def test_a_send_names_the_question_and_types_nothing(self):
+        from core import actions
+        with mock.patch.object(actions, "find_window", return_value=_window()), \
+                mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
+                mock.patch.object(actions.tmux, "pane_current_command", return_value="python"), \
+                mock.patch.object(actions.tmux, "exit_copy_mode", return_value={"ok": True}), \
+                mock.patch.object(actions.tmux, "send_keys") as keys, \
+                mock.patch.object(actions.tmux, "send_text_confirmed") as paste, \
+                self._screen(self.REPORTS):
+            r = actions.send_prompt(7, "hello")
+        self.assertFalse(r["ok"])
+        self.assertIn("“Report errors to humanize?”", r["error"])
+        self.assertIn("enter yes · esc ask again next time", r["error"])
+        keys.assert_not_called()  # no Esc: what it asks is the user's to answer
+        paste.assert_not_called()
+
+
 class TestTyped(_HmzHomeTest):
     """The lines typed into one hmz, read off the history it shares with every
     other hmz of its home."""

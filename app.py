@@ -525,12 +525,12 @@ def _timeline(w, pid: int, limit: int) -> dict:
         # line is in no run.
         typed = hmz.typed(pid, w.cwd, w.started_at)
         cleared = hmz.cleared_at_ms(typed, codex.cleared_at_ms(pid))
-        crumb = hmz.menu(w)
+        held = hmz.held_note(w)
         events = hmz.hmz_timeline(tp or None, limit=limit, typed=typed, since_ms=cleared)
         out.update(
             platform="hmz",
             events=events,
-            note=(hmz.MENU_NOTE.format(crumb) if crumb
+            note=(held if held
                   else hmz.CLEARED_NOTE if cleared and not events else None if tp
                   else hmz.TYPED_NO_RUN_NOTE if typed else hmz.NO_RUN_NOTE),
         )

@@ -79,9 +79,22 @@ CLEARED_NOTE = ("已 /clear。hmz 的 /clear 只清它自己的屏幕，卡片�
 MENU_NOTE = ("hmz 停在菜单「{}」上，要在它的终端里操作。第一次用某个 flow 时会先弹它的配置菜单"
              "（各角色用什么 agent、参数、预算），填完 Save 才会用你输入的那一行开跑。")
 
+# …and while hmz asks something in a box over its screen, which it takes no line
+# until it is answered: "Report errors to humanize?" on its first start, the
+# save and leave questions on the way out of a menu.
+QUESTION_NOTE = ("hmz 在问「{}」（{}），要在它的终端里回答。答之前它不收输入，"
+                 "卡片发过去的也进不去。")
+
 # The breadcrumb hmz tops each menu with — `hmz › parallel_flame_chase › Set
 # budget for parallel_flame_chase` — and `● unsaved` beside it mid-edit.
 _CRUMB = re.compile(r"^\s*hmz › (.+?)(?:\s{2,}●.*)?\s*$")
+
+# hmz's question box (its Popup) has no breadcrumb: it is a bare ╭──╮ drawn over
+# whatever was there, the question its first line and the keys that answer it
+# its last — `enter yes   esc ask again next time`. A menu's own boxes (a sheet's
+# rows) keep their keys outside them.
+_BOX_TOP = re.compile(r"╭(─+)╮")
+_ANSWER_KEYS = re.compile(r"^(?:enter \S+\s{2,})?esc \S")
 
 # Commands that are not the interface: `hmz exec` runs a flow headless, and
 # `hmz internal …` is the sandbox / credential plumbing under every turn.
@@ -594,17 +607,65 @@ def _discover() -> list[tuple[Window, list[dict]]]:
     return windows
 
 
+def _screen(w: Window) -> list[str]:
+    """The non-blank lines on hmz `w`'s screen, or none while it runs a flow."""
+    if w.status == "busy" or not w.tty:
+        return []
+    pane = tmux.pane_for_tty(w.tty)
+    if pane is None:
+        return []
+    return [l for l in tmux.capture_pane(pane).get("text", "").splitlines() if l.strip()]
+
+
+def _crumb(lines: list[str]) -> str:
+    m = _CRUMB.match(lines[0]) if lines else None
+    return m.group(1).strip() if m else ""
+
+
+def _question(lines: list[str]) -> tuple[str, str]:
+    """What the question box on `lines` asks and the keys that answer it —
+    ("Report errors to humanize?", "enter yes · esc ask again next time") —
+    or ("", "") when there is none."""
+    for i, top in enumerate(lines):
+        for m in _BOX_TOP.finditer(top):
+            rule = m.group(1)
+            # Its rows by its width, not its column: what is drawn left of the
+            # box can hold wide characters, and the box's own │ are the pair
+            # exactly that far apart.
+            row = re.compile(rf"│(.{{{len(rule)}}})│")
+            said = []
+            for line in lines[i + 1:]:
+                if f"╰{rule}╯" in line:
+                    break
+                r = row.search(line)
+                if r and r.group(1).strip():
+                    said.append(r.group(1).strip())
+            if len(said) >= 2 and _ANSWER_KEYS.match(said[-1]):
+                return said[0], re.sub(r"\s{2,}", " · ", said[-1])
+    return "", ""
+
+
 def menu(w: Window) -> str:
     """Where in a menu hmz `w` stands — "parallel_flame_chase › Set budget for
     parallel_flame_chase" — or "" when it isn't in one or is running a flow."""
-    if w.status == "busy" or not w.tty:
-        return ""
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return ""
-    lines = [l for l in tmux.capture_pane(pane).get("text", "").splitlines() if l.strip()]
-    m = _CRUMB.match(lines[0]) if lines else None
-    return m.group(1).strip() if m else ""
+    return _crumb(_screen(w))
+
+
+def question(w: Window) -> tuple[str, str]:
+    """What hmz `w` is asking in a box over its screen, and the keys that answer
+    it, or ("", "") — see _question."""
+    return _question(_screen(w))
+
+
+def held_note(w: Window) -> Optional[str]:
+    """What the timeline says while hmz `w` waits on its own terminal: asked
+    something — the box over a menu comes first — or in a menu; else None."""
+    lines = _screen(w)
+    asked, keys = _question(lines)
+    if asked:
+        return QUESTION_NOTE.format(asked, keys)
+    crumb = _crumb(lines)
+    return MENU_NOTE.format(crumb) if crumb else None
 
 
 def hmz_window_dicts() -> list[dict]:
@@ -628,9 +689,14 @@ def hmz_window_dicts() -> list[dict]:
             first_input, current_task, last_error = "", "", None
             epic, events = None, []
         tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
-        crumb = menu(w)
-        if crumb:
-            # Not waiting_perm: that card's Quick Approve would type "1" into it.
+        lines = _screen(w)
+        asked, keys = _question(lines)
+        crumb = _crumb(lines)
+        # Not waiting_perm: that card's Quick Approve would type "1" into it.
+        if asked:
+            tri = {"triage": "stalled", "triage_reason": f"在问：{asked}",
+                   "triage_suggestion": f"去终端回答（{keys}）"}
+        elif crumb:
             tri = {"triage": "stalled", "triage_reason": f"停在菜单：{crumb}",
                    "triage_suggestion": "去终端填完并 Save"}
         models = _models(began)
