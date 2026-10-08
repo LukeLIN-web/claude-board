@@ -33,7 +33,6 @@ class HistorySession:
     project: str
     project_name: str
     first_input: str
-    input_count: int
     first_ts: str
     last_ts: str
     transcript_path: Optional[str]
@@ -85,9 +84,7 @@ def _load_history_jsonl() -> dict[str, dict]:
                         "first_ts": ts,
                         "last_ts": ts,
                         "project": project,
-                        "count": 0,
                     }
-                out[sid]["count"] += 1
                 out[sid]["last_ts"] = ts
     except Exception:
         pass
@@ -141,7 +138,6 @@ def _build_index() -> list[HistorySession]:
             project=project,
             project_name=project_name,
             first_input=h.get("first_input", ""),
-            input_count=h.get("count", 0),
             first_ts=h.get("first_ts", ""),
             last_ts=h.get("last_ts", ""),
             transcript_path=t.get("path"),

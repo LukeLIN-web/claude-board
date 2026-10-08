@@ -730,7 +730,6 @@ def hmz_window_dicts() -> list[dict]:
         models = _models(began)
         d.update({
             "permission_msg": None,
-            "permission_ts": None,
             "first_input": first_input,
             "current_task": current_task or None,
             "last_error": last_error,

@@ -152,14 +152,8 @@ def _local_snapshot() -> dict:
             cw["model_label"] = live
             cw["model_source"] = "pane"
     for w in snap["windows"]:
-        tty = w.get("tty")
-        if tty and tty in perm_by_tty:
-            ev = perm_by_tty[tty]
-            w["permission_msg"] = ev.msg
-            w["permission_ts"] = ev.raw_ts
-        else:
-            w["permission_msg"] = None
-            w["permission_ts"] = None
+        ev = perm_by_tty.get(w.get("tty"))
+        w["permission_msg"] = ev.msg if ev else None
         tp = w.get("transcript_path")
         if tp:
             if not w.get("name"):
