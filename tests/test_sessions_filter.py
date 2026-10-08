@@ -208,7 +208,7 @@ class HistoryFilterTests(unittest.TestCase):
         def mk(sid, project):
             return history.HistorySession(
                 session_id=sid, project=project, project_name=project.rsplit("/", 1)[-1],
-                first_input="", input_count=0, first_ts="", last_ts="",
+                first_input="", first_ts="", last_ts="",
                 transcript_path=None, transcript_size=0, transcript_mtime=0,
                 is_alive=False,
             )

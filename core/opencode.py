@@ -62,7 +62,6 @@ def list_opencode_sessions() -> list[dict]:
             "project": directory or "",
             "project_name": project_name,
             "first_input": (first_input or title or "")[:300],
-            "input_count": 0,
             "first_ts": _ms_to_iso(created),
             "last_ts": _ms_to_iso(updated),
             "transcript_path": None,

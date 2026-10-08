@@ -364,7 +364,6 @@ def _codex_session(f: Path, st: os.stat_result) -> Optional[dict]:
         "project": cwd,
         "project_name": cwd.rsplit("/", 1)[-1] if cwd else f.stem,
         "first_input": _extract_first_user_input(f),
-        "input_count": 0,
         "first_ts": meta.get("timestamp", ""),
         "last_ts": meta.get("timestamp", ""),
         "transcript_path": str(f),
@@ -843,7 +842,6 @@ def codex_window_dicts() -> list[dict]:
         current_task = _last_assistant_text(events, since)
         d.update({
             "permission_msg": None,
-            "permission_ts": None,
             "first_input": (_extract_first_user_input(tp, since) if tp else "")[:100],
             "current_task": current_task or None,
             "last_error": _last_turn_error(events, since),
