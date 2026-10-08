@@ -400,6 +400,41 @@ class TestRolloutsParsedOncePerChange(unittest.TestCase):
         self.assertEqual(list(codex._session_cache), [a])
 
 
+def _exec(cmd):
+    return {"type": "response_item", "payload": {
+        "type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": cmd})}}
+
+
+class TestMemoryActivity(unittest.TestCase):
+    """A Codex session's memory reads and writes are counted per memory, as
+    Claude's and OpenCode's are, so the Memory page's reverse lookup finds it."""
+
+    MEM = "/home/u/.claude/projects/-home-u-proj/memory"
+
+    def setUp(self):
+        self.path = _write_rollout(ROLLOUT_LINES + [
+            _exec(f"cat {self.MEM}/notes.md"),
+            _exec(f"sed -n 1,5p {self.MEM}/notes.md {self.MEM}/MEMORY.md"),
+            _exec(f"echo more >> {self.MEM}/notes.md"),
+        ])
+
+    def test_reads_and_writes_are_counted(self):
+        act = codex.extract_codex_session_activity(self.path)
+        self.assertEqual(act["memory_breakdown"], {
+            "per_memory_reads": {"notes": 2}, "per_memory_writes": {"notes": 1},
+            "per_memory_edits": {}})
+        self.assertEqual(act["memory_ops"], [{"name": "notes", "operation": "read"},
+                                             {"name": "notes", "operation": "write"}])
+
+    def test_the_reverse_lookup_finds_the_session(self):
+        from core import history
+        s = history.HistorySession(**codex._codex_session(self.path, self.path.stat()))
+        with mock.patch.object(history, "index", return_value=[s]):
+            got = history.sessions_touching("notes", "memory_breakdown", history.MEMORY_KINDS)
+        self.assertEqual([(r["session_id"], r["reads"], r["writes"]) for r in got["sessions"]],
+                         [("abc", 2, 1)])
+
+
 class TestTurnContextModel(unittest.TestCase):
     """The model + reasoning effort a session ran on come from turn_context; the
     last one wins, since /model rewrites both mid-session."""
