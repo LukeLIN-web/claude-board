@@ -24,7 +24,8 @@
 # Exit codes: 0 ok · 2 usage/config · 3 board not running · 4 tunnel failed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# .env.local, then .env.local.<hostname>; sets PORT, defines wait_for.
+# .env.local, then .env.local.<hostname>; sets PORT, defines wait_for and
+# board_code.
 source scripts/env.sh
 
 DOMAIN="${FLEET_TUNNEL_DOMAIN:-}"
@@ -71,7 +72,7 @@ command -v ngrok >/dev/null 2>&1 || {
 
 # The board binds loopback only. Starting a tunnel to a dead port would publish
 # ngrok's own error page rather than anything useful, so check first.
-if ! curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/"; then
+if [ "$(board_code)" = "000" ]; then
     echo "error: nothing serving on 127.0.0.1:$PORT — start the board first (./run.sh)" >&2
     exit 3
 fi

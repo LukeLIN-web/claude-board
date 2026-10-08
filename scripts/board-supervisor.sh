@@ -14,7 +14,8 @@
 # Exit codes: 0 ok · 2 usage/config
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# .env.local, then .env.local.<hostname>; sets PORT and RUN_DIR, defines wait_for.
+# .env.local, then .env.local.<hostname>; sets PORT and RUN_DIR, defines
+# wait_for, board_code and exec_board.
 source scripts/env.sh
 
 RESTART_DELAY="${FLEET_BOARD_RESTART_DELAY:-3}"
@@ -38,13 +39,8 @@ supervisor_running() {
     esac
 }
 
-board_code() {
-    curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
-        "http://127.0.0.1:$PORT/" 2>/dev/null || true
-}
-
 port_listening() {
-    [ "$(board_code)" != "000" ]
+    [ "$(board_code 2)" != "000" ]
 }
 
 pid_gone() {
@@ -56,7 +52,7 @@ pid_gone() {
 # the board is still booting; any other time it is between restarts.
 report() {
     local code
-    code="$(board_code)"
+    code="$(board_code 2)"
     if supervisor_running; then
         if [ "$code" = "000" ]; then
             echo "[board-supervisor] active (pid $pid); $1"
@@ -105,8 +101,7 @@ __supervise)
         while port_listening; do sleep 2; done
 
         echo "[board-supervisor] $(date -Is) starting board on 127.0.0.1:$PORT"
-        WATCHFILES_FORCE_POLLING=1 .venv/bin/uvicorn app:app \
-            --host 127.0.0.1 --port "$PORT" --reload --reload-dir . &
+        exec_board &
         child="$!"
         wait "$child"
         code="$?"

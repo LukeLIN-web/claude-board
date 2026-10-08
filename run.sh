@@ -20,18 +20,12 @@ fi
 
 echo "[claude-fleet] listening on http://127.0.0.1:${PORT}"
 
-# This repo often lives on a network/shared mount (e.g. /shared) where inotify
-# events don't fire, so uvicorn's default --reload silently never detects edits
-# and the server keeps serving stale code. Force watchfiles into polling mode and
-# scope the watch to this dir so reload actually works here.
-export WATCHFILES_FORCE_POLLING=1
-RELOAD_ARGS=(--reload --reload-dir .)
-
 # Foreground mode is intentionally unsupervised: it belongs to the calling
 # terminal and Ctrl-C should stop it. Detached mode goes through the supervisor,
-# which survives the shell and restarts uvicorn whenever it exits.
+# which survives the shell and restarts uvicorn whenever it exits. Both launch
+# the same way (exec_board, scripts/env.sh).
 if [ -n "$CLAUDE_FLEET_FOREGROUND" ]; then
-    exec uvicorn app:app --host 127.0.0.1 --port "$PORT" "${RELOAD_ARGS[@]}"
+    exec_board
 fi
 
 exec scripts/board-supervisor.sh "${1:-start}"
