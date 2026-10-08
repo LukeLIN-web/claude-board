@@ -5,7 +5,6 @@ import asyncio
 import json
 import os
 import time
-from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
@@ -15,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, history, hmz, memory, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
+from core import actions, auth, btwcapture, btwlog, codex, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -33,8 +32,6 @@ STATIC_DIR = HERE / "static"
 #                         advanced by its own clock since the snapshot arrived
 #                         (liveSeconds in static/index.html), so a quiet card
 #                         goes "3m ago", "4m ago"… without a push.
-#   peers[].age_seconds   how long ago a peer last answered. The page shows only
-#                         whether it is online, which is a field of its own.
 # Everything else counts, whatever it is called. So a value that grows with the
 # clock must not be written into a card's text — "空闲 12m" in a reason would
 # re-send the board once a minute per quiet card, every second for a fresh one —
@@ -44,7 +41,6 @@ STATIC_DIR = HERE / "static"
 # closeable changes its triage, and the header counts with it.
 _TICKING_SNAPSHOT = frozenset({"ts"})
 _TICKING_CARD = frozenset({"idle_seconds", "elapsed_s"})
-_TICKING_PEER = frozenset({"age_seconds"})
 
 
 class State:
@@ -72,9 +68,6 @@ class State:
         view = {k: v for k, v in snap.items() if k not in _TICKING_SNAPSHOT}
         view["windows"] = [{k: v for k, v in w.items() if k not in _TICKING_CARD}
                            for w in snap["windows"]]
-        if "peers" in snap:
-            view["peers"] = [{k: v for k, v in p.items() if k not in _TICKING_PEER}
-                             for p in snap["peers"]]
         # Sorted keys: the same content always reads the same, whatever order
         # the enrichment happened to set a card's fields in.
         return json.dumps(view, sort_keys=True)
@@ -168,20 +161,26 @@ def _local_snapshot() -> dict:
             w["permission_msg"] = None
             w["permission_ts"] = None
         tp = w.get("transcript_path")
-        if not w.get("name") and tp:
-            from core.history import _extract_first_user_text
-            first = _extract_first_user_text(Path(tp))
-            if first:
-                w["first_input"] = first[:100]
         if tp:
+            if not w.get("name"):
+                first = history._extract_first_user_text(Path(tp))
+                if first:
+                    w["first_input"] = first[:100]
             w["current_task"] = transcripts.current_task_hint(tp)
             # The model that last *answered* — a board-driven switch only shows up
             # here once the session replies on the new model, which is the point:
             # the card can't claim a switch the session never actually made.
             w["model"] = transcripts.current_model(tp)
+            w["skills_used"] = transcripts.extract_skills_used(tp)
+            w["memory_ops"] = transcripts.extract_memory_ops(tp)
+            w["background_tasks"] = transcripts.extract_background_tasks(tp)
+            # A looping prompt is the one background thing a card can't show any
+            # other way: it leaves no shell and no task row, so an unmarked card
+            # just looks like a session talking to itself every half hour.
+            w["loop"] = transcripts.session_loop(tp)
         else:
-            w["current_task"] = None
-            w["model"] = ""
+            w.update(current_task=None, model="", skills_used=[], memory_ops=[],
+                     background_tasks=[], loop=None)
         w["model_label"] = transcripts.pretty_model(w["model"])
         w["model_source"] = "transcript" if w["model"] else ""
         if not w["model_label"]:
@@ -205,25 +204,9 @@ def _local_snapshot() -> dict:
                 # the folder-trust prompt is answered by its own route, and it
                 # is the one a spawn into a never-opened directory always hits.
                 w["waiting_for"] = "trust prompt"
-        if tp:
-            w["skills_used"] = transcripts.extract_skills_used(tp)
-            w["memory_ops"] = transcripts.extract_memory_ops(tp)
-            w["background_tasks"] = transcripts.extract_background_tasks(tp)
-            # A looping prompt is the one background thing a card can't show any
-            # other way: it leaves no shell and no task row, so an unmarked card
-            # just looks like a session talking to itself every half hour.
-            w["loop"] = transcripts.session_loop(tp)
-        else:
-            w["skills_used"] = []
-            w["memory_ops"] = []
-            w["background_tasks"] = []
-            w["loop"] = None
         # After background_tasks, not before: that list is how patrol tells a
         # session waiting on background work from one waiting on a person.
-        tri = patrol.classify(w)
-        w["triage"] = tri["triage"]
-        w["triage_reason"] = tri["reason"]
-        w["triage_suggestion"] = tri["suggestion"]
+        w.update(patrol.classify(w))
         # Queued prompts: reliable dashboard-sent items (reconciled against the
         # transcript) plus best-effort TUI-typed items scraped from the pane.
         # A queue only exists while busy, which also bounds the extra capture.
@@ -494,47 +477,23 @@ def api_timeline(key: str, limit: int = 2000) -> dict:
 
 def _timeline(w, pid: int, limit: int) -> dict:
     """A local card's timeline panel: its events and what is pinned above them."""
-    tp = w.transcript_path or ""
     out = {
         "pid": pid,
         "session_id": w.session_id,
         "project_name": w.project_name,
+        "platform": w.platform,
         # Defaults, which Codex and hmz mostly keep: neither writes a recap, so
         # there is no goal to pin, nor has a /loop skill, so nothing schedules
         # a looping prompt — and neither has a Claude-style interactive menu to
         # scrape from the pane.
-        "skills_used": [],
-        "memory_ops": [],
-        "plan_history": [],
-        "goal": None,
-        "loop": None,
+        **_claude_panels(""),
         "menu": None,
     }
     if w.platform == "codex":
-        # Codex transcripts have their own shape.
-        activity = codex.extract_codex_session_activity(tp) if tp else {}
-        out.update(
-            platform="codex",
-            events=codex.codex_timeline(tp, limit=limit, since_ms=codex.cleared_at_ms(pid)) if tp else [],
-            skills_used=activity.get("skills_used", []),
-            memory_ops=activity.get("memory_ops", []),
-        )
-        return out
+        return {**out, **codex.live_timeline(w, limit)}
     if w.platform == "hmz":
-        # What was typed into it too: hmz takes a line it then refuses, and that
-        # line is in no run.
-        typed = hmz.typed(pid, w.cwd, w.started_at)
-        cleared = hmz.cleared_at_ms(typed, codex.cleared_at_ms(pid))
-        held = hmz.held_note(w)
-        events = hmz.hmz_timeline(tp or None, limit=limit, typed=typed, since_ms=cleared)
-        out.update(
-            platform="hmz",
-            events=events,
-            note=(held if held
-                  else hmz.CLEARED_NOTE if cleared and not events else None if tp
-                  else hmz.TYPED_NO_RUN_NOTE if typed else hmz.NO_RUN_NOTE),
-        )
-        return out
+        return {**out, **hmz.live_timeline(w, limit)}
+    tp = w.transcript_path or ""
     events = transcripts.timeline(tp, limit=limit) if tp else []
     # Merge in /btw asides — they live only in the fleet's archive (never the
     # transcript). Re-sort by timestamp so they interleave with real turns;
@@ -544,15 +503,14 @@ def _timeline(w, pid: int, limit: int) -> dict:
     if btw_evs:
         events = sorted(events + btw_evs,
                         key=lambda e: transcripts._parse_ts(e.get("ts", "")))[-limit:]
-    out.update(
-        platform="claude",
-        events=events,
+    return {
+        **out,
+        "events": events,
         **_claude_panels(tp),
         # Live interactive menu (AskUserQuestion / permission prompt) parsed from
         # the tmux pane — the transcript doesn't record it until it's resolved.
-        menu=actions.get_pane_menu(pid),
-    )
-    return out
+        "menu": actions.get_pane_menu(w),
+    }
 
 
 @app.get("/api/windows/{key}/plan")
@@ -580,6 +538,16 @@ def api_focus(key: str) -> dict:
         else {"ok": False, "error": "no tty available for this pid"}))
 
 
+def _on_host(body: BaseModel, path: str, local: Callable[[], dict]) -> dict:
+    """Run a route that names a `host` on that host's board. A configured peer's
+    label forwards the request there, with the host stripped: the peer runs it
+    locally, and a peer list that ever names this board back can't bounce the
+    request around. Anything else — empty, or this host's own label — runs here."""
+    if peers.is_peer(body.host):
+        return peers.forward(body.host, "POST", path, body.model_dump(exclude={"host"}))
+    return local()
+
+
 class CreateBody(BaseModel):
     cwd: str
     platform: str = "claude"  # "claude" | "codex" | "hmz"
@@ -594,14 +562,11 @@ class PromptBody(BaseModel):
 
 @app.post("/api/windows/create")
 def api_window_create(body: CreateBody) -> dict:
-    if body.host and body.host in peers.configured():
-        # Forward with the host stripped: the peer spawns locally, and a peer
-        # list that ever names this board back can't bounce the request around.
-        return peers.forward(body.host, "POST", "/api/windows/create",
-                             {"cwd": body.cwd, "platform": body.platform})
-    if not sessions._cwd_visible(body.cwd):
-        raise HTTPException(403, "cwd is hidden by the dashboard filter")
-    return actions.create_session(body.cwd, body.platform)
+    def create() -> dict:
+        if not sessions._cwd_visible(body.cwd):
+            raise HTTPException(403, "cwd is hidden by the dashboard filter")
+        return actions.create_session(body.cwd, body.platform)
+    return _on_host(body, "/api/windows/create", create)
 
 
 class SpawnDirsBody(BaseModel):
@@ -616,11 +581,9 @@ def api_spawn_dirs(body: SpawnDirsBody) -> dict:
     api_window_create makes. Lets the New session picker offer the directories
     other machines' cards are in, without offering one that only exists on them
     (a host-local /home path, say)."""
-    if body.host and body.host in peers.configured():
-        return peers.forward(body.host, "POST", "/api/spawn-dirs", {"paths": body.paths})
-    ok = [p for p in body.paths[:200]
-          if sessions._cwd_visible(p) and os.path.isdir(os.path.expanduser(p))]
-    return {"ok": True, "paths": ok}
+    return _on_host(body, "/api/spawn-dirs", lambda: {"ok": True, "paths": [
+        p for p in body.paths[:200]
+        if sessions._cwd_visible(p) and os.path.isdir(os.path.expanduser(p))]})
 
 
 class UsageBody(BaseModel):
@@ -633,19 +596,18 @@ def api_usage(body: UsageBody) -> dict:
     """`cli`'s plan usage on `host`, Claude's or Codex's: how much of each limit
     is gone and when it resets (core/usage.py). Each machine has its own login,
     so a peer's is read by the peer's board."""
-    if body.host and body.host in peers.configured():
-        return peers.forward(body.host, "POST", "/api/usage", {"cli": body.cli})
-    return usage.read_usage(body.cli)
+    return _on_host(body, "/api/usage", lambda: usage.read_usage(body.cli))
 
 
-def _send_recorded(pid: int, text: str) -> dict:
-    """Type `text` into the session and, if that worked, record it as sent from
-    the dashboard — what the card's Queued list is built from (promptqueue)."""
+def _send_recorded(w, pid: int, text: str) -> dict:
+    """Type `text` into window `w`'s session and, if that worked, record it as
+    sent from the dashboard — what the card's Queued list is built from
+    (promptqueue)."""
     # Stamp the send time before the keystrokes: send_prompt types, verifies the
     # composer and verifies the submit, which takes long enough that Claude's own
     # transcript row for the prompt can predate a post-send stamp (see record_sent).
     sent_at = time.time()
-    r = actions.send_prompt(pid, text)
+    r = actions.send_prompt(w, text)
     if r.get("ok"):
         promptqueue.record_sent(pid, text, ts=sent_at)
     return r
@@ -654,7 +616,7 @@ def _send_recorded(pid: int, text: str) -> dict:
 @app.post("/api/windows/{key}/prompt")
 def api_window_prompt(key: str, body: PromptBody) -> dict:
     return _on_card(key, "POST", "prompt",
-                    lambda w, pid: _send_recorded(pid, body.text), body)
+                    lambda w, pid: _send_recorded(w, pid, body.text), body)
 
 
 @app.post("/api/windows/{key}/clear")
@@ -667,7 +629,7 @@ def api_window_clear(key: str) -> dict:
     time that hides older events from the card and timeline (see
     codex.mark_cleared, hmz.cleared_at_ms)."""
     def clear(w, pid: int) -> dict:
-        r = _send_recorded(pid, "/clear")
+        r = _send_recorded(w, pid, "/clear")
         if r.get("ok"):
             codex.mark_cleared(pid)
         return r
@@ -689,7 +651,7 @@ def api_window_model(key: str, body: ModelBody) -> dict:
     two-step picker with `model` and/or `effort`; that picker has no session-only
     scope and also rewrites ~/.codex/config.toml."""
     return _on_card(key, "POST", "model",
-                    lambda w, pid: actions.switch_model(pid, body.model, body.effort), body)
+                    lambda w, pid: actions.switch_model(w, body.model, body.effort), body)
 
 
 class PermissionBody(BaseModel):
@@ -699,7 +661,7 @@ class PermissionBody(BaseModel):
 @app.post("/api/windows/{key}/permission")
 def api_window_permission(key: str, body: PermissionBody) -> dict:
     return _on_card(key, "POST", "permission",
-                    lambda w, pid: actions.respond_permission(pid, body.choice), body)
+                    lambda w, pid: actions.respond_permission(w, body.choice), body)
 
 
 class MenuKeysBody(BaseModel):
@@ -709,12 +671,12 @@ class MenuKeysBody(BaseModel):
 @app.post("/api/windows/{key}/keys")
 def api_window_keys(key: str, body: MenuKeysBody) -> dict:
     return _on_card(key, "POST", "keys",
-                    lambda w, pid: actions.send_menu_keys(pid, body.keys), body)
+                    lambda w, pid: actions.send_menu_keys(w, body.keys), body)
 
 
 @app.post("/api/windows/{key}/close")
 def api_close(key: str) -> dict:
-    return _on_card(key, "POST", "close", lambda w, pid: actions.close_session(pid))
+    return _on_card(key, "POST", "close", lambda w, pid: actions.close_session(w))
 
 
 class BtwDismissBody(BaseModel):
@@ -763,8 +725,8 @@ def api_history(q: str = "", page: int = 1, limit: int = 30) -> dict:
 def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
     # Claude Code transcripts — none at all on a host that runs only Codex or
     # OpenCode, where there is no projects/ dir to list.
-    from core.sessions import PROJECTS_DIR
-    for proj_dir in (PROJECTS_DIR.iterdir() if PROJECTS_DIR.is_dir() else ()):
+    projects = sessions.PROJECTS_DIR
+    for proj_dir in (projects.iterdir() if projects.is_dir() else ()):
         if not proj_dir.is_dir():
             continue
         f = proj_dir / f"{session_id}.jsonl"
@@ -789,7 +751,6 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
         return {"session_id": session_id, "project_slug": "codex", "events": events, "platform": "codex"}
     # OpenCode sessions (SQLite), judged on the directory the session records.
     try:
-        from core import opencode
         directory = opencode.session_directory(session_id)
         events = (opencode.opencode_timeline(session_id, limit=limit)
                   if directory is not None and sessions._cwd_visible(directory) else [])
@@ -807,6 +768,19 @@ def _history_cwd(session_id: str) -> str | None:
     return (s.project or str(Path.home())) if s else None
 
 
+def _relaunch(session_id: str, fork: bool) -> dict:
+    """Open history session `session_id` again in the directory it ran in —
+    under a new id with `fork`. Answers the "resume from summary?" picker a
+    large/old session parks on (see actions.resume_claude), so the card isn't
+    left stuck on a menu."""
+    cwd = _history_cwd(session_id)
+    if cwd is None:
+        return {"ok": False, "error": "session not found in index"}
+    r = actions.resume_claude(cwd, session_id, fork=fork)
+    r.update({"action": "forked" if fork else "resumed", "session_id": session_id, "cwd": cwd})
+    return r
+
+
 @app.post("/api/history/{session_id}/resume")
 def api_history_resume(session_id: str) -> dict:
     # If the session is alive, focus it instead of opening a new window.
@@ -814,101 +788,41 @@ def api_history_resume(session_id: str) -> dict:
     if w and w.alive and w.tty:
         result = actions.focus_terminal(w.tty)
         return {"ok": result.get("ok", False), "action": "focused", "session_id": session_id, "pid": w.pid}
-
-    cwd = _history_cwd(session_id)
-    if cwd is None:
-        return {"ok": False, "error": "session not found in index"}
-    # Answers the "resume from summary?" picker a large/old session parks on
-    # (see actions.resume_claude), so the card isn't left stuck on a menu.
-    r = actions.resume_claude(cwd, session_id)
-    r.update({"action": "resumed", "session_id": session_id, "cwd": cwd})
-    return r
+    return _relaunch(session_id, fork=False)
 
 
 @app.post("/api/history/{session_id}/fork")
 def api_history_fork(session_id: str) -> dict:
-    cwd = _history_cwd(session_id)
-    if cwd is None:
-        return {"ok": False, "error": "session not found in index"}
-    r = actions.resume_claude(cwd, session_id, fork=True)
-    r.update({"action": "forked", "session_id": session_id, "cwd": cwd})
-    return r
-
-
-# What each session's history-index breakdown counts, keyed by its field there
-# and named as the reverse-lookup rows below name it. The index produced these
-# per session already, for Claude, OpenCode and Codex alike.
-_SKILL_KINDS = {"per_skill_invokes": "invoke", "per_skill_reads": "reads",
-                "per_skill_writes": "writes", "per_skill_bash_refs": "bash_refs"}
-_MEMORY_KINDS = {"per_memory_reads": "reads", "per_memory_writes": "writes",
-                 "per_memory_edits": "edits"}
-
-
-def _sessions_touching(name: str, breakdown_key: str, kinds: dict[str, str]) -> dict:
-    """Reverse lookup: the sessions whose `breakdown_key` counts `name` under
-    any of `kinds`, busiest first, with the per-kind counts."""
-    rows = []
-    for s in history.index():
-        bd = getattr(s, breakdown_key) or {}
-        counts = {field: (bd.get(k) or {}).get(name, 0) for k, field in kinds.items()}
-        total = sum(counts.values())
-        if total == 0:
-            continue
-        rows.append({
-            "session_id": s.session_id,
-            "project_name": s.project_name,
-            "platform": s.platform,
-            "title": s.first_input[:120],
-            "ts": s.last_ts or s.first_ts or "",
-            **counts,
-            "total": total,
-        })
-    rows.sort(key=lambda r: -r["total"])
-    return {"name": name, "sessions": rows, "session_count": len(rows)}
+    return _relaunch(session_id, fork=True)
 
 
 @app.get("/api/skills/{name}/sessions")
 def api_skill_sessions(name: str) -> dict:
     """Reverse lookup: which sessions touched this skill, with per-session counts."""
-    return _sessions_touching(name, "skill_breakdown", _SKILL_KINDS)
+    return history.sessions_touching(name, "skill_breakdown", history.SKILL_KINDS)
 
 
 @app.get("/api/memory/{name}/sessions")
 def api_memory_sessions(name: str) -> dict:
     """Reverse lookup: which sessions read/wrote this memory."""
-    return _sessions_touching(name, "memory_breakdown", _MEMORY_KINDS)
+    return history.sessions_touching(name, "memory_breakdown", history.MEMORY_KINDS)
 
 
 @app.get("/api/memory/{name}")
 def api_memory_detail(name: str) -> dict:
-    f = memory.find_memory(name)
-    if not f:
+    d = memory.memory_detail(name)
+    if not d:
         raise HTTPException(404, "memory not found")
-    fm, body = memory.split_frontmatter(f.read_text(errors="replace"))
-    return {
-        "name": fm.get("name", name),
-        "description": fm.get("description", ""),
-        "type": fm.get("type", "unknown"),
-        "content": body,
-        "path": str(f),
-    }
+    return d
 
 
 @app.get("/api/skills")
 def api_skills() -> dict:
-    session_count: Counter[str] = Counter()
-    activity = {k: Counter() for k in _SKILL_KINDS}
-    for s in history.index():
-        session_count.update(s.skills_used)
-        # Use the per-session breakdown that history index already produced
-        # (covers Claude + OpenCode + Codex uniformly).
-        bd = s.skill_breakdown or {}
-        for k, c in activity.items():
-            c.update(bd.get(k) or {})
+    session_count, activity = history.skill_totals()
     all_skills = skills.list_all_skills()
     for s in all_skills:
         name = s["name"]
-        n = {field: activity[k][name] for k, field in _SKILL_KINDS.items()}
+        n = {field: c[name] for field, c in activity.items()}
         s["session_count"] = session_count[name]
         s["invoke_count"] = n["invoke"]
         s["reads"] = n["reads"]
@@ -921,21 +835,13 @@ def api_skills() -> dict:
 
 @app.get("/api/memory")
 def api_memory(project: str | None = None) -> dict:
-    read_count: dict[str, int] = {}
-    write_count: dict[str, int] = {}
-    for s in history.index():
-        for m in s.memory_ops:
-            name = m["name"]
-            if m["operation"] == "read":
-                read_count[name] = read_count.get(name, 0) + 1
-            else:
-                write_count[name] = write_count.get(name, 0) + 1
+    reads, writes = history.memory_session_counts()
     result = memory.list_memories(project_slug=project)
     for group_mems in result.get("groups", {}).values():
         for m in group_mems:
             stem = m.get("file_stem", m["name"])
-            m["read_sessions"] = read_count.get(stem, 0)
-            m["write_sessions"] = write_count.get(stem, 0)
+            m["read_sessions"] = reads[stem]
+            m["write_sessions"] = writes[stem]
     return result
 
 

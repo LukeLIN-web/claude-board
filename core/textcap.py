@@ -146,7 +146,7 @@ def edit_diff(old: str | None, new: str | None, limit: int = EDIT_DIFF_CHARS) ->
             else:
                 lines.extend("- " + x for x in mid_a[i1:i2])
                 lines.extend("+ " + x for x in mid_b[j1:j2])
-    _emit_equal(lines, a[len(a) - tail:] if tail else [])
+    _emit_equal(lines, a[len(a) - tail:])
 
     if old != new and not any(ln[:1] in "-+" for ln in lines):
         lines.append("…（仅换行/行尾空白不同）")  # splitlines() hides those

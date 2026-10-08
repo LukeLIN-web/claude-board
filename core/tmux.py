@@ -487,10 +487,8 @@ def capture_pane(pane: str, scrollback: int = 0) -> dict:
     `scrollback` > 0 includes that many lines of history above the visible area —
     needed for tall interactive menus whose top options scroll off-screen.
     """
-    args = ["capture-pane", "-p", "-t", pane]
-    if scrollback > 0:
-        args = ["capture-pane", "-p", "-S", f"-{scrollback}", "-t", pane]
-    r = _run(*args)
+    history = ("-S", f"-{scrollback}") if scrollback > 0 else ()
+    r = _run("capture-pane", "-p", *history, "-t", pane)
     if not r["ok"]:
         return {"ok": False, "error": r["error"], "text": ""}
     return {"ok": True, "text": r["stdout"]}

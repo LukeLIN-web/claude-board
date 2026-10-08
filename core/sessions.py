@@ -169,11 +169,23 @@ def transcript_visible(path: str | Path) -> bool:
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
     except OSError:
         return False
     return True
+
+
+def _ps_tty(raw: str) -> Optional[str]:
+    """The device a `ps` tty column names, or None for a process with no
+    controlling terminal ("?", "??") — a background job, not a window."""
+    return f"/dev/{raw}" if raw and raw not in ("?", "??") else None
+
+
+def _proc_cwd(pid: int) -> str:
+    """The directory `pid` runs in, "" where /proc can't say."""
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
 
 
 def _proc_start_ms(pid: int) -> int:
@@ -593,20 +605,17 @@ def list_claude_proc_windows(
     # transcript (its file's mtime is refreshed by the resume itself).
     claimed_sids.update(parsed["session_id"] for _, _, parsed in procs if parsed["session_id"])
     for pid, tty_raw, parsed in procs:
-        if tty_raw in ("?", "??") or not tty_raw:
+        tty = _ps_tty(tty_raw)
+        if not tty:
             continue  # no controlling terminal → background/daemon, not a window
         if pid in known_pids:
             continue  # already carded from its session file
-        tty = f"/dev/{tty_raw}"
         if tty in seen_ttys:
             continue  # one card per terminal; file-based window or earlier proc wins
         if not _pid_alive(pid):
             continue
 
-        try:
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-        except Exception:
-            cwd = ""
+        cwd = _proc_cwd(pid)
         if not _cwd_visible(cwd):
             continue
         seen_ttys.add(tty)

@@ -61,7 +61,7 @@ from typing import Callable, Optional
 
 from . import codex, patrol, tmux, transcripts
 from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
-                       _proc_start_ms, proc_table)
+                       _proc_cwd, _proc_start_ms, _ps_tty, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
 
 HMZ_HOME = HOME_BASE / ".hmz"
@@ -314,8 +314,6 @@ def _fold_codex(st: dict, d: dict) -> None:
         st["spent"] = {st["model"] or "codex": {k: n for k, n in kinds.items() if n > 0}}
 
 
-# The price list, indexed per file and kept until the file changes.
-_PRICES: dict[str, tuple[float, dict]] = {}
 _SPELLING = re.compile(r"[^a-z0-9]")
 # Scraps that name a release rather than a model, cut the way hmz's own lookup
 # cuts them: `claude-haiku-4-5-20251001` is priced as `claude-haiku-4.5`.
@@ -331,20 +329,15 @@ def _spelled(model: str) -> str:
     return _SPELLING.sub("", model.lower())
 
 
+# Indexed once per version of the file.
+@transcripts.memo_by_file
 def _prices(path: Path) -> dict[str, dict[str, float]]:
     """hmz's copy of the price list at `path` (see _price_list) — USD per
     million tokens by kind, under every spelling of each model it lists — or {}
     where there is none."""
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return {}
-    kept = _PRICES.get(str(path))
-    if kept and kept[0] == mtime:
-        return kept[1]
     index: dict[str, dict[str, float]] = {}
     try:
-        models = json.loads(path.read_text()).get("models") or {}
+        models = json.loads(Path(path).read_text()).get("models") or {}
     except Exception:
         models = {}
     for ident, m in (models.items() if isinstance(models, dict) else []):
@@ -355,7 +348,6 @@ def _prices(path: Path) -> dict[str, dict[str, float]]:
         for name in (str(ident), str(m.get("name") or "")):
             if _spelled(name):
                 index.setdefault(_spelled(name), per)
-    _PRICES[str(path)] = (mtime, index)
     return index
 
 
@@ -584,15 +576,12 @@ def _discover() -> list[tuple[Window, list[dict]]]:
         return []
     windows: list[tuple[Window, list[dict]]] = []
     for pid, info in proc_table().items():
-        tty = info.tty
-        if not tty or tty in ("?", "??") or not _is_interactive_hmz(info.args):
+        tty = _ps_tty(info.tty)
+        if not tty or not _is_interactive_hmz(info.args):
             continue
         if not _pid_alive(pid):
             continue
-        try:
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-        except OSError:
-            cwd = ""
+        cwd = _proc_cwd(pid)
         if not _cwd_visible(cwd):
             continue
         started_at = _proc_start_ms(pid)
@@ -625,7 +614,7 @@ def _discover() -> list[tuple[Window, list[dict]]]:
             started_at=started_at,
             updated_at=updated_at,
             version="",
-            tty=f"/dev/{tty}",
+            tty=tty,
             transcript_path=str(epic) if epic else None,
             alive=True,
             hidden=False,
@@ -637,12 +626,9 @@ def _discover() -> list[tuple[Window, list[dict]]]:
 
 def _screen(w: Window) -> list[str]:
     """The non-blank lines on hmz `w`'s screen, or none while it runs a flow."""
-    if w.status == "busy" or not w.tty:
+    if w.status == "busy":
         return []
-    pane = tmux.pane_for_tty(w.tty)
-    if pane is None:
-        return []
-    return [l for l in tmux.capture_pane(pane).get("text", "").splitlines() if l.strip()]
+    return [l for l in (tmux.capture_tty(w.tty) or "").splitlines() if l.strip()]
 
 
 def _crumb(lines: list[str]) -> str:
@@ -673,27 +659,45 @@ def _question(lines: list[str]) -> tuple[str, str]:
     return "", ""
 
 
-def menu(w: Window) -> str:
-    """Where in a menu hmz `w` stands — "parallel_flame_chase › Set budget for
-    parallel_flame_chase" — or "" when it isn't in one or is running a flow."""
-    return _crumb(_screen(w))
-
-
 def question(w: Window) -> tuple[str, str]:
     """What hmz `w` is asking in a box over its screen, and the keys that answer
     it, or ("", "") — see _question."""
     return _question(_screen(w))
 
 
-def held_note(w: Window) -> Optional[str]:
-    """What the timeline says while hmz `w` waits on its own terminal: asked
-    something — the box over a menu comes first — or in a menu; else None."""
+def held(w: Window) -> tuple[str, str, str]:
+    """What holds hmz `w` on its own terminal, off one read of its screen: the
+    question it asks and the keys that answer it (see _question), else where in
+    a menu it stands — "parallel_flame_chase › Set budget for
+    parallel_flame_chase" — as (asked, keys, crumb). The box over a menu comes
+    first; all "" when neither, or while it runs a flow."""
     lines = _screen(w)
     asked, keys = _question(lines)
+    return asked, keys, "" if asked else _crumb(lines)
+
+
+def _held_note(w: Window) -> Optional[str]:
+    """What the timeline says while hmz `w` waits on its own terminal (see
+    held), or None."""
+    asked, keys, crumb = held(w)
     if asked:
         return QUESTION_NOTE.format(asked, keys)
-    crumb = _crumb(lines)
     return MENU_NOTE.format(crumb) if crumb else None
+
+
+def live_timeline(w: Window, limit: int) -> dict:
+    """A live hmz card's timeline: its `events` (see hmz_timeline), with what was
+    typed into it too — hmz takes a line it then refuses, and that line is in
+    no run — and the `note` that says what holds it or why there is nothing."""
+    lines = typed(w.pid, w.cwd, w.started_at)
+    cleared = cleared_at_ms(lines, codex.cleared_at_ms(w.pid))
+    events = hmz_timeline(w.transcript_path, limit=limit, typed=lines, since_ms=cleared)
+    note = _held_note(w)
+    if note is None and cleared and not events:
+        note = CLEARED_NOTE
+    elif note is None and not w.transcript_path:
+        note = TYPED_NO_RUN_NOTE if lines else NO_RUN_NOTE
+    return {"events": events, "note": note}
 
 
 def hmz_window_dicts() -> list[dict]:
@@ -717,16 +721,12 @@ def hmz_window_dicts() -> list[dict]:
             first_input, current_task, last_error = "", "", None
             epic, events = None, []
         tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
-        lines = _screen(w)
-        asked, keys = _question(lines)
-        crumb = _crumb(lines)
+        asked, keys, crumb = held(w)
         # Not waiting_perm: that card's Quick Approve would type "1" into it.
         if asked:
-            tri = {"triage": "stalled", "triage_reason": f"在问：{asked}",
-                   "triage_suggestion": f"去终端回答（{keys}）"}
+            tri = patrol._triage("stalled", f"在问：{asked}", f"去终端回答（{keys}）")
         elif crumb:
-            tri = {"triage": "stalled", "triage_reason": f"停在菜单：{crumb}",
-                   "triage_suggestion": "去终端填完并 Save"}
+            tri = patrol._triage("stalled", f"停在菜单：{crumb}", "去终端填完并 Save")
         models = _models(began)
         d.update({
             "permission_msg": None,
@@ -812,10 +812,15 @@ def _history(path: Path, start: int = 0) -> list[dict]:
     return out
 
 
+# Every hmz on a home shares its history, which grows for as long as hmz is used
+# and is read for every hmz card on every refresh: read once per version.
+_all_history = transcripts.memo_by_file(_history)
+
+
 def typed(pid: int, cwd: str, since_ms: int) -> list[dict]:
     """The lines typed into hmz `pid` since it started, oldest first, as hmz
     wrote them down — whether or not any of them started anything."""
-    return [d for d in _history(_home(pid) / "history.jsonl")
+    return [d for d in _all_history(_home(pid) / "history.jsonl")
             if d["workdir"] == cwd and transcripts._parse_ts(d["at"]) * 1000 >= since_ms]
 
 
@@ -870,7 +875,7 @@ def prompt_taken(pid: int, cwd: str, text: str, pane: str) -> Callable[[], bool]
     except OSError:
         mark = 0
     want = _squeeze(text)
-    said = _history(path)
+    said = _all_history(path)
     # hmz's "last given" is the newest line typed in this directory, or the
     # newest anywhere when nothing was ever typed here.
     here = [d["text"] for d in said if d["workdir"] == cwd] or [d["text"] for d in said]
@@ -900,7 +905,7 @@ def refusal(pane: str, text: str) -> str:
     lines = tmux.capture_pane(pane).get("text", "").splitlines()
     composer = next((i for i in range(len(lines) - 1, -1, -1)
                      if lines[i].lstrip().startswith(_COMPOSER)), -1)
-    needle = _squeeze(text)[-24:]
+    needle = tmux._needle(text)
     if composer < 0 or not needle:
         return ""
     # Where the echo ends, found on the screen with its wrapping squeezed out.
@@ -999,8 +1004,8 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
             continue
         if kind == "began":
             text = f"${e.get('flow', '')} {e.get('task', '')}".strip()
-            events.append({"ts": ts, "kind": "user_text", "text": cap_text(text, MESSAGE_CHARS),
-                           "tool": None, "role": "user", "extra": {}})
+            events.append(transcripts.event(ts, "user_text", cap_text(text, MESSAGE_CHARS),
+                                            role="user"))
             continue
         if kind == "opened":
             agent = str(e.get("agent") or "")
@@ -1013,16 +1018,16 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
             text = f"run ended: {e.get('how', '')}"
         else:
             continue
-        events.append({"ts": ts, "kind": "assistant_text", "text": text,
-                       "tool": None, "role": "assistant", "extra": extra})
+        events.append(transcripts.event(ts, "assistant_text", text, role="assistant",
+                                        extra=extra))
     # A typed line the run took is already here, in the line it began on —
     # `$<flow> <task>`, so a line typed without its `$<flow>` is looked for inside.
     shown = [_squeeze(ev.get("text") or "") for ev in events if ev.get("kind") == "user_text"]
     for d in typed:
         line = _squeeze(cap_text(d["text"], MESSAGE_CHARS))
         if line and not _before(d["at"], since_ms) and not any(line in s for s in shown):
-            events.append({"ts": d["at"], "kind": "user_text", "text": cap_text(d["text"], MESSAGE_CHARS),
-                           "tool": None, "role": "user", "extra": {}})
+            events.append(transcripts.event(d["at"], "user_text",
+                                            cap_text(d["text"], MESSAGE_CHARS), role="user"))
     if path:
         events += [ev for ev in _said(Path(path), run, limit) if not _before(ev.get("ts") or "", since_ms)]
     # Stable: at one instant the run's own lines come first, in their order.

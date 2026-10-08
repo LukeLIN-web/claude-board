@@ -117,8 +117,11 @@ def reload_config() -> dict[str, str]:
 reload_config()
 
 
-def configured() -> dict[str, str]:
-    return dict(_peers)
+def is_peer(label: str) -> bool:
+    """Whether `label` names a configured peer — the routes that take a host
+    run on that board when it does, and here otherwise (this host's own label
+    or none at all)."""
+    return label in _peers
 
 
 def enabled() -> bool:
@@ -239,7 +242,10 @@ def remote_windows() -> list[dict]:
 
 
 def status() -> list[dict]:
-    """Per-peer health for the UI header: online, how stale, last error."""
+    """Per-peer health for the UI header: online, and the last error.
+
+    Nothing that moves with the clock (how long ago it answered): the snapshot
+    carries this, and a value that ticks would re-send the board every poll."""
     now = time.time()
     with _lock:
         entries = {k: dict(v) for k, v in _cache.items()}
@@ -247,13 +253,9 @@ def status() -> list[dict]:
     for label in sorted(_peers):
         entry = entries.get(label) or {}
         ts = entry.get("ts") or 0
-        age = (now - ts) if ts else None
         out.append({
             "host": label,
-            "url": _peers[label],
-            "online": bool(ts) and age <= STALE_AFTER,
-            "age_seconds": round(age, 1) if age is not None else None,
-            "windows": len(entry.get("windows", [])),
+            "online": bool(ts) and now - ts <= STALE_AFTER,
             "error": entry.get("error"),
         })
     return out

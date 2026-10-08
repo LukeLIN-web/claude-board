@@ -1,14 +1,16 @@
 """Parse OpenCode sessions from SQLite DB at ~/.local/share/opencode/opencode.db."""
 from __future__ import annotations
 
+import datetime
 import json
 import sqlite3
+from collections import Counter
 from typing import Optional
 
 from .search import excerpt, find
 from .sessions import HOME_BASE
 from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
-from .transcripts import _SKILL_PATH_RE
+from .transcripts import _SKILL_PATH_RE, event
 
 OPENCODE_DB = HOME_BASE / ".local/share/opencode/opencode.db"
 
@@ -45,6 +47,7 @@ def list_opencode_sessions() -> list[dict]:
             ORDER BY s.time_updated DESC
         """)
         rows = cur.fetchall()
+        calls = _tool_calls_by_session(conn)
     except Exception:
         return []
     finally:
@@ -54,7 +57,6 @@ def list_opencode_sessions() -> list[dict]:
     for row in rows:
         sid, title, directory, created, updated, first_input, model = row
         project_name = directory.rsplit("/", 1)[-1] if directory else "opencode"
-        activity = extract_opencode_session_activity(sid)
         sessions.append({
             "session_id": sid,
             "project": directory or "",
@@ -69,10 +71,7 @@ def list_opencode_sessions() -> list[dict]:
             "is_alive": False,
             "platform": "opencode",
             "model": model or "",
-            "skills_used": activity["skills_used"],
-            "memory_ops": activity["memory_ops"],
-            "skill_breakdown": activity.get("skill_activity", {}),
-            "memory_breakdown": activity.get("memory_activity", {}),
+            **_activity(calls.get(sid, [])),
         })
     return sessions
 
@@ -126,7 +125,7 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
             if not text.strip():
                 continue
             kind = "user_text" if role == "user" else "assistant_text"
-            events.append({"ts": ts, "kind": kind, "text": cap_text(text, MESSAGE_CHARS), "tool": None, "role": role or "assistant", "extra": {}})
+            events.append(event(ts, kind, cap_text(text, MESSAGE_CHARS), role=role or "assistant"))
 
         elif ptype == "tool":
             state = pd.get("state") or {}
@@ -134,11 +133,11 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
             # A call that ended any other way (an error) with output gets no row.
             if output and status not in ("completed", "running"):
                 continue
-            events.append({"ts": ts, "kind": "tool_use", "text": "", "tool": pd.get("tool", ""), "role": "assistant",
-                           "extra": _tool_preview(state.get("input") or {})})
+            events.append(event(ts, "tool_use", role="assistant", tool=pd.get("tool", ""),
+                                extra=_tool_preview(state.get("input") or {})))
             if output and status == "completed":
-                events.append({"ts": ts, "kind": "tool_result", "text": cap_text(output, TOOL_RESULT_CHARS),
-                               "tool": None, "role": "user", "extra": {}})
+                events.append(event(ts, "tool_result", cap_text(output, TOOL_RESULT_CHARS),
+                                    role="user"))
 
     return events[-limit:]
 
@@ -184,46 +183,37 @@ def search_opencode(query: str) -> dict[str, list[str]]:
     return result
 
 
-def extract_opencode_session_activity(session_id: str) -> dict:
-    """Extract skill/memory activity for an OpenCode session.
+def _tool_calls_by_session(conn: sqlite3.Connection) -> dict[str, list[tuple[str, dict]]]:
+    """Every tool call OpenCode recorded, as (tool, input) per session id — one
+    query for them all, reading only those two fields of each part (a part
+    also holds the call's output)."""
+    out: dict[str, list[tuple[str, dict]]] = {}
+    for sid, tool, inp in conn.execute("""
+            SELECT session_id, json_extract(data, '$.tool'), json_extract(data, '$.state.input')
+            FROM part WHERE json_extract(data, '$.type') = 'tool'
+    """):
+        try:
+            inp = json.loads(inp) if inp else {}
+        except ValueError:
+            continue
+        out.setdefault(sid, []).append((tool or "", inp if isinstance(inp, dict) else {}))
+    return out
 
-    Returns {skills_used, memory_ops, skill_activity} matching
-    Claude Code's format but adapted for OpenCode's tool naming.
-    OpenCode tools: bash, read, write, edit, skill (all lowercase).
-    File path field: filePath (not file_path).
-    """
-    conn = _get_conn()
-    if not conn:
-        return {"skills_used": [], "memory_ops": [], "skill_activity": {}}
-    try:
-        cur = conn.execute("""
-            SELECT data FROM part
-            WHERE session_id = ? AND json_extract(data, '$.type') = 'tool'
-        """, (session_id,))
-        rows = cur.fetchall()
-    except Exception:
-        return {"skills_used": [], "memory_ops": [], "skill_activity": {}}
-    finally:
-        conn.close()
 
-    skill_invokes: dict[str, int] = {}
-    skill_reads: dict[str, int] = {}
-    skill_writes: dict[str, int] = {}
-    skill_bash: dict[str, int] = {}
-    memory_reads: dict[str, int] = {}
-    memory_writes: dict[str, int] = {}
-    memory_edits: dict[str, int] = {}
+def _activity(calls: list[tuple[str, dict]]) -> dict:
+    """Skill/memory activity of a session's tool `calls`, in the shape Claude
+    Code's (transcripts.session_activity) and Codex's sessions report it,
+    adapted for OpenCode's tool naming: bash, read, write, edit, patch, skill
+    (all lowercase), the file path under filePath (not file_path)."""
+    skill_invokes: Counter[str] = Counter()
+    skill_reads: Counter[str] = Counter()
+    skill_writes: Counter[str] = Counter()
+    skill_bash: Counter[str] = Counter()
+    memory_counts = {"read": Counter(), "write": Counter(), "edit": Counter()}
     memory_ops: list[dict] = []
     mem_seen: set[tuple[str, str]] = set()
 
-    for (data_str,) in rows:
-        try:
-            pd = json.loads(data_str)
-        except:
-            continue
-        tool = pd.get("tool", "")
-        state = pd.get("state") or {}
-        inp = state.get("input") or {}
+    for tool, inp in calls:
         fp = inp.get("filePath", "") or inp.get("file_path", "") or ""
         cmd = inp.get("command", "") or ""
 
@@ -231,59 +221,45 @@ def extract_opencode_session_activity(session_id: str) -> dict:
         if tool == "skill":
             name = inp.get("name", "")
             if name:
-                skill_invokes[name] = skill_invokes.get(name, 0) + 1
+                skill_invokes[name] += 1
 
         # File operations on skill files
         if tool in ("read", "write", "edit", "patch"):
             m = _SKILL_PATH_RE.search(fp)
             if m:
-                sk = m.group(1)
-                if tool == "read":
-                    skill_reads[sk] = skill_reads.get(sk, 0) + 1
-                else:
-                    skill_writes[sk] = skill_writes.get(sk, 0) + 1
+                (skill_reads if tool == "read" else skill_writes)[m.group(1)] += 1
 
         # File operations on memory files
         if tool in ("read", "write", "edit", "patch") and "/memory/" in fp:
             mem_name = fp.rsplit("/", 1)[-1].replace(".md", "")
             if mem_name == "MEMORY":
                 continue
-            op = "read" if tool == "read" else tool
-            if tool == "read":
-                memory_reads[mem_name] = memory_reads.get(mem_name, 0) + 1
-            elif tool == "write":
-                memory_writes[mem_name] = memory_writes.get(mem_name, 0) + 1
-            elif tool in ("edit", "patch"):
-                memory_edits[mem_name] = memory_edits.get(mem_name, 0) + 1
-            key = (mem_name, op)
+            memory_counts["edit" if tool == "patch" else tool][mem_name] += 1
+            key = (mem_name, tool)
             if key not in mem_seen:
                 mem_seen.add(key)
-                memory_ops.append({"name": mem_name, "operation": op})
+                memory_ops.append({"name": mem_name, "operation": tool})
 
         # Bash referencing skills
         if tool == "bash" and ("skills/" in cmd or "SKILL.md" in cmd):
-            matches = _SKILL_PATH_RE.findall(cmd)
-            if matches:
-                for sk in set(matches):
-                    skill_bash[sk] = skill_bash.get(sk, 0) + 1
-            else:
-                skill_bash["_general"] = skill_bash.get("_general", 0) + 1
+            for sk in set(_SKILL_PATH_RE.findall(cmd)) or ("_general",):
+                skill_bash[sk] += 1
 
-    skills_used = list(set(list(skill_invokes.keys()) + list(skill_reads.keys()) + list(skill_writes.keys())))
-
+    # Plain dicts: history.HistorySession holds these, and dataclasses.asdict
+    # rebuilds a Counter from its (key, count) pairs — counting the pairs.
     return {
-        "skills_used": skills_used,
+        "skills_used": list(set(skill_invokes) | set(skill_reads) | set(skill_writes)),
         "memory_ops": memory_ops,
-        "skill_activity": {
-            "per_skill_invokes": skill_invokes,
-            "per_skill_reads": skill_reads,
-            "per_skill_writes": skill_writes,
-            "per_skill_bash_refs": skill_bash,
+        "skill_breakdown": {
+            "per_skill_invokes": dict(skill_invokes),
+            "per_skill_reads": dict(skill_reads),
+            "per_skill_writes": dict(skill_writes),
+            "per_skill_bash_refs": dict(skill_bash),
         },
-        "memory_activity": {
-            "per_memory_reads": memory_reads,
-            "per_memory_writes": memory_writes,
-            "per_memory_edits": memory_edits,
+        "memory_breakdown": {
+            "per_memory_reads": dict(memory_counts["read"]),
+            "per_memory_writes": dict(memory_counts["write"]),
+            "per_memory_edits": dict(memory_counts["edit"]),
         },
     }
 
@@ -301,5 +277,4 @@ def _tool_preview(inp: dict) -> dict:
 def _ms_to_iso(ms: Optional[int]) -> str:
     if not ms:
         return ""
-    import datetime
     return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc).isoformat()

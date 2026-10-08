@@ -12,7 +12,8 @@ from core import actions, btwcapture
 
 
 def _fake_window(tty, platform="claude", session_id=None):
-    return types.SimpleNamespace(tty=tty, platform=platform, session_id=session_id)
+    return types.SimpleNamespace(pid=1234, tty=tty, platform=platform,
+                                 session_id=session_id)
 
 
 # The card most tests drive: a Claude session on /dev/pts/3 with no session id.
@@ -63,8 +64,8 @@ def _pane(*screens, then=None, window=_CARD, pane="%5", foreground="node"):
     """A tmux pane for the code under test to drive, with nothing reaching a real
     tmux server or process table.
 
-    pid 1234 resolves to `window` (find_window; None for no window) and that to
-    `pane` (pane_for_tty; None for no pane). capture_pane shows `screens` in turn
+    `window` (the card the test drives, yielded as `card`) resolves to `pane`
+    (pane_for_tty; None for no pane). capture_pane shows `screens` in turn
     (see _screens; an idle composer when none are given), send_keys and send_text
     succeed, pane_current_command reports `foreground` and exit_copy_mode
     succeeds. Before it types, send_prompt inspects all of these — what's in the
@@ -86,8 +87,7 @@ def _pane(*screens, then=None, window=_CARD, pane="%5", foreground="node"):
         sent.append(keys)
         return {"ok": True}
 
-    with mock.patch.object(actions, "find_window", return_value=window), \
-         mock.patch.object(actions, "uninterruptible_wrappers", return_value=[]) as uw, \
+    with mock.patch.object(actions, "uninterruptible_wrappers", return_value=[]) as uw, \
          mock.patch.object(actions.tmux, "pane_for_tty", return_value=pane) as pf, \
          mock.patch.object(actions.tmux, "pane_current_command", return_value=foreground), \
          mock.patch.object(actions.tmux, "exit_copy_mode", return_value={"ok": True}) as ecm, \
@@ -98,7 +98,7 @@ def _pane(*screens, then=None, window=_CARD, pane="%5", foreground="node"):
          mock.patch.object(actions.time, "sleep", side_effect=clock.sleep) as sl, \
          mock.patch.object(actions.time, "time", side_effect=clock.time):
         yield types.SimpleNamespace(
-            sent=sent, pane_for_tty=pf, exit_copy_mode=ecm, capture_pane=cp,
+            card=window, sent=sent, pane_for_tty=pf, exit_copy_mode=ecm, capture_pane=cp,
             send_keys=sk, send_text=st, sleep=sl, wrappers=uw)
 
 
@@ -177,7 +177,7 @@ class CreateSessionTests(unittest.TestCase):
 class SendPromptTests(unittest.TestCase):
     def test_happy_path_resolves_pane_and_sends(self):
         with _pane() as p:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         p.pane_for_tty.assert_called_once_with("/dev/pts/3")
         # Claude's busy pane can drop the injected keystrokes, so verify the text
         # lands before Enter (send_text itself checks the composer empties after)
@@ -188,7 +188,7 @@ class SendPromptTests(unittest.TestCase):
 
     def test_codex_window_gets_settle_before_enter(self):
         with _pane(_CODEX_LIVE_TEXT, window=_fake_window("/dev/pts/3", platform="codex")) as p:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         # Codex gets a length-scaled settle, its submit-verify anchored on
         # Codex's `›` composer marker.
         p.send_text.assert_called_once_with(
@@ -200,7 +200,7 @@ class SendPromptTests(unittest.TestCase):
 
     def test_newlines_collapsed_to_spaces(self):
         with _pane() as p:
-            actions.send_prompt(1234, "line1\nline2\nline3")
+            actions.send_prompt(p.card, "line1\nline2\nline3")
         self.assertEqual(p.send_text.call_args[0][1], "line1 line2 line3")
 
     def test_shell_foreground_refuses_to_send(self):
@@ -210,7 +210,7 @@ class SendPromptTests(unittest.TestCase):
         for shell in ("bash", "zsh", "-fish"):
             with self.subTest(shell):
                 with _pane(foreground=shell) as p:
-                    r = actions.send_prompt(1234, "hello")
+                    r = actions.send_prompt(p.card, "hello")
                 self.assertFalse(r["ok"])
                 self.assertIn("shell", r["error"])
                 p.send_text.assert_not_called()
@@ -221,33 +221,27 @@ class SendPromptTests(unittest.TestCase):
         for cmd in ("claude", "node", "", None):
             with self.subTest(cmd):
                 with _pane(foreground=cmd) as p:
-                    r = actions.send_prompt(1234, "hello")
+                    r = actions.send_prompt(p.card, "hello")
                 self.assertTrue(r["ok"])
                 p.send_text.assert_called_once()
 
     def test_no_pane_returns_explicit_error(self):
         with _pane(pane=None) as p:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         self.assertFalse(r["ok"])
         self.assertEqual(r["error"], "session not in a tmux pane")
         p.send_text.assert_not_called()
 
-    def test_missing_window_returns_error(self):
-        with _pane(window=None) as p:
-            r = actions.send_prompt(1234, "hello")
-        self.assertFalse(r["ok"])
-        p.send_text.assert_not_called()
-
     def test_empty_text_rejected_before_send(self):
         with _pane() as p:
-            r = actions.send_prompt(1234, "   \n  ")
+            r = actions.send_prompt(p.card, "   \n  ")
         self.assertFalse(r["ok"])
         p.send_text.assert_not_called()
 
     def test_oversized_text_rejected_before_send(self):
         big = "a" * 8001
         with _pane() as p:
-            r = actions.send_prompt(1234, big)
+            r = actions.send_prompt(p.card, big)
         self.assertFalse(r["ok"])
         self.assertIn("8000", r["error"])
         p.send_text.assert_not_called()
@@ -255,7 +249,7 @@ class SendPromptTests(unittest.TestCase):
     def test_max_length_accepted(self):
         ok_text = "a" * 8000
         with _pane() as p:
-            r = actions.send_prompt(1234, ok_text)
+            r = actions.send_prompt(p.card, ok_text)
         self.assertTrue(r["ok"])
         p.send_text.assert_called_once()
 
@@ -301,7 +295,7 @@ class SendPromptTests(unittest.TestCase):
                               ("borderless", self._BTW_OVERLAY_BORDERLESS)):
             with self.subTest(name):
                 with _pane(overlay, _LIVE_TEXT) as p:
-                    r = actions.send_prompt(1234, "hello")
+                    r = actions.send_prompt(p.card, "hello")
                 p.send_keys.assert_any_call("%5", "Escape")
                 p.send_text.assert_called_once()
                 self.assertTrue(r["ok"])
@@ -309,7 +303,7 @@ class SendPromptTests(unittest.TestCase):
     def test_no_escape_when_composer_is_clean(self):
         # No overlay -> never touch Escape (it would interrupt a working session).
         with _pane(_LIVE_TEXT) as p:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         p.send_keys.assert_not_called()
         p.send_text.assert_called_once()
         self.assertTrue(r["ok"])
@@ -328,16 +322,16 @@ class SendPromptTests(unittest.TestCase):
                            _LIVE_TEXT,  # dismiss: cleared
                            window=_fake_window("/dev/pts/3", session_id="sessX")) as p, \
                      mock.patch.object(btwcapture, "capture_sync") as cs:
-                    r = actions.send_prompt(1234, "hello")
+                    r = actions.send_prompt(p.card, "hello")
                 cs.assert_called_once_with("%5", "sessX")
                 p.send_keys.assert_any_call("%5", "Escape")
                 self.assertTrue(r["ok"])
 
     def test_no_archive_without_session_id(self):
         # Windows without a session id (e.g. codex) have no /btw archive to feed.
-        with _pane(self._BTW_OVERLAY, _LIVE_TEXT), \
+        with _pane(self._BTW_OVERLAY, _LIVE_TEXT) as p, \
              mock.patch.object(btwcapture, "capture_sync") as cs:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         cs.assert_not_called()
         self.assertTrue(r["ok"])
 
@@ -388,7 +382,7 @@ class SendPromptReadinessTests(unittest.TestCase):
 
     def _send(self, *screens):
         with _pane(*screens) as p:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         return r, p
 
     def test_booting_pane_waits_for_composer_then_sends(self):
@@ -439,7 +433,7 @@ class SendPromptReadinessTests(unittest.TestCase):
     def test_codex_pane_waits_for_its_own_composer(self):
         codex = _fake_window("/dev/pts/3", platform="codex")
         with _pane(CODEX_BANNER_BOX, CODEX_BANNER_BOX, _CODEX_LIVE_TEXT, window=codex) as p:
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         self.assertTrue(r["ok"])
         self.assertEqual(p.capture_pane.call_count, 3)  # banner twice, then the composer
         self.assertEqual(p.send_text.call_args.kwargs["marker"], "›")
@@ -454,7 +448,7 @@ def _fail_send(after_text):
             "ok": True, "text": after_text if p.send_text.called else _LIVE_TEXT}
         p.send_text.return_value = {"ok": False, "reason": "unlanded",
                                     "error": "prompt text never landed in composer"}
-        r = actions.send_prompt(1234, "hello")
+        r = actions.send_prompt(p.card, "hello")
     return r, p.send_text
 
 
@@ -485,7 +479,7 @@ class SendPromptBlockerTests(unittest.TestCase):
             p.capture_pane.side_effect = lambda *a, **k: {
                 "ok": True,
                 "text": _LIVE_TEXT if clears and ("Escape",) in p.sent else blocker_text}
-            r = actions.send_prompt(1234, "hello")
+            r = actions.send_prompt(p.card, "hello")
         return r, p.send_keys, p.send_text
 
     def test_model_dialog_is_escaped_then_send_delivers_with_note(self):
@@ -572,7 +566,7 @@ class SendMenuKeysOverlayTests(unittest.TestCase):
     def _run(self, keys, pane_text):
         with _pane(pane_text, window=_fake_window("/dev/pts/3", session_id="sessX")) as p, \
              mock.patch.object(btwcapture, "capture_sync") as cs:
-            r = actions.send_menu_keys(1234, keys)
+            r = actions.send_menu_keys(p.card, keys)
         return r, p.send_keys, cs
 
     def test_escape_archives_settled_overlay_first(self):
@@ -607,7 +601,7 @@ class SendMenuKeysInterruptEscalationTests(unittest.TestCase):
              mock.patch.object(actions.os, "kill") as kill:
             p.wrappers.side_effect = wrappers
             p.send_keys.side_effect = lambda *a: {"ok": send_ok}
-            r = actions.send_menu_keys(1234, keys)
+            r = actions.send_menu_keys(p.card, keys)
         return r, p, kill
 
     def test_wedged_wrapper_is_force_killed(self):
@@ -1073,7 +1067,7 @@ class SwitchModelTests(unittest.TestCase):
              mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}):
             p.capture_pane.side_effect = capture
             p.send_keys.side_effect = send_keys
-            r = actions.switch_model(1234, alias)
+            r = actions.switch_model(p.card, alias)
         return r, sent, state
 
     def test_commits_with_s_not_enter(self):
@@ -1183,7 +1177,7 @@ class SwitchModelTests(unittest.TestCase):
              mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}):
             p.capture_pane.side_effect = capture
             p.send_keys.side_effect = send_keys
-            r = actions.switch_model(1234, "fable")
+            r = actions.switch_model(p.card, "fable")
         self.assertFalse(r["ok"])
         self.assertIn("never opened", r["error"])
         p.send_keys.assert_called_once_with("%1", "Escape")
@@ -1192,16 +1186,14 @@ class SwitchModelTests(unittest.TestCase):
     def test_dialog_that_never_opens_gets_no_keys(self):
         with _pane("❯ /model\n", window=_fake_window("/dev/pts/9"), pane="%1") as p, \
              mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}):
-            r = actions.switch_model(1234, "fable")
+            r = actions.switch_model(p.card, "fable")
         self.assertIn("never opened", r["error"])
         p.send_keys.assert_not_called()
 
     def test_codex_takes_the_codex_path(self):
         # The Claude alias rules don't apply: "gpt-5.6-sol" is not alnum, and the
         # codex driver is what answers (here: rejected before any key, no tty).
-        with mock.patch.object(actions, "find_window",
-                               return_value=_fake_window(None, platform="codex")):
-            r = actions.switch_model(1234, "gpt-5.6-sol")
+        r = actions.switch_model(_fake_window(None, platform="codex"), "gpt-5.6-sol")
         self.assertFalse(r["ok"])
         self.assertIn("no tty", r["error"])
 
@@ -1339,13 +1331,13 @@ class SwitchCodexModelTests(unittest.TestCase):
              mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}) as sp:
             p.capture_pane.side_effect = capture
             p.send_keys.side_effect = send_keys
-            r = actions.switch_model(1234, model, effort)
+            r = actions.switch_model(p.card, model, effort)
         return r, sent, state, sp
 
     def test_model_and_effort(self):
         r, sent, state, sp = self._drive("gpt-5.6-sol", "high")
         self.assertTrue(r["ok"], r)
-        sp.assert_called_once_with(1234, mock.ANY, "%1", "/model")
+        sp.assert_called_once_with(mock.ANY, "%1", "/model")
         self.assertEqual(state["picks"], [("model", 2), ("effort", 3)])
         self.assertEqual(r["model"], "gpt-5.6-sol high")
         self.assertEqual(state["screen"], "closed")
@@ -1484,7 +1476,7 @@ class RespondPermissionRoutingTests(unittest.TestCase):
 
     def _respond(self, pane_text, choice="approve"):
         with _pane(pane_text, window=_fake_window("/dev/pts/9"), pane="%0") as p:
-            r = actions.respond_permission(100, choice)
+            r = actions.respond_permission(p.card, choice)
         return r, p.sent
 
     def test_numbered_permission_still_gets_the_digit(self):

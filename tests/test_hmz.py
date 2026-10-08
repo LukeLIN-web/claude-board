@@ -242,7 +242,7 @@ class TestMenu(unittest.TestCase):
         with mock.patch.object(hmz.tmux, "pane_for_tty", return_value="%1"), \
                 mock.patch.object(hmz.tmux, "capture_pane",
                                   return_value={"ok": True, "text": screen}):
-            return hmz.menu(w)
+            return hmz.held(w)[2]
 
     def test_the_setup_menu(self):
         self.assertEqual(self._menu(self.SETUP), "parallel_flame_chase")
@@ -371,14 +371,13 @@ class TestQuestion(unittest.TestCase):
 
     def test_a_send_names_the_question_and_types_nothing(self):
         from core import actions
-        with mock.patch.object(actions, "find_window", return_value=_window()), \
-                mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
+        with mock.patch.object(actions.tmux, "pane_for_tty", return_value="%1"), \
                 mock.patch.object(actions.tmux, "pane_current_command", return_value="python"), \
                 mock.patch.object(actions.tmux, "exit_copy_mode", return_value={"ok": True}), \
                 mock.patch.object(actions.tmux, "send_keys") as keys, \
                 mock.patch.object(actions.tmux, "send_text_confirmed") as paste, \
                 self._screen(self.REPORTS):
-            r = actions.send_prompt(7, "hello")
+            r = actions.send_prompt(_window(), "hello")
         self.assertFalse(r["ok"])
         self.assertIn("“Report errors to humanize?”", r["error"])
         self.assertIn("enter yes · esc ask again next time", r["error"])

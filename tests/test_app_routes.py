@@ -106,7 +106,7 @@ class CreateRouteTests(unittest.TestCase):
         self.assertEqual(r["paths"], [])
 
     def test_spawn_dirs_asks_the_peer_it_would_spawn_on(self):
-        with mock.patch.object(appmod.peers, "configured", return_value={"63": "http://x"}), \
+        with mock.patch.dict(appmod.peers._peers, {"63": "http://x"}, clear=True), \
              mock.patch.object(appmod.peers, "forward", return_value={"ok": True, "paths": []}) as m:
             appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp"], host="63"))
         m.assert_called_once_with("63", "POST", "/api/spawn-dirs", {"paths": ["/tmp"]})
@@ -273,10 +273,11 @@ class OpenCodeHistoryTimelineTests(unittest.TestCase):
 class PromptRouteTests(unittest.TestCase):
     def test_dispatches_to_send_prompt(self):
         # The route now guards on a visible window before sending.
-        with mock.patch.object(appmod.sessions, "find_window", return_value=object()), \
+        w = object()
+        with mock.patch.object(appmod.sessions, "find_window", return_value=w), \
              mock.patch.object(appmod.actions, "send_prompt", return_value={"ok": True}) as m:
             r = appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"))
-        m.assert_called_once_with(4321, "hi there")
+        m.assert_called_once_with(w, "hi there")
         self.assertTrue(r["ok"])
 
     def test_prompt_blocked_for_hidden_window(self):
@@ -522,18 +523,17 @@ class DiffSignatureTests(unittest.TestCase):
             self.assertNotEqual(self._sig(self._win(), counts={"busy": 1, "idle": 0}),
                                 self._sig(self._win(), counts={"busy": 0, "idle": 1}))
         with self.subTest(field="peers[].online"):
-            peer = {"host": "b", "online": True, "age_seconds": 1.0, "error": None}
+            peer = {"host": "b", "online": True, "error": None}
             self.assertNotEqual(self._sig(self._win(), peers=[peer]),
                                 self._sig(self._win(), peers=[{**peer, "online": False}]))
 
     def test_ticking_values_alone_do_not_change_signature(self):
         # The page advances these on its own clock between snapshots; resending
         # the board for them would mean every tick.
-        peer = {"host": "b", "online": True, "age_seconds": 1.0, "error": None}
+        peer = {"host": "b", "online": True, "error": None}
         self.assertEqual(
             self._sig(self._win(idle_seconds=40, elapsed_s=125.0), ts=1000, peers=[peer]),
-            self._sig(self._win(idle_seconds=41, elapsed_s=127.0), ts=3000,
-                      peers=[{**peer, "age_seconds": 2.9}]))
+            self._sig(self._win(idle_seconds=41, elapsed_s=127.0), ts=3000, peers=[peer]))
 
 
 class QuietBoardTests(unittest.TestCase):
@@ -672,11 +672,11 @@ class ModelRouteTests(unittest.TestCase):
         self.assertEqual(appmod.ModelBody(model="opus").effort, "")
 
     def test_route_hands_both_fields_to_the_switch(self):
-        with mock.patch.object(appmod, "_require_window"), \
+        with mock.patch.object(appmod, "_require_window") as rw, \
              mock.patch.object(appmod.actions, "switch_model",
                                return_value={"ok": True}) as sw:
             appmod.api_window_model("1234", appmod.ModelBody(model="gpt-5.6-sol", effort="high"))
-        sw.assert_called_once_with(1234, "gpt-5.6-sol", "high")
+        sw.assert_called_once_with(rw.return_value, "gpt-5.6-sol", "high")
 
 
 class HistoryLaunchRouteTests(unittest.TestCase):

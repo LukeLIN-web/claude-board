@@ -7,13 +7,13 @@ import re
 import subprocess
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
 from . import sessions
 from .codex import CODEX_SESSIONS_DIR
 from .sessions import PROJECTS_DIR
+from .transcripts import _parse_ts
 
 # rg's --max-count. With context on, rg still prints a match that falls in the
 # last counted match's after-context, so the cap is applied again below.
@@ -109,10 +109,6 @@ def _extract_text(d: dict) -> str:
 
 def _extract_type_label(d: dict) -> str:
     t = d.get("type", "")
-    if t == "user":
-        return "user"
-    if t == "assistant":
-        return "assistant"
     if t == "attachment" and (d.get("attachment") or {}).get("type") == "queued_command":
         return "user:queued"
     if t == "queue-operation":
@@ -171,14 +167,6 @@ def _file_hits(path: Path, lines: dict[int, str], matched: list[int], query: str
             "context": context,
         })
     return hits
-
-
-def _epoch(ts) -> float:
-    """A row's ISO `timestamp` in seconds since the epoch; 0 if it has none."""
-    try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
 
 
 def _newest_files(query: str, limit: int, deadline: float) -> dict[str, float]:
@@ -270,7 +258,7 @@ def search(query: str, limit: int = 60) -> list[dict]:
                     path = (data.get("path") or {}).get("text")
                     if len(hits) >= limit:
                         cutoff = sorted(h["ts"] for h in hits)[-limit]
-                        if files.get(path, 0.0) <= _epoch(cutoff):
+                        if files.get(path, 0.0) <= _parse_ts(cutoff):
                             break
                     lines, matched = {}, []
                 elif kind in ("match", "context"):
