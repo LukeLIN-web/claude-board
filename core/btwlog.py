@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from .transcripts import event
+
 # One JSONL per session under the user's Claude dir. Append-only: a line is
 # either an entry or a {"dismiss": id} tombstone (see dismiss()).
 _DIR = Path.home() / ".claude" / "fleet_btwlog"
@@ -272,10 +274,8 @@ def timeline_events(session_id: str) -> list[dict]:
     for e in entries(session_id):
         iso = _iso(e.get("ts", 0.0))
         if e.get("question"):
-            out.append({"ts": iso, "kind": "user_text",
-                        "text": "/btw " + e["question"], "tool": None,
-                        "role": "user", "extra": {"source": "btw"}})
-        out.append({"ts": iso, "kind": "assistant_text",
-                    "text": e.get("answer", ""), "tool": None,
-                    "role": "assistant", "extra": {"source": "btw"}})
+            out.append(event(iso, "user_text", "/btw " + e["question"], role="user",
+                             extra={"source": "btw"}))
+        out.append(event(iso, "assistant_text", e.get("answer", ""), role="assistant",
+                         extra={"source": "btw"}))
     return out

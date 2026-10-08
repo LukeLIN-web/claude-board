@@ -114,7 +114,7 @@ def _panel_says(text: str) -> str:
 
 
 def _at_composer(text: str) -> bool:
-    return _MARKER in text and not actions._trust_prompt_painting(text)
+    return actions.composer_drawn(text, _MARKER)
 
 
 def _panel_open(text: str) -> bool:

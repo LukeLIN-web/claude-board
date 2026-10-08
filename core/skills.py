@@ -4,11 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from .codex import CODEX_HOME
 from .memory import split_frontmatter
-from .sessions import CLAUDE_HOME, HOME_BASE
+from .sessions import CLAUDE_HOME
 
 SKILLS_DIR = CLAUDE_HOME / "skills"
-CODEX_SKILLS_DIR = HOME_BASE / ".codex" / "skills"
+CODEX_SKILLS_DIR = CODEX_HOME / "skills"
 
 
 def _parse_skill_md(path: Path) -> Optional[dict]:

@@ -185,7 +185,7 @@ def _answered(live: Live, nonce: str):
 def _ask(live: Live) -> str:
     """Send one probe through the board, wait for haiku's answer; the transcript path."""
     nonce = f"PONG{uuid.uuid4().hex[:6].upper()}"
-    r = actions.send_prompt(live.pid, f"Reply with only the word {nonce} and nothing else. Use no tools.")
+    r = actions.send_prompt(sessions.find_window(live.pid), f"Reply with only the word {nonce} and nothing else. Use no tools.")
     assert r.get("ok"), f"send failed: {r}"
     path = _wait_for(lambda: _answered(live, nonce), 120, 1.0)
     assert path, f"no answer with {nonce} in the session's transcript"
@@ -213,7 +213,7 @@ def test_send_clears_an_open_rewind_panel(live):
 def test_model_dialog_commits_a_pick(live):
     # Last on purpose: no prompt follows it, so whatever it picks, nothing is
     # sent to a model other than haiku.
-    r = actions.switch_model(live.pid, "haiku")
+    r = actions.switch_model(sessions.find_window(live.pid), "haiku")
     assert r.get("ok"), f"switch failed: {r}"
     assert "haiku" in r["model"].lower()
     assert actions._model_dialogs_closed(_pane_text(live))

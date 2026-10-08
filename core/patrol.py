@@ -1,12 +1,11 @@
 """Triage classifier: inspect each session's transcript to determine its state."""
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Optional
 
-from .transcripts import tail_raw_lines
+from .transcripts import _tail_lines, memo_by_file
 
 IDLE_THRESHOLD = 300     # 5 min
 CLOSEABLE_THRESHOLD = 3600  # 1 hour
@@ -32,8 +31,15 @@ TRIAGE_PRIORITY = {
 }
 
 
+def _triage(triage: str, reason: str, suggestion: str = "") -> dict:
+    """A card's triage fields."""
+    return {"triage": triage, "triage_reason": reason, "triage_suggestion": suggestion}
+
+
+@memo_by_file
 def _last_assistant_info(transcript_path: str) -> Optional[dict]:
-    """Extract stop_reason and the last content block of the last assistant turn.
+    """Extract stop_reason, the last tool called and the last thing said in the
+    last assistant turn.
 
     Whether background work is in flight is NOT decided here. It used to be, two
     ways, and both were guesses: any `queue-operation` row after the last
@@ -48,35 +54,23 @@ def _last_assistant_info(transcript_path: str) -> Optional[dict]:
 
     # Find the last assistant message for stop_reason etc.
     stop_reason = ""
-    last_block_type = ""
     last_text = ""
     last_tool = ""
-    for raw in reversed(tail_raw_lines(p, 40)):
-        try:
-            d = json.loads(raw)
-        except Exception:
-            continue
+    for d in reversed(_tail_lines(p, 40)):
         if d.get("type") != "assistant":
             continue
         msg = d.get("message") or {}
         content = msg.get("content") or []
         stop_reason = msg.get("stop_reason", "")
         if isinstance(content, list) and content:
-            last_block = content[-1]
-            last_block_type = last_block.get("type", "")
-            if last_block_type == "text":
-                last_text = last_block.get("text", "")
-            elif last_block_type == "tool_use":
-                last_tool = last_block.get("name", "")
-            for c in reversed(content):
-                if c.get("type") == "text" and c.get("text", "").strip():
-                    last_text = c["text"].strip()
-                    break
+            if content[-1].get("type") == "tool_use":
+                last_tool = content[-1].get("name", "")
+            last_text = next((c["text"].strip() for c in reversed(content)
+                              if c.get("type") == "text" and c.get("text", "").strip()), "")
         break
 
     return {
         "stop_reason": stop_reason,
-        "last_block_type": last_block_type,
         "last_text": last_text[:200],
         "last_tool": last_tool,
     }
@@ -85,18 +79,14 @@ def _last_assistant_info(transcript_path: str) -> Optional[dict]:
 def classify(window_dict: dict) -> dict:
     """Classify a window dict (from sessions.snapshot) into a triage state.
 
-    Returns {triage, reason, suggestion}.
+    Returns the card's triage/triage_reason/triage_suggestion fields.
     """
     status = window_dict.get("status", "unknown")
     idle = window_dict.get("idle_seconds", 0)
     transcript = window_dict.get("transcript_path")
 
     if status == "waiting":
-        return {
-            "triage": "waiting_perm",
-            "reason": window_dict.get("waiting_for") or "等待授权",
-            "suggestion": "去终端批准",
-        }
+        return _triage("waiting_perm", window_dict.get("waiting_for") or "等待授权", "去终端批准")
 
     # Ahead of the busy shortcut, because that is what hid this: a session
     # holding a finished task's undelivered notification keeps reporting itself
@@ -106,112 +96,62 @@ def classify(window_dict: dict) -> dict:
              if t.get("state") == "undelivered"
              and time.time() - (t.get("ts") or 0) >= DELIVERY_GRACE]
     if stuck:
-        return {
-            "triage": "stalled",
-            "reason": f"后台任务已完成但通知没被取走{_count(stuck)}。{_what(stuck[0])}",
-            "suggestion": "去终端敲一下",
-        }
+        return _triage("stalled", f"后台任务已完成但通知没被取走{_count(stuck)}。{_what(stuck[0])}",
+                       "去终端敲一下")
 
     if status == "busy" and idle < IDLE_THRESHOLD:
-        return {
-            "triage": "working",
-            "reason": "正在工作",
-            "suggestion": "",
-        }
+        return _triage("working", "正在工作")
 
     if status == "shell":
-        return {
-            "triage": "working",
-            "reason": "shell 进程运行中",
-            "suggestion": "",
-        }
+        return _triage("working", "shell 进程运行中")
 
     if not transcript:
-        return {
-            "triage": "closeable",
-            "reason": "无 transcript 记录",
-            "suggestion": "可以关闭",
-        }
+        return _triage("closeable", "无 transcript 记录", "可以关闭")
 
     # Async work still out: a backgrounded Bash, a persistent Monitor, a subagent.
     # app.py fills this in before classifying (transcripts.extract_background_tasks).
     # Ahead of the transcript read below, which this answer doesn't need.
     background = window_dict.get("background_tasks") or []
     if background:
-        return {
-            "triage": "working",
-            "reason": f"有后台任务在执行{_count(background)}。{_what(background[0])}",
-            "suggestion": "",
-        }
+        return _triage("working", f"有后台任务在执行{_count(background)}。{_what(background[0])}")
 
     info = _last_assistant_info(transcript)
     if not info:
-        return {
-            "triage": "closeable",
-            "reason": "transcript 为空",
-            "suggestion": "可以关闭",
-        }
+        return _triage("closeable", "transcript 为空", "可以关闭")
 
     stop = info["stop_reason"]
 
     if stop == "end_turn":
-        summary = info["last_text"].split("\n")[0][:80] if info["last_text"] else ""
+        summary = info["last_text"].split("\n")[0][:80]
         if idle >= CLOSEABLE_THRESHOLD:
-            return {
-                "triage": "closeable",
-                "reason": f"已完成，空闲 {IDLE}。{summary}",
-                "suggestion": "可以关闭",
-            }
-        return {
-            "triage": "completed",
-            "reason": f"已完成，空闲 {IDLE}。{summary}",
-            "suggestion": "建议 review",
-        }
+            return _triage("closeable", f"已完成，空闲 {IDLE}。{summary}", "可以关闭")
+        return _triage("completed", f"已完成，空闲 {IDLE}。{summary}", "建议 review")
 
     if stop == "tool_use":
         tool = info["last_tool"]
         if status == "busy":
-            return {
-                "triage": "working",
-                "reason": f"正在执行 {tool}" if tool else "正在工作",
-                "suggestion": "",
-            }
-        return {
-            "triage": "stalled",
-            "reason": f"停在 {tool}，空闲 {IDLE}" if tool else f"中途停止，空闲 {IDLE}",
-            "suggestion": "需要用户介入",
-        }
+            return _triage("working", f"正在执行 {tool}" if tool else "正在工作")
+        return _triage("stalled", f"停在 {tool}，空闲 {IDLE}" if tool else f"中途停止，空闲 {IDLE}",
+                       "需要用户介入")
 
     # Fallback
     if idle >= CLOSEABLE_THRESHOLD:
-        return {
-            "triage": "closeable",
-            "reason": f"空闲 {IDLE}",
-            "suggestion": "可以关闭",
-        }
-    return {
-        "triage": "completed" if idle >= IDLE_THRESHOLD else "working",
-        "reason": f"空闲 {IDLE}",
-        "suggestion": "",
-    }
+        return _triage("closeable", f"空闲 {IDLE}", "可以关闭")
+    return _triage("completed" if idle >= IDLE_THRESHOLD else "working", f"空闲 {IDLE}")
 
 
 def classify_idle(status: str, idle: int, task: str) -> dict:
     """Triage for a card with no Claude transcript to read (Codex, hmz): busy is
     working, otherwise the idle time decides, with `task` — what the session is
-    on — after the reason. Returns the card's triage/triage_reason/
-    triage_suggestion fields."""
+    on — after the reason. Returns the card's triage fields, as classify does."""
     if status == "busy":
-        return {"triage": "working", "triage_reason": "正在工作", "triage_suggestion": ""}
+        return _triage("working", "正在工作")
     tail = f"。{task}" if task else ""
     if idle >= CLOSEABLE_THRESHOLD:
-        return {"triage": "closeable", "triage_reason": f"空闲 {IDLE}{tail}",
-                "triage_suggestion": "可以关闭"}
+        return _triage("closeable", f"空闲 {IDLE}{tail}", "可以关闭")
     if idle >= IDLE_THRESHOLD:
-        return {"triage": "completed", "triage_reason": f"已完成，空闲 {IDLE}{tail}",
-                "triage_suggestion": "建议 review"}
-    return {"triage": "completed", "triage_reason": f"空闲 {IDLE}{tail}",
-            "triage_suggestion": ""}
+        return _triage("completed", f"已完成，空闲 {IDLE}{tail}", "建议 review")
+    return _triage("completed", f"空闲 {IDLE}{tail}")
 
 
 def _count(tasks: list) -> str:

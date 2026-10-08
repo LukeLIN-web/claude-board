@@ -27,7 +27,9 @@ from .sessions import (
     _exe_index,
     _pid_alive,
     _proc_argv,
+    _proc_cwd,
     _proc_start_ms,
+    _ps_tty,
     proc_table,
     transcript_visible,
 )
@@ -94,6 +96,17 @@ def _typed_item_text(payload: dict) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
+def _event_user_text(payload: dict) -> str:
+    """The prompt an `event_msg` payload carries, "" when it carries none: the
+    text of a `user_message`, or a newer build's UserMessage item (see
+    _typed_item_text)."""
+    if payload.get("type") == "user_message":
+        return (payload.get("message") or "").strip()
+    if payload.get("type") == "item_completed":
+        return _typed_item_text(payload)
+    return ""
+
+
 def _tool_output_text(output) -> str:
     """A tool result's text, whether Codex wrote it as a string or as parts."""
     if isinstance(output, list):
@@ -152,6 +165,9 @@ def _parse_session_meta(path: Path) -> Optional[dict]:
         return None
 
 
+# Asked for on every 2s tick per live card; after a Clear it reads every row from
+# before the clear, until a new prompt is typed.
+@transcripts.memo_by_file
 def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
     """Return the user's first real prompt; fall back to the first assistant reply.
 
@@ -171,15 +187,9 @@ def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
             payload = d.get("payload") or {}
 
             if t == "event_msg":
-                ptype = payload.get("type")
-                if ptype == "user_message":
-                    msg = (payload.get("message") or "").strip()
-                    if msg:
-                        return msg[:300]
-                if ptype == "item_completed":
-                    msg = _typed_item_text(payload)
-                    if msg:
-                        return msg[:300]
+                msg = _event_user_text(payload)
+                if msg:
+                    return msg[:300]
 
             if t == "response_item" and payload.get("type") == "message":
                 if payload.get("role") == "user":
@@ -200,41 +210,27 @@ def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
 
 
 # Parsed rollouts, kept while the file is unchanged — path → ((st_mtime_ns,
-# st_size), result). A live card asks for its activity every 2s tick, and the
-# history index (rebuilt every 30s) lists every rollout: re-reading ~1k of them
-# (~900 MB) for it took seconds each time.
-_activity_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+# st_size), result). The history index (rebuilt every 30s) lists every rollout:
+# re-reading ~1k of them (~900 MB) for it took seconds each time. It cycles
+# through more rollouts than memo_by_file keeps, so it keeps its own, pruned of
+# the ones that are gone.
 _session_cache: dict[Path, tuple[tuple[int, int], Optional[dict]]] = {}
 
 
 def _clear_caches() -> None:
     """Forget every parsed rollout (tests / explicit refresh)."""
-    _activity_cache.clear()
     _session_cache.clear()
 
 
+# A live card asks for its activity every 2s tick.
+@transcripts.memo_by_file
 def extract_codex_session_activity(path: Path | str) -> dict:
     """Codex has no file I/O tools — everything goes through exec_command.
     We must scan the command strings for skill/memory file references.
     Read again only once the rollout changes; the result is shared, so callers
     must not change it.
     """
-    p = Path(path)
-    try:
-        st = p.stat()
-    except OSError:
-        return {
-            "skills_used": [], "memory_ops": [], "model": "", "effort": "",
-            "skill_breakdown": {
-                "per_skill_invokes": {}, "per_skill_reads": {},
-                "per_skill_writes": {}, "per_skill_bash_refs": {},
-            },
-        }
-    key = (st.st_mtime_ns, st.st_size)
-    hit = _activity_cache.get(str(p))
-    if hit is None or hit[0] != key:
-        hit = _activity_cache[str(p)] = (key, _scan_activity(p))
-    return hit[1]
+    return _scan_activity(Path(path))
 
 
 def _scan_activity(p: Path) -> dict:
@@ -407,6 +403,9 @@ def find_rollout(session_id: str) -> Optional[Path]:
     return best
 
 
+# An open card's timeline is asked for every 2.5 s, and without `tail` this reads
+# the whole rollout.
+@transcripts.memo_by_file
 def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
                    tail: int = 0) -> list[dict]:
     """Parse Codex JSONL into TurnEvent-compatible dicts.
@@ -435,11 +434,7 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
                 # an `item_completed` event carrying a UserMessage item.
                 # (role=user response_item turns mix in synthetic injections,
                 # so they are never the source of a user row.)
-                text = ""
-                if payload.get("type") == "user_message":
-                    text = (payload.get("message") or "").strip()
-                elif payload.get("type") == "item_completed":
-                    text = _typed_item_text(payload)
+                text = _event_user_text(payload)
                 if text:
                     text = cap_text(text, MESSAGE_CHARS)
                     # A rollout speaks one of the two shapes, never both. If
@@ -449,11 +444,7 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
                     prev = events[-1] if events else None
                     if not (prev and prev["kind"] == "user_text"
                             and prev["text"] == text):
-                        events.append({
-                            "ts": ts, "kind": "user_text",
-                            "text": text, "tool": None,
-                            "role": "user", "extra": {},
-                        })
+                        events.append(transcripts.event(ts, "user_text", text, role="user"))
 
             elif t == "response_item":
                 item_type = payload.get("type", "")
@@ -464,32 +455,38 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
                     args = payload.get("arguments")
                     if item_type == "custom_tool_call":
                         args = payload.get("input")
-                    events.append({
-                        "ts": ts, "kind": "tool_use",
-                        "text": "", "tool": payload.get("name", "function"),
-                        "role": "assistant",
-                        "extra": {"arguments": cap_text(args, TOOL_ARG_CHARS)},
-                    })
+                    events.append(transcripts.event(
+                        ts, "tool_use", role="assistant", tool=payload.get("name", "function"),
+                        extra={"arguments": cap_text(args, TOOL_ARG_CHARS)}))
                 elif item_type in ("function_call_output", "custom_tool_call_output"):
-                    events.append({
-                        "ts": ts, "kind": "tool_result",
-                        "text": cap_text(_tool_output_text(payload.get("output")),
-                                         TOOL_RESULT_CHARS),
-                        "tool": None, "role": "user", "extra": {},
-                    })
+                    events.append(transcripts.event(
+                        ts, "tool_result",
+                        cap_text(_tool_output_text(payload.get("output")), TOOL_RESULT_CHARS),
+                        role="user"))
                 elif item_type == "message":
                     content = payload.get("content")
                     if isinstance(content, list):
                         for c in content:
                             if isinstance(c, dict) and c.get("type") == "output_text":
-                                events.append({
-                                    "ts": ts, "kind": "assistant_text",
-                                    "text": cap_text(c.get("text"), MESSAGE_CHARS),
-                                    "tool": None, "role": "assistant", "extra": {},
-                                })
+                                events.append(transcripts.event(
+                                    ts, "assistant_text", cap_text(c.get("text"), MESSAGE_CHARS),
+                                    role="assistant"))
     except Exception:
         pass
     return events[-limit:]
+
+
+def live_timeline(w: Window, limit: int) -> dict:
+    """A live Codex card's timeline: its `events` from the clear on (see
+    mark_cleared), and the skills and memory its rollout touched."""
+    if not w.transcript_path:
+        return {"events": []}
+    activity = extract_codex_session_activity(w.transcript_path)
+    return {
+        "events": codex_timeline(w.transcript_path, limit=limit, since_ms=cleared_at_ms(w.pid)),
+        "skills_used": activity["skills_used"],
+        "memory_ops": activity["memory_ops"],
+    }
 
 
 # ---------- live session discovery (running codex TUIs as dashboard cards) ----------
@@ -727,8 +724,8 @@ def _discover() -> list[tuple[Window, list[dict]]]:
     # one foreground tty == one session.
     by_tty: dict[str, list[int]] = {}
     for pid, info in table.items():
-        tty = info.tty
-        if not tty or tty in ("?", "??"):
+        tty = _ps_tty(info.tty)
+        if not tty:
             continue
         # On the real argv (see _proc_argv), read only for a codex: ps joins it
         # with spaces, which splits a `-c` value that has one and makes a
@@ -755,13 +752,7 @@ def _discover() -> list[tuple[Window, list[dict]]]:
             continue
         seen.add(card_pid)
 
-        cwd = ""
-        for pid in (anchor, card_pid, *pids):
-            try:
-                cwd = os.readlink(f"/proc/{pid}/cwd")
-                break
-            except Exception:
-                continue
+        cwd = next(filter(None, map(_proc_cwd, (anchor, card_pid, *pids))), "")
         meta = (_parse_session_meta(Path(rollout)) or {}) if rollout else {}
         cwd = cwd or meta.get("cwd", "") or ""
         # The machine-local filter (CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE), as every
@@ -818,7 +809,7 @@ def _discover() -> list[tuple[Window, list[dict]]]:
             version=version,
             # The launcher shares the tty its group was found on (see
             # _top_codex_ancestor).
-            tty=f"/dev/{tty}",
+            tty=tty,
             transcript_path=transcript,
             alive=True,
             hidden=False,

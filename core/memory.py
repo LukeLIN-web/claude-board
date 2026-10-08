@@ -118,6 +118,21 @@ def find_memory(name: str) -> Optional[Path]:
     return None
 
 
+def memory_detail(name: str) -> Optional[dict]:
+    """The memory file `name` (see find_memory), read whole, or None."""
+    f = find_memory(name)
+    if not f:
+        return None
+    fm, body = split_frontmatter(f.read_text(errors="replace"))
+    return {
+        "name": fm.get("name", name),
+        "description": fm.get("description", ""),
+        "type": fm.get("type", "unknown"),
+        "content": body,
+        "path": str(f),
+    }
+
+
 def list_memories(project_slug: Optional[str] = None) -> dict:
     """Return memories grouped by type for a project."""
     if not PROJECTS_DIR.exists():

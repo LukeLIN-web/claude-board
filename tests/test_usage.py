@@ -241,7 +241,7 @@ class ReadUsageTests(unittest.TestCase):
 
 class RouteTests(unittest.TestCase):
     def test_peer_host_is_forwarded(self):
-        with mock.patch.object(appmod.peers, "configured", return_value={"b": "http://x"}), \
+        with mock.patch.dict(appmod.peers._peers, {"b": "http://x"}, clear=True), \
              mock.patch.object(appmod.peers, "forward", return_value={"ok": True}) as fwd, \
              mock.patch.object(appmod.usage, "read_usage") as local:
             appmod.api_usage(appmod.UsageBody(host="b"))
@@ -249,19 +249,19 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(fwd.call_args[0], ("b", "POST", "/api/usage", {"cli": "claude"}))
 
     def test_peer_is_asked_for_the_cli_asked_for(self):
-        with mock.patch.object(appmod.peers, "configured", return_value={"b": "http://x"}), \
+        with mock.patch.dict(appmod.peers._peers, {"b": "http://x"}, clear=True), \
              mock.patch.object(appmod.peers, "forward", return_value={"ok": True}) as fwd:
             appmod.api_usage(appmod.UsageBody(host="b", cli="codex"))
         self.assertEqual(fwd.call_args[0][3], {"cli": "codex"})
 
     def test_own_host_reads_the_cli_asked_for(self):
-        with mock.patch.object(appmod.peers, "configured", return_value={}), \
+        with mock.patch.dict(appmod.peers._peers, {}, clear=True), \
              mock.patch.object(appmod.usage, "read_usage", return_value={"ok": True}) as local:
             appmod.api_usage(appmod.UsageBody(cli="codex"))
         local.assert_called_once_with("codex")
 
     def test_own_host_reads_here(self):
-        with mock.patch.object(appmod.peers, "configured", return_value={"b": "http://x"}), \
+        with mock.patch.dict(appmod.peers._peers, {"b": "http://x"}, clear=True), \
              mock.patch.object(appmod.peers, "forward") as fwd, \
              mock.patch.object(appmod.usage, "read_usage", return_value={"ok": True}) as local:
             self.assertEqual(appmod.api_usage(appmod.UsageBody(host="")), {"ok": True})

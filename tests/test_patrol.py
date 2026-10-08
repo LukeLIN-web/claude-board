@@ -224,8 +224,8 @@ class ClassifyTests(unittest.TestCase):
         got = self._classify([_end_turn("等子代理")],
                              tasks=[self._stuck(15 * 60)])
         self.assertEqual(got["triage"], "stalled")
-        self.assertEqual(got["suggestion"], "去终端敲一下")
-        self.assertIn("W6 facts: prompts", got["reason"])
+        self.assertEqual(got["triage_suggestion"], "去终端敲一下")
+        self.assertIn("W6 facts: prompts", got["triage_reason"])
 
     def test_it_outranks_the_session_calling_itself_busy(self):
         # The reason this went unseen: a session holding an undelivered
@@ -248,12 +248,12 @@ class ClassifyTests(unittest.TestCase):
             {"type": "bash_bg", "description": "train.sh", "command": "",
              "state": "running", "ts": 0.0}])
         self.assertEqual(got["triage"], "working")
-        self.assertIn("train.sh", got["reason"])
+        self.assertIn("train.sh", got["triage_reason"])
 
     def test_nothing_in_flight_is_finished(self):
         got = self._classify([_end_turn("写完了,等你看")])
         self.assertEqual(got["triage"], "completed")
-        self.assertEqual(got["suggestion"], "建议 review")
+        self.assertEqual(got["triage_suggestion"], "建议 review")
 
     def test_prose_about_background_work_does_not_make_a_session_busy(self):
         # There is no keyword fallback any more: a session that merely mentions
@@ -265,7 +265,7 @@ class ClassifyTests(unittest.TestCase):
     def test_a_session_stopped_mid_tool_still_needs_a_person(self):
         got = self._classify([_launch("t1", "Bash", {"command": "pytest"})])
         self.assertEqual(got["triage"], "stalled")
-        self.assertEqual(got["suggestion"], "需要用户介入")
+        self.assertEqual(got["triage_suggestion"], "需要用户介入")
 
     def test_background_work_outranks_a_long_idle(self):
         # Idle past the closeable threshold with a subagent still out: the card

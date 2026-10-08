@@ -4,13 +4,16 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from collections import Counter
 from dataclasses import dataclass, asdict, field
 from itertools import islice
 from pathlib import Path
 from typing import Optional
 
+from .codex import list_codex_sessions
+from .opencode import list_opencode_sessions, search_opencode
 from .search import excerpt, rg_command
-from .sessions import CLAUDE_HOME, PROJECTS_DIR, list_windows
+from .sessions import CLAUDE_HOME, PROJECTS_DIR, _cwd_visible, list_windows
 from .transcripts import (
     _iter_lines,
     _row_model,
@@ -147,21 +150,12 @@ def _build_index() -> list[HistorySession]:
             is_alive=sid in alive,
         ))
 
-    # Merge Codex sessions
-    try:
-        from .codex import list_codex_sessions
-        for cs in list_codex_sessions():
-            sessions.append(HistorySession(**cs))
-    except Exception:
-        pass
-
-    # Merge OpenCode sessions
-    try:
-        from .opencode import list_opencode_sessions
-        for oc in list_opencode_sessions():
-            sessions.append(HistorySession(**oc))
-    except Exception:
-        pass
+    # Merge Codex and OpenCode sessions
+    for source in (list_codex_sessions, list_opencode_sessions):
+        try:
+            sessions.extend(HistorySession(**s) for s in source())
+        except Exception:
+            pass
 
     sessions.sort(key=lambda s: s.transcript_mtime or 0, reverse=True)
 
@@ -284,7 +278,6 @@ def index() -> list[HistorySession]:
     if now - _cache_ts > _CACHE_TTL or not _cache:
         _cache = _build_index()
         _cache_ts = now
-    from .sessions import _cwd_visible
     return [s for s in _cache if _cwd_visible(s.project)]
 
 
@@ -309,7 +302,6 @@ def list_sessions(q: Optional[str] = None, page: int = 1, limit: int = 30) -> di
         rg_matches = _rg_search_sessions(q)
         # Also search OpenCode SQLite
         try:
-            from .opencode import search_opencode
             oc_matches = search_opencode(q)
             for sid, snips in oc_matches.items():
                 if sid not in rg_matches:
@@ -336,3 +328,59 @@ def list_sessions(q: Optional[str] = None, page: int = 1, limit: int = 30) -> di
         "limit": limit,
         "sessions": sessions_out,
     }
+
+
+# What each session's breakdown counts, keyed by its field there and named as
+# the reverse-lookup rows below name it. The index produces these per session,
+# for Claude, OpenCode and Codex alike.
+SKILL_KINDS = {"per_skill_invokes": "invoke", "per_skill_reads": "reads",
+               "per_skill_writes": "writes", "per_skill_bash_refs": "bash_refs"}
+MEMORY_KINDS = {"per_memory_reads": "reads", "per_memory_writes": "writes",
+                "per_memory_edits": "edits"}
+
+
+def sessions_touching(name: str, breakdown_key: str, kinds: dict[str, str]) -> dict:
+    """Reverse lookup: the sessions whose `breakdown_key` counts `name` under
+    any of `kinds`, busiest first, with the per-kind counts."""
+    rows = []
+    for s in index():
+        bd = getattr(s, breakdown_key) or {}
+        counts = {row: (bd.get(k) or {}).get(name, 0) for k, row in kinds.items()}
+        total = sum(counts.values())
+        if total == 0:
+            continue
+        rows.append({
+            "session_id": s.session_id,
+            "project_name": s.project_name,
+            "platform": s.platform,
+            "title": s.first_input[:120],
+            "ts": s.last_ts or s.first_ts or "",
+            **counts,
+            "total": total,
+        })
+    rows.sort(key=lambda r: -r["total"])
+    return {"name": name, "sessions": rows, "session_count": len(rows)}
+
+
+def skill_totals() -> tuple[Counter, dict[str, Counter]]:
+    """Over every session: how many invoked each skill, and each SKILL_KINDS
+    count summed per skill, keyed by that kind's row name."""
+    session_count: Counter[str] = Counter()
+    activity = {row: Counter() for row in SKILL_KINDS.values()}
+    for s in index():
+        session_count.update(s.skills_used)
+        bd = s.skill_breakdown or {}
+        for k, row in SKILL_KINDS.items():
+            activity[row].update(bd.get(k) or {})
+    return session_count, activity
+
+
+def memory_session_counts() -> tuple[Counter, Counter]:
+    """How many sessions read each memory, and how many wrote or edited it."""
+    reads: Counter[str] = Counter()
+    writes: Counter[str] = Counter()
+    for s in index():
+        for m in s.memory_ops:
+            (reads if m["operation"] == "read" else writes)[m["name"]] += 1
+    return reads, writes
+
