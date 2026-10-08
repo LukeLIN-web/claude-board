@@ -237,6 +237,8 @@ def _scan_activity(p: Path) -> dict:
     bash_refs: dict[str, int] = {}
     skill_reads: dict[str, int] = {}
     skill_writes: dict[str, int] = {}
+    memory_reads: dict[str, int] = {}
+    memory_writes: dict[str, int] = {}
     memory_ops_seen: set[tuple[str, str]] = set()
     memory_ops: list[dict] = []
     model = ""
@@ -287,13 +289,14 @@ def _scan_activity(p: Path) -> dict:
                     else:
                         skill_reads[sk] = skill_reads.get(sk, 0) + 1
 
-            # Memory path mentions
-            mem_matches = _MEMORY_PATH_RE.findall(haystack)
-            for mem_name in set(mem_matches):
+            # Memory path mentions. A command can't say edit from write, so an
+            # edit counts as a write.
+            write_kw = any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<"))
+            op, counts = ("write", memory_writes) if write_kw else ("read", memory_reads)
+            for mem_name in set(_MEMORY_PATH_RE.findall(haystack)):
                 if mem_name == "MEMORY":
                     continue
-                write_kw = any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<"))
-                op = "write" if write_kw else "read"
+                counts[mem_name] = counts.get(mem_name, 0) + 1
                 key = (mem_name, op)
                 if key not in memory_ops_seen:
                     memory_ops_seen.add(key)
@@ -312,6 +315,11 @@ def _scan_activity(p: Path) -> dict:
             "per_skill_reads": skill_reads,
             "per_skill_writes": skill_writes,
             "per_skill_bash_refs": bash_refs,
+        },
+        "memory_breakdown": {
+            "per_memory_reads": memory_reads,
+            "per_memory_writes": memory_writes,
+            "per_memory_edits": {},
         },
     }
 
@@ -368,6 +376,7 @@ def _codex_session(f: Path, st: os.stat_result) -> Optional[dict]:
         "skills_used": activity["skills_used"],
         "memory_ops": activity["memory_ops"],
         "skill_breakdown": activity["skill_breakdown"],
+        "memory_breakdown": activity["memory_breakdown"],
     }
 
 
