@@ -35,3 +35,26 @@ wait_for() {
     done
     "$@"
 }
+
+# http_code URL [MAX_TIME] — the HTTP status URL answers with, or 000 when
+# nothing does (curl's own code for no response). MAX_TIME defaults to 5s.
+http_code() {
+    curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-5}" "$1" 2>/dev/null || true
+}
+
+# board_code [MAX_TIME] — what an anonymous GET / gets from this host's board:
+# 000 means nothing is listening, so one call answers "is it up" too.
+board_code() {
+    http_code "http://127.0.0.1:$PORT/" "${1:-5}"
+}
+
+# exec_board — replace this shell with the board's uvicorn on $PORT. Never
+# returns. This repo often lives on a network/shared mount (e.g. /shared) where
+# inotify events don't fire, so uvicorn's default --reload silently never
+# detects edits; force watchfiles into polling mode so reload works here.
+# Polling walks the whole tree (.venv and .git included, ~5k paths on NFS): at
+# watchfiles' default 300ms that cost ~24% of a core, at 2s it is a sixth of it.
+exec_board() {
+    export WATCHFILES_FORCE_POLLING=1 WATCHFILES_POLL_DELAY_MS=2000
+    exec .venv/bin/uvicorn app:app --host 127.0.0.1 --port "$PORT" --reload --reload-dir .
+}

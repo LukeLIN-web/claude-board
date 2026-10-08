@@ -31,7 +31,8 @@
 #             · 5 board is running WITHOUT the gate (refusing to publish).
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# .env.local, then .env.local.<hostname>; sets PORT and RUN_DIR, defines wait_for.
+# .env.local, then .env.local.<hostname>; sets PORT and RUN_DIR, defines
+# wait_for and the board_code/http_code probes.
 source scripts/env.sh
 
 LOG="$RUN_DIR/cf-tunnel.log"
@@ -39,14 +40,10 @@ URL_FILE="$RUN_DIR/cf-tunnel.url"
 WATCHDOG_PID_FILE="$RUN_DIR/cf-tunnel.watchdog.pid"
 WATCH_INTERVAL="${FLEET_TUNNEL_WATCH_INTERVAL:-30}"
 
-# Ask the local board what an anonymous visitor gets. Echoes the status code;
-# curl reports 000 when nothing is listening, so this answers "is the board up"
-# and "is it gated" in one round trip. Used by `start`, `status` and the
-# watchdog, so the probe has exactly one definition.
-probe_gate() {
-    curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/"
-}
-
+# The probe is board_code (scripts/env.sh): what an anonymous visitor gets from
+# the local board, 000 when nothing is listening, so one round trip answers "is
+# the board up" and "is it gated". `start`, `status` and the watchdog all use it.
+#
 # The one place the accepted responses are written down. A gated board bounces
 # an anonymous browser (303 to /login; 302 and 401 accepted so this does not
 # have to be re-tuned when the gate's shape changes). Keeping this in a single
@@ -91,12 +88,12 @@ stop)
     exit 0
     ;;
 # Internal: the supervisor started by `start`, kept in this file so it shares
-# probe_gate/gate_verdict with the check it continues. Not for direct use.
+# gate_verdict with the check it continues. Not for direct use.
 __watchdog)
     while sleep "$WATCH_INTERVAL"; do
         # Tunnel gone ⇒ nothing left to guard. Exit rather than idle forever.
         pgrep -x cloudflared >/dev/null || exit 0
-        if [ "$(gate_verdict "$(probe_gate)")" = "ungated" ]; then
+        if [ "$(gate_verdict "$(board_code)")" = "ungated" ]; then
             echo "[cf-tunnel] watchdog: board on 127.0.0.1:$PORT lost its gate — tearing the tunnel down" >&2
             pkill -x cloudflared
             rm -f "$URL_FILE"
@@ -115,7 +112,7 @@ status)
     echo "[cf-tunnel] running${url:+ -> $url}"
     # Check the gate before reporting anything reassuring. The watchdog should
     # have caught this already; if it is dead, this is the backstop.
-    if [ "$(gate_verdict "$(probe_gate)")" = "ungated" ]; then
+    if [ "$(gate_verdict "$(board_code)")" = "ungated" ]; then
         echo "[cf-tunnel] DANGER: the board on 127.0.0.1:$PORT has NO gate and this tunnel is publishing it." >&2
         echo "            Stop it now (scripts/cf-tunnel.sh stop), set FLEET_AUTH_PASSWORD, restart the board." >&2
         exit 5
@@ -123,7 +120,7 @@ status)
     watchdog_running && echo "[cf-tunnel] watchdog: active" \
         || echo "[cf-tunnel] watchdog: NOT running — nothing will tear the tunnel down if the board loses its gate" >&2
     if [ -n "$url" ]; then
-        edge="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url/")"
+        edge="$(http_code "$url/" 20)"
         case "$(gate_verdict "$edge")" in
         gated)   echo "[cf-tunnel] edge: anonymous request gets HTTP $edge (login) — gate is up" ;;
         down)    echo "[cf-tunnel] edge: could not reach $url from this host — see the DNS note in start" >&2 ;;
@@ -149,7 +146,7 @@ command -v cloudflared >/dev/null 2>&1 || {
 # an anonymous GET / must be rejected, and curl says 000 if nothing is serving.
 # 200 means the board in front of us is ungated, and publishing it would put a
 # shell that types into tmux panes on a public hostname.
-code="$(probe_gate)"
+code="$(board_code)"
 case "$(gate_verdict "$code")" in
 down)
     echo "error: nothing serving on 127.0.0.1:$PORT — start the board first (./run.sh)" >&2
@@ -204,7 +201,7 @@ echo "[cf-tunnel] up -> $url (password required)"
 sleep 5
 edge=""
 for _ in $(seq 12); do
-    edge="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$url/")"
+    edge="$(http_code "$url/" 15)"
     [ "$edge" != "000" ] && break
     sleep 5
 done

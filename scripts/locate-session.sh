@@ -38,6 +38,10 @@ pane_for_tty() {
     | awk -F'\t' -v tty="$1" '$2 == tty { print $1; exit }'
 }
 
+pane_target() {
+  tmux display-message -p -t "$1" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null
+}
+
 # --- primary: native ~/.claude/sessions/<pid>.json ---
 matches=()
 if [ -d "$SESS_DIR" ]; then
@@ -72,8 +76,7 @@ if [ "${#live[@]}" -eq 1 ]; then
   pane="" target=""
   if [ -n "$tty" ] && [ "$tty" != "?" ]; then
     pane=$(pane_for_tty "/dev/$tty")
-    [ -n "$pane" ] && target=$(tmux display-message -p -t "$pane" \
-      '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+    [ -n "$pane" ] && target=$(pane_target "$pane")
   fi
   emit "$pid" "$full" "$cwd" "$transcript" "${tty:+/dev/$tty}" "$pane" "$target" "claude-sessions-dir"
   exit 0
@@ -85,8 +88,7 @@ for f in "$MAP_DIR/$sid.json" $(ls "$MAP_DIR"/"$sid"*.json 2>/dev/null); do
   pane=$(jq -r '.tmux_pane // empty' "$f")
   # only trust the hint if the pane still exists
   if [ -n "$pane" ] && tmux display-message -p -t "$pane" '' >/dev/null 2>&1; then
-    target=$(tmux display-message -p -t "$pane" \
-      '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+    target=$(pane_target "$pane")
     emit "" "$(jq -r '.session_id' "$f")" "$(jq -r '.cwd // ""' "$f")" \
          "$(jq -r '.transcript_path // ""' "$f")" "" "$pane" "$target" "session-map-hook"
     exit 0
