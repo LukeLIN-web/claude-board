@@ -142,6 +142,14 @@ class TurnEvent:
     extra: dict          # small structured payload (e.g. tool input keys)
 
 
+def event(ts: str, kind: str, text: str = "", *, role: str,
+          tool: Optional[str] = None, extra: Optional[dict] = None) -> dict:
+    """A timeline event as the page reads one — a TurnEvent's fields, as a dict —
+    for the sources that build their own (Codex, hmz, OpenCode, /btw)."""
+    return {"ts": ts, "kind": kind, "text": text, "tool": tool, "role": role,
+            "extra": {} if extra is None else extra}
+
+
 # Room for every live card plus the recent sessions the History index enriches
 # (history._ENRICH_LIMIT). An LRU smaller than the set it cycles through evicts
 # each entry just before its next use, and then it caches nothing.
@@ -150,26 +158,28 @@ _memo_lock = threading.Lock()
 
 
 def memo_by_file(fn):
-    """Memoize `fn(path)` on the file's (mtime_ns, size).
+    """Memoize `fn(path, *args)` on the file's (mtime_ns, size) — and on the
+    other arguments, which must be hashable.
 
-    The board runs half a dozen extractors over every live transcript on every
-    2 s refresh, and each is a full read and JSON parse — about 0.2 s apiece on
-    a 51 MB transcript, for a session that may not have written a byte since.
-    Only for functions whose answer depends on nothing but the file.
+    The board runs its extractors over every live transcript on every 2 s
+    refresh, mostly for sessions that haven't written a byte since. Only for
+    functions whose answer depends on nothing but the file and those arguments;
+    one that reads the file front to back is better off as a fold_by_file,
+    which also keeps up with a file that is still growing.
 
-    One entry per path (a new stamp replaces the old one), least recently used
-    dropped past _MEMO_SIZE. The result is shared by every caller that gets it,
-    so treat it as read-only.
+    One entry per path and arguments (a new stamp replaces the old one), least
+    recently used dropped past _MEMO_SIZE. The result is shared by every caller
+    that gets it, so treat it as read-only.
     """
-    cache: OrderedDict[str, tuple[tuple[int, int], object]] = OrderedDict()
+    cache: OrderedDict[tuple, tuple[tuple[int, int], object]] = OrderedDict()
 
     @functools.wraps(fn)
-    def wrapper(path):
-        key = str(path)
+    def wrapper(path, *args, **kwargs):
+        key = (str(path), args, frozenset(kwargs.items()))
         try:
-            st = os.stat(key)
+            st = os.stat(key[0])
         except OSError:
-            return fn(path)
+            return fn(path, *args, **kwargs)
         stamp = (st.st_mtime_ns, st.st_size)
         with _memo_lock:
             hit = cache.get(key)
@@ -178,7 +188,7 @@ def memo_by_file(fn):
                 return hit[1]
         # Read outside the lock: a file that grows meanwhile is only ever newer
         # than `stamp`, so the next call sees a new stamp and reads it again.
-        value = fn(path)
+        value = fn(path, *args, **kwargs)
         with _memo_lock:
             cache[key] = (stamp, value)
             cache.move_to_end(key)
@@ -198,6 +208,116 @@ def _parse_rows(lines: Iterable[str]) -> Iterator[dict]:
             yield json.loads(line)
         except Exception:
             continue
+
+
+# How much of each end of the part already folded is kept to recognize the file
+# again (see _Fold.same_file).
+_FINGERPRINT = 64
+_UNSET = object()
+
+
+class _Fold:
+    """One file's progress through a fold_by_file extractor: how far it has been
+    read, and the extractor's state over the rows up to there."""
+
+    __slots__ = ("lock", "ident", "offset", "head", "tail", "state", "value")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.ident: Optional[tuple[int, int]] = None
+        self.offset = 0
+        self.head = self.tail = b""
+        self.state = None
+        self.value = _UNSET
+
+    def same_file(self, f, st: os.stat_result) -> bool:
+        """Whether the part already folded is still the start of `f`.
+
+        A transcript only ever grows, but a file rewritten in place keeps its
+        inode and can come back longer (an editor, a test), so the bytes at
+        both ends of the folded part are checked as well as the inode."""
+        if (st.st_dev, st.st_ino) != self.ident or st.st_size < self.offset:
+            return False
+        fd = f.fileno()
+        return (os.pread(fd, len(self.head), 0) == self.head
+                and os.pread(fd, len(self.tail), self.offset - len(self.tail)) == self.tail)
+
+    def advance(self, f, make):
+        st = os.fstat(f.fileno())
+        if not self.same_file(f, st):
+            self.ident, self.offset = (st.st_dev, st.st_ino), 0
+            self.head = self.tail = b""
+            self.state, self.value = make(), _UNSET
+        start = offset = self.offset
+        step = self.state.step
+        f.seek(start)
+        for line in f:
+            if not line.endswith(b"\n"):
+                break  # a row still being written: the next call reads it whole
+            offset += len(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(d, dict):
+                step(d)
+        if offset != start:
+            n = min(offset, _FINGERPRINT)
+            if not start:
+                self.head = os.pread(f.fileno(), n, 0)
+            self.offset, self.tail = offset, os.pread(f.fileno(), n, offset - n)
+            self.value = _UNSET
+        if self.value is _UNSET:
+            self.value = self.state.result()
+        return self.value
+
+
+def fold_by_file(make):
+    """`make`'s answer for a transcript, read incrementally: path -> result.
+
+    `make()` builds an extractor with `step(row)`, fed each row in file order,
+    and `result()`, its answer over the rows so far. Each call reads only what
+    was appended since the last one, so a working session — whose file changes
+    on every refresh, defeating memo_by_file — costs its new rows rather than a
+    full read and parse of a file that runs to hundreds of MB. A file that
+    shrinks, is replaced, or is rewritten in place is read again from the top.
+
+    A last line with no newline yet is a row still being written; it waits for
+    the next call. `result()` must hand back what later rows can't change (a
+    copy of any container it keeps), and callers share it, so it is read-only.
+    One entry per path, least recently used dropped past _MEMO_SIZE; callers on
+    the same path wait for one another rather than both reading it.
+    """
+    folds: OrderedDict[str, _Fold] = OrderedDict()
+
+    def wrapper(path):
+        key = str(path)
+        with _memo_lock:
+            fold = folds.get(key)
+            if fold is None:
+                fold = folds[key] = _Fold()
+                if len(folds) > _MEMO_SIZE:
+                    folds.popitem(last=False)
+            else:
+                folds.move_to_end(key)
+        with fold.lock:
+            try:
+                # A big buffer: a first read walks rows of several MB each.
+                f = open(key, "rb", buffering=1 << 20)
+            except FileNotFoundError:
+                return make().result()
+            with f:
+                try:
+                    return fold.advance(f, make)
+                except BaseException:
+                    fold.ident = None  # stopped partway: start over next time
+                    raise
+
+    wrapper.__doc__ = make.__doc__
+    return wrapper
 
 
 def _iter_lines(path: Path) -> Iterable[dict]:
@@ -293,7 +413,7 @@ def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
                     ts, kind, "", mem_name, "assistant",
                     {"operation": tool_name.lower(), "path": file_path},
                 ))
-            elif tool_name == "Edit" and isinstance(inp, dict):
+            elif tool_name == "Edit":
                 # The generic branch below caps each arg on its own, and an
                 # Edit's two strings start out identical — all 200 chars go to
                 # the shared prefix and the row shows everything except the
@@ -312,7 +432,7 @@ def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
                 # full question and each option's label/description.
                 q_payload: list[dict] = []
                 text_lines: list[str] = []
-                raw_qs = inp.get("questions") if isinstance(inp, dict) else None
+                raw_qs = inp.get("questions")
                 for q in (raw_qs or []):
                     if not isinstance(q, dict):
                         continue
@@ -341,7 +461,7 @@ def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
                 ))
             else:
                 preview: dict = {}
-                for k, v in (inp.items() if isinstance(inp, dict) else []):
+                for k, v in inp.items():
                     if isinstance(v, str):
                         preview[k] = cap_text(v, TOOL_ARG_CHARS)
                     elif isinstance(v, (int, float, bool)) or v is None:
@@ -502,8 +622,7 @@ def _first_sentence(text: str) -> str:
 _PROMPT_GOAL_RE = re.compile(r"^\s*goal\b[:：]?\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
 
-@memo_by_file
-def session_goal(path: str | Path) -> Optional[dict]:
+class _SessionGoal:
     """What this session is for, as {text, ts, source} — None if it never said.
 
     Two sources, newest wins, because either can be the only one present:
@@ -521,38 +640,44 @@ def session_goal(path: str | Path) -> Optional[dict]:
     then buried under a few hundred tool rows, which is exactly when someone
     opens the board to ask what a session is even doing.
     """
-    goal: Optional[dict] = None
 
-    def offer(text: str, ts: str, source: str) -> None:
-        nonlocal goal
+    def __init__(self) -> None:
+        self.goal: Optional[dict] = None
+
+    def _offer(self, text: str, ts: str, source: str) -> None:
         text = _first_sentence(text)
         if not text:
             return
         # Ties go to whatever came later in the file: a recap is written after
         # the turn it summarizes, so on an equal stamp it is the fresher word.
-        if goal is None or _parse_ts(ts) >= _parse_ts(goal["ts"]):
-            goal = {"text": cap_text(text, GOAL_CHARS), "ts": ts, "source": source}
+        if self.goal is None or _parse_ts(ts) >= _parse_ts(self.goal["ts"]):
+            self.goal = {"text": cap_text(text, GOAL_CHARS), "ts": ts, "source": source}
 
-    for d in _iter_lines(Path(path)):
+    def step(self, d: dict) -> None:
         t = d.get("type")
         if t == "system" and d.get("subtype") == "away_summary":
             content = _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
             m = _GOAL_RE.match(content)
             if m:
-                offer(m.group(1), d.get("timestamp", ""), "recap")
-            continue
+                self._offer(m.group(1), d.get("timestamp", ""), "recap")
+            return
         # Anything the user typed, including a prompt Claude took off its queue.
         # No other row holds one, and normalizing an assistant row diffs every
         # Edit in it.
         if t not in ("user", "attachment"):
-            continue
+            return
         for ev in _normalize(d):
             if ev.kind != "user_text" or ev.extra.get("meta"):
                 continue
             m = _PROMPT_GOAL_RE.match(ev.text)
             if m:
-                offer(m.group(1), ev.ts, "prompt")
-    return goal
+                self._offer(m.group(1), ev.ts, "prompt")
+
+    def result(self) -> Optional[dict]:
+        return self.goal
+
+
+session_goal = fold_by_file(_SessionGoal)
 
 
 _CRON_STEP_RE = re.compile(r"^\*/(\d+)$")
@@ -645,8 +770,7 @@ def _loop_task_text(prompt: str) -> str:
     return "自主循环" if text in _LOOP_SENTINELS else text
 
 
-@memo_by_file
-def session_loop(path: str | Path) -> Optional[dict]:
+class _SessionLoop:
     """The prompt this session keeps re-running, as {text, ts, source, cadence}.
 
     Like a goal, a loop is set once and then buried — except it goes on acting on
@@ -670,43 +794,49 @@ def session_loop(path: str | Path) -> Optional[dict]:
     cron, `ScheduleWakeup(stop=True)` ends a self-paced one, and either way
     there is nothing left to pin.
     """
-    loop: Optional[dict] = None
 
-    def offer(text: str, ts: str, source: str, cadence: Optional[str]) -> None:
-        nonlocal loop
+    def __init__(self) -> None:
+        self.loop: Optional[dict] = None
+
+    def _offer(self, text: str, ts: str, source: str, cadence: Optional[str]) -> None:
         text = text.strip()
         if not text:
             return
-        loop = {"text": cap_text(text, LOOP_CHARS), "ts": ts,
-                "source": source, "cadence": cadence}
+        self.loop = {"text": cap_text(text, LOOP_CHARS), "ts": ts,
+                     "source": source, "cadence": cadence}
 
-    for d in _iter_lines(Path(path)):
+    def step(self, d: dict) -> None:
         if d.get("type") == "assistant":
             ts = d.get("timestamp", "")
             for name, inp, _ in _tool_uses(d):
                 if name == "Skill" and str(inp.get("skill", "")).lstrip("/") == "loop":
-                    offer(str(inp.get("args") or ""), ts, "prompt", None)
+                    self._offer(str(inp.get("args") or ""), ts, "prompt", None)
                 elif name == "CronDelete":
-                    loop = None
+                    self.loop = None
                 elif name == "CronCreate" and inp.get("recurring"):
-                    offer(str(inp.get("prompt") or ""), ts, "cron",
-                          _cron_cadence(str(inp.get("cron") or "")))
+                    self._offer(str(inp.get("prompt") or ""), ts, "cron",
+                                _cron_cadence(str(inp.get("cron") or "")))
                 elif name == "ScheduleWakeup":
                     if inp.get("stop"):
-                        loop = None
+                        self.loop = None
                     else:
-                        offer(_loop_task_text(str(inp.get("prompt") or "")), ts,
-                              "wakeup", _delay_cadence(inp.get("delaySeconds")))
-            continue
+                        self._offer(_loop_task_text(str(inp.get("prompt") or "")), ts,
+                                    "wakeup", _delay_cadence(inp.get("delaySeconds")))
+            return
         # A `/loop` someone typed. Read off the raw row: the envelope is the
         # only thing that distinguishes the command from a sentence about loops.
         if d.get("type") != "user" or is_injected_user_row(d):
-            continue
+            return
         raw = _queued_prompt_text((d.get("message") or {}).get("content"))
         if _LOOP_CMD_RE.search(raw):
             args = _CMD_ARGS_RE.search(raw)
-            offer(args.group(1) if args else "", d.get("timestamp", ""), "prompt", None)
-    return loop
+            self._offer(args.group(1) if args else "", d.get("timestamp", ""), "prompt", None)
+
+    def result(self) -> Optional[dict]:
+        return self.loop
+
+
+session_loop = fold_by_file(_SessionLoop)
 
 
 def _normalize(d: dict) -> list[TurnEvent]:
@@ -746,17 +876,24 @@ def _row_model(d: dict) -> str:
     return "" if model.startswith("<") else model
 
 
-@memo_by_file
-def current_model(path: str | Path) -> str:
+class _CurrentModel:
     """Model id of the session's most recent assistant turn ("" if none yet).
 
     The last row, not the first (history._extract_model): a session that switched
     model mid-run is *on* the new one, and that's what the board's card claims.
     """
-    model = ""
-    for d in _iter_lines(Path(path)):
-        model = _row_model(d) or model
-    return model
+
+    def __init__(self) -> None:
+        self.model = ""
+
+    def step(self, d: dict) -> None:
+        self.model = _row_model(d) or self.model
+
+    def result(self) -> str:
+        return self.model
+
+
+current_model = fold_by_file(_CurrentModel)
 
 
 def pretty_model(raw: str) -> str:
@@ -865,6 +1002,9 @@ def _pending_notice_events(raw: list[dict]) -> dict[int, TurnEvent]:
     return out
 
 
+# An open card's timeline is asked for every 2.5 s, and a session that is not
+# working has written nothing since the last time.
+@memo_by_file
 def timeline(path: str | Path, limit: int = 50) -> list[dict]:
     """Return ≤ limit most recent flattened turn events for a transcript."""
     # Read more lines than needed because one jsonl row can expand into several events.
@@ -913,16 +1053,18 @@ def consumed_prompt_texts(path: str | Path, since: float) -> list[tuple[float, s
     return [(ts, text) for ts, text in _consumed_prompts(path) if ts >= since]
 
 
-@memo_by_file
-def _consumed_prompts(path: str | Path) -> list[tuple[float, str]]:
+class _ConsumedPrompts:
     """consumed_prompt_texts for the whole transcript, before `since` cuts it."""
-    out: list[tuple[float, str]] = []
-    for d in _iter_lines(Path(path)):
+
+    def __init__(self) -> None:
+        self.out: list[tuple[float, str]] = []
+
+    def step(self, d: dict) -> None:
         t = d.get("type")
         if t == "queue-operation":
             text = d.get("content") or ""
             if d.get("operation") == "remove" and text.strip():
-                out.append((_parse_ts(d.get("timestamp", "")), text))
+                self.out.append((_parse_ts(d.get("timestamp", "")), text))
         # Only a user row: a queued prompt's `queued_command` attachment is the
         # same delivery the `remove` row above already counted. Counting it twice
         # would let one prompt clear two identical copies off the card, one of
@@ -930,8 +1072,13 @@ def _consumed_prompts(path: str | Path) -> list[tuple[float, str]]:
         elif t == "user":
             for ev in _normalize(d):
                 if ev.kind == "user_text" and ev.text.strip():
-                    out.append((_parse_ts(ev.ts), ev.text))
-    return out
+                    self.out.append((_parse_ts(ev.ts), ev.text))
+
+    def result(self) -> list[tuple[float, str]]:
+        return list(self.out)
+
+
+_consumed_prompts = fold_by_file(_ConsumedPrompts)
 
 
 @memo_by_file
@@ -958,8 +1105,7 @@ def current_task_hint(path: str | Path) -> Optional[str]:
 _SKILL_PATH_RE = re.compile(r'/\.claude/skills/([^/]+)/')
 
 
-@memo_by_file
-def session_activity(path: str | Path) -> dict:
+class _SessionActivity:
     """Skill and memory activity of a session, in one pass over its transcript.
 
     Returns {
@@ -971,38 +1117,40 @@ def session_activity(path: str | Path) -> dict:
     }, the shape codex and opencode sessions report too. Breakdown counts are
     not deduplicated.
     """
-    invokes: dict[str, int] = {}
-    skill_reads: dict[str, int] = {}
-    skill_writes: dict[str, int] = {}
-    bash_refs: dict[str, int] = {}
-    mem_counts: dict[str, dict[str, int]] = {"Read": {}, "Write": {}, "Edit": {}}
-    mem_ops: list[dict] = []
-    seen: set[tuple[str, str]] = set()
 
-    for d in _iter_lines(Path(path)):
+    def __init__(self) -> None:
+        self.invokes: dict[str, int] = {}
+        self.skill_reads: dict[str, int] = {}
+        self.skill_writes: dict[str, int] = {}
+        self.bash_refs: dict[str, int] = {}
+        self.mem_counts: dict[str, dict[str, int]] = {"Read": {}, "Write": {}, "Edit": {}}
+        self.mem_ops: list[dict] = []
+        self.seen: set[tuple[str, str]] = set()
+
+    def step(self, d: dict) -> None:
         for name, inp, _ in _tool_uses(d):
             if name == "Skill":
                 sk = inp.get("skill", "")
                 if sk:
-                    invokes[sk] = invokes.get(sk, 0) + 1
+                    self.invokes[sk] = self.invokes.get(sk, 0) + 1
 
             elif name in ("Read", "Write", "Edit"):
                 fp = str(inp.get("file_path", ""))
                 m = _SKILL_PATH_RE.search(fp)
                 if m:
-                    counts = skill_reads if name == "Read" else skill_writes
+                    counts = self.skill_reads if name == "Read" else self.skill_writes
                     counts[m.group(1)] = counts.get(m.group(1), 0) + 1
                 if "/memory/" not in fp:
                     continue
                 mem_name = fp.rsplit("/", 1)[-1].replace(".md", "")
                 if mem_name == "MEMORY":
                     continue
-                counts = mem_counts[name]
+                counts = self.mem_counts[name]
                 counts[mem_name] = counts.get(mem_name, 0) + 1
                 key = (mem_name, name.lower())
-                if key in seen:
+                if key in self.seen:
                     continue
-                seen.add(key)
+                self.seen.add(key)
                 entry: dict = {"name": mem_name, "operation": name.lower()}
                 if name == "Write":
                     entry["content_preview"] = (inp.get("content") or "")[:300]
@@ -1012,29 +1160,33 @@ def session_activity(path: str | Path) -> dict:
                     entry["content_preview"] = edit_diff(
                         inp.get("old_string"), inp.get("new_string"), 300,
                     )
-                mem_ops.append(entry)
+                self.mem_ops.append(entry)
 
             elif name == "Bash":
                 cmd = str(inp.get("command", ""))
                 if "skills/" in cmd or "SKILL.md" in cmd:
                     for sk in set(_SKILL_PATH_RE.findall(cmd)) or ("_general",):
-                        bash_refs[sk] = bash_refs.get(sk, 0) + 1
+                        self.bash_refs[sk] = self.bash_refs.get(sk, 0) + 1
 
-    return {
-        "skills_used": list(invokes),
-        "memory_ops": mem_ops,
-        "skill_breakdown": {
-            "per_skill_invokes": invokes,
-            "per_skill_reads": skill_reads,
-            "per_skill_writes": skill_writes,
-            "per_skill_bash_refs": bash_refs,
-        },
-        "memory_breakdown": {
-            "per_memory_reads": mem_counts["Read"],
-            "per_memory_writes": mem_counts["Write"],
-            "per_memory_edits": mem_counts["Edit"],
-        },
-    }
+    def result(self) -> dict:
+        return {
+            "skills_used": list(self.invokes),
+            "memory_ops": list(self.mem_ops),
+            "skill_breakdown": {
+                "per_skill_invokes": dict(self.invokes),
+                "per_skill_reads": dict(self.skill_reads),
+                "per_skill_writes": dict(self.skill_writes),
+                "per_skill_bash_refs": dict(self.bash_refs),
+            },
+            "memory_breakdown": {
+                "per_memory_reads": dict(self.mem_counts["Read"]),
+                "per_memory_writes": dict(self.mem_counts["Write"]),
+                "per_memory_edits": dict(self.mem_counts["Edit"]),
+            },
+        }
+
+
+session_activity = fold_by_file(_SessionActivity)
 
 
 def extract_skills_used(path: str | Path) -> list[str]:
@@ -1093,8 +1245,7 @@ def _note_finished(notified: dict[str, dict], body: str, ts: str) -> Optional[st
     return hit.group(1)
 
 
-@memo_by_file
-def extract_background_tasks(path: str | Path) -> list[dict]:
+class _BackgroundTasks:
     """Async work this session started and has not finished with, as
     [{type, description, command, state, ts}].
 
@@ -1112,16 +1263,19 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
     notice delivered without queueing shows up only as that user row, or as a
     `queued_command` attachment, so those count as the report too.
     """
-    launched: dict[str, dict] = {}   # tool_use_id -> {type, description, command}
-    notified: dict[str, dict] = {}   # task_id -> {tool_use_id, summary, ts}
-    delivered: set[str] = set()      # task_ids the session has taken
-    for d in _iter_lines(Path(path)):
+
+    def __init__(self) -> None:
+        self.launched: dict[str, dict] = {}   # tool_use_id -> {type, description, command}
+        self.notified: dict[str, dict] = {}   # task_id -> {tool_use_id, summary, ts}
+        self.delivered: set[str] = set()      # task_ids the session has taken
+
+    def step(self, d: dict) -> None:
         t = d.get("type")
         if t == "assistant":
             for name, inp, c in _tool_uses(d):
                 kind = _async_launch_kind(name, inp)
                 if kind and c.get("id"):
-                    launched[c["id"]] = {
+                    self.launched[c["id"]] = {
                         "type": kind,
                         "description": (inp.get("description") or "")[:200],
                         "command": (inp.get("command") or inp.get("prompt") or "")[:200],
@@ -1133,62 +1287,68 @@ def extract_background_tasks(path: str | Path) -> list[dict]:
                 # Carries no content, so it cannot be attributed. It appears
                 # alongside real deliveries, so read it as one: a missed stall is
                 # quieter than a card that cries stall at every flush.
-                delivered.update(notified)
-                continue
+                self.delivered.update(self.notified)
+                return
             hit = _TN_TASK_ID_RE.search(body)
             if not hit:
-                continue
+                return
             if op != "enqueue":
-                delivered.add(hit.group(1))
-                continue
-            _note_finished(notified, body, d.get("timestamp", ""))
+                self.delivered.add(hit.group(1))
+                return
+            _note_finished(self.notified, body, d.get("timestamp", ""))
         elif t == "user" and not d.get("isSidechain"):
             content = (d.get("message") or {}).get("content")
             body = json.dumps(content, ensure_ascii=False)
             hit = _TN_TASK_ID_RE.search(body)
             if hit:
-                delivered.add(hit.group(1))
+                self.delivered.add(hit.group(1))
             # A notice handed straight to an idle session never passes the queue,
             # so this row is the only trace that the task finished.
             if isinstance(content, str):
-                _note_finished(notified, content, d.get("timestamp", ""))
+                _note_finished(self.notified, content, d.get("timestamp", ""))
         elif t == "attachment" and not d.get("isSidechain"):
             # The same handover, logged as the queued command it was delivered as —
             # on some transcripts with no enqueue/remove pair around it at all.
             a = d.get("attachment") or {}
             body = a.get("prompt")
             if a.get("type") == "queued_command" and isinstance(body, str):
-                task_id = _note_finished(notified, body, d.get("timestamp", ""))
+                task_id = _note_finished(self.notified, body, d.get("timestamp", ""))
                 if task_id:
-                    delivered.add(task_id)
+                    self.delivered.add(task_id)
 
-    out: list[dict] = []
-    settled: set[str] = set()  # tool_use_ids whose completion has been delivered
-    for task_id, n in notified.items():
-        if task_id in delivered:
+    def result(self) -> list[dict]:
+        out: list[dict] = []
+        settled: set[str] = set()  # tool_use_ids whose completion has been delivered
+        for task_id, n in self.notified.items():
+            if task_id in self.delivered:
+                settled.add(n["tool_use_id"])
+                continue
+            info = self.launched.get(n["tool_use_id"]) or {
+                "type": "task", "description": n["summary"][:200], "command": ""}
+            out.append({**info, "state": "undelivered", "ts": n["ts"]})
             settled.add(n["tool_use_id"])
-            continue
-        info = launched.get(n["tool_use_id"]) or {
-            "type": "task", "description": n["summary"][:200], "command": ""}
-        out.append({**info, "state": "undelivered", "ts": n["ts"]})
-        settled.add(n["tool_use_id"])
-    for tool_use_id, info in launched.items():
-        if tool_use_id not in settled:
-            out.append({**info, "state": "running", "ts": 0.0})
-    return out
+        for tool_use_id, info in self.launched.items():
+            if tool_use_id not in settled:
+                out.append({**info, "state": "running", "ts": 0.0})
+        return out
 
 
-@memo_by_file
-def extract_plan_history(path: str | Path) -> list[dict]:
+extract_background_tasks = fold_by_file(_BackgroundTasks)
+
+
+class _PlanHistory:
     """Extract chronological plan file mutations from a transcript.
 
     Returns [{ts, plan_file, operation, version_label, content, diff}].
     Write = full content snapshot. Edit = old_string/new_string diff.
     """
-    history: list[dict] = []
-    write_count: dict[str, int] = {}
-    edit_count: dict[str, int] = {}
-    for d in _iter_lines(Path(path)):
+
+    def __init__(self) -> None:
+        self.history: list[dict] = []
+        self.write_count: dict[str, int] = {}
+        self.edit_count: dict[str, int] = {}
+
+    def step(self, d: dict) -> None:
         ts = d.get("timestamp") or ""
         for tool_name, inp, _ in _tool_uses(d):
             if tool_name not in ("Write", "Edit"):
@@ -1198,10 +1358,10 @@ def extract_plan_history(path: str | Path) -> list[dict]:
                 continue
             plan_name = fp.rsplit("/", 1)[-1]
             if tool_name == "Write":
-                write_count[plan_name] = write_count.get(plan_name, 0) + 1
-                edit_count[plan_name] = 0
-                vn = write_count[plan_name]
-                history.append({
+                self.write_count[plan_name] = self.write_count.get(plan_name, 0) + 1
+                self.edit_count[plan_name] = 0
+                vn = self.write_count[plan_name]
+                self.history.append({
                     "ts": ts,
                     "plan_file": plan_name,
                     "operation": "write",
@@ -1209,13 +1369,13 @@ def extract_plan_history(path: str | Path) -> list[dict]:
                     "content": inp.get("content", ""),
                     "diff": None,
                 })
-            elif tool_name == "Edit":
-                vn = write_count.get(plan_name, 0)
-                edit_count[plan_name] = edit_count.get(plan_name, 0) + 1
-                en = edit_count[plan_name]
+            else:
+                vn = self.write_count.get(plan_name, 0)
+                self.edit_count[plan_name] = self.edit_count.get(plan_name, 0) + 1
+                en = self.edit_count[plan_name]
                 old_s = inp.get("old_string", "")
                 new_s = inp.get("new_string", "")
-                history.append({
+                self.history.append({
                     "ts": ts,
                     "plan_file": plan_name,
                     "operation": "edit",
@@ -1223,4 +1383,9 @@ def extract_plan_history(path: str | Path) -> list[dict]:
                     "content": None,
                     "diff": {"old": old_s[:2000], "new": new_s[:2000]},
                 })
-    return history
+
+    def result(self) -> list[dict]:
+        return list(self.history)
+
+
+extract_plan_history = fold_by_file(_PlanHistory)
