@@ -808,19 +808,7 @@
       </div>
       <template x-for="ev in visibleEvents" :key="ev._idx">
         <div :id="'tl-ev-'+ev._idx" class="text-sm border-l-2 pl-3 py-1"
-             :class="{
-               'border-blue-400': ev.kind==='user_text' && !ev.extra?.pending,
-               'border-orange-300 border-dashed': ev.extra?.pending,
-               'border-emerald-400': ev.kind==='assistant_text',
-               'border-amber-400': ev.kind==='tool_use',
-               'border-amber-500': ev.kind==='ask_question',
-               'border-purple-500': ev.kind==='skill_invoke',
-               'border-sky-400 border-dashed': ev.kind==='memory_read',
-               'border-pink-500': ev.kind==='memory_write',
-               'border-violet-500': ev.kind==='model',
-               'border-cyan-500': ev.kind==='recap',
-               'border-gray-300': ev.kind==='tool_result'
-             }">
+             :class="ev.extra?.pending ? 'border-orange-300 border-dashed' : evKind(ev).border">
           <div class="flex items-center gap-2 text-xs text-gray-400 mb-0.5">
             <span x-text="fmtTimeET(ev.ts)" :title="ev.ts || ''"></span>
             <!-- Which of an hmz run's agents this turn is from. -->
@@ -830,34 +818,9 @@
             <template x-if="ev.extra?.source==='btw'">
               <span class="text-teal-600 font-medium">💬 btw</span>
             </template>
-            <template x-if="ev.kind==='skill_invoke'">
-              <span class="text-purple-600 font-medium">skill: <span x-text="ev.tool"></span></span>
-            </template>
-            <template x-if="ev.kind==='memory_read'">
-              <span class="text-sky-600 font-medium">mem↓ <span x-text="ev.tool"></span></span>
-            </template>
-            <template x-if="ev.kind==='memory_write'">
-              <span class="text-pink-600 font-medium">mem↑ <span x-text="ev.tool"></span></span>
-            </template>
-            <template x-if="ev.kind==='ask_question'">
-              <span class="text-amber-700 font-medium">❓ <span x-text="ev.tool"></span></span>
-            </template>
-            <!-- The model that answered changed between two assistant turns — a
-                 /model switch, whether driven from a card or typed in the TUI. -->
-            <template x-if="ev.kind==='model'">
-              <span class="text-violet-600 font-medium">🔀 model</span>
-            </template>
-            <!-- The recap Claude writes when you've been away: where the session
-                 got to, and what it wants next. -->
-            <template x-if="ev.kind==='recap'">
-              <span class="text-cyan-700 font-medium"
-                    title="Claude 在你离开后写的进度小结（transcript 里的 away_summary）">📋 recap</span>
-            </template>
-            <template x-if="ev.kind!=='skill_invoke' && ev.kind!=='memory_read' && ev.kind!=='memory_write' && ev.kind!=='ask_question' && ev.kind!=='model' && ev.kind!=='recap'">
-              <span :class="{'text-blue-600': ev.kind==='user_text', 'text-emerald-600': ev.kind==='assistant_text', 'text-amber-600': ev.kind==='tool_use', 'text-gray-500': true}"
-                    class="font-medium"
-                    x-text="ev.kind==='tool_use' ? ev.tool : ev.kind.replace('_text','').replace('tool_result','result')"></span>
-            </template>
+            <!-- The event's kind (EV_KINDS below). -->
+            <span class="font-medium" :class="evKind(ev).badge" :title="evKind(ev).title"
+                  x-text="evKind(ev).label(ev)"></span>
             <!-- Harness-injected, not typed: a skill body, a command caveat.
                  Say so, or a row cut at 200 chars reads as a truncated prompt. -->
             <template x-if="ev.extra?.meta && !ev.extra?.pending">
@@ -954,7 +917,7 @@
           </template>
           <!-- Everything else (tool results): wrapped, and clamped only until
                the reader asks for the rest — nothing is cut in the markup. -->
-          <template x-if="ev.kind !== 'tool_use' && ev.kind !== 'assistant_text' && ev.kind !== 'user_text' && ev.kind !== 'ask_question' && ev.kind !== 'model' && ev.kind !== 'recap'">
+          <template x-if="!evKind(ev).ownBody">
             <div>
               <pre class="text-xs text-gray-700 whitespace-pre-wrap break-words"
                    :class="eventExpanded[ev._idx] ? '' : 'max-h-32 overflow-y-auto'"
@@ -1023,12 +986,8 @@
             </div>
           </div>
           <div class="flex gap-1 shrink-0" @click.stop>
-            <button x-show="s.is_alive" @click="resumeSession(s)"
-                    class="text-xs border border-gray-200 text-gray-500 px-2 py-0.5 rounded hover:bg-gray-100">
-              Focus</button>
-            <button x-show="!s.is_alive" @click="resumeSession(s)"
-                    class="text-xs border border-gray-200 text-gray-500 px-2 py-0.5 rounded hover:bg-gray-100">
-              Resume</button>
+            <button @click="resumeSession(s)" x-text="s.is_alive ? 'Focus' : 'Resume'"
+                    class="text-xs border border-gray-200 text-gray-500 px-2 py-0.5 rounded hover:bg-gray-100"></button>
             <button x-show="!s.is_alive" @click="forkHistorySession(s)"
                     class="text-xs border border-green-200 text-green-600 px-2 py-0.5 rounded hover:bg-green-50">
               Fork</button>
@@ -1114,6 +1073,35 @@ const HISTORY_LIMIT = 20;
 // no recorded start time).
 const byStartedAt = (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid;
 
+// How the timeline draws each kind of event: the colour of its left rule, its
+// badge (colour, text, hover title), and whether it has a body of its own —
+// the rest show their text in the clamped block at the bottom of the row, under
+// the detail line skill and memory rows add. Whole class names, so Tailwind's
+// scan of the page finds them. A kind not listed gets EV_KIND_OTHER.
+const toolLabel = (prefix) => (ev) => prefix + (ev.tool ?? '');
+const EV_KIND_OTHER = {
+  border: '', badge: 'text-gray-500', ownBody: false,
+  label: (ev) => ev.kind.replace('_text', '').replace('tool_result', 'result'),
+};
+const EV_KINDS = Object.fromEntries(Object.entries({
+  user_text: { border: 'border-blue-400', badge: 'text-blue-600 text-gray-500', ownBody: true },
+  assistant_text: { border: 'border-emerald-400', badge: 'text-emerald-600 text-gray-500', ownBody: true },
+  tool_use: { border: 'border-amber-400', badge: 'text-amber-600 text-gray-500', ownBody: true,
+              label: (ev) => ev.tool },
+  tool_result: { border: 'border-gray-300' },
+  ask_question: { border: 'border-amber-500', badge: 'text-amber-700', ownBody: true, label: toolLabel('❓ ') },
+  skill_invoke: { border: 'border-purple-500', badge: 'text-purple-600', label: toolLabel('skill: ') },
+  memory_read: { border: 'border-sky-400 border-dashed', badge: 'text-sky-600', label: toolLabel('mem↓ ') },
+  memory_write: { border: 'border-pink-500', badge: 'text-pink-600', label: toolLabel('mem↑ ') },
+  // The model that answered changed between two assistant turns — a /model
+  // switch, whether driven from a card or typed in the TUI.
+  model: { border: 'border-violet-500', badge: 'text-violet-600', ownBody: true, label: () => '🔀 model' },
+  // The recap Claude writes when you've been away: where the session got to,
+  // and what it wants next.
+  recap: { border: 'border-cyan-500', badge: 'text-cyan-700', ownBody: true, label: () => '📋 recap',
+           title: 'Claude 在你离开后写的进度小结（transcript 里的 away_summary）' },
+}).map(([kind, k]) => [kind, { ...EV_KIND_OTHER, ...k }]));
+
 function fleet() {
   return {
     windows: [],
@@ -1164,6 +1152,8 @@ function fleet() {
     _snapshotPoll: null,
     // The timeline request out now, if any. See refreshTimeline.
     _timelineFetch: null,
+    // The raw snapshot last drawn. See _applySnapshotText.
+    _snapshotSig: null,
     historySessions: [],
     historyTotal: 0,
     historyQuery: '',
@@ -1234,11 +1224,15 @@ function fleet() {
       for (const w of this.windows) if (w.cwd && keep(w)) seen.add(w.cwd);
       return [...seen];
     },
+    // The machine a spawn runs on: the picked one, else this board's own.
+    get spawnTarget() {
+      return this.spawnHost || this.localHost;
+    },
     // Directories to offer when spawning. Scoped to the machine the spawn will
     // run on: another host's paths may not exist there, and a spawn into a
     // missing directory is a confusing failure.
     get recentCwds() {
-      const host = this.spawnHost || this.localHost;
+      const host = this.spawnTarget;
       const multi = this.hosts.length > 1;
       return this._cwds(w => !multi || w.host === host);
     },
@@ -1246,19 +1240,19 @@ function fleet() {
     // (refreshSpawnDirs) — most live on the shared mount, so a fresh machine
     // with no cards of its own still gets a list to pick from.
     get otherCwds() {
-      const host = this.spawnHost || this.localHost;
+      const host = this.spawnTarget;
       if (this.spawnOtherDirs.host !== host) return [];
       const recent = new Set(this.recentCwds);
       return this.spawnOtherDirs.paths.filter(d => !recent.has(d));
     },
     async refreshSpawnDirs() {
       if (this.hosts.length < 2) return;
-      const host = this.spawnHost || this.localHost;
+      const host = this.spawnTarget;
       const paths = this._cwds(w => w.host !== host);
       const d = paths.length ? await this.apiPost('/api/spawn-dirs', { paths, host })
                              : { ok: true, paths: [] };
       // The answer is for the host asked; drop it if the picker moved on meanwhile.
-      if (d.ok && host === (this.spawnHost || this.localHost)) {
+      if (d.ok && host === this.spawnTarget) {
         this.spawnOtherDirs = { host, paths: d.paths || [] };
       }
     },
@@ -1343,14 +1337,17 @@ function fleet() {
     get hiddenEventCount() {
       return Math.max(0, (this.timelineData?.events || []).length - this.timelineWindow);
     },
-    // A collapsed row is clamped to max-h-32 (~8 lines); offer the toggle only
-    // when the text plausibly overflows that.
     // An Edit row the backend shaped into a diff. An Edit call with neither
     // string still falls through to the generic k=v row.
     isEditDiff(ev) {
       return ev.kind === 'tool_use' && ev.tool === 'Edit' && !!ev.extra?.diff;
     },
+    evKind(ev) {
+      return EV_KINDS[ev.kind] || EV_KIND_OTHER;
+    },
 
+    // A collapsed row is clamped to max-h-32 (~8 lines); offer the toggle only
+    // when the text plausibly overflows that.
     eventIsLong(ev) {
       const t = ev.text || '';
       return t.split('\n').length > 8 || t.length > 400;
@@ -1393,8 +1390,19 @@ function fleet() {
     async _fetchSnapshot() {
       try {
         const r = await fetch('/api/windows');
-        if (r.ok) this.applySnapshot(await r.json());
+        if (r.ok) this._applySnapshotText(await r.text());
       } catch (e) { /* transient; the next snapshot catches up */ }
+    },
+
+    // Draw a snapshot from its raw JSON, unless it is the one already drawn:
+    // a poll that beats the server's next rebuild gets the same snapshot back,
+    // and so does a stream reopening onto a quiet board. Redrawing it would
+    // rebuild every card for nothing, and restart the cards' durations from
+    // this later arrival instead of the first (see `now`).
+    _applySnapshotText(txt) {
+      if (txt === this._snapshotSig) return;
+      this._snapshotSig = txt;
+      this.applySnapshot(JSON.parse(txt));
     },
 
     // Open the snapshot stream that feeds the card list.
@@ -1414,7 +1422,7 @@ function fleet() {
       this.evtSource = new EventSource('/api/events');
       this.evtSource.addEventListener('snapshot', (e) => {
         this._noteStreamAlive();
-        this.applySnapshot(JSON.parse(e.data));
+        this._applySnapshotText(e.data);
       });
       // Carries no payload; its only job is to prove the stream still flows
       // through a stretch where nothing on the board changed.
@@ -1667,12 +1675,23 @@ function fleet() {
       }
     },
 
+    // GET an API read. Resolves to the parsed body, or null when the server
+    // can't be reached or answers with an error, so a caller keeps whatever it
+    // was showing. A 401 never resolves (see apiPost).
+    async apiGet(url) {
+      try {
+        const r = await fetch(url);
+        return r.ok ? await r.json() : null;
+      } catch { return null; }
+    },
+
     // POST one action and toast how it went: `ok` on success — a string, or a
     // function of the response for a toast that reports what came back — and
-    // `fail` + the error otherwise. With `busy` (a per-card flag map) and `key`,
-    // the action is skipped while that card's flag is up and holds it until
-    // the answer is in, so a double click sends once and the button can show
-    // it's working. Resolves to the response.
+    // `fail` + the error otherwise. With `busy` (a per-card flag map, or the
+    // component itself for a flag of its own) and `key`, the action is skipped
+    // while that flag is up and holds it until the answer is in, so a double
+    // click sends once and the button can show it's working. Resolves to the
+    // response, or to nothing when skipped.
     async act(url, { body, ok, fail, busy, key } = {}) {
       if (busy) {
         if (busy[key]) return;
@@ -1744,41 +1763,24 @@ function fleet() {
     },
 
     async spawnSession() {
-      if (this.spawning) return;
       const cwd = (this.spawnCwd && this.spawnCwd.trim()) || this.spawnCwdSelect;
       if (!cwd) { this.toast('Pick or type a directory'); return; }
-      this.spawning = true;
-      try {
-        const d = await this.apiPost('/api/windows/create',
-                                     { cwd, platform: this.spawnPlatform, host: this.spawnHost });
-        if (d.ok) {
-          this.toast('Spawned ' + this.spawnPlatform + ' in ' + cwd
-                     + (this.hosts.length > 1 ? ' on ' + this.spawnHost : ''));
-          this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = '';
-        } else {
-          this.toast('Spawn failed: ' + (d.error || ''));
-        }
-      } finally {
-        this.spawning = false;
-      }
+      const { spawnPlatform: platform, spawnHost: host } = this;
+      const d = await this.act('/api/windows/create', {
+        body: { cwd, platform, host },
+        ok: 'Spawned ' + platform + ' in ' + cwd + (this.hosts.length > 1 ? ' on ' + host : ''),
+        fail: 'Spawn failed: ', busy: this, key: 'spawning',
+      });
+      if (d?.ok) { this.showSpawn = false; this.spawnCwd = ''; this.spawnCwdSelect = ''; }
     },
 
     async sendPrompt(key) {
-      if (this.promptSending[key]) return;
       const text = (this.promptDrafts[key] || '').trim();
       if (!text) { this.toast('Type a prompt first'); return; }
-      this.promptSending[key] = true;
-      try {
-        const d = await this.apiPost(`/api/windows/${key}/prompt`, { text });
-        if (d.ok) {
-          this.toast(d.note || 'Sent prompt');
-          this.promptDrafts[key] = '';
-        } else {
-          this.toast('Send failed: ' + (d.error || ''));
-        }
-      } finally {
-        this.promptSending[key] = false;
-      }
+      const d = await this.act(`/api/windows/${key}/prompt`,
+                               { body: { text }, ok: (d) => d.note || 'Sent prompt', fail: 'Send failed: ',
+                                 busy: this.promptSending, key });
+      if (d?.ok) this.promptDrafts[key] = '';
     },
 
     // Most recent prompt the user typed into this session (last user_text event).
@@ -1918,20 +1920,15 @@ function fleet() {
 
     async openTimelineForSession(sessionId) {
       const w = this.windows.find(w => w.session_id === sessionId);
-      if (w) {
-        this.toggleExpand(w.key);
-        this.searchResults = null;
-      } else {
-        await this.openHistoryTimeline(sessionId);
-        this.searchResults = null;
-      }
+      if (w) this.toggleExpand(w.key);
+      else await this.openHistoryTimeline(sessionId);
+      this.searchResults = null;
     },
 
     async doSearch() {
       if (!this.searchQuery.trim()) { this.searchResults = null; return; }
-      const r = await fetch(`/api/search?q=${encodeURIComponent(this.searchQuery)}&limit=40`);
-      const d = await r.json();
-      this.searchResults = d.hits || [];
+      const d = await this.apiGet(`/api/search?q=${encodeURIComponent(this.searchQuery)}&limit=40`);
+      if (d) this.searchResults = d.hits || [];
     },
 
     // The archive runs to four figures and nobody pages through it — the rows
@@ -1940,8 +1937,8 @@ function fleet() {
     // can say how much is being held back.
     async loadHistory() {
       const q = this.historyQuery ? `&q=${encodeURIComponent(this.historyQuery)}` : '';
-      const r = await fetch(`/api/history?page=1&limit=${HISTORY_LIMIT}${q}`);
-      const d = await r.json();
+      const d = await this.apiGet(`/api/history?page=1&limit=${HISTORY_LIMIT}${q}`);
+      if (!d) return;
       this.historySessions = d.sessions || [];
       this.historyTotal = d.total || 0;
     },
@@ -1950,9 +1947,9 @@ function fleet() {
       this._resetTimeline();
       this.expandedKey = null;
       this.expandedHistoryId = sessionId;
-      const r = await fetch(`/api/history/${sessionId}/timeline`);
-      if (r.ok) {
-        this.timelineData = await r.json();
+      const d = await this.apiGet(`/api/history/${sessionId}/timeline`);
+      if (d) {
+        this.timelineData = d;
         this._revealTimeline();
       } else {
         this.toast('No transcript for this session');
@@ -2011,9 +2008,8 @@ function fleet() {
       // For active windows use /api/windows/{pid}/plan; for history sessions
       // fall back to scanning plan_history for the latest write content.
       if (this.expandedKey) {
-        const r = await fetch(`/api/windows/${this.expandedKey}/plan`);
-        this.planData = await r.json();
-        if (!this.planData?.plan) this.planData = null;
+        const d = await this.apiGet(`/api/windows/${this.expandedKey}/plan`);
+        this.planData = d?.plan ? d : null;
       } else {
         // history session: reconstruct latest from plan_history
         const writes = (this.timelineData?.plan_history || []).filter(p => p.operation === 'write');
@@ -2057,22 +2053,19 @@ function fleet() {
       if (this[open] === name) { this[open] = null; return; }
       this[open] = name;
       if (!this[cache][name]) {
-        const r = await fetch(`/api/${kind}/${encodeURIComponent(name)}/sessions`);
-        const d = await r.json();
-        this[cache][name] = d.sessions || [];
+        const d = await this.apiGet(`/api/${kind}/${encodeURIComponent(name)}/sessions`);
+        if (d) this[cache][name] = d.sessions || [];
       }
     },
 
     async loadSkills() {
-      const r = await fetch('/api/skills');
-      const d = await r.json();
-      this.skillsList = d.skills || [];
+      const d = await this.apiGet('/api/skills');
+      if (d) this.skillsList = d.skills || [];
     },
 
     async loadMemory() {
-      const r = await fetch('/api/memory');
-      const d = await r.json();
-      this.memoryData = d;
+      const d = await this.apiGet('/api/memory');
+      if (d) this.memoryData = d;
     },
 
     // Toasts carry a unique id and each schedules its OWN removal by that id.
