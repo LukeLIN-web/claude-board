@@ -4,7 +4,7 @@ A /btw aside is answered in an ephemeral TUI overlay and is *never* written to
 the session transcript — verified empirically: a session whose only interaction
 is /btw produces no transcript file at all. So the fleet is the only place that
 can remember it. We scrape the overlay from the pane (best-effort, only while it
-is on-screen; see actions.parse_btw_overlay), latch each distinct Q+A here, and
+is on-screen; see btwscreen.parse_btw_overlay), latch each distinct Q+A here, and
 persist to disk so the answer survives the overlay being dismissed, the pane
 scrolling, and the fleet process restarting.
 

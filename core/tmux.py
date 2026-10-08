@@ -550,13 +550,13 @@ def codex_enter_settle(text_len: int) -> float:
     return min(scaled, _CODEX_ENTER_SETTLE_MAX)
 
 
-# Footer line of an open /btw aside overlay (same anchor actions._overlay_anchors
-# keys on). While the aside is open, the composer line STILL shows the "/btw …"
-# command and the overlay echoes it again below — and a resent Enter would
-# dismiss the overlay, killing the aside mid-answer. So an on-screen footer
-# means "submitted", never "stranded". Any pre-existing overlay was closed by
-# actions.send_prompt before the send, so by verify time the footer can only
-# belong to the aside this very submit opened.
+# Footer line of an open /btw aside overlay (the same anchor
+# btwscreen._overlay_anchors keys on). While the aside is open, the composer
+# line STILL shows the "/btw …" command and the overlay echoes it again below —
+# and a resent Enter would dismiss the overlay, killing the aside mid-answer.
+# So an on-screen footer means "submitted", never "stranded". Any pre-existing
+# overlay was closed by actions.send_prompt before the send, so by verify time
+# the footer can only belong to the aside this very submit opened.
 _BTW_OVERLAY_FOOTER = "Esc to close"
 
 # Claude collapses a paste past ~1000 chars into a "[Pasted text #N]"

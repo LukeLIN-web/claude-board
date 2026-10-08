@@ -1,11 +1,12 @@
 """Gate + background runner for full /btw answer capture.
 
 A /btw answer taller than its overlay window only ever shows a slice on screen;
-recovering the rest means scrolling the overlay (actions.capture_full_btw_answer),
-which injects ↓ keys into the live pane and takes seconds. Neither belongs on the
-2 s dashboard-refresh path, so this module:
+recovering the rest means scrolling the overlay
+(btwscreen.capture_full_btw_answer), which injects ↓ keys into the live pane and
+takes seconds. Neither belongs on the 2 s dashboard-refresh path, so this
+module:
 
-  1. does the cheap, key-free top-slice scrape first (actions.get_btw_state);
+  1. does the cheap, key-free top-slice scrape first (btwscreen.get_btw_state);
   2. skips entirely if that aside is already fully archived (btwlog.has_slice) —
      so a still-open overlay is not re-scrolled on every poll;
   3. otherwise runs the slow scroll-stitch on a daemon thread, one at a time per
@@ -24,7 +25,7 @@ from __future__ import annotations
 
 import threading
 
-from . import actions, btwlog, tmux
+from . import btwlog, btwscreen, tmux
 
 _lock = threading.Lock()  # guards _session_locks
 # session_id -> held for as long as a scroll-stitch of that session's pane runs
@@ -57,7 +58,7 @@ def maybe_capture(tty: str, session_id: str) -> str | None:
     if pane is None:
         return None
     try:
-        state = actions.get_btw_state(pane)  # cheap, no key injection
+        state = btwscreen.get_btw_state(pane)  # cheap, no key injection
     except Exception:
         return None
     if not state:
@@ -84,7 +85,7 @@ def capture_sync(pane: str, session_id: str) -> None:
     if not session_id:
         return
     try:
-        slice_ov = actions.get_btw_answer(pane)
+        slice_ov = btwscreen.get_btw_answer(pane)
     except Exception:
         return
     if not slice_ov or _archived(session_id, slice_ov):
@@ -106,7 +107,7 @@ def _stitch(lock: threading.Lock, pane: str, session_id: str,
     stands."""
     try:
         try:
-            full = actions.capture_full_btw_answer(pane)
+            full = btwscreen.capture_full_btw_answer(pane)
         except Exception:
             full = None  # a scrape/scroll failure degrades to the fallback
         got = full or fallback
