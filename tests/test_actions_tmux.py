@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from core import actions, btwcapture
+from tests.helpers import fixture_text
 
 
 def _fake_window(tty, platform="claude", session_id=None):
@@ -498,6 +499,18 @@ class SendPromptBlockerTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertIn("permission/choice menu", r["note"])
         self.assertIn("⚠", r["note"])  # Esc denied a pending tool call
+
+    def test_goal_panel_is_escaped_then_send_delivers_with_note(self):
+        # A bare /goal leaves its panel over the composer; until something
+        # Esc'd it, every send waited 15 s for a composer and gave up.
+        for name in ("goal_panel_empty.txt", "goal_panel_active.txt"):
+            with self.subTest(name):
+                r, sk, st = self._send_with_blocker(fixture_text(name))
+                sk.assert_any_call("%5", "Escape")
+                st.assert_called_once()
+                self.assertTrue(r["ok"])
+                self.assertIn("/goal panel", r["note"])
+                self.assertNotIn("⚠", r["note"])  # closing it leaves the goal set
 
     def test_blocker_that_wont_clear_reports_specific_error_without_typing(self):
         r, sk, st = self._send_with_blocker(self._MODEL_DIALOG, clears=False)

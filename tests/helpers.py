@@ -81,3 +81,11 @@ def make_window(**over) -> sessions.Window:
                   transcript_path=None, alive=True, hidden=False, platform="claude")
     fields.update(over)
     return sessions.Window(**fields)
+
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+
+
+def fixture_text(name: str) -> str:
+    """A pane captured off a live session, kept in fixtures/."""
+    return (FIXTURES / name).read_text()

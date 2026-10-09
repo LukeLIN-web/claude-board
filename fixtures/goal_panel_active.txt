@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/claude-board-goalprobe-helzvvw9
+
+
+❯ 用 Bash 跑 sleep 15，然后只回复 done
+
+● Sleeping for 15 seconds · 2s
+  ⎿  $ sleep 15 (4s)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+❯ Goal set: 你回复一次 OK 就算达成，不要用任何工具
+  ctrl+x ctrl+s to send now
+
+
+✻ Envisioning… (5s · ↓ 82 tokens)
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   ◎ Goal active
+   running 2s · 0 tokens
+
+   Goal: 你回复一次 OK 就算达成，不要用任何工具
+
+   /goal clear to stop early · Esc to dismiss

@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/claude-board-goalprobe-2bfg8780
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Goal
+
+   No goal set
+   /goal <condition> to set one
+
+   Esc to dismiss
