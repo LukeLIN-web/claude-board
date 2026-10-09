@@ -559,6 +559,27 @@ def codex_enter_settle(text_len: int) -> float:
 # the footer can only belong to the aside this very submit opened.
 _BTW_OVERLAY_FOOTER = "Esc to close"
 
+# The panel a bare `/goal` opens in place of the composer (seen live on
+# v2.1.295): "Goal · No goal set · /goal <condition> to set one · Esc to
+# dismiss", or, with a goal running, "◎ Goal active · running 2s · Goal: … ·
+# /goal clear to stop early · Esc to dismiss". Its `/goal …` hint read as a
+# stranded "/goal", so the submit-verify pressed Enter into the panel and
+# reported the send failed; and every later send waited out the composer that
+# the panel hides. Like the /btw footer, an open panel means our `/goal` went
+# through: actions.send_prompt closes any panel already up before it types.
+_GOAL_PANEL_FOOTER = "Esc to dismiss"
+
+
+def goal_panel_open(text: str) -> bool:
+    """Whether the /goal panel sits at the foot of the captured screen `text`:
+    its footer is the last line, its `/goal …` hint on or just above it. The
+    footer alone is not enough — other informational overlays dismiss on Esc
+    too — and an ordinary screen ends in the composer's status line."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or not lines[-1].endswith(_GOAL_PANEL_FOOTER):
+        return False
+    return any(ln.startswith("/goal ") for ln in lines[-3:])
+
 # Claude collapses a paste past ~1000 chars into a "[Pasted text #N]"
 # placeholder (multi-line pastes render "[Pasted text #N +M lines]") and keeps
 # the full content internally, expanding it on submit. The literal tail is
@@ -610,7 +631,8 @@ def _tail_in(cap: str, text: str, marker: str) -> bool:
 
     Exception: a /btw aside keeps its command text on the composer line for as
     long as its answer overlay is open, so the overlay footer in the region
-    means the prompt DID submit (see _BTW_OVERLAY_FOOTER).
+    means the prompt DID submit (see _BTW_OVERLAY_FOOTER). So does an open
+    /goal panel, whose `/goal …` hint would otherwise match (goal_panel_open).
 
     No marker on screen means there is NO composer — the TUI exited or was
     suspended and its parent shell owns the pty. The injected text still echoes
@@ -624,7 +646,7 @@ def _tail_in(cap: str, text: str, marker: str) -> bool:
     if idx == -1:
         return False
     region = cap[idx:]
-    if _BTW_OVERLAY_FOOTER in region:
+    if _BTW_OVERLAY_FOOTER in region or goal_panel_open(cap):
         return False
     squeezed = "".join(region.split())
     if _PASTED_PLACEHOLDER_RE.search(squeezed):

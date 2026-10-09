@@ -1013,6 +1013,9 @@ def _diagnose_blocker(text: str) -> Optional[dict]:
         return {"kind": "model", "label": "a /model dialog", "warn": False}
     if btwscreen.overlay_open(text):
         return {"kind": "btw", "label": "a /btw aside", "warn": False}
+    if tmux.goal_panel_open(text):
+        # Esc only closes the panel; the goal itself stays set.
+        return {"kind": "goal", "label": "the /goal panel", "warn": False}
     if _menu_markers_present(text):
         return {"kind": "menu", "label": "a permission/choice menu", "warn": True}
     return None

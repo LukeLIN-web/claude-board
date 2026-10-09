@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from core import tmux
+from tests.helpers import fixture_text
 
 # Every argv assertion below is about the command being built, so the module runs
 # with FLEET_TMUX_SOCKET unset. Leaving it to the ambient environment made these
@@ -652,6 +653,53 @@ class SendTextVerifySubmitTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         enters = [c for c in calls if c[-1] == "Enter"]
         self.assertEqual(len(enters), 1)  # submit Enter only — overlay untouched
+
+    def test_open_goal_panel_does_not_trigger_enter_resend(self):
+        # The panel a bare /goal opens carries a "/goal …" hint, which read as
+        # the command stranded in the composer: Enter went into the panel three
+        # more times and the send was reported failed although /goal had run.
+        for name in GOAL_PANELS:
+            with self.subTest(name):
+                calls = []
+
+                def fake_run(argv, **kw):
+                    calls.append(argv)
+                    if "capture-pane" in argv:
+                        return FakeProc(returncode=0, stdout=fixture_text(name))
+                    return FakeProc(returncode=0)
+
+                with _patch_run(fake_run), \
+                        mock.patch.object(tmux.time, "sleep"):
+                    r = tmux.send_text("%5", "/goal", marker="❯")
+                self.assertTrue(r["ok"])
+                enters = [c for c in calls if c[-1] == "Enter"]
+                self.assertEqual(len(enters), 1)
+
+
+# The /goal panel, captured live on v2.1.295: with no goal set, and over a turn
+# working on one.
+GOAL_PANELS = ("goal_panel_empty.txt", "goal_panel_active.txt")
+
+
+class GoalPanelTests(unittest.TestCase):
+
+    def test_both_live_panels_are_recognized(self):
+        for name in GOAL_PANELS:
+            with self.subTest(name):
+                self.assertTrue(tmux.goal_panel_open(fixture_text(name)))
+
+    def test_an_idle_pane_is_not_the_panel(self):
+        self.assertFalse(tmux.goal_panel_open("● OK\n────\n❯ \n────\n  ⏵⏵ bypass permissions on\n"))
+
+    def test_the_panel_quoted_in_a_turn_is_not_the_panel(self):
+        # Same words, but scrolled up into the transcript: the composer and its
+        # status line are below them, so nothing is covering the composer.
+        quoted = ("● It shows:\n  /goal clear to stop early · Esc to dismiss\n"
+                  "────\n❯ \n────\n  ⏵⏵ bypass permissions on\n")
+        self.assertFalse(tmux.goal_panel_open(quoted))
+
+    def test_another_overlay_dismissed_with_esc_is_not_the_panel(self):
+        self.assertFalse(tmux.goal_panel_open("  Status\n\n  Version: 2.1.295\n\n  Esc to dismiss\n"))
 
 
 # Claude's task list, which it draws BELOW the composer: every blocked task
