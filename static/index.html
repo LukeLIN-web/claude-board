@@ -686,10 +686,17 @@
       <pre class="text-violet-900 whitespace-pre-wrap break-words m-0 font-sans"
            :style="'font-size:'+assistantFontPx+'px; line-height:1.5'" x-text="timelineData?.loop?.text || ''"></pre>
     </div>
-    <!-- Most recent prompt the user sent — always visible while a session is open -->
+    <!-- Most recent prompt the user sent, and the reply to it — always visible while a session is open -->
     <div class="mb-3 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2" x-show="timelineData && lastUserPrompt()">
       <div class="text-[10px] font-semibold text-blue-700 uppercase tracking-wide mb-1">最近发送的 prompt</div>
       <pre class="text-xs text-blue-900 whitespace-pre-wrap break-words max-h-32 overflow-y-auto m-0 font-sans" x-text="lastUserPrompt()"></pre>
+      <div class="mt-2 pt-2 border-t border-blue-200">
+        <div class="text-[10px] font-semibold text-emerald-700 uppercase tracking-wide mb-1">最近的回复</div>
+        <pre x-show="lastAssistantReply()"
+             class="text-xs text-gray-800 whitespace-pre-wrap break-words max-h-48 overflow-y-auto m-0 font-sans"
+             x-text="lastAssistantReply()"></pre>
+        <div x-show="!lastAssistantReply()" class="text-xs text-gray-400">这条 prompt 之后还没有文字回复</div>
+      </div>
     </div>
     <!-- Send a single prompt into this live session's tmux pane (only for live sessions) -->
     <div class="flex items-end gap-2 mb-4" x-show="expandedKey !== null && tmuxAvailable">
@@ -1793,6 +1800,19 @@ function fleet() {
             && (events[i].text || '').trim()) {
           return events[i].text.trim();
         }
+      }
+      return '';
+    },
+
+    // Newest assistant text since that prompt. Stops at the prompt: a reply from
+    // before it would read as the answer to it, and while Claude is still on
+    // tools there's nothing to show yet.
+    lastAssistantReply() {
+      const events = this.timelineData?.events || [];
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i];
+        if (ev.kind === 'assistant_text' && (ev.text || '').trim()) return ev.text.trim();
+        if (ev.kind === 'user_text' && !ev.extra?.meta && (ev.text || '').trim()) return '';
       }
       return '';
     },
