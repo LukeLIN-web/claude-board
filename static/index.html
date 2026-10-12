@@ -496,11 +496,6 @@
           </div>
         </div>
         <div class="px-4 pb-3 pt-1 flex gap-2 flex-wrap" @click.stop>
-          <!-- hmz has nothing to compact: each run's agents are made for that run. -->
-          <button x-show="tmuxAvailable && w.platform !== 'hmz'" @click="sendCanned(w.key, '/compact', 'Compact')" :disabled="!!promptSending[w.key]"
-                  class="text-xs border border-pink-200 text-pink-600 px-2 py-1 rounded hover:bg-pink-50 transition disabled:opacity-50 disabled:cursor-wait"
-                  title="Send /compact: replace the conversation with a summary of it, freeing context. Unlike Clear, the session keeps the thread">
-            Compact</button>
           <button x-show="tmuxAvailable && w.platform !== 'codex' && w.platform !== 'hmz'" @click="sendCanned(w.key, '/humanize:ask-codex review', 'Review')" :disabled="!!promptSending[w.key]"
                   class="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded hover:bg-blue-50 transition disabled:opacity-50 disabled:cursor-wait"
                   title="Send /humanize:ask-codex review to this session">
@@ -1824,7 +1819,7 @@ function fleet() {
                       { ok: 'Sent /clear', fail: 'Clear failed: ', busy: this.promptSending, key });
     },
 
-    // A card button's canned prompt (Commit, Review, Compact), held under the same
+    // A card button's canned prompt (Commit, Review), held under the same
     // per-card flag as Send so it can't interleave with a typed prompt.
     sendCanned(key, text, what) {
       return this.act(`/api/windows/${key}/prompt`,
