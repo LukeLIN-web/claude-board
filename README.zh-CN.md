@@ -86,7 +86,8 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 
 - **新建 session** — 在顶部选 agent（**Claude Code** 或 **Codex**）和一个最近用过的目录（或自己输），
   点 **Spawn**。Fleet 执行 `tmux new-window … claude --dangerously-skip-permissions` 或
-  `tmux new-window … codex --yolo`，新 session 全自动启动——不会卡在 permission 提示上。新窗口会在
+  `tmux new-window … codex --yolo --no-daemon -c check_for_update_on_startup=false`，新 session
+  全自动启动——不会卡在 permission 提示、daemon 或更新的选择框上，folder-trust 提示也替你答了。新窗口会在
   下一次 2s 轮询时出现。
 - **发送 prompt** — 每张卡片有个 `Send a prompt…` 输入框。输入一行、回车，Fleet 通过
   `tmux send-keys` 把它注入该 session 的 tmux pane（字面文本 + 单独一个 Enter 提交）。
