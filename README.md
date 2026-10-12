@@ -108,8 +108,10 @@ available.
 - **Spawn a session** — pick the agent (**Claude Code** or **Codex**) and a recent
   directory (or type one) in the header, then hit **Spawn**. Fleet runs
   `tmux new-window … claude --dangerously-skip-permissions` or
-  `tmux new-window … codex --yolo` so the new session starts fully non-interactive —
-  no permission prompts blocking the pane. The new window shows up on the next 2s poll.
+  `tmux new-window … codex --yolo --no-daemon -c check_for_update_on_startup=false`
+  so the new session starts fully non-interactive — no permission prompts, daemon
+  or update pickers blocking the pane, and the folder-trust prompt answered for
+  you. The new window shows up on the next 2s poll.
 - **Send a prompt** — each card has a `Send a prompt…` box. Type a line, press
   Enter, and Fleet injects it into that session's tmux pane via
   `tmux send-keys` (literal text + a separate Enter to submit).

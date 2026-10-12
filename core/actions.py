@@ -259,8 +259,19 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
     if not os.path.isdir(resolved):
         return {"ok": False, "error": f"not a directory: {resolved}"}
     if platform == "codex":
-        return tmux.new_window(resolved, ["codex", "--yolo"])
-    if platform == "hmz":
+        # Two startup pickers a spawn would otherwise open on, each with its
+        # cursor on a row that ends the session — which the card's first send
+        # or /model switch then committed with its Enter:
+        #   --no-daemon: while Codex's shared background server runs at other
+        #     feature settings than this build (it updates itself apart from the
+        #     TUI — seen: a 0.162.1 daemon under the 0.160.0 TUI), a
+        #     "Background server has incompatible feature settings" picker, on
+        #     "3. Cancel".
+        #   check_for_update_on_startup=false: an update offer, on "1. Update
+        #     now", which runs the installer in place of the session.
+        r = tmux.new_window(resolved, ["codex", "--yolo", "--no-daemon",
+                                       "-c", "check_for_update_on_startup=false"])
+    elif platform == "hmz":
         # Its first start would otherwise hold the new card on a question in a
         # box over the composer: whether to send error reports. Answered yes
         # here, where nobody has answered it (see hmz.answer_reports).
@@ -268,13 +279,14 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         if exe:
             hmz.answer_reports(exe, resolved)
         return tmux.new_window(resolved, ["hmz"])
-    r = tmux.new_window(resolved)
-    # First spawn into a directory raises Claude's folder-trust prompt, which no
-    # digit answers — leaving the new card stuck on a dialog the spawner isn't
-    # watching. Answer it here (see confirm_trust_prompt) so a spawn lands on a
-    # live composer, not on a modal.
+    else:
+        r = tmux.new_window(resolved)
+    # First spawn into a directory raises the CLI's folder-trust prompt, Codex's
+    # under --yolo too — leaving the new card stuck on a dialog the spawner
+    # isn't watching. Answer it here (see confirm_trust_prompt) so a spawn lands
+    # on a live composer, not on a modal.
     if r.get("ok") and r.get("pane_id"):
-        r["trust"] = confirm_trust_prompt(r["pane_id"])
+        r["trust"] = confirm_trust_prompt(r["pane_id"], platform=platform)
     return r
 
 
@@ -306,9 +318,25 @@ _TRUST_POLL = 0.2
 
 def composer_drawn(text: str, marker: str) -> bool:
     """Whether `text` shows a drawn composer: its CLI's `marker` (see
-    tmux.COMPOSER_MARKERS), and no part of the folder-trust prompt, whose cursor
-    row draws the same "❯" (see _TRUST_HINTS)."""
-    return marker in text and not _trust_prompt_painting(text)
+    tmux.COMPOSER_MARKERS), and no part of Claude's folder-trust prompt, whose
+    cursor row draws the same "❯" (see _TRUST_HINTS), nor a numbered picker in
+    the composer's place (see picker_cursor_row)."""
+    return (marker in text and not _trust_prompt_painting(text)
+            and not picker_cursor_row(text, marker))
+
+
+def picker_cursor_row(text: str, marker: str) -> str:
+    """The row a numbered picker's cursor is on ("3. Cancel"), when that picker
+    sits where the composer goes; "" otherwise.
+
+    Both CLIs draw their composer glyph as the cursor of their numbered pickers
+    too ("› 1. Trust and continue", "❯ 1. Yes"), and a picker takes the
+    composer's place at the bottom of the pane — so the last line carrying
+    `marker` is the composer only while it isn't a numbered row. Typing there
+    and pressing Enter commits whatever row the cursor is on."""
+    last = next((ln for ln in reversed(text.splitlines()) if marker in ln), "")
+    m = re.match(rf"^[\s\xa0]*{re.escape(marker)}[\s\xa0]*(\d+\.[\s\xa0]+\S.*?)\s*$", last)
+    return m.group(1) if m else ""
 
 
 def _wait_pane(pane: str, pred, timeout: float, poll: float) -> Optional[str]:
@@ -402,8 +430,10 @@ _TRUST_ARM_SETTLE = 0.6
 
 
 def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3,
-                         settle: float = _TRUST_ARM_SETTLE) -> dict:
+                         settle: float = _TRUST_ARM_SETTLE, platform: str = "claude") -> dict:
     """Poll a freshly launched `pane_id` for the folder-trust prompt, answer it.
+    `platform` names the CLI in the pane: Claude's prompt and Codex's
+    (answer_codex_trust_prompt) differ in every string but share this poll.
 
     A board launch is unattended by construction: nobody is watching a detached
     pane, so a session parked on this prompt is a red card that stays red until
@@ -423,18 +453,22 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
     """
     if not pane_id:
         return {"answered": False, "waited": 0.0, "reason": "no pane"}
-    marker = tmux.composer_marker("claude")  # only Claude launches raise this prompt
+    marker = tmux.composer_marker(platform)
+    prompt_up, answer = ((codex_trust_prompt_up, answer_codex_trust_prompt)
+                         if platform == "codex" else (trust_prompt_up, answer_trust_prompt))
     waited = 0.0
     for _ in range(max(1, attempts)):
         text = tmux.capture_pane(pane_id).get("text", "")
-        if trust_prompt_up(text):
+        if prompt_up(text):
             # Let the dialog arm its input handler before the first key.
             time.sleep(settle)
             waited += settle
-            r = answer_trust_prompt(pane_id)
+            r = answer(pane_id)
             return {"answered": bool(r.get("answered")), "waited": round(waited, 2),
                     "reason": "" if r.get("ok") else r.get("error", "")}
-        if composer_drawn(text, marker):
+        # Codex draws a bare composer for a moment before it raises the prompt
+        # (~0.4s on 0.160.0); its status line comes only once it has settled.
+        if composer_drawn(text, marker) and (platform != "codex" or codex_status_model(text)):
             return {"answered": False, "waited": round(waited, 2), "reason": "already trusted"}
         time.sleep(interval)
         waited += interval
@@ -984,7 +1018,7 @@ def _wait_composer_ready(pane: str, marker: str) -> bool:
         text = cap.get("text", "")
         if _rewind_panel_open(text):
             tmux.send_keys(pane, "Escape")
-        elif marker in text:
+        elif marker in text and not picker_cursor_row(text, marker):
             return True
         if time.time() >= deadline:
             return False
@@ -1140,6 +1174,11 @@ def _send_prompt_inner(w, pane: str, text: str) -> dict:
     # eats or doubles the prompt, and a Rewind panel (which the wait dismisses
     # itself) eats it outright.
     if not _wait_composer_ready(pane, marker):
+        row = picker_cursor_row(tmux.capture_pane(pane).get("text", ""), marker)
+        if row:
+            return {"ok": False,
+                    "error": f"send blocked: a picker is open on this pane, its cursor "
+                             f"on “{row}” — answer it in the terminal, then resend."}
         return {"ok": False,
                 "error": "composer not on screen — TUI still starting or a "
                          "full-screen dialog is covering it; prompt not sent"}
@@ -1435,8 +1474,15 @@ def _pick_model_row(rows: dict[int, str], alias: str) -> int:
 # updates the instant a /model pick commits, before any turn has run on the new
 # model, which is what makes it the readout: the rollout's turn_context only
 # says what the LAST turn ran on and lags a switch by a whole turn.
+#
+# 0.160.0 prints the model as a display name ("GPT-6-Astra medium"), older
+# builds as its id ("gpt-6-astra medium"); read either, report the id's case —
+# the case the rollout label and the card's model select use. The effort is one
+# of Codex's levels: a picker footer has the same shape ("enter continue · esc
+# quit" under the trust prompt).
 _CODEX_STATUS_RE = re.compile(
-    r"^[\s ]*(?P<model>[a-z][\w.-]*)[\s ]+(?P<effort>[a-z]+)[\s ]+·[\s ]+\S"
+    r"^[\s ]*(?P<model>[a-z][\w.-]*)[\s ]+"
+    r"(?P<effort>none|minimal|low|medium|high|xhigh|max|ultra)[\s ]+·[\s ]+\S", re.I
 )
 
 
@@ -1445,7 +1491,7 @@ def codex_status_model(text: str) -> str:
     for line in reversed(text.splitlines()):
         m = _CODEX_STATUS_RE.match(line)
         if m:
-            return f"{m.group('model')} {m.group('effort')}"
+            return f"{m.group('model')} {m.group('effort')}".lower()
     return ""
 
 
@@ -1523,6 +1569,42 @@ def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
                 "error": f"could not move the Codex {what} picker cursor onto {wanted or 'the current row'}"}
     tmux.send_keys(pane, "Enter")
     return {"ok": True, "name": dict(rows)[target]}
+
+
+# Codex's folder-trust prompt, raised the first time it opens a directory that
+# ~/.codex/config.toml holds no trust_level for, a --yolo launch included:
+#
+#     Trust this folder? Codex can read, edit, and run files here, subject to your
+#     …
+#   › 1. Trust and continue
+#     2. Quit
+#
+#     enter continue · esc quit
+#
+# Esc quits, and so does Enter on "Quit"; the Escape that backs a failed pick
+# out of the /model pickers is only pressed while one of those is on screen
+# (_escape_codex_pickers), never here.
+_CODEX_TRUST_HEAD = "Trust this folder?"
+_CODEX_TRUST_YES = "trust and continue"
+
+
+def codex_trust_prompt_up(text: str) -> bool:
+    """Whether a captured pane shows Codex's trust prompt, rows drawn."""
+    return bool((_codex_picker(text, _CODEX_TRUST_HEAD) or ([],))[0])
+
+
+def answer_codex_trust_prompt(pane: str) -> dict:
+    """Answer Codex's trust prompt in `pane` with "Trust and continue": the
+    cursor is stepped onto that row and seen there before Enter, as with
+    answer_trust_prompt."""
+    picked = _codex_pick(pane, _CODEX_TRUST_HEAD, _CODEX_TRUST_YES, "trust")
+    if not picked["ok"]:
+        return picked
+    # An unreadable pane ("") is not a closed prompt.
+    if _wait_pane(pane, lambda t: bool(t) and _CODEX_TRUST_HEAD not in t,
+                  _TRUST_WAIT, _TRUST_POLL) is not None:
+        return {"ok": True, "answered": True, "label": picked["name"]}
+    return {"ok": False, "error": "the Codex trust prompt did not close"}
 
 
 def _switch_codex_model(w, model: str, effort: str) -> dict:

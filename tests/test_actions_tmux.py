@@ -117,15 +117,20 @@ class CreateSessionTests(unittest.TestCase):
             with mock.patch.object(actions.tmux, "new_window",
                                    return_value={"ok": True, "pane_id": "%1"}):
                 r = actions.create_session(d)
-        self.trust.assert_called_once_with("%1")
+        self.trust.assert_called_once_with("%1", platform="claude")
         self.assertTrue(r["trust"]["answered"])
 
-    def test_codex_spawn_has_no_trust_prompt_to_answer(self):
+    def test_codex_spawn_skips_its_startup_pickers_and_answers_trust(self):
+        # Launched plain, Codex can open on a daemon picker whose cursor sits on
+        # Cancel (fixtures/codex_daemon_mismatch.txt) or an update offer whose
+        # cursor sits on Update now; the flags keep both from being drawn.
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(actions.tmux, "new_window",
-                                   return_value={"ok": True, "pane_id": "%1"}):
+                                   return_value={"ok": True, "pane_id": "%1"}) as m:
                 actions.create_session(d, platform="codex")
-        self.trust.assert_not_called()
+        m.assert_called_once_with(d, ["codex", "--yolo", "--no-daemon",
+                                      "-c", "check_for_update_on_startup=false"])
+        self.trust.assert_called_once_with("%1", platform="codex")
 
     def test_failed_spawn_is_not_polled(self):
         with tempfile.TemporaryDirectory() as d:
@@ -430,6 +435,20 @@ class SendPromptReadinessTests(unittest.TestCase):
         p.send_text.assert_not_called()
         self.assertFalse(r["ok"])
         self.assertIn("composer", r["error"])
+
+    def test_a_codex_startup_picker_is_not_typed_into(self):
+        # Its cursor row draws the composer's glyph. Read as a composer, the
+        # send typed into it and its Enter picked "3. Cancel": Codex exited and
+        # the card went with it. Not Esc'd either — Esc quits from these too.
+        codex = _fake_window("/dev/pts/3", platform="codex")
+        for name, row in (("codex_daemon_mismatch.txt", "3. Cancel"),
+                          ("codex_trust_prompt.txt", "1. Trust and continue")):
+            with _pane(fixture_text(name), window=codex) as p:
+                r = actions.send_prompt(p.card, "/model")
+            p.send_text.assert_not_called()
+            self.assertEqual(p.sent, [], name)
+            self.assertFalse(r["ok"])
+            self.assertIn(row, r["error"])
 
     def test_codex_pane_waits_for_its_own_composer(self):
         codex = _fake_window("/dev/pts/3", platform="codex")
@@ -1263,8 +1282,15 @@ class CodexStatusModelTests(unittest.TestCase):
         text = CODEX_STATUS_BUSY + CODEX_STATUS_IDLE
         self.assertEqual(actions.codex_status_model(text), "gpt-6-astra high")
 
+    def test_display_name_is_read_in_the_ids_case(self):
+        # 0.160.0's status line names the model as "GPT-6-Astra"; the card's
+        # select and the rollout label say "gpt-6-astra".
+        text = "› Ask Codex to do anything\n  GPT-6-Astra high · /tmp/proj\n"
+        self.assertEqual(actions.codex_status_model(text), "gpt-6-astra high")
+
     def test_banner_box_and_pickers_are_not_the_status_line(self):
-        for text in (CODEX_BANNER_BOX, CODEX_MODEL_PICKER, CODEX_EFFORT_PICKER, ""):
+        for text in (CODEX_BANNER_BOX, CODEX_MODEL_PICKER, CODEX_EFFORT_PICKER, "",
+                     fixture_text("codex_trust_prompt.txt")):
             self.assertEqual(actions.codex_status_model(text), "", text[:30])
 
 
@@ -1602,3 +1628,60 @@ class ConfirmTrustPromptTests(unittest.TestCase):
 
     def test_no_pane_is_a_no_op(self):
         self.assertEqual(actions.confirm_trust_prompt("")["reason"], "no pane")
+
+
+_CODEX_TRUST = fixture_text("codex_trust_prompt.txt")
+_CODEX_TRUST_ON_QUIT = (_CODEX_TRUST.replace("› 1. Trust", "  1. Trust")
+                        .replace("  2. Quit", "› 2. Quit"))
+
+
+class CodexTrustPromptTests(unittest.TestCase):
+    """Codex's folder-trust prompt, on a pane a codex spawn just made: a
+    numbered picker this time, where Esc and "2. Quit" both end the session."""
+
+    def _run(self, caps, default=_CODEX_LIVE_TEXT, **kw):
+        with _pane(*caps, then=default, window=_fake_window("/dev/pts/3", "codex")) as p:
+            return actions.confirm_trust_prompt("%0", platform="codex", **kw), p.sent
+
+    def test_recognized_by_its_rows(self):
+        self.assertTrue(actions.codex_trust_prompt_up(_CODEX_TRUST))
+        for text in (_CODEX_LIVE_TEXT, fixture_text("codex_daemon_mismatch.txt"),
+                     "  Trust this folder? Codex can read\n"):  # rows not painted yet
+            self.assertFalse(actions.codex_trust_prompt_up(text), text[:40])
+
+    def test_answers_with_trust_and_continue(self):
+        r, sent = self._run(["", _CODEX_TRUST, _CODEX_TRUST, _CODEX_TRUST, _CODEX_LIVE_TEXT])
+        self.assertTrue(r["answered"], r)
+        self.assertEqual(r["reason"], "")
+        self.assertEqual(sent, [("Enter",)])
+
+    def test_steps_off_quit_before_enter(self):
+        r, sent = self._run([_CODEX_TRUST_ON_QUIT, _CODEX_TRUST_ON_QUIT, _CODEX_TRUST_ON_QUIT,
+                             _CODEX_TRUST, _CODEX_LIVE_TEXT])
+        self.assertTrue(r["answered"], r)
+        self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_already_trusted_directory_returns_immediately(self):
+        r, sent = self._run([_CODEX_LIVE_TEXT])
+        self.assertEqual(r["reason"], "already trusted")
+        self.assertEqual(sent, [])
+
+    def test_the_composer_it_flashes_while_booting_is_not_trusted_yet(self):
+        # Codex draws a bare composer, no status line under it, before the
+        # prompt. Leaving there sent the card's first prompt into the prompt.
+        boot = "  >_ OpenAI Codex (v0.160.0)\n› Ask Codex to do anything\n  ? for shortcuts\n"
+        r, sent = self._run([boot, boot, _CODEX_TRUST, _CODEX_TRUST, _CODEX_TRUST,
+                             _CODEX_LIVE_TEXT])
+        self.assertTrue(r["answered"], r)
+        self.assertEqual(sent, [("Enter",)])
+
+    def test_its_cursor_row_is_not_a_composer(self):
+        self.assertFalse(actions.composer_drawn(_CODEX_TRUST, "›"))
+        self.assertTrue(actions.composer_drawn(_CODEX_LIVE_TEXT, "›"))
+
+    def test_another_startup_picker_gets_no_keys(self):
+        # The daemon picker opens on Cancel: nothing here may press anything.
+        r, sent = self._run([], default=fixture_text("codex_daemon_mismatch.txt"), attempts=3)
+        self.assertFalse(r["answered"])
+        self.assertEqual(r["reason"], "no prompt")
+        self.assertEqual(sent, [])
