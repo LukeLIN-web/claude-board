@@ -458,10 +458,12 @@ class TestAnswerReports(unittest.TestCase):
                 mock.patch.object(actions.hmz, "answer_reports",
                                   side_effect=lambda *a: order.append(("answer", *a))), \
                 mock.patch.object(actions.tmux, "new_window",
-                                  side_effect=lambda *a: order.append(("spawn", *a)) or {"ok": True}):
+                                  side_effect=lambda *a, **k: order.append(("spawn", *a, k))
+                                  or {"ok": True}):
             actions.create_session(str(self.dir), platform="hmz")
         self.assertEqual(order, [("answer", "/x/bin/hmz", str(self.dir)),
-                                 ("spawn", str(self.dir), ["hmz"])])
+                                 ("spawn", str(self.dir), ["hmz"],
+                                  {"runs": ("claude", "codex")})])
 
 
 class TestTyped(_HmzHomeTest):

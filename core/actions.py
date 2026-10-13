@@ -278,7 +278,9 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         exe = tmux._resolve_cli("hmz")
         if exe:
             hmz.answer_reports(exe, resolved)
-        return tmux.new_window(resolved, ["hmz"])
+        # hmz finds its agents, claude and codex, off PATH by itself; their hooks
+        # and Bash calls only look on PATH (an RLCR Stop hook runs codex).
+        return tmux.new_window(resolved, ["hmz"], runs=("claude", "codex"))
     else:
         r = tmux.new_window(resolved)
     # First spawn into a directory raises the CLI's folder-trust prompt, Codex's
