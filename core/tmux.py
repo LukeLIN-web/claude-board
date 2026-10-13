@@ -192,7 +192,7 @@ def _resolve_cli(name: str) -> Optional[str]:
     return None
 
 
-def _pane_env_prefix(exe: str) -> list[str]:
+def _pane_env_prefix(exe: str, runs: tuple[str, ...] = ()) -> list[str]:
     """`env …` argv prefix for the pane command that runs `exe`; empty if none.
 
     Two fixes ride on the pane command itself, in the order `env` takes them
@@ -207,16 +207,28 @@ def _pane_env_prefix(exe: str) -> list[str]:
        Appended, not prepended: it fills in what the pane could not find and
        never shadows what it already resolves (a conda-base `hmz` must not hand
        its pane conda's `python`).
+
+    `runs` names the CLIs `exe` starts in turn, whose directories are appended
+    the same way. An `hmz` found in conda's bin starts `claude` from
+    ~/.local/bin, and that claude's hooks look for `codex` on the PATH it was
+    handed: with only conda's bin added, an RLCR loop's Stop hook blocked every
+    turn on "Codex CLI Not Found".
     """
     prefix = _venv_unset_prefix()
     # The pane's PATH is the board's spawn PATH: tmux gives a new pane the
     # environment of the client that ran new-window (see _resolve_cli).
     path = _spawn_env().get("PATH", "")
-    exe_dir = os.path.dirname(exe)
-    on_path = {os.path.normpath(p) for p in path.split(os.pathsep) if p}
-    if exe_dir and os.path.normpath(exe_dir) not in on_path:
+    entries = [p for p in path.split(os.pathsep) if p]
+    on_path = {os.path.normpath(p) for p in entries}
+    added = []
+    for found in (exe, *map(_resolve_cli, runs)):
+        d = os.path.dirname(found or "")
+        if d and os.path.normpath(d) not in on_path:
+            on_path.add(os.path.normpath(d))
+            added.append(d)
+    if added:
         prefix = (prefix or ["env"]) + [
-            f"PATH={path}{os.pathsep}{exe_dir}" if path else f"PATH={exe_dir}"]
+            "PATH=" + os.pathsep.join([path, *added] if path else added)]
     return prefix
 
 
@@ -410,13 +422,15 @@ def _spawn_landed(pane_id: str) -> bool:
     return False
 
 
-def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
+def new_window(cwd: str, cmd: Optional[list[str]] = None,
+               runs: tuple[str, ...] = ()) -> dict:
     """Open a new tmux window in `cwd` running `cmd`; returns {ok, pane_id, error?}.
 
     Defaults to spawning `claude --dangerously-skip-permissions` so the fleet can
     drive new sessions non-interactively (no per-action permission prompts blocking
     the pane). Callers that need a different command — e.g. forking or resuming an
-    existing session — pass `cmd` explicitly.
+    existing session — pass `cmd` explicitly. `runs` names the CLIs `cmd` starts
+    in turn, for the pane's PATH (see _pane_env_prefix).
 
     When no host session exists yet, `cmd` is launched as a fresh detached
     session (running directly, with no placeholder shell) so spawn/resume/fork
@@ -436,8 +450,8 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None) -> dict:
                          f"shell that can run {cmd[0]}"}
     # Force-unset the board's venv markers on the pane command itself so a stale
     # tmux server can't re-inject VIRTUAL_ENV into the spawned session, and give
-    # the pane the directory `exe` was found in if its PATH lacks it.
-    cmd = [*_pane_env_prefix(exe), exe, *cmd[1:]]
+    # the pane the directories `exe` and `runs` were found in if its PATH lacks them.
+    cmd = [*_pane_env_prefix(exe, runs), exe, *cmd[1:]]
     target = _resolve_target()
     if target["exists"]:
         r = _run("new-window", "-P", "-F", "#{pane_id}",

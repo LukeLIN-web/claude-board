@@ -376,6 +376,36 @@ class NewWindowTests(unittest.TestCase):
                          ["env", "-u", "VIRTUAL_ENV", "-u", "VIRTUAL_ENV_PROMPT",
                           "-u", "PYTHONHOME", "PATH=/usr/bin:/opt/bin"])
 
+    def test_pane_path_gains_the_dirs_of_what_the_cli_runs(self):
+        # An hmz from conda's bin starts claude from ~/.local/bin, whose RLCR
+        # Stop hook needs codex on PATH: with only conda's bin added it blocked
+        # every turn on "Codex CLI Not Found". Each dir is added once, and a CLI
+        # this host lacks adds nothing.
+        found = {"hmz": "/conda/bin/hmz", "claude": "/u/.local/bin/claude",
+                 "codex": "/u/.local/bin/codex"}
+        calls = []
+        with mock.patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()), \
+             mock.patch.object(tmux, "_resolve_cli", side_effect=found.get):
+            with _patch_run(_server(calls)):
+                r = tmux.new_window("/tmp", ["hmz"], runs=("claude", "codex", "jq"))
+        self.assertTrue(r["ok"])
+        self.assertEqual(_argv(calls, "new-window")[-3:],
+                         ["env", "PATH=/usr/bin:/conda/bin:/u/.local/bin",
+                          "/conda/bin/hmz"])
+
+    def test_dirs_already_on_the_board_path_are_not_added(self):
+        found = {"hmz": "/conda/bin/hmz", "claude": "/u/.local/bin/claude"}
+        calls = []
+        with mock.patch.dict("os.environ", {"PATH": "/u/.local/bin:/conda/bin"},
+                             clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()), \
+             mock.patch.object(tmux, "_resolve_cli", side_effect=found.get):
+            with _patch_run(_server(calls)):
+                tmux.new_window("/tmp", ["hmz"], runs=("claude",))
+        self.assertEqual(_argv(calls, "new-window")[-1:], ["/conda/bin/hmz"])
+        self.assertFalse(any(a.startswith("PATH=") for a in _argv(calls, "new-window")))
+
     def test_empty_board_path_gets_just_the_cli_dir(self):
         # No leading separator: an empty PATH entry means the cwd.
         calls = []
