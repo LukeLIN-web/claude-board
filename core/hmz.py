@@ -590,6 +590,15 @@ def _discover() -> list[tuple[Window, list[dict]]]:
         events: list[dict] = []
         if epic:
             events = _events(epic)
+            # A run still going is the one this hmz opens on, wherever it was
+            # started: a host holds it apart from any terminal. One that ended
+            # before this hmz started is not on its screen — it opens ready, and
+            # its first line starts another — so a New Session in a directory
+            # whose last run was stopped is a card with no run yet, not that run.
+            end = _ended(events)
+            if end and transcripts._parse_ts(end.get("at", "")) * 1000 < started_at:
+                epic, events = None, []
+        if epic:
             status = "busy" if _began(events) and not _ended(events) else "idle"
             # The epic is written as sessions open and flows are called and
             # return; a long turn leaves it untouched, and `busy` says enough.
