@@ -4,12 +4,16 @@ httpx/TestClient is not a project dependency, so we exercise the route handler
 functions directly (FastAPI's decorator returns the original function) and the
 Pydantic request models at the model level.
 """
+import asyncio
 import contextlib
+import json
 import os
+import time
 import types
 import unittest
 from unittest import mock
 
+import fastapi
 import pydantic
 
 import app as appmod
@@ -711,3 +715,56 @@ class HistoryLaunchRouteTests(unittest.TestCase):
         r, _, crp = self._launch(appmod.api_history_fork, {"ok": True, "backend": "iterm"})
         crp.assert_not_called()
         self.assertNotIn("picker", r)
+
+
+def _get(headers=None):
+    from starlette.requests import Request
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "method": "GET", "path": "/api/windows",
+                    "headers": raw, "query_string": b""})
+
+
+class SnapshotAgeTests(unittest.TestCase):
+    """A board stuck mid-refresh keeps answering with its last snapshot; every
+    way the snapshot leaves the board says how old it is."""
+
+    def setUp(self):
+        built = int((time.time() - 30) * 1000)
+        for attr, snap in (("last_snapshot", {"windows": [], "counts": {}, "ts": built}),
+                           ("last_local_snapshot", {"windows": [], "counts": {}, "ts": built})):
+            patch = mock.patch.object(appmod.state, attr, snap)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_age_counts_from_the_snapshot_build(self):
+        self.assertAlmostEqual(appmod._snapshot_age(appmod.state.last_snapshot), 30, delta=2)
+        self.assertEqual(appmod._snapshot_age({"ts": 0}), 0.0)
+
+    def test_the_page_gets_the_age_in_a_header_and_the_body_untouched(self):
+        """The page skips a body identical to the last one it drew; an age
+        in the body would make every poll a redraw."""
+        resp = fastapi.Response()
+        body = appmod.api_windows(_get(), resp)
+        self.assertIs(body, appmod.state.last_snapshot)
+        self.assertNotIn("age", body)
+        self.assertAlmostEqual(float(resp.headers["x-snapshot-age"]), 30, delta=2)
+
+    def test_a_peer_gets_the_age_in_the_body(self):
+        body = appmod.api_windows(_get({appmod.peers.PEER_HEADER: "1"}), fastapi.Response())
+        self.assertAlmostEqual(body["age"], 30, delta=2)
+        self.assertNotIn("age", appmod.state.last_local_snapshot,
+                         "the age is per answer, not part of the kept snapshot")
+
+    def test_the_stream_opens_with_the_snapshot_then_its_age(self):
+        async def opening():
+            resp = await appmod.api_events(_get())
+            it = resp.body_iterator
+            try:
+                return [await it.__anext__(), await it.__anext__()]
+            finally:
+                await it.aclose()
+
+        snap, beat = asyncio.run(opening())
+        self.assertEqual(snap["event"], "snapshot")
+        self.assertEqual(beat["event"], "heartbeat")
+        self.assertAlmostEqual(json.loads(beat["data"])["age"], 30, delta=2)

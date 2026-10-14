@@ -79,6 +79,24 @@ class CacheTests(_OnePeerTest):
         self.assertEqual(peers.remote_windows(), [],
                          "a board that went away must stop showing ghost cards")
 
+    def test_a_peer_stuck_mid_refresh_is_dimmed_but_kept(self):
+        """It answers every poll at once, with cards it built long ago: they
+        are marked stale from their build, not their arrival, and stay up —
+        the sessions are real, only old."""
+        self._poll({"windows": [{"pid": 42}], "age": peers.DROP_AFTER + 60})
+        (w,) = peers.remote_windows()
+        self.assertTrue(w["peer_stale"])
+        (row,) = peers.status()
+        self.assertTrue(row["online"])
+        self.assertTrue(row["stale"])
+
+    def test_a_peer_that_sends_no_usable_age_counts_as_fresh(self):
+        """A board too old to send one, or a value that isn't an age."""
+        for age in (None, "30", -5, True):
+            self._poll({"windows": [{"pid": 42}], "age": age})
+            self.assertFalse(peers.remote_windows()[0]["peer_stale"], age)
+            self.assertFalse(peers.status()[0]["stale"], age)
+
     def test_a_failed_poll_keeps_the_last_good_cards(self):
         """A blip between polls shouldn't blank the peer's cards — only age
         eventually drops them."""

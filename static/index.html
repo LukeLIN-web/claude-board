@@ -56,18 +56,26 @@
             :class="statusFilter==='completed' || statusFilter==='closeable' ? 'ring-2 ring-gray-400' : ''"
             @click="statusFilter = (statusFilter==='completed' ? 'closeable' : statusFilter==='closeable' ? '' : 'completed')"
             x-text="counts.idle + ' idle'"></span>
+      <!-- The board answering but not refreshing: every card is as of the last
+           refresh it finished (see staleFor). -->
+      <span x-show="staleFor" x-cloak class="bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full"
+            title="这台机器的 board 卡在刷新中途（常见原因：某个子进程在等慢磁盘/NFS），页面上的卡片停在它上次刷新完的样子"
+            x-text="'卡片 ' + runClock(staleFor) + ' 没刷新'"></span>
     </div>
     <!-- One chip per machine, shown only once this board is aggregating more
          than its own host. Click to see just that machine's cards; a peer whose
-         board stopped answering goes red and says so on hover. -->
+         board stopped answering goes red and says so on hover, one that answers
+         with old cards (stuck mid-refresh) goes amber. -->
     <div class="flex gap-1 text-xs" x-show="hosts.length > 1">
       <template x-for="h in hosts" :key="h.host">
         <span class="px-2 py-0.5 rounded-full cursor-pointer border"
               :class="[hostFilter === h.host ? 'ring-2 ring-slate-400' : '',
-                       h.online ? 'bg-slate-100 text-slate-700 border-slate-200'
-                                : 'bg-red-50 text-red-700 border-red-200']"
-              :title="h.online ? (h.host + ' · ' + h.count + ' cards')
-                               : ('no answer from ' + h.host + (h.error ? ' — ' + h.error : ''))"
+                       !h.online ? 'bg-red-50 text-red-700 border-red-200'
+                       : h.stale ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                 : 'bg-slate-100 text-slate-700 border-slate-200']"
+              :title="!h.online ? ('no answer from ' + h.host + (h.error ? ' — ' + h.error : ''))
+                      : h.stale ? (h.host + ' 的 board 在应答，但卡片已经一阵没刷新了（卡在刷新中途）')
+                                : (h.host + ' · ' + h.count + ' cards')"
               @click="hostFilter = (hostFilter === h.host ? '' : h.host)"
               x-text="h.host + ' · ' + h.count"></span>
       </template>
@@ -385,7 +393,7 @@
                   x-text="w.triage"></span>
             <span x-show="hosts.length > 1"
                   class="text-[10px] px-1.5 rounded-full shrink-0 bg-slate-200 text-slate-700 font-medium"
-                  :title="w.peer_stale ? 'this machine\'s board has stopped answering' : 'runs on ' + w.host"
+                  :title="w.peer_stale ? 'this machine\'s board has not refreshed its cards lately' : 'runs on ' + w.host"
                   x-text="w.host"></span>
           </div>
           <div class="text-xs text-gray-500 truncate" x-text="w.cwd"></div>
@@ -1068,6 +1076,12 @@
 // matches when searching.
 const HISTORY_LIMIT = 20;
 
+// How old this board's snapshot may get, in seconds, before the header says
+// its cards are not refreshing (see staleFor). The server rebuilds every 2s
+// and a build takes well under a second, so this much means it is stuck
+// mid-refresh.
+const STALE_SNAPSHOT_S = 15;
+
 // Pin each card to a fixed position by creation time so panels never jump when
 // a session's status flips (working ↔ completed) — the server sorts by recent
 // activity, which reshuffles cards and is easy to misclick. started_at is
@@ -1114,6 +1128,10 @@ function fleet() {
     // that just sits there is never re-sent to move its "3m ago" along.
     now: Date.now(),
     _snapAt: Date.now(),
+    // How old the server last said its snapshot was, in seconds, and the
+    // page's clock when it said so (_noteSnapshotAge, staleFor).
+    snapshotAge: 0,
+    _snapshotAgeAt: Date.now(),
     counts: { total: 0, busy: 0, waiting: 0, idle: 0 },
     statusFilter: '',
     // Show only one machine's cards. '' = every machine.
@@ -1211,10 +1229,10 @@ function fleet() {
     _hostRows() {
       const counts = {};
       for (const w of this.windows) counts[w.host] = (counts[w.host] || 0) + 1;
-      const rows = [{ host: this.localHost, online: true, error: null,
+      const rows = [{ host: this.localHost, online: true, stale: false, error: null,
                       count: counts[this.localHost] || 0 }];
       for (const p of this.peers) {
-        rows.push({ host: p.host, online: !!p.online, error: p.error,
+        rows.push({ host: p.host, online: !!p.online, stale: !!p.stale, error: p.error,
                     count: counts[p.host] || 0 });
       }
       return rows.filter(r => r.host);
@@ -1392,7 +1410,10 @@ function fleet() {
     async _fetchSnapshot() {
       try {
         const r = await fetch('/api/windows');
-        if (r.ok) this._applySnapshotText(await r.text());
+        if (r.ok) {
+          this._noteSnapshotAge(parseFloat(r.headers.get('X-Snapshot-Age')));
+          this._applySnapshotText(await r.text());
+        }
       } catch (e) { /* transient; the next snapshot catches up */ }
     },
 
@@ -1424,11 +1445,18 @@ function fleet() {
       this.evtSource = new EventSource('/api/events');
       this.evtSource.addEventListener('snapshot', (e) => {
         this._noteStreamAlive();
+        // Sent the moment it is built. The one a stream opens with may be
+        // older; the heartbeat right behind it says how much.
+        this._noteSnapshotAge(0);
         this._applySnapshotText(e.data);
       });
-      // Carries no payload; its only job is to prove the stream still flows
-      // through a stretch where nothing on the board changed.
-      this.evtSource.addEventListener('heartbeat', () => this._noteStreamAlive());
+      // Proves the stream still flows through a stretch where nothing on the
+      // board changed, and says how old the snapshot is by now — a board stuck
+      // mid-refresh keeps heartbeating over the same cards.
+      this.evtSource.addEventListener('heartbeat', (e) => {
+        this._noteStreamAlive();
+        try { this._noteSnapshotAge(JSON.parse(e.data).age); } catch (err) { /* no age */ }
+      });
       this.evtSource.onerror = () => {
         // onerror fires once per failed connection attempt, so without this
         // guard a flapping phone connection stacks a new timer — and now a
@@ -1452,11 +1480,29 @@ function fleet() {
     },
 
     // An event arrived, so the stream is delivering: stop any fallback polling
-    // and re-arm the watchdog. The server sends a heartbeat every 20s when the
+    // and re-arm the watchdog. The server sends a heartbeat every 5s when the
     // board is quiet, so 45s of silence means the stream has gone dark.
     _noteStreamAlive() {
       if (this._snapshotPoll) { clearInterval(this._snapshotPoll); this._snapshotPoll = null; }
       this._armStreamWatchdog(45000);
+    },
+
+    // An age the server reported for its snapshot. Anything else — a header
+    // or heartbeat from a board too old to send one — leaves the last one.
+    _noteSnapshotAge(age) {
+      if (typeof age !== 'number' || !(age >= 0)) return;
+      this.snapshotAge = age;
+      this._snapshotAgeAt = Date.now();
+    },
+
+    // Seconds this board's cards have gone without a refresh, once that is
+    // past STALE_SNAPSHOT_S; 0 until then. Counted on from the server's last
+    // report by the page's clock, like a card's durations (liveSeconds) — the
+    // next report comes within a heartbeat. The whole page is that old: the
+    // peers' cards are merged into the same snapshot.
+    get staleFor() {
+      if (this.snapshotAge <= STALE_SNAPSHOT_S) return 0;
+      return Math.floor(this.snapshotAge + (this.now - this._snapshotAgeAt) / 1000);
     },
 
     _armStreamWatchdog(ms) {

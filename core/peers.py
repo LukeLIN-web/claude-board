@@ -32,6 +32,11 @@ STALENESS: peer windows come from the last successful poll, never from a
 blocking fetch in the request path — a wedged peer must not stall the local
 board. Cards older than STALE_AFTER are marked (the UI dims them) and dropped
 entirely after DROP_AFTER, so a board that went away stops showing ghosts.
+A card's age for the mark runs from when the peer built it — its answer says
+how long before it answered (`age`) — not from when the answer arrived: a peer
+stuck mid-refresh answers every poll at once, with the same cards for minutes.
+Dropping runs from the last answer, so that peer's cards stay up, dimmed: they
+are real sessions, only old.
 """
 from __future__ import annotations
 
@@ -184,19 +189,31 @@ def _poll_once(label: str, base: str) -> None:
         _record_error(label, f"HTTP {status}")
         return
     wins = [_stamp(w, label) for w in payload.get("windows", []) if isinstance(w, dict)]
+    # How old the peer's snapshot already was when it answered (see STALENESS).
+    # A board too old to send it counts as fresh on arrival, as before.
+    age = payload.get("age")
+    if isinstance(age, bool) or not isinstance(age, (int, float)) or age < 0:
+        age = 0.0
     with _lock:
         _cache[label] = {
             "windows": wins,
             "ts": time.time(),
+            "age": float(age),
             "error": None,
         }
+
+
+def _data_age(entry: dict, now: float) -> float:
+    """How old a cache entry's cards are: the time since they arrived plus how
+    old they already were then."""
+    return now - (entry.get("ts") or 0) + entry.get("age", 0.0)
 
 
 def _record_error(label: str, msg: str) -> None:
     """Keep the last good windows, only note the failure — a peer that blips
     between polls shouldn't blank its cards. Age is what eventually drops them."""
     with _lock:
-        entry = _cache.setdefault(label, {"windows": [], "ts": 0.0})
+        entry = _cache.setdefault(label, {"windows": [], "ts": 0.0, "age": 0.0})
         entry["error"] = msg
 
 
@@ -230,10 +247,9 @@ def remote_windows() -> list[dict]:
     for label, entry in entries.items():
         if label not in _peers:
             continue  # peer removed from the config since it was polled
-        age = now - (entry.get("ts") or 0)
-        if age > DROP_AFTER:
+        if now - (entry.get("ts") or 0) > DROP_AFTER:
             continue
-        stale = age > STALE_AFTER
+        stale = _data_age(entry, now) > STALE_AFTER
         for w in entry.get("windows", []):
             w = dict(w)
             w["peer_stale"] = stale
@@ -242,7 +258,9 @@ def remote_windows() -> list[dict]:
 
 
 def status() -> list[dict]:
-    """Per-peer health for the UI header: online, and the last error.
+    """Per-peer health for the UI header: online, stale, and the last error.
+    `stale` is a peer that answers but whose cards are old — one stuck
+    mid-refresh (see STALENESS); an offline peer's cards are old too.
 
     Nothing that moves with the clock (how long ago it answered): the snapshot
     carries this, and a value that ticks would re-send the board every poll."""
@@ -256,6 +274,7 @@ def status() -> list[dict]:
         out.append({
             "host": label,
             "online": bool(ts) and now - ts <= STALE_AFTER,
+            "stale": bool(ts) and _data_age(entry, now) > STALE_AFTER,
             "error": entry.get("error"),
         })
     return out
