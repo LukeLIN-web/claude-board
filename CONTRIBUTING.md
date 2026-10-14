@@ -58,4 +58,5 @@ never from real sessions — please keep it that way.
 
 Open a GitHub issue with your OS, Python version, and the relevant snippet from
 the board's log: `bash run.sh` runs it detached, so its output goes to
-`uvicorn.<hostname>.log` in the repo root, not to your terminal.
+`~/.local/state/claude-fleet/board.log` (under `$XDG_STATE_HOME` if you set
+it), not to your terminal.

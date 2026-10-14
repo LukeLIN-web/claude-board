@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -74,6 +74,20 @@ class State:
 
 
 state = State()
+
+# The longest the event stream goes without sending anything. Each heartbeat
+# says how old the snapshot is: a board stuck mid-refresh (a subprocess waiting
+# on a slow disk, say) still answers every request and keeps the stream open,
+# so without it the page would go on showing the last cards as current.
+HEARTBEAT_S = 5.0
+
+
+def _snapshot_age(snap: dict) -> float:
+    """Seconds since `snap` was built, by this host's clock. Sent as a number
+    of seconds, so neither a browser's clock nor a peer's has to agree with
+    this one; 0 until the first snapshot exists."""
+    ts = snap.get("ts") or 0
+    return round(max(0.0, time.time() - ts / 1000), 1) if ts else 0.0
 
 
 # Model labels read off a session's welcome banner, keyed by (pid, session id).
@@ -399,18 +413,26 @@ def _apply_instance_label(html: str) -> str:
 
 
 @app.get("/api/windows")
-def api_windows(request: Request) -> dict:
+def api_windows(request: Request, response: Response) -> dict:
     # A peer board asking what *this* host is running gets the local half only.
     # Without this, two boards configured as each other's peer would each serve
     # the other its own cards back and the page would show every session twice.
     # Built here only until the watcher has built one (ts 0) — not whenever the
     # list is empty, which on a host with no sessions is every poll.
+    #
+    # Both answers say how old the snapshot is (see HEARTBEAT_S). A peer gets it
+    # in the body, which it parses (peers._poll_once); the page in a header,
+    # because it skips a body identical to the one it last drew
+    # (_applySnapshotText) and a field that grows by the second would make
+    # every poll a redraw.
     if request.headers.get(peers.PEER_HEADER):
         if not state.last_local_snapshot["ts"]:
             state.last_local_snapshot = _local_snapshot()
-        return state.last_local_snapshot
+        local = state.last_local_snapshot
+        return {**local, "age": _snapshot_age(local)}
     if not state.last_snapshot["ts"]:
         state.last_snapshot = _enriched_snapshot()
+    response.headers["X-Snapshot-Age"] = str(_snapshot_age(state.last_snapshot))
     return state.last_snapshot
 
 
@@ -849,18 +871,25 @@ async def api_events(request: Request) -> EventSourceResponse:
     queue: asyncio.Queue = asyncio.Queue(maxsize=32)
     state.subscribers.add(queue)
 
+    def heartbeat() -> dict:
+        return {"event": "heartbeat",
+                "data": json.dumps({"age": _snapshot_age(state.last_snapshot)})}
+
     async def event_gen():
-        # Send the current snapshot once immediately.
+        # Send the current snapshot once immediately, and how old it is: it can
+        # be minutes old on a board stuck mid-refresh. Every later snapshot is
+        # sent as soon as it is built, so it needs no age of its own.
         yield {"event": "snapshot", "data": json.dumps(state.last_snapshot)}
+        yield heartbeat()
         try:
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    payload = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
                     yield {"event": "snapshot", "data": payload}
                 except asyncio.TimeoutError:
-                    yield {"event": "heartbeat", "data": str(int(time.time()))}
+                    yield heartbeat()
         finally:
             state.subscribers.discard(queue)
 

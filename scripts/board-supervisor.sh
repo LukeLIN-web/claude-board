@@ -21,7 +21,14 @@ source scripts/env.sh
 RESTART_DELAY="${FLEET_BOARD_RESTART_DELAY:-3}"
 PID_FILE="$RUN_DIR/board-supervisor.pid"
 LOCK_FILE="$RUN_DIR/board-supervisor.lock"
-LOG_FILE="uvicorn.$(hostname).log"
+# On this host's own disk, not in the repo. The repo often sits on NFS, and a
+# board whose stdout is an NFS file waits on that server every time it runs a
+# subprocess: the child swaps the inherited stdout and stderr for pipes before
+# exec, and closing an NFS file open for writing flushes it and waits for the
+# commit. A wedged NFS client once turned the board's 2s refresh into minutes
+# that way, while the same tmux calls answered in milliseconds from a shell.
+# Where homes are shared over NFS, other hosts can still read this file there.
+LOG_FILE="$RUN_DIR/board.log"
 
 # On success, $pid holds the supervisor's pid; callers use it as is.
 supervisor_running() {
