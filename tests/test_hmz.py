@@ -641,6 +641,37 @@ class TestClear(_HmzHomeTest):
             hmz.codex._cleared_at_ms[7] = int(self._ms(self.CLEARED)) + 60_000
             self.assertEqual(hmz.list_hmz_windows()[0].updated_at, int(self._ms(self.CLEARED)) + 60_000)
 
+    def _discovered(self, events, started_ms):
+        epic = write_jsonl(events, scratch_dir() / "20261002T005030.513Z-a779c6" / "epic.jsonl")
+        table = {7: sessions.Proc(1, "Sl+", "pts/1", "hmz", TUI)}
+        env = {"CLAUDE_FLEET_CWD_INCLUDE": "", "CLAUDE_FLEET_CWD_EXCLUDE": ""}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(hmz, "proc_table", return_value=table), \
+             mock.patch.object(hmz, "_pid_alive", return_value=True), \
+             mock.patch.object(hmz, "_proc_start_ms", return_value=started_ms), \
+             mock.patch.object(hmz, "_latest_epic", return_value=epic), \
+             mock.patch.object(hmz.os, "readlink", return_value=self.CWD):
+            sessions._reload_cwd_filters()
+            self.addCleanup(sessions._reload_cwd_filters)
+            return hmz._discover()[0]
+
+    def test_a_run_ended_before_it_started_is_not_its_own(self):
+        # The live miss: New Session in robot/yaofen, whose chat was stopped two
+        # minutes before, opened hmz on an empty prompt, and the card showed that
+        # chat's task, id and bill.
+        w, events = self._discovered(ENDED, int(self._ms("2026-10-02T01:12:00.000Z")))
+        self.assertEqual((w.session_id, w.transcript_path, w.status, events),
+                         ("hmz-7", None, "idle", []))
+
+    def test_a_run_going_when_it_started_is_its_own(self):
+        # One run per directory, held apart from the terminal: a second hmz opens on it.
+        later = int(self._ms("2026-10-02T01:00:00.000Z"))
+        w, _ = self._discovered(RUN, later)
+        self.assertEqual((w.session_id, w.status), ("20261002T005030.513Z-a779c6", "busy"))
+        # …and one that ended while it was open stays on its card.
+        w, _ = self._discovered(ENDED, later)
+        self.assertEqual((w.session_id, w.status), ("20261002T005030.513Z-a779c6", "idle"))
+
     def test_a_run_still_going_stays(self):
         w = _window(transcript_path=str(write_jsonl(RUN)), status="busy")
         self._say("/clear")
