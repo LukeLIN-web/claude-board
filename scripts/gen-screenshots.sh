@@ -35,7 +35,10 @@ echo "· seeding demo data"
 python3 fixtures/seed.py >/dev/null
 
 echo "· starting dashboard on :$PORT"
-source .venv/bin/activate 2>/dev/null || { python3 -m venv .venv && source .venv/bin/activate; }
+# The board's venv, where run.sh keeps it (VENV in scripts/env.sh, which this
+# doesn't source: it would load .env.local's port and password into the demo).
+VENV="${CLAUDE_FLEET_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-fleet/venv}"
+source "$VENV/bin/activate" 2>/dev/null || { mkdir -p "$(dirname "$VENV")" && python3 -m venv "$VENV" && source "$VENV/bin/activate"; }
 python -c "import fastapi" 2>/dev/null || pip install -q -e .
 CLAUDE_FLEET_HOME="$DEMO" uvicorn app:app --host 127.0.0.1 --port "$PORT" >/tmp/fleet-shots.log 2>&1 &
 SRV_PID=$!

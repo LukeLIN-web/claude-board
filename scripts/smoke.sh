@@ -13,7 +13,7 @@
 # throwaway home, and tmux calls go to a private socket that has no server.
 #
 #   bash scripts/smoke.sh                  # uses python3 and the first Chrome found
-#   PYTHON=.venv/bin/python bash scripts/smoke.sh
+#   PYTHON=~/.local/share/claude-fleet/venv/bin/python bash scripts/smoke.sh
 #   CHROME=/path/to/chrome bash scripts/smoke.sh
 #   SMOKE_NO_BROWSER=1 bash scripts/smoke.sh   # steps 1-3 only
 set -euo pipefail

@@ -16,7 +16,7 @@ cd claude-board && bash run.sh
 # 浏览器打开 http://127.0.0.1:7879
 ```
 
-首次运行自动建 venv 装依赖，不用管。换端口：`CLAUDE_FLEET_PORT=9000 bash run.sh`。默认的后台模式有 supervisor，board 退出后会自动重启。可用 `bash run.sh status` / `restart` / `stop` 管理。
+首次运行自动建 venv 装依赖，不用管。venv 建在本机磁盘的 `~/.local/share/claude-fleet/venv`（可用 `CLAUDE_FLEET_VENV` 改），多台机器经 NFS 共用一份代码时，每台各有自己的 venv。换端口：`CLAUDE_FLEET_PORT=9000 bash run.sh`。默认的后台模式有 supervisor，board 退出后会自动重启。可用 `bash run.sh status` / `restart` / `stop` 管理。
 
 ## 解决什么问题
 
