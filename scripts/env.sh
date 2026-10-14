@@ -20,6 +20,12 @@ fi
 PORT="${CLAUDE_FLEET_PORT:-7879}"
 # Where the supervisor and the tunnels keep pid files, logs and the tunnel URL.
 RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-fleet"
+# The board's virtualenv, on this machine's own disk rather than in the repo.
+# The repo is often one NFS mount shared by several hosts: a venv there is
+# built by one host's python for all of them, and every import the board does
+# reads it over the network, so a slow server slows its start and every
+# reload, and a wedged one stops them. run.sh creates it on first use.
+VENV="${CLAUDE_FLEET_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-fleet/venv}"
 
 # wait_for TRIES DELAY cmd... — run cmd up to TRIES times, DELAY seconds apart,
 # stopping at the first success; when none succeeds, check once more after the
@@ -52,9 +58,10 @@ board_code() {
 # returns. This repo often lives on a network/shared mount (e.g. /shared) where
 # inotify events don't fire, so uvicorn's default --reload silently never
 # detects edits; force watchfiles into polling mode so reload works here.
-# Polling walks the whole tree (.venv and .git included, ~5k paths on NFS): at
-# watchfiles' default 300ms that cost ~24% of a core, at 2s it is a sixth of it.
+# Polling walks the whole tree, .git included: with the venv still in it (~5k
+# paths on NFS), watchfiles' default 300ms cost ~24% of a core, and 2s a sixth
+# of that. The venv is outside it now (VENV), which leaves well under half.
 exec_board() {
     export WATCHFILES_FORCE_POLLING=1 WATCHFILES_POLL_DELAY_MS=2000
-    exec .venv/bin/uvicorn app:app --host 127.0.0.1 --port "$PORT" --reload --reload-dir .
+    exec "$VENV/bin/uvicorn" app:app --host 127.0.0.1 --port "$PORT" --reload --reload-dir .
 }

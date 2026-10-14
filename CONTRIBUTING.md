@@ -32,8 +32,10 @@ never from real sessions — please keep it that way.
 
 ## Before opening a PR
 
-- Run what CI runs (`.github/workflows/ci.yml`):
+- Run what CI runs (`.github/workflows/ci.yml`), in the venv `run.sh` made
+  (`~/.local/share/claude-fleet/venv`):
   ```bash
+  source ~/.local/share/claude-fleet/venv/bin/activate
   pip install -e '.[dev]'
   ruff check .                     # pyflakes-level: unused/undefined names
   python scripts/secrets-audit.py  # credentials and machine-specific strings

@@ -56,7 +56,7 @@ def _venv_bin_dirs() -> set[str]:
 
     `sys.prefix` diverges from `sys.base_prefix` exactly when the interpreter is
     running inside a venv, so it identifies the venv even when the server was
-    started via `.venv/bin/uvicorn` without `activate` setting VIRTUAL_ENV.
+    started via the venv's `bin/uvicorn` without `activate` setting VIRTUAL_ENV.
     """
     dirs: set[str] = set()
     if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
@@ -71,8 +71,8 @@ def _spawn_env() -> dict:
     """Process env for spawned sessions, with two kinds of board context removed.
 
     1. Claude child-session markers (see above) so sessions are top-level.
-    2. The board's own virtualenv. run.sh activates `.venv`, which prepends
-       `.venv/bin` to PATH and sets VIRTUAL_ENV. Spawned `claude` sessions work
+    2. The board's own virtualenv. run.sh activates it (VENV in
+       scripts/env.sh), which prepends its `bin` to PATH and sets VIRTUAL_ENV. Spawned `claude` sessions work
        in arbitrary project directories and must see a clean interpreter —
        otherwise `which python` inside them resolves to the board's venv instead
        of whatever the project expects.
@@ -136,7 +136,7 @@ def private_server(name: str):
 
 
 # Env vars that mark the board's own virtualenv. `_spawn_env()` drops them, but a
-# `pop` is not an `unset`: a long-lived tmux server started while `.venv` was
+# `pop` is not an `unset`: a long-lived tmux server started while the venv was
 # active still holds these in its own environment and re-injects them into every
 # new pane it forks — so a spawned session can inherit VIRTUAL_ENV from the stale
 # server even after `_spawn_env()` cleaned the board's PATH. Wrapping the pane

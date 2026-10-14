@@ -1,17 +1,18 @@
 #!/bin/bash
-# Claude Fleet launcher. First run will create .venv and install deps.
+# Claude Fleet launcher. First run will create the venv and install deps.
 set -e
 cd "$(dirname "$0")"
 
-# .env.local, then .env.local.<hostname>; sets PORT.
+# .env.local, then .env.local.<hostname>; sets PORT and VENV.
 source scripts/env.sh
 
-if [ ! -d .venv ]; then
-    echo "[claude-fleet] creating venv..."
-    python3 -m venv .venv
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "[claude-fleet] creating venv at $VENV..."
+    mkdir -p "$(dirname "$VENV")"
+    python3 -m venv "$VENV"
 fi
 
-source .venv/bin/activate
+source "$VENV/bin/activate"
 
 if ! python -c "import fastapi" 2>/dev/null; then
     echo "[claude-fleet] installing deps..."
