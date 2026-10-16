@@ -1206,6 +1206,11 @@ def extract_memory_ops(path: str | Path) -> list[dict]:
 # to the launch that started the work.
 _TN_TASK_ID_RE = re.compile(r"<task-id>\s*(.*?)\s*</task-id>", re.DOTALL)
 _TN_TOOL_USE_RE = re.compile(r"<tool-use-id>\s*(.*?)\s*</tool-use-id>", re.DOTALL)
+# The same <task-id>, named by the launch's own tool_result: "agentId: a2151…"
+# (Agent), "running in background with ID: bpyx…" (Bash), "Monitor started (task
+# bvtn…" (Monitor). It joins a notification that carries no <tool-use-id> back to
+# its launch; without it that launch read as running for good.
+_LAUNCH_TASK_ID_RE = re.compile(r"(?:agentId:|with ID:|Monitor started \(task)\s*(\w+)")
 
 
 def _async_launch_kind(name: str, inp: dict) -> str:
@@ -1245,14 +1250,19 @@ def _note_finished(notified: dict[str, dict], body: str, ts: str) -> Optional[st
     return hit.group(1)
 
 
-class _BackgroundTasks:
-    """Async work this session started and has not finished with, as
-    [{type, description, command, state, ts}].
+@dataclass(frozen=True)
+class _Ledger:
+    """What one transcript says about its async work (see _BackgroundTasks)."""
+    launched: dict      # tool_use_id -> {type, description, command}
+    task_ids: dict      # task_id -> tool_use_id of the launch that named it
+    notified: dict      # task_id -> {tool_use_id, summary, ts}
+    delivered: frozenset  # task_ids the session has taken
+    flushed: bool       # a `dequeue` came, which settles every notice before it
 
-    `state` is "running" while the work is still going, and "undelivered" once it
-    has reported completion that the session has not picked up — the work is
-    done and its answer is sitting in a queue nobody is draining. That gap is the
-    one a person has to close, and it looks exactly like a session still working.
+
+class _BackgroundTasks:
+    """The async-work ledger of one transcript: what was launched, what reported
+    over, and which of those reports the session took.
 
     Not "a tool_use with no tool_result": every async launch gets its tool_result
     back *at launch* ("Async agent launched successfully", "Command running in
@@ -1262,12 +1272,17 @@ class _BackgroundTasks:
     delivery in a `remove` row or in a user row carrying the same <task-id>. A
     notice delivered without queueing shows up only as that user row, or as a
     `queued_command` attachment, so those count as the report too.
+
+    A ledger rather than the list, because the list can need several transcripts:
+    work launched before a /clear reports after it (see extract_background_tasks).
     """
 
     def __init__(self) -> None:
-        self.launched: dict[str, dict] = {}   # tool_use_id -> {type, description, command}
-        self.notified: dict[str, dict] = {}   # task_id -> {tool_use_id, summary, ts}
-        self.delivered: set[str] = set()      # task_ids the session has taken
+        self.launched: dict[str, dict] = {}
+        self.task_ids: dict[str, str] = {}
+        self.notified: dict[str, dict] = {}
+        self.delivered: set[str] = set()
+        self.flushed = False
 
     def step(self, d: dict) -> None:
         t = d.get("type")
@@ -1288,6 +1303,7 @@ class _BackgroundTasks:
                 # alongside real deliveries, so read it as one: a missed stall is
                 # quieter than a card that cries stall at every flush.
                 self.delivered.update(self.notified)
+                self.flushed = True
                 return
             hit = _TN_TASK_ID_RE.search(body)
             if not hit:
@@ -1306,6 +1322,14 @@ class _BackgroundTasks:
             # so this row is the only trace that the task finished.
             if isinstance(content, str):
                 _note_finished(self.notified, content, d.get("timestamp", ""))
+                return
+            for c in content or ():
+                if (isinstance(c, dict) and c.get("type") == "tool_result"
+                        and c.get("tool_use_id") in self.launched):
+                    named = _LAUNCH_TASK_ID_RE.search(
+                        json.dumps(c.get("content"), ensure_ascii=False))
+                    if named:
+                        self.task_ids[named.group(1)] = c["tool_use_id"]
         elif t == "attachment" and not d.get("isSidechain"):
             # The same handover, logged as the queued command it was delivered as —
             # on some transcripts with no enqueue/remove pair around it at all.
@@ -1316,24 +1340,170 @@ class _BackgroundTasks:
                 if task_id:
                     self.delivered.add(task_id)
 
-    def result(self) -> list[dict]:
-        out: list[dict] = []
-        settled: set[str] = set()  # tool_use_ids whose completion has been delivered
-        for task_id, n in self.notified.items():
-            if task_id in self.delivered:
-                settled.add(n["tool_use_id"])
-                continue
-            info = self.launched.get(n["tool_use_id"]) or {
-                "type": "task", "description": n["summary"][:200], "command": ""}
-            out.append({**info, "state": "undelivered", "ts": n["ts"]})
-            settled.add(n["tool_use_id"])
-        for tool_use_id, info in self.launched.items():
-            if tool_use_id not in settled:
-                out.append({**info, "state": "running", "ts": 0.0})
-        return out
+    def result(self) -> _Ledger:
+        return _Ledger(dict(self.launched), dict(self.task_ids),
+                       {k: dict(v) for k, v in self.notified.items()},
+                       frozenset(self.delivered), self.flushed)
 
 
-extract_background_tasks = fold_by_file(_BackgroundTasks)
+_background_ledger = fold_by_file(_BackgroundTasks)
+
+
+def _settle(ledgers: list[_Ledger]) -> list[dict]:
+    """The work `ledgers` leave out, read as one transcript in the order given."""
+    launched: dict[str, dict] = {}
+    task_ids: dict[str, str] = {}
+    notified: dict[str, dict] = {}
+    delivered: set[str] = set()
+    for led in ledgers:
+        if led.flushed:
+            delivered.update(notified)
+        launched.update(led.launched)
+        task_ids.update(led.task_ids)
+        for task_id, n in led.notified.items():
+            entry = notified.setdefault(task_id, dict(n))
+            if not entry["tool_use_id"]:
+                entry["tool_use_id"] = n["tool_use_id"]
+        delivered.update(led.delivered)
+    out: list[dict] = []
+    settled: set[str] = set()  # tool_use_ids whose work has reported over
+    for task_id, n in notified.items():
+        tool_use_id = n["tool_use_id"] or task_ids.get(task_id, "")
+        settled.add(tool_use_id)
+        if task_id in delivered:
+            continue
+        info = launched.get(tool_use_id) or {
+            "type": "task", "description": n["summary"][:200], "command": ""}
+        out.append({**info, "state": "undelivered", "ts": n["ts"]})
+    for tool_use_id, info in launched.items():
+        if tool_use_id not in settled:
+            out.append({**info, "state": "running", "ts": 0.0})
+    return out
+
+
+# How far from the /clear row the transcript it left behind was last written. The
+# CLI closes the old file as it opens the new one: on ~300 /clears read, within
+# 2.2 s either side, nearly all within a quarter second.
+_CLEAR_HANDOFF_S = 3.0
+_CLEAR_CHAIN_MAX = 20
+# Cleared transcript -> the one it was cleared out of. Kept once found: the old
+# file is done being written, so the answer can't change, and finding it again
+# would stat the whole project directory per hop on every refresh.
+_cleared_out_of: OrderedDict[str, Path] = OrderedDict()
+
+
+@memo_by_file
+def _cleared_at(path: Path) -> float:
+    """When the session in `path` opened with a /clear (epoch s), 0.0 if it didn't.
+
+    A cleared transcript starts with the command itself, after the caveat row
+    that goes ahead of every local command; the first other user row decides."""
+    try:
+        with path.open() as f:
+            for i, d in enumerate(_parse_rows(f)):
+                if i >= 20:
+                    break
+                if d.get("type") != "user" or d.get("isMeta"):
+                    continue
+                content = (d.get("message") or {}).get("content")
+                m = _CMD_NAME_RE.search(content) if isinstance(content, str) else None
+                return _parse_ts(d.get("timestamp", "")) if m and m.group(1) == "/clear" else 0.0
+    except OSError:
+        pass
+    return 0.0
+
+
+@memo_by_file
+def _root_session(path: Path) -> str:
+    """The `session_id` the rows carry: the session the process started as, the
+    same on every transcript it clears into. "" when none of the first rows has it.
+    """
+    try:
+        with open(path) as f:
+            for i, d in enumerate(_parse_rows(f)):
+                if i >= 200:
+                    break
+                sid = d.get("session_id")
+                if isinstance(sid, str) and sid:
+                    return sid
+    except OSError:
+        pass
+    return ""
+
+
+def _cleared_from(path: Path, cleared: float) -> Optional[Path]:
+    """The transcript that a /clear at `cleared` closed to open `path`, or None.
+
+    It sits in the same project directory, last written at the /clear. Two
+    sessions in one directory cleared in the same second (a dispatcher clears
+    several at once) both qualify; then the process's first session decides."""
+    key = str(path)
+    with _memo_lock:
+        hit = _cleared_out_of.get(key)
+        if hit is not None:
+            _cleared_out_of.move_to_end(key)
+            return hit
+    found: list[Path] = []
+    try:
+        with os.scandir(path.parent) as it:
+            for e in it:
+                if not e.name.endswith(".jsonl") or e.name == path.name:
+                    continue
+                try:
+                    if abs(e.stat().st_mtime - cleared) <= _CLEAR_HANDOFF_S:
+                        found.append(Path(e.path))
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    if len(found) > 1:
+        root = _root_session(path)
+        found = [p for p in found if root and _root_session(p) == root]
+    if len(found) != 1:
+        return None  # looked for again next time: the new rows may name the root
+    with _memo_lock:
+        _cleared_out_of[key] = found[0]
+        if len(_cleared_out_of) > _MEMO_SIZE:
+            _cleared_out_of.popitem(last=False)
+    return found[0]
+
+
+def _clear_chain(path: Path, since: float) -> list[Path]:
+    """`path`, then each transcript a /clear left behind on the way to it, newest
+    first. Only /clears at or after `since` (epoch s, when the process started)
+    count: the transcript a session was resumed from belongs to a process that has
+    since exited, and so does whatever work it had out."""
+    chain = [path]
+    while len(chain) < _CLEAR_CHAIN_MAX:
+        cleared = _cleared_at(chain[-1])
+        if not cleared or cleared < since:
+            break
+        prev = _cleared_from(chain[-1], cleared)
+        if prev is None or prev in chain:
+            break
+        chain.append(prev)
+    return chain
+
+
+def extract_background_tasks(path: str | Path, since: float = 0.0) -> list[dict]:
+    """Async work this session started and has not finished with, as
+    [{type, description, command, state, ts}].
+
+    `state` is "running" while the work is still going, and "undelivered" once it
+    has reported completion that the session has not picked up — the work is
+    done and its answer is sitting in a queue nobody is draining. That gap is the
+    one a person has to close, and it looks exactly like a session still working.
+
+    /clear starts a fresh transcript but keeps the backgrounded work running, and
+    its notices land in the new one. Read alone, the new transcript showed none of
+    that work: the card said "no background tasks", and triage offered to close a
+    session whose tasks were still going. With `since`, the process's start (epoch
+    s), the transcripts it cleared out of are read first, oldest first; without
+    it, `path` alone.
+    """
+    path = Path(path)
+    chain = _clear_chain(path, since) if since else [path]
+    return _settle([_background_ledger(p) for p in reversed(chain)])
 
 
 class _PlanHistory:

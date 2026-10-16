@@ -181,7 +181,10 @@ def _local_snapshot() -> dict:
             w["model"] = transcripts.current_model(tp)
             w["skills_used"] = transcripts.extract_skills_used(tp)
             w["memory_ops"] = transcripts.extract_memory_ops(tp)
-            w["background_tasks"] = transcripts.extract_background_tasks(tp)
+            # From the process's start: work launched before a /clear is still
+            # out, in the transcripts the session cleared out of.
+            w["background_tasks"] = transcripts.extract_background_tasks(
+                tp, (w.get("started_at") or 0) / 1000)
             # A looping prompt is the one background thing a card can't show any
             # other way: it leaves no shell and no task row, so an unmarked card
             # just looks like a session talking to itself every half hour.

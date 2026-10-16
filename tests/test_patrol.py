@@ -7,11 +7,13 @@ session waiting on work that is still running (leave it alone) and one holding a
 finished task's notification it never picked up (go type something). Both look
 identical from the outside: quiet session, no output, status says busy.
 """
+import json
+import os
 import time
 import unittest
 
 from core import patrol, transcripts
-from tests.helpers import write_jsonl
+from tests.helpers import scratch_dir, write_jsonl
 
 
 def _launch(tid, name, inp):
@@ -40,6 +42,27 @@ def _queue(op, body, ts="2026-09-08T21:00:33Z"):
 def _delivered(body, ts="2026-09-08T21:16:11Z"):
     """The notification arriving as a user turn — the session took it."""
     return {"type": "user", "timestamp": ts, "message": {"content": body}}
+
+
+# What each kind of launch answers at once, naming the <task-id> its notices carry.
+_LAUNCH_ANSWERS = {
+    "Agent": "Async agent launched successfully.\nagentId: {} (internal ID - do not mention to user.",
+    "Bash": "Command running in background with ID: {}. Output is being written to: /tmp/x.output",
+    "Monitor": "Monitor started (task {}, persistent — runs until TaskStop or session end).",
+}
+_LAUNCH_INPUTS = {
+    "Agent": {"description": "W6 facts"},
+    "Bash": {"command": "make", "description": "W6 facts", "run_in_background": True},
+    "Monitor": {"command": "tail log", "description": "W6 facts", "persistent": True},
+}
+
+
+def _answered(tid, name, task_id, ts="2026-09-08T20:40:01Z"):
+    """The launch's tool_result, as the CLI logs it: a list of text blocks."""
+    text = _LAUNCH_ANSWERS[name].format(task_id)
+    return {"type": "user", "timestamp": ts,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                     "content": [{"type": "text", "text": text}]}]}}
 
 
 class BackgroundLedgerTests(unittest.TestCase):
@@ -189,6 +212,21 @@ class BackgroundLedgerTests(unittest.TestCase):
         self.assertEqual([(t["state"], t["description"]) for t in got],
                          [("undelivered", 'Agent "scan" finished')])
 
+    def test_a_notice_with_no_tool_use_id_finds_its_launch_by_the_id_it_was_given(self):
+        # A finished agent can report with <task-id> alone. The launch's answer
+        # named that id, so the two still pair: otherwise the work read as
+        # running for the rest of the session, and an unread notice showed twice.
+        for name in _LAUNCH_ANSWERS:
+            with self.subTest(name=name):
+                launch = [_launch("t1", name, _LAUNCH_INPUTS[name]),
+                          _answered("t1", name, "task1"), _end_turn("等着")]
+                got = self._tasks([*launch, _queue("enqueue", _notification("task1")),
+                                   _delivered(_notification("task1"))])
+                self.assertEqual(got, [])
+                got = self._tasks([*launch, _queue("enqueue", _notification("task1"))])
+                self.assertEqual([(t["state"], t["description"]) for t in got],
+                                 [("undelivered", "W6 facts")])
+
     def test_foreground_work_is_not_tracked(self):
         got = self._tasks([
             _launch("t1", "Bash", {"command": "sleep 600"}),
@@ -204,6 +242,107 @@ class BackgroundLedgerTests(unittest.TestCase):
             _end_turn("三件"),
         ])
         self.assertEqual({t["type"] for t in got}, {"bash_bg", "monitor", "agent"})
+
+
+_STARTED = transcripts._parse_ts("2026-09-08T20:00:00Z")  # the process's start
+_CLEARED = "2026-09-08T20:50:00Z"
+
+
+def _clear(ts=_CLEARED, **row):
+    """The head of a transcript a /clear opened: the caveat, then the command."""
+    return [{"type": "mode", "mode": "normal"},
+            {"type": "user", "isMeta": True, "timestamp": ts,
+             "message": {"content": "<local-command-caveat>The command below was run "
+                                    "directly in Claude Code.</local-command-caveat>"}, **row},
+            {"type": "user", "timestamp": ts, **row,
+             "message": {"content": "<command-name>/clear</command-name>\n"
+                                    "<command-message>clear</command-message>\n"
+                                    "<command-args></command-args>"}},
+            {"type": "system", "subtype": "local_command", "timestamp": ts,
+             "content": "<local-command-stdout></local-command-stdout>"}]
+
+
+class ClearedSessionTests(unittest.TestCase):
+    """extract_background_tasks across /clear: the work keeps running, and its
+    notices land in the new transcript, which never saw it launched."""
+
+    def setUp(self):
+        self.dir = scratch_dir()
+
+    def _file(self, name, rows, written=_CLEARED):
+        """A transcript in the project directory, last written at `written`."""
+        p = write_jsonl(rows, self.dir / f"{name}.jsonl", ensure_ascii=False)
+        at = transcripts._parse_ts(written)
+        os.utime(p, (at, at))
+        return p
+
+    def _bash(self, tid="t1", task_id="task1", what="train.sh"):
+        return [_launch(tid, "Bash", {"command": what, "description": what,
+                                      "run_in_background": True}),
+                _answered(tid, "Bash", task_id), _end_turn("挂上了")]
+
+    def _tasks(self, path, since=_STARTED):
+        return [(t["state"], t["description"])
+                for t in transcripts.extract_background_tasks(path, since)]
+
+    def test_work_launched_before_a_clear_is_still_running_after_it(self):
+        self._file("old", self._bash())
+        new = self._file("new", _clear(), written="2026-09-08T20:55:00Z")
+        self.assertEqual(self._tasks(new), [("running", "train.sh")])
+        # Without the process's start the new transcript is read alone.
+        self.assertEqual(transcripts.extract_background_tasks(new), [])
+
+    def test_its_notice_after_the_clear_settles_it_or_waits_on_a_person(self):
+        self._file("old", self._bash())
+        notice = _notification("task1", "t1", summary='Background command "train.sh" completed')
+        new = self._file("new", [*_clear(), _queue("enqueue", notice)])
+        self.assertEqual(self._tasks(new), [("undelivered", "train.sh")])
+        with open(new, "a") as f:
+            f.write(json.dumps(_queue("remove", notice)) + "\n")
+        self.assertEqual(self._tasks(new), [])
+
+    def test_a_flush_after_the_clear_settles_a_notice_queued_before_it(self):
+        # The queue outlives the /clear; a `dequeue` names nothing, so it settles
+        # whatever was waiting, the old transcript's notices included.
+        self._file("old", [*self._bash(), _queue("enqueue", _notification("task1", "t1"))])
+        new = self._file("new", [*_clear(), _queue("dequeue", None)])
+        self.assertEqual(self._tasks(new), [])
+
+    def test_work_that_finished_before_the_clear_stays_finished(self):
+        notice = _notification("task1", "t1")
+        self._file("old", [*self._bash(), _queue("enqueue", notice), _queue("remove", notice)])
+        new = self._file("new", _clear())
+        self.assertEqual(self._tasks(new), [])
+
+    def test_each_clear_back_to_the_process_start_is_read(self):
+        self._file("a", self._bash("t1", "task1", "first"), written="2026-09-08T20:30:00Z")
+        self._file("b", [*_clear("2026-09-08T20:30:00Z"), *self._bash("t2", "task2", "second")])
+        c = self._file("c", _clear(), written="2026-09-08T20:59:00Z")
+        self.assertEqual(self._tasks(c), [("running", "first"), ("running", "second")])
+
+    def test_a_clear_from_before_the_process_started_is_not_followed(self):
+        # The session was resumed from a cleared transcript: the clear, and the
+        # work it carried over, belonged to a process that has since exited.
+        self._file("old", self._bash())
+        new = self._file("new", _clear())
+        self.assertEqual(self._tasks(new, since=transcripts._parse_ts(_CLEARED) + 60), [])
+
+    def test_a_transcript_last_written_at_another_time_is_not_the_one_cleared(self):
+        self._file("old", self._bash(), written="2026-09-08T20:49:50Z")
+        new = self._file("new", _clear())
+        self.assertEqual(self._tasks(new), [])
+
+    def test_of_two_sessions_cleared_in_the_same_second_the_process_picks(self):
+        # A dispatcher clears several sessions at once; each new transcript names
+        # the session its process started as, on its rows, as the old one did.
+        self._file("ours", [{**r, "session_id": "root-a"} for r in self._bash()])
+        self._file("theirs", [{**r, "session_id": "root-b"}
+                              for r in self._bash("t9", "task9", "someone else's")])
+        new = self._file("new", _clear(session_id="root-a"))
+        self.assertEqual(self._tasks(new), [("running", "train.sh")])
+        # With nothing to tell them apart, neither is read.
+        unnamed = self._file("unnamed", _clear())
+        self.assertEqual(self._tasks(unnamed), [])
 
 
 class ClassifyTests(unittest.TestCase):

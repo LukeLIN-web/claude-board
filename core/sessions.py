@@ -409,7 +409,8 @@ def list_windows(include_dead: bool = False) -> list[Window]:
         # for a clean launch but is the ORIGINAL session time on `--resume`, hours
         # off; proc start keeps the card put either way. Dead/historical windows
         # have no /proc, so fall back to the file's startedAt. Codex pins the same
-        # way (core/codex.py). started_at is sort-only; it is never displayed.
+        # way (core/codex.py). started_at is never displayed; besides the sort,
+        # it bounds which /clears the card's background work is read across.
         started_at = (_proc_start_ms(pid) if alive else 0) or int(
             data.get("startedAt", 0))
 
