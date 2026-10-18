@@ -526,8 +526,9 @@
           <!-- One control per platform. Claude: its /model dialog, committed with
                "s" so the pick stays session-only. Codex: its two-step picker
                (model, then reasoning effort — modelOptions offers both as
-               groups, a pick of one keeps the other), which also rewrites
-               ~/.codex/config.toml, so modelTitle says so. -->
+               groups, a pick of one keeps the other), committed with "s" too
+               where it has that key; an older Codex also rewrites
+               ~/.codex/config.toml, and the toast says which happened. -->
           <select x-show="tmuxAvailable && w.platform !== 'hmz'"
                   @change="switchModel(w, $event.target.value); $event.target.value = ''"
                   :disabled="!!promptSending[w.key]"
@@ -1895,7 +1896,7 @@ function fleet() {
     modelTitle(w) {
       if (w.platform === 'codex') {
         return (w.model_label ? 'On ' + w.model_label + ' (model, reasoning effort), per its status line. ' : '')
-          + 'Switch this session\'s model or reasoning effort. Codex\'s picker also saves the pick to ~/.codex/config.toml as the default for sessions started afterwards.';
+          + 'Switch this session\'s model or reasoning effort, for this session only. A Codex without that option in its picker also saves the pick to ~/.codex/config.toml as the default for sessions started afterwards.';
       }
       return (w.model ? 'Running on ' + w.model + '. ' : (w.model_source === 'banner' ? 'On ' + w.model_label + ', per the banner it printed at startup / after /clear — it has not answered since. ' : ''))
         + 'Switch this session\'s model (this session only — your default for new sessions is untouched). Shows the model that last answered; before its first reply, the one its welcome banner names.';
@@ -1911,9 +1912,10 @@ function fleet() {
       // d.model is the row that was committed — "Opus (1M context)" where the
       // alias only said "opus", "gpt-5.6-sol high" where only one of the two
       // was picked — which the card's label can't say on its own.
-      const scope = w.platform === 'codex' ? 'also the new default in ~/.codex/config.toml' : 'this session only';
+      const scope = (d) => w.platform === 'codex' && !d.session_only
+        ? 'also the new default in ~/.codex/config.toml' : 'this session only';
       return this.act(`/api/windows/${key}/model`,
-                      { body, ok: (d) => `Model → ${d.model || name} (${scope})`,
+                      { body, ok: (d) => `Model → ${d.model || name} (${scope(d)})`,
                         fail: 'Model switch failed: ', busy: this.promptSending, key });
     },
 

@@ -1331,14 +1331,20 @@ class CodexPickerParseTests(unittest.TestCase):
 
 
 class SwitchCodexModelTests(unittest.TestCase):
-    """The codex driver walks two pickers by keypress; the fake below plays both,
-    with a wrapping cursor and the (current) tags the real ones carry."""
+    """The codex driver walks two pickers by keypress — three, through "More
+    reasoning…" — and the fake below plays them all, with a wrapping cursor,
+    the (current) tags the real ones carry, and, given `session_key`, 0.160.0's
+    footer: "s session" under every row it commits, but "More reasoning…"."""
 
     _MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
     _EFFORTS = ["Low", "Medium", "High", "Extra high", "More reasoning…"]
+    _ADVANCED = ["Max", "Ultra"]
 
-    def _drive(self, model, effort, current=4, effort_cursor=2, close_sticks=False):
-        state = {"screen": "model", "cursor": current, "picks": []}
+    def _drive(self, model, effort, current=4, effort_cursor=2, close_sticks=False,
+               session_key=False, advanced_current=2, opened_on="closed"):
+        state = {"screen": opened_on, "cursor": advanced_current if opened_on == "advanced"
+                 else current, "picks": []}
+        rows = {"model": self._MODELS, "effort": self._EFFORTS, "advanced": self._ADVANCED}
 
         def picker(head, names, cursor, current_row):
             lines = [f"  {head}" + (" gpt-x" if head.endswith("for") else "")]
@@ -1346,7 +1352,9 @@ class SwitchCodexModelTests(unittest.TestCase):
                 mark = "› " if i == cursor else "  "
                 tag = " (current)" if i == current_row else ""
                 lines.append(f"{mark}{i}. {name}{tag}  blurb")
-            lines.append("  Press enter to confirm or esc to go back")
+            commits = state["screen"] != "model" and names[cursor - 1] != "More reasoning…"
+            lines.append("  enter default · s session · esc back" if session_key and commits
+                         else "  Press enter to confirm or esc to go back")
             return "\n".join(lines) + "\n"
 
         def capture(pane, scrollback=0):
@@ -1356,29 +1364,47 @@ class SwitchCodexModelTests(unittest.TestCase):
             elif state["screen"] == "effort":
                 text = picker(actions._CODEX_EFFORT_PICKER_HEAD, self._EFFORTS,
                               state["cursor"], effort_cursor)
+            elif state["screen"] == "advanced":
+                text = picker(actions._CODEX_ADVANCED_PICKER_HEAD, self._ADVANCED,
+                              state["cursor"], advanced_current)
             else:
                 text = CODEX_STATUS_IDLE
             return {"ok": True, "text": text}
 
         sent = []
 
+        def commit(key):
+            state["picks"].append((state["screen"], state["cursor"], key))
+            if state["screen"] == "model":
+                state["screen"], state["cursor"] = "effort", effort_cursor
+            elif state["screen"] == "effort" and state["cursor"] == 5:
+                state["screen"], state["cursor"] = "advanced", advanced_current
+            elif not close_sticks:
+                state["screen"] = "closed"
+
         def send_keys(pane, *keys):
             sent.extend(keys)
             for k in keys:
-                if k == "Down":
-                    state["cursor"] = state["cursor"] % 5 + 1
+                if k == "Down" and state["screen"] in rows:
+                    state["cursor"] = state["cursor"] % len(rows[state["screen"]]) + 1
                 elif k == "Enter":
-                    state["picks"].append((state["screen"], state["cursor"]))
-                    if state["screen"] == "model":
-                        state["screen"], state["cursor"] = "effort", effort_cursor
-                    elif state["screen"] == "effort" and not close_sticks:
-                        state["screen"] = "closed"
+                    commit(k)
+                elif k == "s" and session_key and state["screen"] in ("effort", "advanced"):
+                    commit(k)
                 elif k == "Escape":
-                    state["screen"] = {"effort": "model"}.get(state["screen"], "closed")
+                    state["screen"] = {"advanced": "effort", "effort": "model"}.get(
+                        state["screen"], "closed")
+            return {"ok": True}
+
+        def send_prompt(w, pane, text):
+            # Codex refuses a line while a picker covers its composer.
+            if state["screen"] != "closed":
+                return {"ok": False, "error": "send blocked: a picker is open on this pane"}
+            state["screen"], state["cursor"] = "model", current
             return {"ok": True}
 
         with _pane(window=_fake_window("/dev/pts/9", platform="codex"), pane="%1") as p, \
-             mock.patch.object(actions, "_send_prompt_to", return_value={"ok": True}) as sp:
+             mock.patch.object(actions, "_send_prompt_to", side_effect=send_prompt) as sp:
             p.capture_pane.side_effect = capture
             p.send_keys.side_effect = send_keys
             r = actions.switch_model(p.card, model, effort)
@@ -1388,9 +1414,45 @@ class SwitchCodexModelTests(unittest.TestCase):
         r, sent, state, sp = self._drive("gpt-5.6-sol", "high")
         self.assertTrue(r["ok"], r)
         sp.assert_called_once_with(mock.ANY, "%1", "/model")
-        self.assertEqual(state["picks"], [("model", 2), ("effort", 3)])
+        self.assertEqual(state["picks"], [("model", 2, "Enter"), ("effort", 3, "Enter")])
         self.assertEqual(r["model"], "gpt-5.6-sol high")
+        self.assertFalse(r["session_only"])
         self.assertEqual(state["screen"], "closed")
+
+    def test_commits_for_the_session_where_the_footer_offers_it(self):
+        # Enter on such a row is "enter default": it saves to config.toml.
+        r, sent, state, _ = self._drive("gpt-5.6-sol", "high", session_key=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 2, "Enter"), ("effort", 3, "s")])
+        self.assertTrue(r["session_only"])
+
+    def test_effort_from_an_ultra_session(self):
+        # Its effort picker opens on "More reasoning… (current)".
+        r, _, state, _ = self._drive("", "xhigh", effort_cursor=5, session_key=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 4, "Enter"), ("effort", 4, "s")])
+        self.assertEqual(r["model"], "gpt-5.6-luna extra high")
+        self.assertEqual(state["screen"], "closed")
+
+    def test_an_ultra_sessions_own_model_keeps_ultra(self):
+        # Its effort picker opens on "More reasoning… (current)", whose Enter
+        # opens the picker holding Ultra.
+        r, _, state, _ = self._drive("gpt-5.6-luna", "", effort_cursor=5, session_key=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(state["picks"], [("model", 4, "Enter"), ("effort", 5, "Enter"),
+                                          ("advanced", 2, "s")])
+        self.assertEqual(r["model"], "gpt-5.6-luna ultra")
+        self.assertEqual(state["screen"], "closed")
+
+    def test_a_picker_left_open_is_backed_out_of_first(self):
+        # What a board that didn't know "Advanced Reasoning" left on the pane:
+        # the /model send was refused for it.
+        r, sent, state, sp = self._drive("", "xhigh", effort_cursor=5, session_key=True,
+                                         opened_on="advanced")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(sent[:3], ["Escape", "Escape", "Escape"])
+        sp.assert_called_once_with(mock.ANY, "%1", "/model")
+        self.assertEqual(r["model"], "gpt-5.6-luna extra high")
 
     def test_wraps_down_to_a_row_above_the_cursor(self):
         # Cursor opens on luna (4); sol (2) is reached by wrapping: 4→5→1→2.
@@ -1400,13 +1462,13 @@ class SwitchCodexModelTests(unittest.TestCase):
     def test_effort_only_keeps_the_current_model(self):
         r, _, state, _ = self._drive("", "xhigh")
         self.assertTrue(r["ok"], r)
-        self.assertEqual(state["picks"], [("model", 4), ("effort", 4)])
+        self.assertEqual(state["picks"], [("model", 4, "Enter"), ("effort", 4, "Enter")])
         self.assertEqual(r["model"], "gpt-5.6-luna extra high")
 
     def test_model_only_keeps_the_effort_the_picker_opens_on(self):
         r, sent, state, _ = self._drive("gpt-6-astra", "")
         self.assertTrue(r["ok"], r)
-        self.assertEqual(state["picks"], [("model", 1), ("effort", 2)])
+        self.assertEqual(state["picks"], [("model", 1, "Enter"), ("effort", 2, "Enter")])
         self.assertEqual(r["model"], "gpt-6-astra medium")
         # Nothing pressed in the effort picker but Enter.
         self.assertEqual(sent[sent.index("Enter") + 1:], ["Enter"])
