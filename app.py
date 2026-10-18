@@ -667,8 +667,9 @@ def api_window_model(key: str, body: ModelBody) -> dict:
     Not a plain `/model <alias>` prompt: that form also saves the pick as the
     user's default for new sessions. actions.switch_model drives the dialog and
     commits with "s" instead (see its docstring). A Codex card goes through its
-    two-step picker with `model` and/or `effort`; that picker has no session-only
-    scope and also rewrites ~/.codex/config.toml."""
+    two-step picker with `model` and/or `effort`, committed with its "s" key too
+    where it has one; `session_only` in the answer says whether it did, and when
+    not, the pick also rewrote ~/.codex/config.toml."""
     return _on_card(key, "POST", "model",
                     lambda w, pid: actions.switch_model(w, body.model, body.effort), body)
 

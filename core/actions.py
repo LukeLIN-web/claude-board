@@ -1510,18 +1510,32 @@ def codex_pane_model(tty: Optional[str]) -> str:
 
 
 # Codex's /model is two pickers in a row — the model list, then the reasoning
-# levels for the model just picked — sharing one row shape and one footer. Rows
-# tag the session's current pick "(current)" and a model's default effort
-# "(default)"; each picker opens with its cursor on the current row. Enter
-# commits and moves on, Escape backs up one picker, and the list wraps, so Down
-# alone reaches every row.
+# levels for the model just picked — sharing one row shape. Rows tag the
+# session's current pick "(current)" and a model's default effort "(default)";
+# each picker opens with its cursor on the current row. Enter commits and moves
+# on, Escape backs up one picker, and the list wraps, so Down alone reaches
+# every row.
 #
-# Unlike Claude's dialog there is no session-only scope: a commit also rewrites
-# `model` / `model_reasoning_effort` in ~/.codex/config.toml — the default for
-# every Codex session started afterwards. The board can't avoid that, so the
-# card says so instead.
+# Max and Ultra sit one picker further in (0.160.0): the effort picker's last
+# row, "More reasoning…", opens "Advanced Reasoning", which holds the two. On a
+# max or ultra session that row is the one tagged current, so the effort picker
+# opens on it. A board that knew only the first two read that third picker as
+# closed, left it open over the composer, and refused the next /model send for
+# it ("a picker is open on this pane").
+#
+# Enter on an effort row also rewrites `model` / `model_reasoning_effort` in
+# ~/.codex/config.toml — the default for every Codex session started
+# afterwards. Where the footer offers "s session" ("enter default · s session ·
+# esc back", 0.160.0), "s" commits the row for the running session alone, and
+# the board takes that. An older Codex has no such key; the card then says the
+# pick became the default.
 _CODEX_MODEL_PICKER_HEAD = "Select Model and Effort"
 _CODEX_EFFORT_PICKER_HEAD = "Select Reasoning Level for"
+_CODEX_ADVANCED_PICKER_HEAD = "Advanced Reasoning"
+_CODEX_PICKER_HEADS = (_CODEX_MODEL_PICKER_HEAD, _CODEX_EFFORT_PICKER_HEAD,
+                       _CODEX_ADVANCED_PICKER_HEAD)
+_CODEX_MORE_REASONING = "more reasoning…"
+_CODEX_SESSION_HINT = "s session"
 _CODEX_ROW_RE = re.compile(r"^[\s ]*(?P<cur>›)?[\s ]*(?P<n>\d+)\.[\s ]+(?P<rest>\S.*)")
 _CODEX_TAG_RE = re.compile(r"[\s ]*\((?:current|default)\)")
 _CODEX_MODEL_NAME_RE = re.compile(r"^[a-z][\w.-]*$")
@@ -1543,19 +1557,24 @@ def _codex_picker(text: str, head: str) -> Optional[tuple[list[tuple[int, str]],
 
 
 def _codex_pickers_closed(text: str) -> bool:
-    return _CODEX_MODEL_PICKER_HEAD not in text and _CODEX_EFFORT_PICKER_HEAD not in text
+    return not any(head in text for head in _CODEX_PICKER_HEADS)
 
 
 def _escape_codex_pickers(pane: str) -> None:
-    """Leave the session at its composer, not parked in a picker."""
-    _escape_until(pane, _codex_pickers_closed, _MODEL_ESCAPES, _MODEL_KEY_SETTLE)
+    """Leave the session at its composer, not parked in a /model picker. Presses
+    Escape only while one is on screen: Esc on a startup picker quits Codex."""
+    # One Escape backs out of each picker, with one to spare.
+    _escape_until(pane, _codex_pickers_closed, len(_CODEX_PICKER_HEADS) + 1,
+                  _MODEL_KEY_SETTLE)
 
 
 def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
     """Drive one Codex picker: wait for it, put the cursor on the row named
-    `wanted` — or, with `wanted` empty, on the row tagged current — and press
-    Enter. {"ok": True, "name": <row name>}, or an error with the pickers backed
-    out of so the session is left at its composer."""
+    `wanted` — or, with `wanted` empty, on the row tagged current — and commit
+    it: with "s" where the footer under that row offers "s session", else Enter.
+    {"ok": True, "name": <row name>, "session_only": <committed with "s">}, or an
+    error with the pickers backed out of so the session is left at its
+    composer."""
     text = _wait_pane(pane, lambda t: head in t, _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL)
     if text is None:
         _escape_codex_pickers(pane)
@@ -1573,8 +1592,12 @@ def _codex_pick(pane: str, head: str, wanted: str, what: str) -> dict:
         _escape_codex_pickers(pane)
         return {"ok": False,
                 "error": f"could not move the Codex {what} picker cursor onto {wanted or 'the current row'}"}
-    tmux.send_keys(pane, "Enter")
-    return {"ok": True, "name": dict(rows)[target]}
+    # The footer names what Enter does on the row under the cursor, so it is
+    # read with the cursor already there.
+    lines = [ln for ln in tmux.capture_pane(pane).get("text", "").splitlines() if ln.strip()]
+    session_only = bool(lines) and _CODEX_SESSION_HINT in lines[-1]
+    tmux.send_keys(pane, "s" if session_only else "Enter")
+    return {"ok": True, "name": dict(rows)[target], "session_only": session_only}
 
 
 # Codex's folder-trust prompt, raised the first time it opens a directory that
@@ -1618,9 +1641,11 @@ def _switch_codex_model(w, model: str, effort: str) -> dict:
 
     Either can be left empty: an empty model keeps the current one (its row is
     tagged in the picker), an empty effort keeps whatever the effort picker opens
-    on — the current level for the current model, the default for a new one.
-    Only a pane clear of both pickers counts as a switch; anything else escapes
-    out and reports failure. Note the config.toml side effect above."""
+    on — the current level for the current model, the default for a new one; on
+    "More reasoning…", the row tagged current in the picker that opens. Only a
+    pane clear of every picker counts as a switch; anything else escapes out and
+    reports failure. `session_only` in the result says whether the commit kept
+    out of config.toml (see above)."""
     model = (model or "").strip().lower()
     effort = (effort or "").strip().lower()
     if model and not _CODEX_MODEL_NAME_RE.match(model):
@@ -1634,6 +1659,9 @@ def _switch_codex_model(w, model: str, effort: str) -> dict:
     if err:
         return err
 
+    # A /model picker still open — left by hand, or by an earlier switch — takes
+    # no line, and the send below would be refused for it.
+    _escape_codex_pickers(pane)
     r = _send_prompt_to(w, pane, "/model")
     if not r.get("ok"):
         return r
@@ -1644,10 +1672,15 @@ def _switch_codex_model(w, model: str, effort: str) -> dict:
     picked = _codex_pick(pane, _CODEX_EFFORT_PICKER_HEAD, _CODEX_EFFORTS.get(effort, ""), "effort")
     if not picked["ok"]:
         return picked
+    if picked["name"].lower() == _CODEX_MORE_REASONING:
+        picked = _codex_pick(pane, _CODEX_ADVANCED_PICKER_HEAD, "", "effort")
+        if not picked["ok"]:
+            return picked
     effort_name = picked["name"].lower()
 
     if _wait_pane(pane, _codex_pickers_closed, _MODEL_DIALOG_WAIT, _MODEL_DIALOG_POLL) is not None:
-        return {"ok": True, "model": f"{model_name} {effort_name}"}
+        return {"ok": True, "model": f"{model_name} {effort_name}",
+                "session_only": picked["session_only"]}
     _escape_codex_pickers(pane)
     return {"ok": False, "error": "the Codex /model picker did not close after confirming"}
 
