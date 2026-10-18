@@ -377,6 +377,13 @@ class CardModelTests(unittest.TestCase):
         # No id is invented for it — the raw field stays empty.
         self.assertEqual(w["model"], "")
 
+    def test_background_work_is_read_from_the_process_start(self):
+        # So a card whose session was cleared still lists the work launched
+        # before the /clear (transcripts.extract_background_tasks).
+        with _snapshot([self._win(started_at=1_790_000_000_500)]) as m:
+            appmod._enriched_snapshot()
+        m.extract_background_tasks.assert_called_once_with("/t.jsonl", 1_790_000_000.5)
+
     def test_unreadable_banner_leaves_the_readout_blank(self):
         w = self._run(self._win(), model="", banner="")
         self.assertEqual(w["model_label"], "")

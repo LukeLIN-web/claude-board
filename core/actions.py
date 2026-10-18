@@ -455,12 +455,12 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
     """
     if not pane_id:
         return {"answered": False, "waited": 0.0, "reason": "no pane"}
-    marker = tmux.composer_marker(platform)
     prompt_up, answer = ((codex_trust_prompt_up, answer_codex_trust_prompt)
                          if platform == "codex" else (trust_prompt_up, answer_trust_prompt))
     waited = 0.0
     for _ in range(max(1, attempts)):
         text = tmux.capture_pane(pane_id).get("text", "")
+        marker = tmux.composer_marker(platform, text)
         if prompt_up(text):
             # Let the dialog arm its input handler before the first key.
             time.sleep(settle)
@@ -1006,24 +1006,27 @@ def _rewind_panel_open(text: str) -> bool:
     return _REWIND_FOOTER in lines[-1] or lines[-1] == _REWIND_CURRENT_ROW
 
 
-def _wait_composer_ready(pane: str, marker: str) -> bool:
-    """Block until `pane` shows its composer `marker`, dismissing a Rewind panel if
-    that's what is covering it. False when the composer never appears — the
+def _wait_composer_ready(pane: str, platform: str) -> Optional[str]:
+    """Block until `pane` shows the composer of `platform`'s CLI, dismissing a
+    Rewind panel if that's what is covering it, and return the glyph it opens
+    with (tmux.composer_marker). None when the composer never appears — the
     caller must then refuse to type rather than feed keystrokes to a pane that
-    will eat or double them. Fails open when the pane can't be captured (the
-    landed-verify downstream still guards the actual send)."""
+    will eat or double them. Fails open, with the CLI's first glyph, when the
+    pane can't be captured (the landed-verify downstream still guards the
+    actual send)."""
     deadline = time.time() + _COMPOSER_READY_TIMEOUT
     while True:
         cap = tmux.capture_pane(pane)
         if not cap.get("ok"):
-            return True
+            return tmux.composer_marker(platform)
         text = cap.get("text", "")
+        marker = tmux.composer_marker(platform, text)
         if _rewind_panel_open(text):
             tmux.send_keys(pane, "Escape")
         elif marker in text and not picker_cursor_row(text, marker):
-            return True
+            return marker
         if time.time() >= deadline:
-            return False
+            return None
         time.sleep(_COMPOSER_READY_POLL)
 
 
@@ -1169,14 +1172,15 @@ def _send_prompt_inner(w, pane: str, text: str) -> dict:
         return {"ok": False,
                 "error": f"send blocked: {blocker['label']} is still open on "
                          "this pane — press Esc on the card, then resend."}
-    # Every composer read from here on — ready, landed, sent, what went wrong —
-    # anchors on this CLI's own glyph (see tmux.COMPOSER_MARKERS).
-    marker = tmux.composer_marker(w.platform)
     # Refuse to type until the composer is actually on screen: a booting TUI
     # eats or doubles the prompt, and a Rewind panel (which the wait dismisses
-    # itself) eats it outright.
-    if not _wait_composer_ready(pane, marker):
-        row = picker_cursor_row(tmux.capture_pane(pane).get("text", ""), marker)
+    # itself) eats it outright. Every composer read from here on — ready,
+    # landed, sent, what went wrong — anchors on the glyph it was drawn with
+    # (see tmux.COMPOSER_MARKERS).
+    marker = _wait_composer_ready(pane, w.platform)
+    if marker is None:
+        text = tmux.capture_pane(pane).get("text", "")
+        row = picker_cursor_row(text, tmux.composer_marker(w.platform, text))
         if row:
             return {"ok": False,
                     "error": f"send blocked: a picker is open on this pane, its cursor "

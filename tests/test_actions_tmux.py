@@ -24,6 +24,8 @@ _CARD = _fake_window("/dev/pts/3")
 _LIVE_TEXT = "❯ \n⏵⏵ bypass permissions on"
 # An idle Codex pane: its composer's placeholder over its status line.
 _CODEX_LIVE_TEXT = "› Ask Codex to do anything\n  gpt-6-astra high · /tmp/proj\n"
+# At reasoning effort "ultra" Codex opens its composer with `»` instead.
+_CODEX_ULTRA_TEXT = "» Ask Codex to do anything\n  gpt-6-astra ultra · /tmp/proj\n"
 # Claude's task list, drawn BELOW its composer; every blocked task carries a `›`.
 _CLAUDE_TASKS = (
     "  3 tasks (0 done, 1 in progress, 2 open)\n"
@@ -457,6 +459,15 @@ class SendPromptReadinessTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(p.capture_pane.call_count, 3)  # banner twice, then the composer
         self.assertEqual(p.send_text.call_args.kwargs["marker"], "›")
+
+    def test_an_ultra_codex_composer_is_sent_to(self):
+        # Waiting for `›` alone, every send to an ultra card failed "composer
+        # not on screen" against an idle, empty composer.
+        codex = _fake_window("/dev/pts/3", platform="codex")
+        with _pane(CODEX_BANNER_BOX, _CODEX_ULTRA_TEXT, window=codex) as p:
+            r = actions.send_prompt(p.card, "hello")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(p.send_text.call_args.kwargs["marker"], "»")
 
 
 def _fail_send(after_text):
@@ -1678,6 +1689,11 @@ class CodexTrustPromptTests(unittest.TestCase):
     def test_its_cursor_row_is_not_a_composer(self):
         self.assertFalse(actions.composer_drawn(_CODEX_TRUST, "›"))
         self.assertTrue(actions.composer_drawn(_CODEX_LIVE_TEXT, "›"))
+
+    def test_an_ultra_composer_is_already_trusted(self):
+        r, sent = self._run([_CODEX_ULTRA_TEXT], default=_CODEX_ULTRA_TEXT)
+        self.assertEqual(r["reason"], "already trusted")
+        self.assertEqual(sent, [])
 
     def test_another_startup_picker_gets_no_keys(self):
         # The daemon picker opens on Cancel: nothing here may press anything.

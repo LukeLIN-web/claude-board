@@ -4,6 +4,7 @@ Whatever order the file grew in, each answer has to be the one a single read of
 the whole file gives — that read is what every other test of these extractors
 pins down, so this only checks that reading in pieces never drifts from it.
 """
+import dataclasses
 import json
 import os
 import threading
@@ -19,7 +20,7 @@ EXTRACTORS = [
     (transcripts.session_goal, transcripts._SessionGoal),
     (transcripts._consumed_prompts, transcripts._ConsumedPrompts),
     (transcripts.session_activity, transcripts._SessionActivity),
-    (transcripts.extract_background_tasks, transcripts._BackgroundTasks),
+    (transcripts._background_ledger, transcripts._BackgroundTasks),
     (transcripts.extract_plan_history, transcripts._PlanHistory),
 ]
 
@@ -74,6 +75,11 @@ def _rows() -> list[dict]:
 
 def _line(row: dict) -> str:
     return json.dumps(row) + "\n"
+
+
+def _plain(o) -> object:
+    """An answer that isn't JSON already (the background ledger), as JSON."""
+    return dataclasses.asdict(o) if dataclasses.is_dataclass(o) else sorted(o)
 
 
 def _full_read(make, path) -> object:
@@ -175,12 +181,12 @@ class FoldTests(unittest.TestCase):
         rows = _rows()
         p = write_jsonl(rows[:3])
         before = {make.__name__: extract(p) for extract, make in EXTRACTORS}
-        frozen = json.dumps(before, sort_keys=True)
+        frozen = json.dumps(before, sort_keys=True, default=_plain)
         with p.open("a") as f:
             f.write("".join(_line(r) for r in rows[3:]))
         for extract, _ in EXTRACTORS:
             extract(p)
-        self.assertEqual(json.dumps(before, sort_keys=True), frozen)
+        self.assertEqual(json.dumps(before, sort_keys=True, default=_plain), frozen)
 
     def test_callers_on_one_file_read_it_once(self):
         steps = []
