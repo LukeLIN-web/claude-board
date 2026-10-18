@@ -617,13 +617,22 @@ def _needle(text: str) -> str:
 # the last of either glyph as the composer read an empty Claude composer as
 # holding "blocked by #N", cleared it blind on every landed-verify attempt, and
 # blamed a failed send on "other text" that was never there.
-COMPOSER_MARKERS = {"claude": "❯", "codex": "›", "hmz": "❯"}
+#
+# Codex has two: `›`, and at reasoning effort "ultra" a bold magenta `»`
+# instead (0.160.0; low through max all draw `›`). Its numbered pickers keep
+# `›` as their cursor at every effort. Read with `›` alone, an ultra session
+# had no composer on screen, and every send failed "composer not on screen".
+COMPOSER_MARKERS = {"claude": ("❯",), "codex": ("›", "»"), "hmz": ("❯",)}
 
 
-def composer_marker(platform: str) -> str:
-    """The composer glyph of `platform`'s CLI. Anything not named is driven
-    down Claude's send path, so it is read with Claude's glyph too."""
-    return COMPOSER_MARKERS.get(platform, COMPOSER_MARKERS["claude"])
+def composer_marker(platform: str, screen: str = "") -> str:
+    """The glyph `platform`'s composer opens with on `screen`: of that CLI's
+    glyphs, the one drawn last, since the composer sits below everything it
+    draws them in. The CLI's first glyph when `screen` shows none, or isn't
+    given. Anything not named is driven down Claude's send path, so it is
+    read with Claude's glyph too."""
+    glyphs = COMPOSER_MARKERS.get(platform, COMPOSER_MARKERS["claude"])
+    return max(glyphs, key=screen.rfind)
 
 
 def _composer_has_tail(pane: str, text: str, marker: str) -> bool:

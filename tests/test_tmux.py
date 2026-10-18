@@ -1185,6 +1185,22 @@ class ComposerTextTests(unittest.TestCase):
         self.assertEqual(tmux._composer_text(cap, "›"), "run the benchmark suite")
 
 
+class ComposerMarkerTests(unittest.TestCase):
+    """composer_marker: the glyph the driven CLI's composer opens with."""
+
+    def test_codex_takes_whichever_of_its_glyphs_is_drawn_last(self):
+        self.assertEqual(tmux.composer_marker("codex"), "›")
+        self.assertEqual(tmux.composer_marker("codex", "» Ask Codex to do anything\n"), "»")
+        # Effort changed mid-session: a turn echoed with one glyph sits above
+        # a composer drawn with the other.
+        self.assertEqual(tmux.composer_marker("codex", "» fix it\n› Ask Codex\n"), "›")
+        self.assertEqual(tmux.composer_marker("codex", "› fix it\n» Ask Codex\n"), "»")
+
+    def test_claude_never_takes_a_codex_glyph(self):
+        self.assertEqual(tmux.composer_marker("claude", _claude_pane_with_tasks()), "❯")
+        self.assertEqual(tmux.composer_marker("claude", "» quoted\n"), "❯")
+
+
 class ClearComposerTests(unittest.TestCase):
     """_clear_composer must send one clearing press (End, Ctrl-U, Backspace) per
     visual LINE (Claude's composer removes only one line per press), verified
