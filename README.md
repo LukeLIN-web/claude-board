@@ -131,6 +131,21 @@ available.
 > after the first turn. (Linux only; background `codex mcp-server` / `app-server`
 > processes are excluded.)
 
+Parent-controlled helper sessions can stay alive without appearing as cards.
+Have the launcher mark the helper's tmux pane on its host (replace `%3` with
+the actual pane id, and select its socket with `tmux -S ...` if needed):
+
+```bash
+tmux set-option -p -t %3 @fleet-passive 1
+# Show the pane as a card again:
+tmux set-option -p -u -t %3 @fleet-passive
+```
+
+The mark lasts for the pane's lifetime, including board restarts. Marked panes
+are excluded from cards and counts in every activity state; history, session-id
+lookup and running work remain available. Unmarked idle sessions stay visible.
+On Linux, Fleet also checks each session's own tmux socket via `/proc`.
+
 ### Actions
 
 | Button | What it does |

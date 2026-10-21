@@ -100,6 +100,19 @@ Claude Fleet 默认只读，但有两个可选的、基于 tmux 的操作，让�
 > `/proc/<pid>/fd` 关联到对应 transcript。刚 spawn 的 Codex 会立即显示成卡片，session id / transcript
 > 在第一轮对话后补全。（仅 Linux；后台的 `codex mcp-server` / `app-server` 进程会被排除。）
 
+由主会话调度的辅助会话可以保持运行，同时不占独立卡片。启动方在助手所在机器上给
+对应 tmux pane 加标记（将 `%3` 换成实际 pane id；其他 socket 用 `tmux -S ...` 指定）：
+
+```bash
+tmux set-option -p -t %3 @fleet-passive 1
+# 恢复显示：
+tmux set-option -p -u -t %3 @fleet-passive
+```
+
+标记随 pane 保留，看板重启后仍有效。被标记的会话无论工作、空闲或等待审批，都不出现在
+卡片和计数中；历史、session id 反查和正在运行的任务照常保留。未标记的普通空闲会话仍显示。
+Linux 上也会通过 `/proc` 检查会话自身的 tmux socket。
+
 ### 操作
 
 | 按钮 | 做什么 |

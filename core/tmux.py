@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable, Optional
 
 _TIMEOUT = 10
@@ -302,6 +303,37 @@ def list_panes() -> list[dict]:
             continue
         panes.append({"pane_id": parts[0], "tty": parts[1]})
     return panes
+
+
+def passive_ttys(pids: list[int]) -> set[str]:
+    """TTYs explicitly marked as parent-controlled helpers, not user cards.
+
+    Set `@fleet-passive` to `1` on the helper's pane. Read its own tmux socket
+    from the process environment too: process discovery can see helpers on a
+    different server from FLEET_TMUX_SOCKET. Missing metadata fails open.
+    """
+    selectors: set[tuple[str, ...]] = {()}
+    for pid in pids:
+        try:
+            entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            value = next(e[5:] for e in entries if e.startswith(b"TMUX="))
+            socket_path, _, _ = os.fsdecode(value).rsplit(",", 2)
+        except (OSError, StopIteration, ValueError):
+            continue
+        if os.path.isabs(socket_path):
+            selectors.add(("-S", socket_path))
+
+    hidden: set[str] = set()
+    for selector in sorted(selectors):
+        result = _run(*selector, "list-panes", "-a", "-F",
+                      "#{pane_tty}\t#{@fleet-passive}")
+        if not result["ok"]:
+            continue
+        for line in result["stdout"].splitlines():
+            tty, sep, passive = line.partition("\t")
+            if sep and tty.startswith("/dev/") and passive == "1":
+                hidden.add(tty)
+    return hidden
 
 
 def pane_for_tty(tty: str) -> Optional[str]:
