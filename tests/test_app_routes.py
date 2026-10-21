@@ -30,6 +30,7 @@ _NEUTRAL = {
     "shell_descendant_counts": (appmod.sessions, {}),
     "pending_by_tty": (appmod.perms, {}),
     "available": (appmod.tmux, True),
+    "passive_ttys": (appmod.tmux, set()),
     "codex_pane_model": (appmod.actions, ""),
     "pane_model": (appmod.actions, ""),
     "pane_dialog": (appmod.actions, None),
@@ -622,6 +623,53 @@ class QuietBoardTests(unittest.TestCase):
                          ("completed", "closeable"))
         st = appmod.State()
         self.assertNotEqual(st.diff_signature(before), st.diff_signature(after))
+
+    def test_passive_helpers_are_absent_but_regular_idle_and_busy_cards_remain(self):
+        for platform in ("claude", "codex", "hmz"):
+            for status, triage in (("idle", "completed"), ("busy", "working"),
+                                   ("waiting", "waiting_perm")):
+                with self.subTest(platform=platform, status=status):
+                    idle = self._card(1, self.done, 600)
+                    busy = self._card(2, self.done, 0, status="busy")
+                    helper = {**self._card(3, self.done, 600, status=status),
+                              "platform": platform, "triage": triage}
+                    original = dict(helper)
+                    with _snapshot(
+                        [idle, busy] + ([helper] if platform == "claude" else []),
+                        codex=[helper] if platform == "codex" else [],
+                        hmz_window_dicts=[helper] if platform == "hmz" else [],
+                        passive_ttys={helper["tty"]},
+                    ) as stubs:
+                        snap = appmod._enriched_snapshot()
+                    self.assertEqual({w["pid"] for w in snap["windows"]}, {1, 2})
+                    self.assertEqual(snap["counts"],
+                                     {"total": 2, "busy": 1, "waiting": 0, "idle": 1})
+                    self.assertEqual(helper, original)
+                    stubs.shell_descendant_counts.assert_called_once_with([1, 2])
+                    stubs.codex_pane_model.assert_not_called()
+
+    def test_removing_passive_marker_restores_the_card_on_the_next_snapshot(self):
+        helper = {**self._card(3, self.done, 600),
+                  "platform": "codex", "triage": "completed"}
+        with _snapshot(codex=[helper], passive_ttys={helper["tty"]}):
+            hidden = appmod._enriched_snapshot()
+        with _snapshot(codex=[helper]):
+            restored = appmod._enriched_snapshot()
+        self.assertEqual(hidden["windows"], [])
+        self.assertEqual([w["pid"] for w in restored["windows"]], [3])
+        self.assertEqual(restored["counts"]["total"], 1)
+        st = appmod.State()
+        self.assertNotEqual(st.diff_signature(hidden), st.diff_signature(restored))
+
+    def test_local_passive_marker_does_not_hide_a_peer_with_the_same_tty(self):
+        local = self._card(3, self.done, 600)
+        peer = {**local, "host": "other", "key": "other:3", "triage": "completed"}
+        with _snapshot([local], passive_ttys={local["tty"]}, enabled=True), \
+             mock.patch.object(appmod.peers, "remote_windows", return_value=[peer]), \
+             mock.patch.object(appmod.peers, "status", return_value=[]):
+            snap = appmod._enriched_snapshot()
+        self.assertEqual([w["key"] for w in snap["windows"]], ["other:3"])
+        self.assertEqual(snap["counts"]["total"], 1)
 
 
 class StaleDialogOpenTests(unittest.TestCase):

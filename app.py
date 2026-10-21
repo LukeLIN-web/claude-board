@@ -152,6 +152,15 @@ def _local_snapshot() -> dict:
     codex_windows = codex.codex_window_dicts()
     hmz_windows = hmz.hmz_window_dicts()
     every = snap["windows"] + codex_windows + hmz_windows
+    # Passive helpers belong to their parent workflow. Only suppress cards;
+    # discovery, history and session-id lookup still include these sessions.
+    passive = tmux.passive_ttys(
+        [w["pid"] for w in every if isinstance(w.get("pid"), int)]
+    )
+    snap["windows"] = [w for w in snap["windows"] if w.get("tty") not in passive]
+    codex_windows = [w for w in codex_windows if w.get("tty") not in passive]
+    hmz_windows = [w for w in hmz_windows if w.get("tty") not in passive]
+    every = snap["windows"] + codex_windows + hmz_windows
     shell_counts = sessions.shell_descendant_counts(
         [w["pid"] for w in every if isinstance(w.get("pid"), int)]
     )
