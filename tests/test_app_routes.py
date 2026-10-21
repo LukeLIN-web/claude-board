@@ -221,6 +221,22 @@ class CodexHistoryTimelineTests(unittest.TestCase):
         self.assertEqual(self._prompts(self.IN), ["first page"])
         self.assertEqual(self._prompts(self.inside.stem), ["first page"])
 
+    def test_archive_includes_activity_and_native_goal_for_the_thread(self):
+        with self.inside.open("a") as f:
+            f.write(json.dumps({"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec", "input":
+                'text(await tools.exec_command({cmd: "cat /home/u/.codex/skills/review/SKILL.md '
+                '/home/u/.codex/memories/MEMORY.md"}));',
+            }}) + "\n")
+        goal = {"text": "Finish the review", "ts": "2026-10-05T08:00:01Z", "source": "codex"}
+        for key in (self.IN, self.inside.stem):
+            with mock.patch.object(appmod.codex, "session_goal", return_value=goal) as read_goal:
+                result = appmod.api_history_timeline(key)
+            read_goal.assert_called_once_with(self.IN)
+            self.assertEqual(result["goal"], goal)
+            self.assertEqual(result["skills_used"], ["review"])
+            self.assertEqual(result["memory_ops"], [{"name": "MEMORY", "operation": "read"}])
+
     def test_served_on_a_host_with_no_claude_projects(self):
         # A host that runs only Codex has no ~/.claude/projects to look in first.
         with mock.patch.object(appmod.sessions, "PROJECTS_DIR", self.root / "no-such-dir"):
