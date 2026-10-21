@@ -501,10 +501,8 @@ def _timeline(w, pid: int, limit: int) -> dict:
         "session_id": w.session_id,
         "project_name": w.project_name,
         "platform": w.platform,
-        # Defaults, which Codex and hmz mostly keep: neither writes a recap, so
-        # there is no goal to pin, nor has a /loop skill, so nothing schedules
-        # a looping prompt — and neither has a Claude-style interactive menu to
-        # scrape from the pane.
+        # Defaults for platforms without Claude's recap, /loop, and menus.
+        # Codex supplies its own native goal below.
         **_claude_panels(""),
         "menu": None,
     }
@@ -768,7 +766,15 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
         if not sessions.transcript_visible(f):
             raise HTTPException(404, "session not found")
         events = codex.codex_timeline(str(f), limit=limit)
-        return {"session_id": session_id, "project_slug": "codex", "events": events, "platform": "codex"}
+        activity = codex.extract_codex_session_activity(f)
+        thread_id = (codex._parse_session_meta(f) or {}).get("id", session_id)
+        return {
+            "session_id": session_id, "project_slug": "codex",
+            "events": events, "platform": "codex",
+            "skills_used": activity["skills_used"],
+            "memory_ops": activity["memory_ops"],
+            "goal": codex.session_goal(thread_id),
+        }
     # OpenCode sessions (SQLite), judged on the directory the session records.
     try:
         directory = opencode.session_directory(session_id)

@@ -11,12 +11,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import time
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
 from . import patrol, transcripts
-from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
+from .textcap import GOAL_CHARS, MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
 from .sessions import (
     HOME_BASE,
     Proc,
@@ -41,10 +44,12 @@ CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 # output right now, regardless of what the last parsed event type was.
 _BUSY_MTIME_WINDOW = 5.0
 
-# Match skill path like /.claude/skills/foo/ or /.codex/skills/foo/
-# Stop at whitespace, quote, &&, ||, semicolons, or maxdepth/-flag args
-_SKILL_PATH_RE = re.compile(r'/\.(?:claude|codex)/skills/([A-Za-z0-9_-]+)(?:/|\b)')
-_MEMORY_PATH_RE = re.compile(r'/memory/([A-Za-z0-9_-]+)\.md')
+# Installed skills can be built-ins, user skills, or cached plugin skills.
+_SKILL_PATH_RE = re.compile(
+    r'/\.(?:claude|codex|agents)/(?:skills/|plugins/[^\s\'"`]+/skills/)'
+    r'(?:\.system/)?([A-Za-z0-9_-]+)(?:/|\b)')
+_MEMORY_PATH_RE = re.compile(
+    r'(?:/memory/|/\.codex/memories/(?:[A-Za-z0-9_.-]+/)*)([A-Za-z0-9_.-]+)\.md')
 
 # Codex reuses the role=user message shape for synthetic, non-prompt turns it
 # injects itself — each wrapped in a lowercase XML-ish tag (<environment_context>,
@@ -225,8 +230,7 @@ def _clear_caches() -> None:
 # A live card asks for its activity every 2s tick.
 @transcripts.memo_by_file
 def extract_codex_session_activity(path: Path | str) -> dict:
-    """Codex has no file I/O tools — everything goes through exec_command.
-    We must scan the command strings for skill/memory file references.
+    """Scan shell commands, code-mode exec calls, and patches for file activity.
     Read again only once the rollout changes; the result is shared, so callers
     must not change it.
     """
@@ -259,19 +263,36 @@ def _scan_activity(p: Path) -> dict:
 
             if t != "response_item":
                 continue
-            if payload.get("type") != "function_call":
+            item_type = payload.get("type")
+            name = payload.get("name", "").rsplit(".", 1)[-1]
+            patch = name == "apply_patch"
+            if item_type == "custom_tool_call" and name in ("exec", "apply_patch"):
+                # Code mode wraps tools.exec_command / tools.apply_patch in raw
+                # JS, not JSON arguments. Inspect only calls, never injected
+                # skill catalogs or paths merely mentioned in user messages.
+                cmd = str(payload.get("input") or "")
+                workdir = ""
+                patch = patch or "tools.apply_patch(" in cmd
+                if patch:
+                    # A patch's body may mention other skills/memories in code;
+                    # only its file headers say which files were changed. A
+                    # tools.exec_command example inside that body isn't a call.
+                    # Mixed shell/patch batches conservatively count headers
+                    # only, since this scanner does not parse JavaScript.
+                    cmd = "\n".join(re.findall(
+                        r'\*\*\* (?:Add|Update|Delete) File: ([^\r\n\\]+)', cmd))
+            elif item_type == "function_call" and name == "exec_command":
+                args_str = payload.get("arguments", "")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                cmd = str(args.get("cmd", "") or args.get("command", ""))
+                workdir = str(args.get("workdir", ""))
+            else:
                 continue
-            name = payload.get("name", "")
-            if name != "exec_command":
-                continue
-
-            args_str = payload.get("arguments", "")
-            try:
-                args = json.loads(args_str) if isinstance(args_str, str) else args_str
-            except Exception:
-                args = {}
-            cmd = str(args.get("cmd", "") or args.get("command", ""))
-            workdir = str(args.get("workdir", ""))
             # Codex sets workdir to skill dir, then runs cmd inside it.
             # Need to scan both for skill references.
             haystack = cmd + " " + workdir
@@ -281,7 +302,7 @@ def _scan_activity(p: Path) -> dict:
             # Skill path mentions (in cmd OR workdir)
             skill_matches = set(_SKILL_PATH_RE.findall(haystack))
             if skill_matches:
-                write_kw = any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir"))
+                write_kw = patch or any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir", "apply_patch("))
                 for sk in skill_matches:
                     bash_refs[sk] = bash_refs.get(sk, 0) + 1
                     if write_kw:
@@ -291,11 +312,10 @@ def _scan_activity(p: Path) -> dict:
 
             # Memory path mentions. A command can't say edit from write, so an
             # edit counts as a write.
-            write_kw = any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<"))
+            write_kw = patch or any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<", "apply_patch("))
             op, counts = ("write", memory_writes) if write_kw else ("read", memory_reads)
-            for mem_name in set(_MEMORY_PATH_RE.findall(haystack)):
-                if mem_name == "MEMORY":
-                    continue
+            for mem_name in {m.group(1) for m in _MEMORY_PATH_RE.finditer(haystack)
+                             if m.group(1) != "MEMORY" or m.group(0).startswith("/.codex/memories/")}:
                 counts[mem_name] = counts.get(mem_name, 0) + 1
                 key = (mem_name, op)
                 if key not in memory_ops_seen:
@@ -484,16 +504,37 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
     return events[-limit:]
 
 
+def session_goal(session_id: str) -> dict | None:
+    """Read this thread's native goal, which can change independently of its rollout."""
+    if not session_id:
+        return None
+    try:
+        db_uri = (CODEX_HOME / "goals_1.sqlite").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(db_uri, uri=True, timeout=0.1)) as conn:
+            row = conn.execute(
+                "SELECT objective, updated_at_ms FROM thread_goals WHERE thread_id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row or not isinstance(row[0], str) or not row[0].strip():
+            return None
+        ts = datetime.fromtimestamp(row[1] / 1000, timezone.utc).isoformat()
+        return {"text": cap_text(row[0], GOAL_CHARS), "ts": ts, "source": "codex"}
+    except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError):
+        return None
+
+
 def live_timeline(w: Window, limit: int) -> dict:
     """A live Codex card's timeline: its `events` from the clear on (see
     mark_cleared), and the skills and memory its rollout touched."""
+    goal = session_goal(w.session_id)
     if not w.transcript_path:
-        return {"events": []}
+        return {"events": [], "goal": goal}
     activity = extract_codex_session_activity(w.transcript_path)
     return {
         "events": codex_timeline(w.transcript_path, limit=limit, since_ms=cleared_at_ms(w.pid)),
         "skills_used": activity["skills_used"],
         "memory_ops": activity["memory_ops"],
+        "goal": goal,
     }
 
 

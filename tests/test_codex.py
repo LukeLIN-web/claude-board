@@ -435,6 +435,82 @@ class TestMemoryActivity(unittest.TestCase):
                          [("abc", 2, 1)])
 
 
+class TestCodeModeActivity(unittest.TestCase):
+    """The same activity tags survive code mode and Codex's own file layout."""
+
+    def activity(self, *payloads):
+        return codex.extract_codex_session_activity(_write_rollout([
+            {"type": "response_item", "payload": payload} for payload in payloads]))
+
+    def test_exec_reads_installed_skills_and_codex_memories(self):
+        activity = self.activity({
+            "type": "custom_tool_call", "name": "exec", "input":
+                'await tools.exec_command({cmd: "cat '
+                '/home/u/.codex/skills/.system/openai-docs/SKILL.md '
+                '/home/u/.codex/plugins/cache/vendor/pages/1.0/skills/write-page/SKILL.md '
+                '/home/u/.agents/skills/review/SKILL.md '
+                '/home/u/.codex/memories/MEMORY.md '
+                '/home/u/.codex/memories/rollout_summaries/task.md"});'})
+        self.assertEqual(set(activity["skills_used"]), {"openai-docs", "write-page", "review"})
+        self.assertEqual(activity["skill_breakdown"]["per_skill_reads"],
+                         {"openai-docs": 1, "write-page": 1, "review": 1})
+        self.assertEqual(activity["memory_breakdown"]["per_memory_reads"],
+                         {"MEMORY": 1, "task": 1})
+        self.assertEqual({(m["name"], m["operation"]) for m in activity["memory_ops"]},
+                         {("MEMORY", "read"), ("task", "read")})
+
+    def test_legacy_exec_still_finds_workdir_and_codex_memory_writes(self):
+        activity = self.activity({"type": "function_call", "name": "functions.exec_command",
+            "arguments": json.dumps({"workdir": "/home/u/.codex/skills/.system/openai-docs",
+                                     "cmd": "cat SKILL.md"})},
+            {"type": "function_call", "name": "exec_command", "arguments": json.dumps({
+                "cmd": "echo note >> /home/u/.codex/memories/MEMORY.md"})})
+        self.assertEqual(activity["skills_used"], ["openai-docs"])
+        self.assertEqual(activity["memory_ops"], [{"name": "MEMORY", "operation": "write"}])
+
+    def test_patch_counts_changed_files_not_paths_in_the_body(self):
+        patch = ("*** Begin Patch\n"
+                 "*** Update File: /home/u/.codex/memories/MEMORY.md\n@@\n"
+                 "+Mention /home/u/.codex/skills/unused/SKILL.md\n"
+                 "*** Add File: /home/u/.agents/skills/review/SKILL.md\n"
+                 "+Mention /home/u/.codex/memories/untouched.md\n*** End Patch")
+        for name, body in (("apply_patch", patch),
+                           ("exec", "await tools.apply_patch(" + json.dumps(patch) + ");")):
+            with self.subTest(tool=name):
+                activity = self.activity({"type": "custom_tool_call", "name": name, "input": body})
+                self.assertEqual(activity["skills_used"], ["review"])
+                self.assertEqual(activity["skill_breakdown"]["per_skill_writes"], {"review": 1})
+                self.assertEqual(activity["memory_ops"], [{"name": "MEMORY", "operation": "write"}])
+
+    def test_exec_command_example_inside_patch_is_not_executed_activity(self):
+        patch = ("*** Begin Patch\n"
+                 "*** Update File: /tmp/proj/tests/test_app_routes.py\n@@\n"
+                 "+tools.exec_command({cmd: 'cat /home/u/.codex/skills/review/SKILL.md "
+                 "/home/u/.codex/memories/untouched.md'})\n"
+                 "*** Update File: /home/u/.codex/memories/notes.md\n@@\n"
+                 "+A real memory update\n*** End Patch")
+        activity = self.activity({"type": "custom_tool_call", "name": "exec",
+                                  "input": "await tools.apply_patch(" + json.dumps(patch) + ");"})
+        self.assertEqual(activity["skills_used"], [])
+        self.assertEqual(activity["memory_ops"], [{"name": "notes", "operation": "write"}])
+
+    def test_available_skills_and_user_mentions_do_not_count_as_use(self):
+        text = ("Available: /home/u/.codex/skills/openai-docs/SKILL.md; "
+                "please read /home/u/.codex/memories/MEMORY.md")
+        activity = self.activity(*[
+            {"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
+            for role in ("user", "developer")])
+        self.assertEqual(activity["skills_used"], [])
+        self.assertEqual(activity["memory_ops"], [])
+
+    def test_bad_arguments_do_not_hide_later_activity(self):
+        activity = self.activity(
+            {"type": "function_call", "name": "exec_command", "arguments": "null"},
+            {"type": "function_call", "name": "exec_command", "arguments": json.dumps({
+                "cmd": "cat /home/u/.codex/skills/review/SKILL.md"})})
+        self.assertEqual(activity["skills_used"], ["review"])
+
+
 class TestTurnContextModel(unittest.TestCase):
     """The model + reasoning effort a session ran on come from turn_context; the
     last one wins, since /model rewrites both mid-session."""
