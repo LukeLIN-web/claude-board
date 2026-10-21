@@ -48,6 +48,10 @@ _BUSY_MTIME_WINDOW = 5.0
 _SKILL_PATH_RE = re.compile(
     r'/\.(?:claude|codex|agents)/(?:skills/|plugins/[^\s\'"`]+/skills/)'
     r'(?:\.system/)?([A-Za-z0-9_-]+)(?:/|\b)')
+# Skills can also be read straight from a repository checkout. Require its
+# manifest here so an unrelated skills/<name>/data file is not counted.
+_REPO_SKILL_PATH_RE = re.compile(
+    r'(?<![\w.-])skills/([A-Za-z0-9_-]+)/SKILL\.md(?![\w./-])')
 _MEMORY_PATH_RE = re.compile(
     r'(?:/memory/|/\.codex/memories/(?:[A-Za-z0-9_.-]+/)*)([A-Za-z0-9_.-]+)\.md')
 
@@ -301,6 +305,7 @@ def _scan_activity(p: Path) -> dict:
 
             # Skill path mentions (in cmd OR workdir)
             skill_matches = set(_SKILL_PATH_RE.findall(haystack))
+            skill_matches.update(_REPO_SKILL_PATH_RE.findall(haystack))
             if skill_matches:
                 write_kw = patch or any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir", "apply_patch("))
                 for sk in skill_matches:

@@ -468,6 +468,27 @@ class TestCodeModeActivity(unittest.TestCase):
         self.assertEqual(activity["skills_used"], ["openai-docs"])
         self.assertEqual(activity["memory_ops"], [{"name": "MEMORY", "operation": "write"}])
 
+    def test_reads_skill_from_a_repository_checkout(self):
+        cmd = "cat /shared/work/humanize/skills/monitor-claude-goal/SKILL.md"
+        for payload in (
+            {"type": "function_call", "name": "exec_command",
+             "arguments": json.dumps({"cmd": cmd})},
+            {"type": "custom_tool_call", "name": "exec",
+             "input": "await tools.exec_command(" + json.dumps({"cmd": cmd}) + ");"},
+        ):
+            with self.subTest(tool=payload["type"]):
+                activity = self.activity(payload)
+                self.assertEqual(activity["skills_used"], ["monitor-claude-goal"])
+                self.assertEqual(activity["skill_breakdown"]["per_skill_reads"],
+                                 {"monitor-claude-goal": 1})
+
+    def test_repository_skill_requires_its_manifest_path(self):
+        paths = [f"/repo/skills/unused/{suffix}" for suffix in (
+            "SKILL.md.bak", "SKILL.md/notes", "data.json", "templates/SKILL.md")]
+        activity = self.activity({"type": "function_call", "name": "exec_command",
+                                  "arguments": json.dumps({"cmd": "cat " + " ".join(paths)})})
+        self.assertEqual(activity["skills_used"], [])
+
     def test_patch_counts_changed_files_not_paths_in_the_body(self):
         patch = ("*** Begin Patch\n"
                  "*** Update File: /home/u/.codex/memories/MEMORY.md\n@@\n"
@@ -496,6 +517,7 @@ class TestCodeModeActivity(unittest.TestCase):
 
     def test_available_skills_and_user_mentions_do_not_count_as_use(self):
         text = ("Available: /home/u/.codex/skills/openai-docs/SKILL.md; "
+                "/repo/skills/monitor-claude-goal/SKILL.md; "
                 "please read /home/u/.codex/memories/MEMORY.md")
         activity = self.activity(*[
             {"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
