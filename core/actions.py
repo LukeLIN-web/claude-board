@@ -249,8 +249,8 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
     """Spawn a new tmux window in `cwd` (validated server-side).
 
     `platform` selects the CLI: "claude" (default) launches Claude Code with
-    permission prompts skipped; "codex" launches the Codex TUI in `--yolo` mode
-    so the fleet can drive it without per-action approval prompts; "hmz" opens
+    permission prompts skipped; "codex" launches the Codex TUI on Astra/high in
+    `--yolo` mode so the fleet can drive it without per-action approval prompts; "hmz" opens
     the humanize interface, whose flows run every agent with approvals bypassed.
     """
     if not cwd or not cwd.strip():
@@ -270,7 +270,9 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
         #   check_for_update_on_startup=false: an update offer, on "1. Update
         #     now", which runs the installer in place of the session.
         r = tmux.new_window(resolved, ["codex", "--yolo", "--no-daemon",
-                                       "-c", "check_for_update_on_startup=false"])
+                                       "-c", "check_for_update_on_startup=false",
+                                       "-m", "gpt-6-astra",
+                                       "-c", 'model_reasoning_effort="high"'])
     elif platform == "hmz":
         # Its first start would otherwise hold the new card on a question in a
         # box over the composer: whether to send error reports. Answered yes

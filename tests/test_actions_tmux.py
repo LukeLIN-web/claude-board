@@ -131,7 +131,9 @@ class CreateSessionTests(unittest.TestCase):
                                    return_value={"ok": True, "pane_id": "%1"}) as m:
                 actions.create_session(d, platform="codex")
         m.assert_called_once_with(d, ["codex", "--yolo", "--no-daemon",
-                                      "-c", "check_for_update_on_startup=false"])
+                                      "-c", "check_for_update_on_startup=false",
+                                      "-m", "gpt-6-astra",
+                                      "-c", 'model_reasoning_effort="high"'])
         self.trust.assert_called_once_with("%1", platform="codex")
 
     def test_failed_spawn_is_not_polled(self):
