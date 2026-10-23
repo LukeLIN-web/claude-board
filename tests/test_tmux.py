@@ -225,9 +225,10 @@ class ListPanesTests(unittest.TestCase):
              _patch_run(returncode=0, stdout=out):
             self.assertEqual(tmux.passive_ttys([101]), {"/dev/pts/3"})
 
-    def test_passive_panes_on_the_process_socket_are_found(self):
+    def test_every_pane_on_another_server_is_passive(self):
         # The board uses its private socket, while two helper processes share
-        # another server. Both servers' markers count, with one listing each.
+        # another server: its panes are hidden marked or not, the board's own
+        # only when marked, with one listing each.
         calls = []
         socket = "/tmp/tmux-1/default"
 
@@ -235,17 +236,25 @@ class ListPanesTests(unittest.TestCase):
             calls.append(argv)
             if "-S" in argv:
                 self.assertEqual(argv[argv.index("-S") + 1], socket)
-                return FakeProc(stdout="/dev/pts/9\t1\n")
+                return FakeProc(stdout="/dev/pts/9\n/dev/pts/10\n")
             self.assertEqual(argv[1:3], ["-L", "board"])
-            return FakeProc(stdout="/dev/pts/3\t1\n")
+            return FakeProc(stdout="/dev/pts/3\t1\n/dev/pts/4\t\n")
 
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board"}), \
              mock.patch("pathlib.Path.read_bytes", return_value=
                         f"PATH=/bin\0TMUX={socket},123,0\0".encode()), \
              _patch_run(side_effect=servers):
             self.assertEqual(tmux.passive_ttys([101, 102]),
-                             {"/dev/pts/3", "/dev/pts/9"})
+                             {"/dev/pts/3", "/dev/pts/9", "/dev/pts/10"})
         self.assertEqual(len(calls), 2)
+
+    def test_a_process_on_the_board_server_is_not_foreign(self):
+        own = f"/tmp/tmux-{os.getuid()}/board"
+        with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board", "TMUX_TMPDIR": "/tmp"}), \
+             mock.patch("pathlib.Path.read_bytes", return_value=f"TMUX={own},123,0\0".encode()), \
+             _patch_run(returncode=0, stdout="/dev/pts/3\t\n") as run:
+            self.assertEqual(tmux.passive_ttys([101]), set())
+        self.assertEqual(run.call_count, 1)
 
     def test_unreadable_process_environment_keeps_the_configured_server(self):
         for env in (PermissionError("denied"), b"PATH=/bin\0",

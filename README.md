@@ -79,8 +79,10 @@ appear only when tmux is available.
 > Spawned Claude and Codex sessions run with `--dangerously-skip-permissions` /
 > `--yolo`: everything is auto-approved. Don't spawn in directories you don't trust.
 
-To keep a helper session running without a card, mark its tmux pane on the host
-it runs on. The mark lasts as long as the pane.
+A session in a tmux server other than Fleet's own (`FLEET_TMUX_SOCKET`, or the
+default server) gets no card. To keep a helper on Fleet's own server running
+without a card, mark its tmux pane on the host it runs on. The mark lasts as
+long as the pane.
 
 ```bash
 tmux set-option -p -t %3 @fleet-passive 1     # hide
