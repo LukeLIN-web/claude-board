@@ -11,7 +11,8 @@ sessions would render and none of them would be real.
 
 So each host runs its own board over its own `~/.claude` and its own tmux, and
 one of them aggregates: it polls its peers' `/api/windows` and merges their
-cards in, then forwards per-card actions back to the board that owns them.
+cards (and GPU rows, core/gpus.py) in, then forwards per-card actions back to
+the board that owns them.
 Every action still executes on the machine whose pid it names.
 
 ADDRESSING: a card is identified by `key`, not pid — `"12345"` for a local
@@ -40,6 +41,7 @@ are real sessions, only old.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import socket
@@ -189,6 +191,9 @@ def _poll_once(label: str, base: str) -> None:
         _record_error(label, f"HTTP {status}")
         return
     wins = [_stamp(w, label) for w in payload.get("windows", []) if isinstance(w, dict)]
+    # The peer's GPU sample (core/gpus.py), re-addressed like its cards. A board
+    # too old to send one has no GPU rows.
+    gpus = [dict(g, host=label) for g in payload.get("gpus", []) if isinstance(g, dict)]
     # How old the peer's snapshot already was when it answered (see STALENESS).
     # A board too old to send it counts as fresh on arrival, as before.
     age = payload.get("age")
@@ -197,6 +202,7 @@ def _poll_once(label: str, base: str) -> None:
     with _lock:
         _cache[label] = {
             "windows": wins,
+            "gpus": gpus,
             "ts": time.time(),
             "age": float(age),
             "error": None,
@@ -213,7 +219,7 @@ def _record_error(label: str, msg: str) -> None:
     """Keep the last good windows, only note the failure — a peer that blips
     between polls shouldn't blank its cards. Age is what eventually drops them."""
     with _lock:
-        entry = _cache.setdefault(label, {"windows": [], "ts": 0.0, "age": 0.0})
+        entry = _cache.setdefault(label, {"windows": [], "gpus": [], "ts": 0.0, "age": 0.0})
         entry["error"] = msg
 
 
@@ -238,23 +244,29 @@ def start() -> None:
         t.start()
 
 
-def remote_windows() -> list[dict]:
-    """Every peer's cards, from the last successful poll. Never blocks."""
+def _live_entries() -> list[tuple[dict, bool]]:
+    """(cache entry, stale) for each configured peer that answered within
+    DROP_AFTER, from the last successful poll. Never blocks."""
     now = time.time()
-    out: list[dict] = []
     with _lock:
         entries = {k: dict(v) for k, v in _cache.items()}
-    for label, entry in entries.items():
-        if label not in _peers:
-            continue  # peer removed from the config since it was polled
-        if now - (entry.get("ts") or 0) > DROP_AFTER:
-            continue
-        stale = _data_age(entry, now) > STALE_AFTER
-        for w in entry.get("windows", []):
-            w = dict(w)
-            w["peer_stale"] = stale
-            out.append(w)
-    return out
+    return [(entry, _data_age(entry, now) > STALE_AFTER)
+            for label, entry in entries.items()
+            # a peer removed from the config since it was polled is gone
+            if label in _peers and now - (entry.get("ts") or 0) <= DROP_AFTER]
+
+
+def remote_windows() -> list[dict]:
+    """Every peer's cards."""
+    return [dict(w, peer_stale=stale)
+            for entry, stale in _live_entries() for w in entry.get("windows", [])]
+
+
+def remote_gpus() -> list[dict]:
+    """Every peer's GPU rows, stale when the peer is or its own sampler is.
+    Copies: `gpus.attach` writes card names into them."""
+    return [dict(copy.deepcopy(g), stale=stale or bool(g.get("stale")))
+            for entry, stale in _live_entries() for g in entry.get("gpus", [])]
 
 
 def status() -> list[dict]:

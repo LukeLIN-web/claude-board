@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
+from core import actions, auth, btwcapture, btwlog, codex, gpus, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -283,6 +283,7 @@ def _local_snapshot() -> dict:
         w["host"] = label
         w["key"] = str(w.get("pid"))
     snap["host"] = label
+    snap["gpus"] = gpus.local(label)
     # Capability flag for the UI to gate the tmux-backed controls. `available()`
     # is cached, so this does not spawn a tmux subprocess on every 2s poll.
     snap["tmux_available"] = tmux.available()
@@ -291,8 +292,8 @@ def _local_snapshot() -> dict:
 
 
 def _finalize_snapshot(snap: dict) -> None:
-    """Recompute the header counts over every visible (non-hidden) window and
-    put the cards in display order. Counts go by `triage`, not the raw `status`:
+    """Recompute the header counts over every visible (non-hidden) window, put
+    the cards in display order and name the card behind each GPU process. Counts go by `triage`, not the raw `status`:
     the header chips filter cards on triage, so a session stuck at status=busy
     but idle past the threshold (triage=completed) must land in the idle tally —
     otherwise it inflates "busy" yet vanishes when you click the busy filter.
@@ -313,6 +314,7 @@ def _finalize_snapshot(snap: dict) -> None:
         patrol.TRIAGE_PRIORITY.get(w.get("triage", ""), 99),
         -w.get("updated_at", 0),
     ))
+    gpus.attach(snap)
 
 
 def _enriched_snapshot() -> dict:
@@ -330,6 +332,7 @@ def _enriched_snapshot() -> dict:
     merged = dict(local)
     remote = peers.remote_windows()
     merged["windows"] = list(local["windows"]) + remote
+    merged["gpus"] = local["gpus"] + peers.remote_gpus()
     merged["peers"] = peers.status()
     # The UI gates the tmux controls on one flag. A card whose own host has no
     # tmux still gets buttons; pressing one returns that host's error, which is
@@ -372,6 +375,7 @@ async def _watcher() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     peers.start()
+    gpus.start()
     task = asyncio.create_task(_watcher())
     try:
         yield

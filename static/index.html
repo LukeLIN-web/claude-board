@@ -136,6 +136,51 @@
         </div>
       </div>
     </div>
+    <!-- GPUs: every machine's cards and who is on each (core/gpus.py). A
+         process a board session started names that card, and clicking it opens
+         the card; anything else shows what it runs, the rest on hover. -->
+    <div class="relative" x-show="gpus.length" @click.outside="showGpus = false">
+      <button @click="showGpus = !showGpus"
+              class="text-xs border px-2 py-1 rounded hover:bg-teal-50 transition"
+              :class="showGpus ? 'border-teal-400 text-teal-700 bg-teal-50' : 'border-gray-200 text-gray-600'">
+        GPUs</button>
+      <div x-show="showGpus" x-cloak
+           class="absolute left-0 mt-1 w-[40rem] max-w-[90vw] max-h-[80vh] overflow-y-auto bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-3">
+        <template x-for="h in gpus" :key="h.host">
+          <div class="text-xs" :class="h.stale ? 'opacity-50' : ''">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="font-semibold" x-text="h.host"></span>
+              <span x-show="h.stale" class="text-amber-700"
+                    title="这台机器的 GPU 读数已经一阵没更新了（nvidia-smi 卡住，或它的 board 没在应答）">stale</span>
+              <span x-show="h.waiting.length" class="bg-amber-100 text-amber-800 rounded px-1.5"
+                    :title="h.waiting.map(p => gpuTitle(p)).join('\n\n')"
+                    x-text="h.waiting.length + ' waiting for a card'"></span>
+              <span x-show="h.claims.length" class="bg-slate-100 text-slate-600 rounded px-1.5"
+                    :title="h.claims.map(c => 'CUDA ' + c.cuda.join(',') + ' · ' + gpuTitle(c)).join('\n\n')"
+                    x-text="h.claims.length + ' gpu_wait claims'"></span>
+            </div>
+            <template x-for="c in h.cards" :key="c.index">
+              <div class="flex items-start gap-2 py-0.5 border-t border-gray-100">
+                <span class="w-4 text-right text-gray-500 shrink-0" x-text="c.index"></span>
+                <span class="w-16 shrink-0 text-gray-600" x-text="gpuMem(c)"></span>
+                <span class="w-9 shrink-0 text-right" :class="c.util >= 50 ? 'text-emerald-700' : 'text-gray-400'"
+                      x-text="c.util == null ? '–' : c.util + '%'"></span>
+                <div class="flex flex-wrap gap-1 min-w-0">
+                  <span x-show="!c.procs.length" class="text-gray-300">—</span>
+                  <template x-for="(p, i) in c.procs" :key="i">
+                    <span class="truncate max-w-[20rem] rounded px-1"
+                          :class="p.card ? 'bg-blue-50 text-blue-700 cursor-pointer hover:underline' : 'text-gray-700'"
+                          :title="gpuTitle(p)"
+                          @click="if (p.card) { showGpus = false; toggleExpand(p.card); }"
+                          x-text="gpuLabel(p)"></span>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
     <!-- New session (tmux spawn) — hidden when tmux is unavailable -->
     <div class="relative" x-show="tmuxAvailable" @click.outside="showSpawn = false">
       <button @click="showSpawn = !showSpawn; if (showSpawn) refreshSpawnDirs()"
@@ -399,6 +444,10 @@
           <div class="text-xs text-gray-500 truncate" x-text="w.cwd"></div>
         </div>
         <div class="px-4 pb-2 text-xs space-y-1">
+          <!-- The GPUs (host:index) this session's processes are on, from the
+               GPU rows the snapshot carries (core/gpus.py attach). -->
+          <div x-show="w.gpus?.length" class="text-[10px] font-medium text-teal-800 bg-teal-50 rounded px-1.5 py-0.5 truncate"
+               x-text="'GPU ' + (w.gpus || []).join(' ')"></div>
           <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
           <!-- Latest turn error (codex): the turn died with no reply, so without
                this line the card looks like the session simply never answered -->
@@ -1201,6 +1250,9 @@ function fleet() {
     spawnHost: '',
     spawnOtherDirs: { host: '', paths: [] },
     showUsage: false,
+    // One row per machine with GPUs, from the snapshot (core/gpus.py).
+    gpus: [],
+    showGpus: false,
     // Plan usage per machine and CLI (POST /api/usage):
     // 'host/cli' -> {loading, data, error} or {missing}.
     usage: {},
@@ -1540,6 +1592,7 @@ function fleet() {
       }
       this.peers = snap.peers || [];
       this.hosts = this._hostRows();
+      this.gpus = snap.gpus || [];
       if (this.showUsage) this.loadUsage(true);
       this.counts = snap.counts || this.counts;
       if ('tmux_available' in snap) this.tmuxAvailable = !!snap.tmux_available;
@@ -1660,6 +1713,34 @@ function fleet() {
     },
     // A run's clock as hmz words it (core/hmz.py _clock): 45s, 2m 5s, 1h 12m,
     // 15h, 1d 2h — the largest two units, a zero one dropped.
+    gpuMem(c) {
+      return c.total_mb ? `${Math.round(c.used_mb / 1024)}/${Math.round(c.total_mb / 1024)}G` : 'N/A';
+    },
+    // Who a GPU process is, in a few words: the board card whose session
+    // started it, else what it runs — a model server by model and port, a
+    // script by name.
+    gpuLabel(p) {
+      if (p.card) {
+        const w = this.windows.find(x => x.key === p.card);
+        return w ? (w.name || w.first_input || w.project_name) : p.card;
+      }
+      if (p.pid == null) return 'another container';
+      const argv = p.cmd.split(' <- ').pop().split(/\s+/);
+      const k = argv.indexOf('serve');
+      if (k >= 0) {
+        const port = argv.indexOf('--port');
+        return 'serve ' + (argv[k + 1] || '').replace(/\/+$/, '').split('/').pop()
+          + (port >= 0 ? ' :' + argv[port + 1] : '');
+      }
+      return (argv.find(a => /\.(py|sh)$/.test(a)) || argv[0] || '').split('/').pop();
+    },
+    gpuTitle(p) {
+      if (p.pid == null) return 'a process in another container (its pid is not visible here)';
+      return [p.cmd, p.cwd && 'cwd ' + p.cwd,
+              p.started_at && 'started ' + this.runClock(Date.now() / 1000 - p.started_at) + ' ago',
+              p.ssh_from && 'over ssh from ' + p.ssh_from,
+              p.used_mb != null && p.used_mb + ' MiB'].filter(Boolean).join('\n');
+    },
     runClock(seconds) {
       const s = Math.floor(seconds);
       for (const [big, small, b, l] of [[86400, 3600, 'd', 'h'], [3600, 60, 'h', 'm'], [60, 1, 'm', 's']]) {

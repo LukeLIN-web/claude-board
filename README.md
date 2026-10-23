@@ -133,6 +133,16 @@ then `scripts/peer-tunnel.sh start` and `bash run.sh restart`. `FLEET_API_TOKEN`
 from the shared `.env.local` gets through the peers' password gate. Search,
 History, Skills and Memory show the aggregating host only.
 
+### GPUs
+
+Each board reads its own host's `nvidia-smi` every 15 s. **GPUs** in the header
+lists every machine's cards with what is on each, and a card whose session
+started a process on a GPU says which (`GPU b:3`); `/api/windows` carries the
+same rows as `gpus`, for scripts deciding who gets which card. To also show
+the claims and the queue of jobs waiting for a card through `gpu_wait.py`, set
+`FLEET_GPU_LOCK_DIR` to its lock directory. A machine whose jobs you want on
+the page needs a board even with no sessions of its own.
+
 ## Acknowledgements
 
 - [HarnessKit](https://github.com/RealZST/HarnessKit) — UI reference for cross-platform skill management

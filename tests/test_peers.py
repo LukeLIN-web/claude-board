@@ -201,7 +201,7 @@ class MergeTests(unittest.TestCase):
         local = {
             "windows": [{"pid": 1, "key": "1", "host": "a", "triage": "completed",
                          "updated_at": 10}],
-            "counts": {}, "ts": 0, "tmux_available": True, "host": "a",
+            "gpus": [], "counts": {}, "ts": 0, "tmux_available": True, "host": "a",
         }
         remote = [{"pid": 1, "key": "b:1", "host": "b", "triage": "waiting_perm",
                    "updated_at": 5, "peer_stale": False}]
@@ -221,7 +221,7 @@ class MergeTests(unittest.TestCase):
         would feed a peer its own cards back."""
         local = {"windows": [{"pid": 1, "key": "1", "host": "a", "triage": "completed",
                               "updated_at": 10}],
-                 "counts": {}, "ts": 0, "tmux_available": True, "host": "a"}
+                 "gpus": [], "counts": {}, "ts": 0, "tmux_available": True, "host": "a"}
         remote = [{"pid": 9, "key": "b:9", "host": "b", "triage": "working",
                    "updated_at": 11}]
         with mock.patch.object(appmod, "_local_snapshot", return_value=local), \
