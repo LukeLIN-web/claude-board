@@ -4,7 +4,6 @@ and the join onto board cards.
 nvidia-smi is stubbed at `core.gpus._smi`; everything else is real — the
 processes are real children of the test, the claim locks are real flocks.
 """
-import fcntl
 import os
 import subprocess
 import sys
@@ -62,30 +61,35 @@ class SampleTests(unittest.TestCase):
             self.assertEqual(gpus.local("a"), [])
 
     def test_claims_and_waiters_follow_the_gpu_wait_locks(self):
-        """A held lock is a claim, one per claiming pid with every ordinal it
+        """A held lock is a claim, one per holding pid with every ordinal it
         holds; a lock nobody holds is a finished claim; a gpu_wait.py with no
-        claim is still waiting."""
+        claim is still waiting. The holder is whoever holds the flock: a
+        process that flocks a file someone else wrote is named by its own
+        command, not by the stale note inside."""
         tool = scratch_dir() / "gpu_wait.py"
-        tool.write_text("import time; time.sleep(30)\n")
-        claimed = _spawn([sys.executable, str(tool), "--need-gb", "20", "--", "python", "job.py"])
-        waiter = _spawn([sys.executable, str(tool), "--need-gb", "40"])
-        self.procs += [claimed, waiter]
+        tool.write_text("import fcntl, os, sys, time\n"
+                        "fds = [os.open(a, os.O_RDWR) for a in sys.argv[1:] if a.endswith('.lock')]\n"
+                        "[fcntl.flock(fd, fcntl.LOCK_EX) for fd in fds]\n"
+                        "time.sleep(30)\n")
         locks = scratch_dir()
-        held = []
-        for name, note in [("gpu2.lock", f"pid={claimed.pid} slots=3 python job.py"),
-                           ("gpu3.s1.lock", f"pid={claimed.pid} slots=3 python job.py"),
-                           ("gpu5.lock", "pid=1 python finished.py")]:
-            (locks / name).write_text(note + "\n")
-            if name != "gpu5.lock":
-                fd = os.open(locks / name, os.O_RDWR)
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                held.append(fd)
-        self.addCleanup(lambda: [os.close(fd) for fd in held])
+        for name in ["gpu2.lock", "gpu3.s1.lock", "gpu5.lock", "gpu6.lock"]:
+            (locks / name).write_text("pid=1 python finished.py\n")
+        claimed = _spawn([sys.executable, str(tool), str(locks / "gpu2.lock"), str(locks / "gpu3.s1.lock"),
+                          "--", "python", "job.py"])
+        for name in ["gpu2.lock", "gpu3.s1.lock"]:
+            (locks / name).write_text(f"pid={claimed.pid} slots=3 python job.py\n")
+        foreign = _spawn([sys.executable, "-c", "import fcntl, os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR); "
+                          "fcntl.flock(fd, fcntl.LOCK_EX); time.sleep(30)", str(locks / "gpu5.lock")])
+        waiter = _spawn([sys.executable, str(tool), "--need-gb", "40"])
+        self.procs += [claimed, foreign, waiter]
         with mock.patch.object(gpus, "_smi", side_effect=_smi_stub([])), \
              mock.patch.dict(os.environ, {"FLEET_GPU_LOCK_DIR": str(locks)}):
             s = gpus.sample()
-        (claim,) = s["claims"]
-        self.assertEqual((claim["pid"], claim["cuda"], claim["cmd"]), (claimed.pid, [2, 3], "python job.py"))
+        claims = {c["pid"]: c for c in s["claims"]}
+        self.assertEqual(sorted(claims), sorted([claimed.pid, foreign.pid]))
+        self.assertEqual((claims[claimed.pid]["cuda"], claims[claimed.pid]["cmd"]), ([2, 3], "python job.py"))
+        self.assertEqual(claims[foreign.pid]["cuda"], [5])
+        self.assertNotIn("finished.py", claims[foreign.pid]["cmd"])
         # the machine running the tests may have gpu_wait.py processes of its own
         ours = [w["pid"] for w in s["waiting"] if w["pid"] in (claimed.pid, waiter.pid)]
         self.assertEqual(ours, [waiter.pid])

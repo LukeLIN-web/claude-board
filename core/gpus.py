@@ -18,6 +18,9 @@ FLEET_GPU_LOCK_DIR to its lock directory. gpu_wait claims a card by holding a
 flock on gpu<N>.lock (further slots of a shared card: gpu<N>.s<K>.lock), N the
 CUDA ordinal, with "pid=<pid> …" and the command written inside. Each sample
 then lists the held claims and the gpu_wait.py processes still waiting for one.
+The holder is the pid the kernel lists for the flock, not the pid written in
+the file: another tool can flock the same file without rewriting it, and the
+note left inside then names an earlier holder long gone.
 A CUDA ordinal is not the nvidia-smi index on a box with a card CUDA can't see,
 so claims are listed beside the cards rather than placed on one.
 
@@ -101,29 +104,31 @@ def _proc(pid: int, boot: float) -> dict:
 
 
 def _claims(lock_dir: str, boot: float) -> list[dict]:
-    """Held gpu_wait claims, one per claiming process, with the CUDA ordinals it
+    """Held gpu_wait claims, one per holding process, with the CUDA ordinals it
     holds. The kernel drops a flock when its last holder dies, so a lock file
-    nobody holds is a finished claim, not a live one."""
-    held = set()
+    nobody holds is a finished claim, not a live one. The note inside names the
+    job only when its holder wrote it."""
+    holder = {}
     with open("/proc/locks") as f:
         for line in f:
             parts = line.split()
             if len(parts) > 5 and parts[1] == "FLOCK":
-                held.add(parts[5])  # maj:min:inode of the locked file
+                holder[parts[5]] = int(parts[4])  # maj:min:inode of the locked file -> pid
     by_pid: dict[int, dict] = {}
     for name in sorted(os.listdir(lock_dir)):
         m = _CLAIM.match(name)
+        if not m:
+            continue
         path = os.path.join(lock_dir, name)
         st = os.stat(path)
-        if not m or f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}" not in held:
+        pid = holder.get(f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}")
+        if pid is None:
             continue
         with open(path, errors="replace") as f:
             words = f.read(CMD_CHARS).split()
-        if not words or not words[0].startswith("pid="):
-            continue
-        pid = int(words[0][4:])
-        note = " ".join(w for w in words[1:] if not w.startswith("slots="))
-        claim = by_pid.setdefault(pid, dict(_proc(pid, boot), cuda=[], cmd=note))
+        claim = by_pid.setdefault(pid, dict(_proc(pid, boot), cuda=[]))
+        if words and words[0] == f"pid={pid}":
+            claim["cmd"] = " ".join(w for w in words[1:] if not w.startswith("slots="))
         claim["cuda"] = sorted(set(claim["cuda"]) | {int(m.group(1))})
     return list(by_pid.values())
 
