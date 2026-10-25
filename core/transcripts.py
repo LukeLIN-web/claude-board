@@ -6,9 +6,10 @@ import json
 import os
 import re
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -29,6 +30,12 @@ _CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL
 # board has no /config, so on a card it's just a line of noise repeated on every
 # recap.
 _RECAP_HINT_RE = re.compile(r"\s*\(\s*disable recaps in /config\s*\)\s*$")
+
+
+def _recap_text(d: dict) -> str:
+    """An `away_summary` row's recap, minus the config hint."""
+    return _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
+
 
 # Envelopes the CLI writes into a `user` turn that nobody typed, and that carry
 # no `isMeta` — so the text is the only marker there is. `<task-notification>` is
@@ -324,7 +331,7 @@ def _iter_lines(path: Path) -> Iterable[dict]:
     try:
         with path.open() as f:
             yield from _parse_rows(f)
-    except FileNotFoundError:
+    except OSError:
         return
 
 
@@ -383,6 +390,14 @@ def _tool_uses(d: dict) -> Iterator[tuple[str, dict, dict]]:
             yield c.get("name", ""), c.get("input") or {}, c
 
 
+def _memory_name(file_path: str) -> Optional[str]:
+    """The memory a Read/Write/Edit of `file_path` touches, or None if it's no
+    memory file."""
+    if "/memory/" not in file_path:
+        return None
+    return file_path.rsplit("/", 1)[-1].replace(".md", "")
+
+
 def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
     out: list[TurnEvent] = []
     content = msg.get("content") or []
@@ -406,8 +421,8 @@ def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
                     ts, "skill_invoke", "", skill_name, "assistant",
                     {"args": cap_text(inp.get("args"), TOOL_ARG_CHARS)},
                 ))
-            elif tool_name in ("Read", "Write", "Edit") and "/memory/" in file_path:
-                mem_name = file_path.rsplit("/", 1)[-1].replace(".md", "")
+            elif (tool_name in ("Read", "Write", "Edit")
+                  and (mem_name := _memory_name(file_path)) is not None):
                 kind = "memory_write" if tool_name in ("Write", "Edit") else "memory_read"
                 out.append(TurnEvent(
                     ts, kind, "", mem_name, "assistant",
@@ -471,9 +486,6 @@ def _flatten_assistant(msg: dict, ts: str) -> list[TurnEvent]:
                     if len(preview) >= 6:
                         break
                 out.append(TurnEvent(ts, "tool_use", "", tool_name, "assistant", preview))
-        elif ct == "thinking":
-            # Skip thinking — too noisy for dashboard.
-            continue
     return out
 
 
@@ -587,7 +599,7 @@ def _flatten_recap(d: dict) -> list[TurnEvent]:
     the turn it sits in, and the client styles it as the standing "where we are"
     rather than as another reply.
     """
-    text = _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
+    text = _recap_text(d)
     if not text:
         return []
     return [TurnEvent(
@@ -656,8 +668,7 @@ class _SessionGoal:
     def step(self, d: dict) -> None:
         t = d.get("type")
         if t == "system" and d.get("subtype") == "away_summary":
-            content = _RECAP_HINT_RE.sub("", d.get("content") or "").strip()
-            m = _GOAL_RE.match(content)
+            m = _GOAL_RE.match(_recap_text(d))
             if m:
                 self._offer(m.group(1), d.get("timestamp", ""), "recap")
             return
@@ -1119,11 +1130,11 @@ class _SessionActivity:
     """
 
     def __init__(self) -> None:
-        self.invokes: dict[str, int] = {}
-        self.skill_reads: dict[str, int] = {}
-        self.skill_writes: dict[str, int] = {}
-        self.bash_refs: dict[str, int] = {}
-        self.mem_counts: dict[str, dict[str, int]] = {"Read": {}, "Write": {}, "Edit": {}}
+        self.invokes: Counter[str] = Counter()
+        self.skill_reads: Counter[str] = Counter()
+        self.skill_writes: Counter[str] = Counter()
+        self.bash_refs: Counter[str] = Counter()
+        self.mem_counts = {"Read": Counter(), "Write": Counter(), "Edit": Counter()}
         self.mem_ops: list[dict] = []
         self.seen: set[tuple[str, str]] = set()
 
@@ -1132,21 +1143,17 @@ class _SessionActivity:
             if name == "Skill":
                 sk = inp.get("skill", "")
                 if sk:
-                    self.invokes[sk] = self.invokes.get(sk, 0) + 1
+                    self.invokes[sk] += 1
 
             elif name in ("Read", "Write", "Edit"):
                 fp = str(inp.get("file_path", ""))
                 m = _SKILL_PATH_RE.search(fp)
                 if m:
-                    counts = self.skill_reads if name == "Read" else self.skill_writes
-                    counts[m.group(1)] = counts.get(m.group(1), 0) + 1
-                if "/memory/" not in fp:
+                    (self.skill_reads if name == "Read" else self.skill_writes)[m.group(1)] += 1
+                mem_name = _memory_name(fp)
+                if mem_name is None or mem_name == "MEMORY":
                     continue
-                mem_name = fp.rsplit("/", 1)[-1].replace(".md", "")
-                if mem_name == "MEMORY":
-                    continue
-                counts = self.mem_counts[name]
-                counts[mem_name] = counts.get(mem_name, 0) + 1
+                self.mem_counts[name][mem_name] += 1
                 key = (mem_name, name.lower())
                 if key in self.seen:
                     continue
@@ -1165,8 +1172,7 @@ class _SessionActivity:
             elif name == "Bash":
                 cmd = str(inp.get("command", ""))
                 if "skills/" in cmd or "SKILL.md" in cmd:
-                    for sk in set(_SKILL_PATH_RE.findall(cmd)) or ("_general",):
-                        self.bash_refs[sk] = self.bash_refs.get(sk, 0) + 1
+                    self.bash_refs.update(set(_SKILL_PATH_RE.findall(cmd)) or ("_general",))
 
     def result(self) -> dict:
         return {
@@ -1398,18 +1404,12 @@ def _cleared_at(path: Path) -> float:
 
     A cleared transcript starts with the command itself, after the caveat row
     that goes ahead of every local command; the first other user row decides."""
-    try:
-        with path.open() as f:
-            for i, d in enumerate(_parse_rows(f)):
-                if i >= 20:
-                    break
-                if d.get("type") != "user" or d.get("isMeta"):
-                    continue
-                content = (d.get("message") or {}).get("content")
-                m = _CMD_NAME_RE.search(content) if isinstance(content, str) else None
-                return _parse_ts(d.get("timestamp", "")) if m and m.group(1) == "/clear" else 0.0
-    except OSError:
-        pass
+    for d in islice(_iter_lines(path), 20):
+        if d.get("type") != "user" or d.get("isMeta"):
+            continue
+        content = (d.get("message") or {}).get("content")
+        m = _CMD_NAME_RE.search(content) if isinstance(content, str) else None
+        return _parse_ts(d.get("timestamp", "")) if m and m.group(1) == "/clear" else 0.0
     return 0.0
 
 
@@ -1418,16 +1418,10 @@ def _root_session(path: Path) -> str:
     """The `session_id` the rows carry: the session the process started as, the
     same on every transcript it clears into. "" when none of the first rows has it.
     """
-    try:
-        with open(path) as f:
-            for i, d in enumerate(_parse_rows(f)):
-                if i >= 200:
-                    break
-                sid = d.get("session_id")
-                if isinstance(sid, str) and sid:
-                    return sid
-    except OSError:
-        pass
+    for d in islice(_iter_lines(path), 200):
+        sid = d.get("session_id")
+        if isinstance(sid, str) and sid:
+            return sid
     return ""
 
 
@@ -1515,8 +1509,8 @@ class _PlanHistory:
 
     def __init__(self) -> None:
         self.history: list[dict] = []
-        self.write_count: dict[str, int] = {}
-        self.edit_count: dict[str, int] = {}
+        self.write_count: Counter[str] = Counter()
+        self.edit_count: Counter[str] = Counter()
 
     def step(self, d: dict) -> None:
         ts = d.get("timestamp") or ""
@@ -1528,30 +1522,26 @@ class _PlanHistory:
                 continue
             plan_name = fp.rsplit("/", 1)[-1]
             if tool_name == "Write":
-                self.write_count[plan_name] = self.write_count.get(plan_name, 0) + 1
+                self.write_count[plan_name] += 1
                 self.edit_count[plan_name] = 0
-                vn = self.write_count[plan_name]
                 self.history.append({
                     "ts": ts,
                     "plan_file": plan_name,
                     "operation": "write",
-                    "version_label": f"v{vn}",
+                    "version_label": f"v{self.write_count[plan_name]}",
                     "content": inp.get("content", ""),
                     "diff": None,
                 })
             else:
-                vn = self.write_count.get(plan_name, 0)
-                self.edit_count[plan_name] = self.edit_count.get(plan_name, 0) + 1
-                en = self.edit_count[plan_name]
-                old_s = inp.get("old_string", "")
-                new_s = inp.get("new_string", "")
+                self.edit_count[plan_name] += 1
                 self.history.append({
                     "ts": ts,
                     "plan_file": plan_name,
                     "operation": "edit",
-                    "version_label": f"v{vn}.{en}",
+                    "version_label": f"v{self.write_count[plan_name]}.{self.edit_count[plan_name]}",
                     "content": None,
-                    "diff": {"old": old_s[:2000], "new": new_s[:2000]},
+                    "diff": {"old": inp.get("old_string", "")[:2000],
+                             "new": inp.get("new_string", "")[:2000]},
                 })
 
     def result(self) -> list[dict]:

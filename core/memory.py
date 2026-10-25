@@ -5,7 +5,6 @@ the same kind of block."""
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Optional
 
 from .sessions import PROJECTS_DIR
@@ -109,19 +108,14 @@ def split_frontmatter(text: str) -> tuple[dict, str]:
     return _parse_frontmatter(m.group(1)), text[m.end():].strip()
 
 
-def find_memory(name: str) -> Optional[Path]:
-    """The memory file `name` (its file stem), in the first project that has one."""
+def memory_detail(name: str) -> Optional[dict]:
+    """The memory file `name` (its file stem), from the first project that has
+    one, read whole; None if none does."""
     for proj_dir in PROJECTS_DIR.iterdir():
         f = proj_dir / "memory" / f"{name}.md"
         if f.exists():
-            return f
-    return None
-
-
-def memory_detail(name: str) -> Optional[dict]:
-    """The memory file `name` (see find_memory), read whole, or None."""
-    f = find_memory(name)
-    if not f:
+            break
+    else:
         return None
     fm, body = split_frontmatter(f.read_text(errors="replace"))
     return {
@@ -138,18 +132,12 @@ def list_memories(project_slug: Optional[str] = None) -> dict:
     if not PROJECTS_DIR.exists():
         return {"groups": {}, "total": 0}
 
-    if project_slug:
-        dirs = [PROJECTS_DIR / project_slug / "memory"]
-    else:
-        dirs = []
-        for d in PROJECTS_DIR.iterdir():
-            mem_dir = d / "memory"
-            if mem_dir.is_dir():
-                dirs.append(mem_dir)
-
-    memories: list[dict] = []
-    for mem_dir in dirs:
-        if not mem_dir.exists():
+    projects = [PROJECTS_DIR / project_slug] if project_slug else PROJECTS_DIR.iterdir()
+    groups: dict[str, list[dict]] = {}
+    total = 0
+    for proj_dir in projects:
+        mem_dir = proj_dir / "memory"
+        if not mem_dir.is_dir():
             continue
         # Parse MEMORY.md index: any memory referenced there is implicitly
         # loaded into every session's system prompt (so explicit-read count
@@ -163,23 +151,20 @@ def list_memories(project_slug: Optional[str] = None) -> dict:
             except Exception:
                 continue
             fm, body = split_frontmatter(text)
-            memories.append({
+            mem_type = fm.get("type", "unknown")
+            groups.setdefault(mem_type, []).append({
                 "name": fm.get("name", f.stem),
                 "file_stem": f.stem,
                 "description": fm.get("description", ""),
-                "type": fm.get("type", "unknown"),
+                "type": mem_type,
                 "path": str(f),
                 "content_preview": body[:500],
-                "project_slug": mem_dir.parent.name,
+                "project_slug": proj_dir.name,
                 "in_memory_index": f.stem in index_names,
             })
+            total += 1
 
-    groups: dict[str, list[dict]] = {}
-    for m in memories:
-        t = m["type"]
-        groups.setdefault(t, []).append(m)
-
-    return {"groups": groups, "total": len(memories)}
+    return {"groups": groups, "total": total}
 
 
 def _parse_memory_index(index_path) -> set:
@@ -187,12 +172,9 @@ def _parse_memory_index(index_path) -> set:
     Any memory in this index is implicitly loaded into every session's
     system prompt by the harness.
     """
-    names: set[str] = set()
     try:
         text = index_path.read_text(errors="replace")
     except Exception:
-        return names
+        return set()
     # Match patterns like `memory/foo.md`, `(foo.md)`, `[foo](foo.md)`, etc
-    for m in re.finditer(r'([A-Za-z0-9_-]+)\.md', text):
-        names.add(m.group(1))
-    return names
+    return {m.group(1) for m in re.finditer(r'([A-Za-z0-9_-]+)\.md', text)}

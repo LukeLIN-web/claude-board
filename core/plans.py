@@ -28,29 +28,21 @@ def plan_for_session(
     name_hint: Optional[str],
     transcript_path: Optional[str] = None,
 ) -> Optional[dict]:
-    # 1. Exact slug match on session name
-    if name_hint:
-        plan = read_plan_by_name(name_hint)
+    # 1. The plan named after the session. A file stem, never a path: session
+    # names are free text, and one with a slash in it must not reach outside the
+    # plans directory.
+    if name_hint and "/" not in name_hint:
+        plan = _read_plan(PLANS_DIR / f"{name_hint}.md")
         if plan:
             return plan
-
-    # 2. Extract from transcript: find the last plan file this session wrote/edited
-    if transcript_path:
-        return _plan_from_transcript(transcript_path)
-    return None
+    # 2. The last plan file this session wrote or edited, if it's still there.
+    history = extract_plan_history(transcript_path) if transcript_path else []
+    return _read_plan(PLANS_DIR / history[-1]["plan_file"]) if history else None
 
 
-def _plan_from_transcript(transcript_path: str) -> Optional[dict]:
-    """Find the last plan file written/edited by this session, if it's still
-    in the plans directory."""
-    history = extract_plan_history(transcript_path)
-    if not history:
+def _read_plan(f: Path) -> Optional[dict]:
+    if not f.exists():
         return None
-    f = PLANS_DIR / history[-1]["plan_file"]
-    return _read_plan(f) if f.exists() else None
-
-
-def _read_plan(f: Path) -> dict:
     try:
         text = f.read_text(errors="replace")
     except Exception:
@@ -61,14 +53,3 @@ def _read_plan(f: Path) -> dict:
         "mtime": int(f.stat().st_mtime * 1000),
         "content": text,
     }
-
-
-def read_plan_by_name(name: str) -> Optional[dict]:
-    # A file stem, never a path: session names are free text, and one with a
-    # slash in it must not reach outside the plans directory.
-    if "/" in name:
-        return None
-    f = PLANS_DIR / f"{name}.md"
-    if not f.exists():
-        return None
-    return _read_plan(f)
