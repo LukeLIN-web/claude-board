@@ -121,12 +121,6 @@ def _extract_type_label(d: dict) -> str:
     return t or "unknown"
 
 
-def _detect_platform(path: Path) -> str:
-    if str(CODEX_SESSIONS_DIR) in str(path):
-        return "codex"
-    return "claude"
-
-
 def _row(raw: str) -> dict:
     try:
         d = json.loads(raw)
@@ -138,7 +132,7 @@ def _row(raw: str) -> dict:
 def _file_hits(path: Path, lines: dict[int, str], matched: list[int], query: str) -> list[dict]:
     """One file's hits, from the lines rg printed for it: each match plus the
     context around it."""
-    platform = _detect_platform(path)
+    platform = "codex" if str(CODEX_SESSIONS_DIR) in str(path) else "claude"
     rows = {n: _row(raw) for n, raw in lines.items()}
     hits: list[dict] = []
     for line_no in matched:

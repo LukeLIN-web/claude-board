@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from .codex import CODEX_HOME
 from .memory import split_frontmatter
@@ -35,45 +35,36 @@ def _parse_skill_md(path: Path) -> Optional[dict]:
     return {"name": name, "description": description[:200], "path": str(path)}
 
 
-def list_all_skills() -> list[dict]:
-    skills: list[dict] = []
-    seen_names: set[str] = set()
-
-    # Claude Code skills
+def _skill_dirs() -> Iterator[tuple[Path, str]]:
+    """Each directory that may hold a skill, with its origin: Claude Code's,
+    then Codex's (user-installed, and the built-ins under `.system`)."""
     if SKILLS_DIR.exists():
         for d in sorted(SKILLS_DIR.iterdir()):
-            if not d.is_dir() or d.name.startswith("."):
-                continue
-            skill_md = d / "SKILL.md"
-            if not skill_md.exists():
-                continue
-            info = _parse_skill_md(skill_md)
-            if info:
-                info["origin"] = "claude"
-                info["is_system"] = False
-                skills.append(info)
-                seen_names.add(info["name"])
-
-    # Codex skills (user-installed + .system built-ins)
+            if d.is_dir() and not d.name.startswith("."):
+                yield d, "claude"
     if CODEX_SKILLS_DIR.exists():
         for d in sorted(CODEX_SKILLS_DIR.iterdir()):
             if not d.is_dir():
                 continue
-            is_system = d.name == ".system"
-            sub_dirs = [d] if not is_system else [x for x in d.iterdir() if x.is_dir()]
-            for sd in sub_dirs:
-                skill_md = sd / "SKILL.md"
-                if not skill_md.exists():
-                    continue
-                info = _parse_skill_md(skill_md)
-                if not info:
-                    continue
-                if info["name"] in seen_names:
-                    # Already covered by Claude side; don't double-list
-                    continue
-                info["origin"] = "codex-system" if is_system else "codex"
-                info["is_system"] = is_system
-                skills.append(info)
-                seen_names.add(info["name"])
+            if d.name == ".system":
+                yield from ((sd, "codex-system") for sd in d.iterdir() if sd.is_dir())
+            else:
+                yield d, "codex"
 
+
+def list_all_skills() -> list[dict]:
+    """Every skill once: a name listed already (Claude Code's first) is not
+    listed again."""
+    skills: list[dict] = []
+    seen_names: set[str] = set()
+    for d, origin in _skill_dirs():
+        skill_md = d / "SKILL.md"
+        if d.name in seen_names or not skill_md.exists():
+            continue
+        info = _parse_skill_md(skill_md)
+        if info:
+            info["origin"] = origin
+            info["is_system"] = origin == "codex-system"
+            skills.append(info)
+            seen_names.add(d.name)
     return skills
