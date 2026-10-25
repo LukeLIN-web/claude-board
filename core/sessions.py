@@ -174,6 +174,15 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def proc_environ(pid: int) -> dict[str, str]:
+    """The environment `pid` was started with, or {} where it can't be read."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return {}
+    return dict(kv.decode(errors="replace").split("=", 1) for kv in env if b"=" in kv)
+
+
 def _ps_tty(raw: str) -> Optional[str]:
     """The device a `ps` tty column names, or None for a process with no
     controlling terminal ("?", "??") — a background job, not a window."""

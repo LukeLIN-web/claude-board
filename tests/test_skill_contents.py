@@ -1,4 +1,4 @@
-"""extract_skill_contents: what a Skill call loaded, read off the meta row
+"""session_activity skill_contents: what a Skill call loaded, read off the meta row
 that names the call — even when the call is far behind the timeline's tail."""
 import unittest
 
@@ -25,7 +25,7 @@ class SkillContentsTests(unittest.TestCase):
             _skill("b", "review"), _loaded("b", "Review body"),
             _skill("c", "design"), _loaded("c", "Design body, again"),
         ])
-        self.assertEqual(transcripts.extract_skill_contents(f),
+        self.assertEqual(transcripts.session_activity(f)["skill_contents"],
                          {"design": "Design body", "review": "Review body"})
 
     def test_a_call_that_loaded_nothing_has_no_body(self):
@@ -35,8 +35,8 @@ class SkillContentsTests(unittest.TestCase):
             _skill("a", "update-config"), user_row("Error: denied"),
             _loaded("z", "unrelated"),
         ])
-        self.assertEqual(transcripts.extract_skill_contents(f), {})
-        self.assertEqual(transcripts.extract_skills_used(f), ["update-config"])
+        self.assertEqual(transcripts.session_activity(f)["skill_contents"], {})
+        self.assertEqual(transcripts.session_activity(f)["skills_used"], ["update-config"])
 
 
 if __name__ == "__main__":

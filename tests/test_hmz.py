@@ -906,12 +906,12 @@ class TestSpending(unittest.TestCase):
     def test_the_machines_directory_is_in_hmzs_temporary_one(self):
         tmp = scratch_dir()
         uid = f"humanize-{os.getuid()}"
-        with mock.patch.object(hmz, "_environ", return_value={"TMPDIR": str(tmp)}):
+        with mock.patch.object(hmz, "proc_environ", return_value={"TMPDIR": str(tmp)}):
             self.assertEqual(hmz._machine(7), tmp / uid)
-        with mock.patch.object(hmz, "_environ", return_value={"TMPDIR": str(tmp / "gone"),
+        with mock.patch.object(hmz, "proc_environ", return_value={"TMPDIR": str(tmp / "gone"),
                                                               "TMP": str(tmp)}):
             self.assertEqual(hmz._machine(7), tmp / uid)
-        with mock.patch.object(hmz, "_environ", return_value={}):
+        with mock.patch.object(hmz, "proc_environ", return_value={}):
             self.assertEqual(hmz._machine(7), hmz.Path("/tmp") / uid)
 
     def test_money_and_counts_as_hmz_writes_them(self):

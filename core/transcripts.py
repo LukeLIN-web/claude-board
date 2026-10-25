@@ -1211,21 +1211,6 @@ class _SessionActivity:
 session_activity = fold_by_file(_SessionActivity)
 
 
-def extract_skills_used(path: str | Path) -> list[str]:
-    """Unique skill names invoked via the Skill tool, first use first."""
-    return session_activity(path)["skills_used"]
-
-
-def extract_skill_contents(path: str | Path) -> dict[str, str]:
-    """{skill name: the text its first Skill-tool invocation loaded}."""
-    return session_activity(path)["skill_contents"]
-
-
-def extract_memory_ops(path: str | Path) -> list[dict]:
-    """Unique memory file operations: [{name, operation, content_preview?}]."""
-    return session_activity(path)["memory_ops"]
-
-
 # The two task-notification fields the ledger below keys on (status and summary
 # are already parsed above, for rendering the row). <task-id> is the only field
 # every row for a task carries — the final "finished" notification can omit

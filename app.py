@@ -177,8 +177,8 @@ def _local_snapshot() -> dict:
             # here once the session replies on the new model, which is the point:
             # the card can't claim a switch the session never actually made.
             w["model"] = transcripts.current_model(tp)
-            w["skills_used"] = transcripts.extract_skills_used(tp)
-            w["memory_ops"] = transcripts.extract_memory_ops(tp)
+            act = transcripts.session_activity(tp)
+            w["skills_used"], w["memory_ops"] = act["skills_used"], act["memory_ops"]
             # From the process's start: work launched before a /clear is still
             # out, in the transcripts the session cleared out of.
             w["background_tasks"] = transcripts.extract_background_tasks(
@@ -469,10 +469,11 @@ def _claude_panels(tp: str) -> dict:
     if not tp:
         return {"skills_used": [], "skill_contents": {}, "memory_ops": [], "plan_history": [],
                 "goal": None, "loop": None}
+    act = transcripts.session_activity(tp)
     return {
-        "skills_used": transcripts.extract_skills_used(tp),
-        "skill_contents": transcripts.extract_skill_contents(tp),
-        "memory_ops": transcripts.extract_memory_ops(tp),
+        "skills_used": act["skills_used"],
+        "skill_contents": act["skill_contents"],
+        "memory_ops": act["memory_ops"],
         "plan_history": transcripts.extract_plan_history(tp),
         # The session's standing goal, pinned above the timeline so it stays put
         # while the events that stated it scroll away.

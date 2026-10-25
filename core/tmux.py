@@ -14,8 +14,9 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Callable, Optional
+
+from .sessions import proc_environ
 
 _TIMEOUT = 10
 # Availability is probed at most once per this many seconds so the 2s dashboard
@@ -322,10 +323,8 @@ def passive_ttys(pids: list[int]) -> set[str]:
     foreign: set[str] = set()
     for pid in pids:
         try:
-            entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-            value = next(e[5:] for e in entries if e.startswith(b"TMUX="))
-            socket_path, _, _ = os.fsdecode(value).rsplit(",", 2)
-        except (OSError, StopIteration, ValueError):
+            socket_path, _, _ = proc_environ(pid)["TMUX"].rsplit(",", 2)
+        except (KeyError, ValueError):
             continue
         if os.path.isabs(socket_path) and os.path.realpath(socket_path) != own:
             foreign.add(socket_path)

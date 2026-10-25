@@ -61,7 +61,7 @@ from typing import Callable, Optional
 
 from . import codex, patrol, tmux, transcripts
 from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
-                       _proc_cwd, _proc_start_ms, _ps_tty, proc_table)
+                       _proc_cwd, _proc_start_ms, _ps_tty, proc_environ, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
 
 HMZ_HOME = HOME_BASE / ".hmz"
@@ -117,18 +117,9 @@ def _is_interactive_hmz(args: str) -> bool:
     return False
 
 
-def _environ(pid: int) -> dict[str, str]:
-    """The environment hmz `pid` was started with, or {} where it can't be read."""
-    try:
-        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return {}
-    return dict(kv.decode(errors="replace").split("=", 1) for kv in env if b"=" in kv)
-
-
 def _home(pid: int) -> Path:
     """Where hmz `pid` keeps its runs and its history."""
-    v = _environ(pid).get("HUMANIZE_HOME")
+    v = proc_environ(pid).get("HUMANIZE_HOME")
     return Path(v) if v else _default_home()
 
 
@@ -191,7 +182,7 @@ def _machine(pid: int) -> Path:
     `machine()` has it: humanize-<uid> in its temporary directory — the first
     of $TMPDIR, $TEMP and $TMP that is a directory, else /tmp, as Python's
     tempfile looks for one."""
-    env = _environ(pid)
+    env = proc_environ(pid)
     tmp = next((v for v in (env.get(k) for k in ("TMPDIR", "TEMP", "TMP"))
                 if v and os.path.isdir(v)), "/tmp")
     return Path(tmp) / f"humanize-{os.getuid()}"
