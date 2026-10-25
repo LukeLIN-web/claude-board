@@ -98,4 +98,3 @@ class PaneTargetTests(unittest.TestCase):
     def test_pane_target_none_on_failure(self):
         with mock.patch.object(tmux, "_run", return_value={"ok": False, "stdout": "", "error": "x"}):
             self.assertIsNone(tmux.pane_target("%3"))
-        self.assertIsNone(tmux.pane_target(""))

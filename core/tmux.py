@@ -156,17 +156,6 @@ def private_server(name: str):
 _VENV_MARKER_VARS = ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "PYTHONHOME")
 
 
-def _venv_unset_prefix() -> list[str]:
-    """`env -u …` argv prefix that strips the board's venv markers from a pane
-    command. Empty when the board isn't running inside a venv (nothing to strip)."""
-    if not _venv_bin_dirs():
-        return []
-    prefix = ["env"]
-    for v in _VENV_MARKER_VARS:
-        prefix += ["-u", v]
-    return prefix
-
-
 # Where a user-installed CLI lives when the board's own PATH cannot see it.
 # `claude` and `codex` install into ~/.local/bin — an entry a login shell adds
 # to PATH and a bare environment does not, so a board brought up by a
@@ -209,7 +198,8 @@ def _pane_env_prefix(exe: str, runs: tuple[str, ...] = ()) -> list[str]:
     Two fixes ride on the pane command itself, in the order `env` takes them
     (`-u` options before assignments):
 
-    1. the board's venv markers are force-unset (`_venv_unset_prefix`);
+    1. the board's venv markers are force-unset (see _VENV_MARKER_VARS) when
+       the board runs inside a venv;
     2. `exe`'s own directory is appended to the pane's PATH when that PATH lacks
        it. Launching by absolute path gets `claude` running in a bare-PATH pane,
        but not what runs inside it: the session's hooks and Bash calls still
@@ -225,7 +215,8 @@ def _pane_env_prefix(exe: str, runs: tuple[str, ...] = ()) -> list[str]:
     handed: with only conda's bin added, an RLCR loop's Stop hook blocked every
     turn on "Codex CLI Not Found".
     """
-    prefix = _venv_unset_prefix()
+    prefix = (["env", *(a for v in _VENV_MARKER_VARS for a in ("-u", v))]
+              if _venv_bin_dirs() else [])
     # The pane's PATH is the board's spawn PATH: tmux gives a new pane the
     # environment of the client that ran new-window (see _resolve_cli).
     path = _spawn_env().get("PATH", "")
@@ -270,6 +261,11 @@ def _run(*args: str, input: Optional[str] = None) -> dict:
     }
 
 
+def _outcome(r: dict) -> dict:
+    """A `_run` result as the {ok[, error]} this module's actions return."""
+    return {"ok": True} if r["ok"] else {"ok": False, "error": r["error"]}
+
+
 def available() -> bool:
     """True if tmux is usable. Cached briefly to avoid per-poll subprocesses.
 
@@ -306,8 +302,6 @@ def list_panes() -> list[dict]:
         return []
     panes: list[dict] = []
     for line in r["stdout"].splitlines():
-        if not line.strip():
-            continue
         parts = line.split("\t")
         if len(parts) < 2:
             continue
@@ -386,7 +380,7 @@ def _display(pane: str, fmt: str) -> Optional[str]:
 def pane_current_command(pane: str) -> Optional[str]:
     """Name of the pane's foreground process (tmux #{pane_current_command}), or
     None when it can't be resolved. Best-effort — callers must fail open."""
-    return _display(pane, "#{pane_current_command}") if pane else None
+    return _display(pane, "#{pane_current_command}")
 
 
 def pane_alive(pane: str) -> bool:
@@ -398,8 +392,6 @@ def pane_alive(pane: str) -> bool:
     exits 0 with empty output on tmux 3.2 instead of failing, so probing the
     target directly reports every dead pane as a live one.
     """
-    if not pane:
-        return False
     return any(p["pane_id"] == pane for p in list_panes())
 
 
@@ -417,16 +409,7 @@ def exit_copy_mode(pane: str) -> None:
 
 def pane_target(pane: str) -> Optional[str]:
     """Human-addressable target ("session:window.pane") for a pane id, or None."""
-    if not pane:
-        return None
     return _display(pane, "#{session_name}:#{window_index}.#{pane_index}")
-
-
-def _session_names() -> list[str]:
-    r = _run("list-sessions", "-F", "#{session_name}")
-    if not r["ok"]:
-        return []
-    return [ln.strip() for ln in r["stdout"].splitlines() if ln.strip()]
 
 
 _DEFAULT_SESSION = "fleet"
@@ -441,7 +424,8 @@ def _resolve_target() -> dict:
     A `new-window` needs a host session to attach to; spawning/resuming from a
     fleet with no live sessions must create that host rather than dead-end.
     """
-    sessions = _session_names()
+    r = _run("list-sessions", "-F", "#{session_name}")
+    sessions = [ln.strip() for ln in r["stdout"].splitlines() if ln.strip()] if r["ok"] else []
     env_target = os.environ.get("FLEET_TMUX_SESSION")
     if env_target:
         return {"target": env_target, "exists": env_target in sessions}
@@ -517,7 +501,7 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
         r = _run("new-session", "-d", "-s", target["target"],
                  "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
     if not r["ok"]:
-        return {"ok": False, "error": r["error"]}
+        return _outcome(r)
     pane_id = r["stdout"].strip()
     if not pane_id:
         return {"ok": False, "error": "tmux opened the window but reported no pane id"}
@@ -537,8 +521,7 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
 def resize_window(pane: str, cols: int, rows: int) -> dict:
     """Size the window holding `pane`. A detached session's window is 80x24, and
     nothing attached will ever widen it."""
-    r = _run("resize-window", "-t", pane, "-x", str(cols), "-y", str(rows))
-    return {"ok": True} if r["ok"] else {"ok": False, "error": r["error"]}
+    return _outcome(_run("resize-window", "-t", pane, "-x", str(cols), "-y", str(rows)))
 
 
 def capture_pane(pane: str, scrollback: int = 0) -> dict:
@@ -560,12 +543,7 @@ def send_keys(pane: str, *keys: str) -> dict:
     Unlike send_text, these are interpreted as keys, not literal characters, so
     they drive interactive menus such as Claude's permission prompt.
     """
-    if not keys:
-        return {"ok": False, "error": "no keys"}
-    r = _run("send-keys", "-t", pane, *keys)
-    if not r["ok"]:
-        return {"ok": False, "error": r["error"]}
-    return {"ok": True}
+    return _outcome(_run("send-keys", "-t", pane, *keys))
 
 
 # A leading "/" opens Claude Code's slash-command autocomplete popup. An Enter
@@ -838,8 +816,7 @@ def _literal_key_arg(text: str) -> str:
 
 def _send_literal(pane: str, text: str) -> dict:
     """Type `text` into `pane` as literal characters, not key names: {ok[, error]}."""
-    r = _run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text))
-    return {"ok": True} if r["ok"] else {"ok": False, "error": r["error"]}
+    return _outcome(_run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text)))
 
 
 def _send_until_landed(pane: str, text: str, marker: str) -> bool:
@@ -1030,7 +1007,7 @@ def send_text_confirmed(
     _clear_composer(pane, marker)
     pasted = _paste(pane, text)
     if not pasted["ok"]:
-        return {"ok": False, "error": pasted["error"]}
+        return _outcome(pasted)
     wait = min(_CONFIRMED_LANDED_BASE + len(text) / 1000.0 * _CONFIRMED_LANDED_PER_KCHAR,
                _CONFIRMED_LANDED_MAX)
     deadline = time.time() + wait

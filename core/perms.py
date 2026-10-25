@@ -31,13 +31,11 @@ def _parse_line(line: str, fallback_ts: float) -> Optional[PermEvent]:
     m = _LINE_RE.search(line)
     if not m:
         return None
-    raw_ts = line[: m.start()].strip()
-    tty = m.group("tty") or None
     return PermEvent(
         project=m.group("project"),
-        tty=tty,
+        tty=m.group("tty") or None,
         msg=m.group("msg").strip(),
-        raw_ts=raw_ts,
+        raw_ts=line[: m.start()].strip(),
         epoch=fallback_ts,
     )
 
@@ -70,12 +68,7 @@ def pending_by_tty() -> dict[str, PermEvent]:
 # memo's key (recent_events reads FOCUS_LOG), and the result is shared: read-only.
 @memo_by_file
 def _pending_by_tty(_log: Path) -> dict[str, PermEvent]:
-    out: dict[str, PermEvent] = {}
-    for ev in recent_events(limit=200):
-        if not ev.tty:
-            continue
-        out[ev.tty] = ev
-    return out
+    return {ev.tty: ev for ev in recent_events(limit=200) if ev.tty}
 
 
 def snapshot() -> dict:
