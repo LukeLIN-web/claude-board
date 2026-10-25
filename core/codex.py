@@ -235,13 +235,7 @@ def extract_codex_session_activity(path: Path | str) -> dict:
 
 
 def _scan_activity(p: Path) -> dict:
-    bash_refs: dict[str, int] = {}
-    skill_reads: dict[str, int] = {}
-    skill_writes: dict[str, int] = {}
-    memory_reads: dict[str, int] = {}
-    memory_writes: dict[str, int] = {}
-    memory_ops_seen: set[tuple[str, str]] = set()
-    memory_ops: list[dict] = []
+    tally = transcripts.ActivityTally()
     model = ""
     effort = ""
 
@@ -301,45 +295,20 @@ def _scan_activity(p: Path) -> dict:
             skill_matches.update(_REPO_SKILL_PATH_RE.findall(haystack))
             if skill_matches:
                 write_kw = patch or any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir", "apply_patch("))
-                for sk in skill_matches:
-                    bash_refs[sk] = bash_refs.get(sk, 0) + 1
-                    if write_kw:
-                        skill_writes[sk] = skill_writes.get(sk, 0) + 1
-                    else:
-                        skill_reads[sk] = skill_reads.get(sk, 0) + 1
+                tally.bash_refs.update(skill_matches)
+                (tally.skill_writes if write_kw else tally.skill_reads).update(skill_matches)
 
             # Memory path mentions. A command can't say edit from write, so an
             # edit counts as a write.
             write_kw = patch or any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<", "apply_patch("))
-            op, counts = ("write", memory_writes) if write_kw else ("read", memory_reads)
             for mem_name in {m.group(1) for m in _MEMORY_PATH_RE.finditer(haystack)
                              if m.group(1) != "MEMORY" or m.group(0).startswith("/.codex/memories/")}:
-                counts[mem_name] = counts.get(mem_name, 0) + 1
-                key = (mem_name, op)
-                if key not in memory_ops_seen:
-                    memory_ops_seen.add(key)
-                    memory_ops.append({"name": mem_name, "operation": op})
+                tally.memory(mem_name, "write" if write_kw else "read")
     except Exception:
         pass
 
-    skills_used = list(set(list(skill_reads.keys()) + list(skill_writes.keys())))
-    return {
-        "skills_used": skills_used,
-        "memory_ops": memory_ops,
-        "model": model,
-        "effort": effort,
-        "skill_breakdown": {
-            "per_skill_invokes": {},
-            "per_skill_reads": skill_reads,
-            "per_skill_writes": skill_writes,
-            "per_skill_bash_refs": bash_refs,
-        },
-        "memory_breakdown": {
-            "per_memory_reads": memory_reads,
-            "per_memory_writes": memory_writes,
-            "per_memory_edits": {},
-        },
-    }
+    return {**tally.result(set(tally.skill_reads) | set(tally.skill_writes)),
+            "model": model, "effort": effort}
 
 
 def list_codex_sessions() -> list[dict]:

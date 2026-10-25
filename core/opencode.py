@@ -4,14 +4,13 @@ from __future__ import annotations
 import datetime
 import json
 import sqlite3
-from collections import Counter
 from contextlib import closing
 from typing import Optional
 
 from .search import excerpt, find
 from .sessions import HOME_BASE
 from .textcap import MESSAGE_CHARS, TOOL_ARG_CHARS, TOOL_RESULT_CHARS, cap_text
-from .transcripts import _SKILL_PATH_RE, event
+from .transcripts import _SKILL_PATH_RE, ActivityTally, event
 
 OPENCODE_DB = HOME_BASE / ".local/share/opencode/opencode.db"
 
@@ -176,14 +175,7 @@ def _activity(calls: list[tuple[str, dict]]) -> dict:
     Code's (transcripts.session_activity) and Codex's sessions report it,
     adapted for OpenCode's tool naming: bash, read, write, edit, patch, skill
     (all lowercase), the file path under filePath (not file_path)."""
-    skill_invokes: Counter[str] = Counter()
-    skill_reads: Counter[str] = Counter()
-    skill_writes: Counter[str] = Counter()
-    skill_bash: Counter[str] = Counter()
-    memory_counts = {"read": Counter(), "write": Counter(), "edit": Counter()}
-    memory_ops: list[dict] = []
-    mem_seen: set[tuple[str, str]] = set()
-
+    t = ActivityTally()
     for tool, inp in calls:
         fp = inp.get("filePath", "") or inp.get("file_path", "") or ""
         cmd = inp.get("command", "") or ""
@@ -192,47 +184,26 @@ def _activity(calls: list[tuple[str, dict]]) -> dict:
         if tool == "skill":
             name = inp.get("name", "")
             if name:
-                skill_invokes[name] += 1
+                t.invokes[name] += 1
 
         # File operations on skill files
         if tool in ("read", "write", "edit", "patch"):
             m = _SKILL_PATH_RE.search(fp)
             if m:
-                (skill_reads if tool == "read" else skill_writes)[m.group(1)] += 1
+                (t.skill_reads if tool == "read" else t.skill_writes)[m.group(1)] += 1
 
         # File operations on memory files
         if tool in ("read", "write", "edit", "patch") and "/memory/" in fp:
             mem_name = fp.rsplit("/", 1)[-1].replace(".md", "")
             if mem_name == "MEMORY":
                 continue
-            memory_counts["edit" if tool == "patch" else tool][mem_name] += 1
-            key = (mem_name, tool)
-            if key not in mem_seen:
-                mem_seen.add(key)
-                memory_ops.append({"name": mem_name, "operation": tool})
+            t.memory(mem_name, tool, "edit" if tool == "patch" else tool)
 
         # Bash referencing skills
         if tool == "bash" and ("skills/" in cmd or "SKILL.md" in cmd):
-            for sk in set(_SKILL_PATH_RE.findall(cmd)) or ("_general",):
-                skill_bash[sk] += 1
+            t.bash_refs.update(set(_SKILL_PATH_RE.findall(cmd)) or ("_general",))
 
-    # Plain dicts: history.HistorySession holds these, and dataclasses.asdict
-    # rebuilds a Counter from its (key, count) pairs — counting the pairs.
-    return {
-        "skills_used": list(set(skill_invokes) | set(skill_reads) | set(skill_writes)),
-        "memory_ops": memory_ops,
-        "skill_breakdown": {
-            "per_skill_invokes": dict(skill_invokes),
-            "per_skill_reads": dict(skill_reads),
-            "per_skill_writes": dict(skill_writes),
-            "per_skill_bash_refs": dict(skill_bash),
-        },
-        "memory_breakdown": {
-            "per_memory_reads": dict(memory_counts["read"]),
-            "per_memory_writes": dict(memory_counts["write"]),
-            "per_memory_edits": dict(memory_counts["edit"]),
-        },
-    }
+    return t.result(set(t.invokes) | set(t.skill_reads) | set(t.skill_writes))
 
 
 def _tool_preview(inp: dict) -> dict:

@@ -1116,32 +1116,68 @@ def current_task_hint(path: str | Path) -> Optional[str]:
 _SKILL_PATH_RE = re.compile(r'/\.claude/skills/([^/]+)/')
 
 
-class _SessionActivity:
-    """Skill and memory activity of a session, in one pass over its transcript.
-
-    Returns {
-        skills_used: [name] — invoked via the Skill tool, first use first,
-        skill_contents: {name: text} — what the first invocation loaded,
+class ActivityTally:
+    """Skill and memory counts of one session, in the shape every platform's
+    session reports: {
+        skills_used: [name],
         memory_ops: [{name, operation, content_preview?}] — each (memory, op) once,
         skill_breakdown: {per_skill_invokes, per_skill_reads, per_skill_writes,
                           per_skill_bash_refs},
         memory_breakdown: {per_memory_reads, per_memory_writes, per_memory_edits},
-    }, the shape codex and opencode sessions report too. Breakdown counts are
-    not deduplicated.
-    """
+    }. Breakdown counts are not deduplicated."""
 
     def __init__(self) -> None:
         self.invokes: Counter[str] = Counter()
+        self.skill_reads: Counter[str] = Counter()
+        self.skill_writes: Counter[str] = Counter()
+        self.bash_refs: Counter[str] = Counter()
+        self.mem_counts = {"read": Counter(), "write": Counter(), "edit": Counter()}
+        self.mem_ops: list[dict] = []
+        self._seen: set[tuple[str, str]] = set()
+
+    def memory(self, name: str, op: str, kind: str = "", preview: Optional[str] = None) -> None:
+        """One `op` on memory `name`, counted as `kind` (read/write/edit; `op`
+        by default)."""
+        self.mem_counts[kind or op][name] += 1
+        if (name, op) in self._seen:
+            return
+        self._seen.add((name, op))
+        entry: dict = {"name": name, "operation": op}
+        if preview is not None:
+            entry["content_preview"] = preview
+        self.mem_ops.append(entry)
+
+    def result(self, skills_used: Iterable[str]) -> dict:
+        # Plain dicts: history.HistorySession holds these, and dataclasses.asdict
+        # rebuilds a Counter from its (key, count) pairs — counting the pairs.
+        return {
+            "skills_used": list(skills_used),
+            "memory_ops": list(self.mem_ops),
+            "skill_breakdown": {
+                "per_skill_invokes": dict(self.invokes),
+                "per_skill_reads": dict(self.skill_reads),
+                "per_skill_writes": dict(self.skill_writes),
+                "per_skill_bash_refs": dict(self.bash_refs),
+            },
+            "memory_breakdown": {
+                "per_memory_reads": dict(self.mem_counts["read"]),
+                "per_memory_writes": dict(self.mem_counts["write"]),
+                "per_memory_edits": dict(self.mem_counts["edit"]),
+            },
+        }
+
+
+class _SessionActivity:
+    """Skill and memory activity of a session, in one pass over its transcript:
+    an ActivityTally whose skills_used are the Skill-tool invocations, first use
+    first, plus skill_contents: {name: text} — what the first invocation loaded."""
+
+    def __init__(self) -> None:
+        self.tally = ActivityTally()
         # A Skill call's result only says "Launching skill"; the body arrives
         # as the next meta user row, which names the call by its tool_use id.
         self.skill_calls: dict[str, str] = {}
         self.skill_contents: dict[str, str] = {}
-        self.skill_reads: Counter[str] = Counter()
-        self.skill_writes: Counter[str] = Counter()
-        self.bash_refs: Counter[str] = Counter()
-        self.mem_counts = {"Read": Counter(), "Write": Counter(), "Edit": Counter()}
-        self.mem_ops: list[dict] = []
-        self.seen: set[tuple[str, str]] = set()
 
     def step(self, d: dict) -> None:
         sk = self.skill_calls.pop(d.get("sourceToolUseID") or "", None)
@@ -1152,11 +1188,12 @@ class _SessionActivity:
                                     if isinstance(c, dict) and c.get("type") == "text")
             if isinstance(content, str):
                 self.skill_contents.setdefault(sk, content)
+        t = self.tally
         for name, inp, block in _tool_uses(d):
             if name == "Skill":
                 sk = inp.get("skill", "")
                 if sk:
-                    self.invokes[sk] += 1
+                    t.invokes[sk] += 1
                     if sk not in self.skill_contents:
                         self.skill_calls[block.get("id", "")] = sk
 
@@ -1164,48 +1201,27 @@ class _SessionActivity:
                 fp = str(inp.get("file_path", ""))
                 m = _SKILL_PATH_RE.search(fp)
                 if m:
-                    (self.skill_reads if name == "Read" else self.skill_writes)[m.group(1)] += 1
+                    (t.skill_reads if name == "Read" else t.skill_writes)[m.group(1)] += 1
                 mem_name = _memory_name(fp)
                 if mem_name is None or mem_name == "MEMORY":
                     continue
-                self.mem_counts[name][mem_name] += 1
-                key = (mem_name, name.lower())
-                if key in self.seen:
-                    continue
-                self.seen.add(key)
-                entry: dict = {"name": mem_name, "operation": name.lower()}
+                preview = None
                 if name == "Write":
-                    entry["content_preview"] = (inp.get("content") or "")[:300]
+                    preview = (inp.get("content") or "")[:300]
                 elif name == "Edit":
                     # Same reason as the timeline card: a raw before/after pair
                     # spends the preview on the prefix both sides share.
-                    entry["content_preview"] = edit_diff(
-                        inp.get("old_string"), inp.get("new_string"), 300,
-                    )
-                self.mem_ops.append(entry)
+                    preview = edit_diff(inp.get("old_string"), inp.get("new_string"), 300)
+                t.memory(mem_name, name.lower(), preview=preview)
 
             elif name == "Bash":
                 cmd = str(inp.get("command", ""))
                 if "skills/" in cmd or "SKILL.md" in cmd:
-                    self.bash_refs.update(set(_SKILL_PATH_RE.findall(cmd)) or ("_general",))
+                    t.bash_refs.update(set(_SKILL_PATH_RE.findall(cmd)) or ("_general",))
 
     def result(self) -> dict:
-        return {
-            "skills_used": list(self.invokes),
-            "skill_contents": dict(self.skill_contents),
-            "memory_ops": list(self.mem_ops),
-            "skill_breakdown": {
-                "per_skill_invokes": dict(self.invokes),
-                "per_skill_reads": dict(self.skill_reads),
-                "per_skill_writes": dict(self.skill_writes),
-                "per_skill_bash_refs": dict(self.bash_refs),
-            },
-            "memory_breakdown": {
-                "per_memory_reads": dict(self.mem_counts["Read"]),
-                "per_memory_writes": dict(self.mem_counts["Write"]),
-                "per_memory_edits": dict(self.mem_counts["Edit"]),
-            },
-        }
+        return {**self.tally.result(self.tally.invokes),
+                "skill_contents": dict(self.skill_contents)}
 
 
 session_activity = fold_by_file(_SessionActivity)
