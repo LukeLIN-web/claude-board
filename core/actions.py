@@ -23,14 +23,6 @@ _USER_FOCUS_SCRIPT = CLAUDE_HOME / "focus-tty.sh"
 _BUNDLED_FOCUS_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "focus-tty.sh"
 
 
-def _resolve_focus_script() -> Optional[Path]:
-    if _USER_FOCUS_SCRIPT.exists():
-        return _USER_FOCUS_SCRIPT
-    if _BUNDLED_FOCUS_SCRIPT.exists():
-        return _BUNDLED_FOCUS_SCRIPT
-    return None
-
-
 def focus_terminal(tty: str) -> dict:
     """Activate the terminal tab that owns `tty`.
 
@@ -40,7 +32,7 @@ def focus_terminal(tty: str) -> dict:
     """
     if not tty:
         return {"ok": False, "error": "no tty"}
-    script = _resolve_focus_script()
+    script = next((p for p in (_USER_FOCUS_SCRIPT, _BUNDLED_FOCUS_SCRIPT) if p.exists()), None)
     if script is None:
         return {
             "ok": False,
@@ -144,6 +136,15 @@ def open_claude_window(cwd: str, claude_args: list[str]) -> dict:
 # when resuming a large/old session. Requiring both avoids matching a session
 # that merely printed the word "resume" in its output.
 _RESUME_PICKER_MARKERS = ("Resume from summary", "Resume full session")
+_RESUME_CHOICE = "2"         # "Resume full session as-is"
+_RESUME_POLL = 0.4
+
+# A dialog that has just painted is not yet listening: Claude draws a menu before
+# arming its input handler, and keys sent into that gap are lost or replayed as
+# something else — a spawn that answered the trust prompt the instant it
+# appeared got its Down/Enter swallowed, sat out the confirm wait with the
+# dialog still up, and the session exited on its own afterwards.
+_DIALOG_ARM_SETTLE = 0.6
 
 
 def _resume_picker_up(pane_id: str) -> bool:
@@ -152,20 +153,13 @@ def _resume_picker_up(pane_id: str) -> bool:
     return all(m in text for m in _RESUME_PICKER_MARKERS)
 
 
-def confirm_resume_picker(
-    pane_id: str,
-    choice: str = "2",
-    attempts: int = 15,
-    interval: float = 0.4,
-    settle: float = 0.6,
-) -> dict:
+def confirm_resume_picker(pane_id: str, attempts: int = 15) -> dict:
     """Poll `pane_id` for Claude's resume-summary picker and auto-answer it.
 
     A freshly launched `claude --resume <id>` on a large/old session parks on a
     "Resume from summary / Resume full session" picker. The fleet drives resumed
     sessions unattended (on a headless host nobody is watching that detached
-    pane), so we answer it. `choice` defaults to "2" — "Resume full session
-    as-is".
+    pane), so we answer it, with "Resume full session as-is".
 
     Driving a live TUI is unforgiving: a key sent the instant the menu paints is
     dropped (the menu text renders before its input handler is armed), and any
@@ -184,23 +178,23 @@ def confirm_resume_picker(
         return {"confirmed": False, "waited": 0.0, "reason": "no pane"}
     waited = 0.0
     seen = False
-    for _ in range(max(1, attempts)):
+    for _ in range(attempts):
         if _resume_picker_up(pane_id):
             seen = True
             break
-        time.sleep(interval)
-        waited += interval
+        time.sleep(_RESUME_POLL)
+        waited += _RESUME_POLL
     if not seen:
         return {"confirmed": False, "waited": round(waited, 2), "reason": "no picker"}
     # Let the TUI's input handler arm before the first keypress.
-    time.sleep(settle)
-    tmux.send_keys(pane_id, choice)
-    time.sleep(settle)
+    time.sleep(_DIALOG_ARM_SETTLE)
+    tmux.send_keys(pane_id, _RESUME_CHOICE)
+    time.sleep(_DIALOG_ARM_SETTLE)
     # Confirm only if the digit selected without dismissing; skip Enter (avoid a
     # leak) if the picker is already gone.
     if _resume_picker_up(pane_id):
         tmux.send_keys(pane_id, "Enter")
-        time.sleep(settle)
+        time.sleep(_DIALOG_ARM_SETTLE)
     gone = not _resume_picker_up(pane_id)
     return {
         "confirmed": gone,
@@ -424,17 +418,10 @@ def answer_trust_prompt(pane: str) -> dict:
     return {"ok": False, "error": "the trust prompt did not close"}
 
 
-# A dialog that has just painted is not yet listening: Claude draws the trust
-# prompt before arming its input handler, and keys sent into that gap are lost
-# or replayed as something else — a spawn that answered the instant the prompt
-# appeared got its Down/Enter swallowed, sat out the confirm wait with the
-# dialog still up, and the session exited on its own afterwards. Same settle,
-# and same reason, as confirm_resume_picker's.
-_TRUST_ARM_SETTLE = 0.6
+_TRUST_PROMPT_POLL = 0.3
 
 
-def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3,
-                         settle: float = _TRUST_ARM_SETTLE, platform: str = "claude") -> dict:
+def confirm_trust_prompt(pane_id: str, attempts: int = 20, platform: str = "claude") -> dict:
     """Poll a freshly launched `pane_id` for the folder-trust prompt, answer it.
     `platform` names the CLI in the pane: Claude's prompt and Codex's
     (answer_codex_trust_prompt) differ in every string but share this poll.
@@ -460,13 +447,13 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
     prompt_up, answer = ((codex_trust_prompt_up, answer_codex_trust_prompt)
                          if platform == "codex" else (trust_prompt_up, answer_trust_prompt))
     waited = 0.0
-    for _ in range(max(1, attempts)):
+    for _ in range(attempts):
         text = tmux.capture_pane(pane_id).get("text", "")
         marker = tmux.composer_marker(platform, text)
         if prompt_up(text):
             # Let the dialog arm its input handler before the first key.
-            time.sleep(settle)
-            waited += settle
+            time.sleep(_DIALOG_ARM_SETTLE)
+            waited += _DIALOG_ARM_SETTLE
             r = answer(pane_id)
             return {"answered": bool(r.get("answered")), "waited": round(waited, 2),
                     "reason": "" if r.get("ok") else r.get("error", "")}
@@ -474,8 +461,8 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, interval: float = 0.3
         # (~0.4s on 0.160.0); its status line comes only once it has settled.
         if composer_drawn(text, marker) and (platform != "codex" or codex_status_model(text)):
             return {"answered": False, "waited": round(waited, 2), "reason": "already trusted"}
-        time.sleep(interval)
-        waited += interval
+        time.sleep(_TRUST_PROMPT_POLL)
+        waited += _TRUST_PROMPT_POLL
     return {"answered": False, "waited": round(waited, 2), "reason": "no prompt"}
 
 
@@ -934,15 +921,6 @@ _OVERLAY_DISMISS_TRIES = 4      # Escape + re-check, a few times
 _OVERLAY_DISMISS_SETTLE = 0.15  # let the overlay tear down before re-capturing
 
 
-def _dismiss_answer_overlay(pane: str) -> None:
-    """Escape a modal /btw answer overlay so a following prompt lands in the real
-    composer instead of being eaten. Best-effort and self-limiting: only presses
-    Escape while the overlay is actually detected (never on a clean/busy pane),
-    and gives up quietly if capture fails or it won't clear."""
-    _escape_until(pane, lambda t: not btwscreen.overlay_open(t),
-                  _OVERLAY_DISMISS_TRIES, _OVERLAY_DISMISS_SETTLE)
-
-
 # An aside's answer exists ONLY in its overlay — dismissing an un-archived one
 # destroys the answer forever. Before Escaping, give a still-generating answer a
 # bounded window to settle, then archive it synchronously.
@@ -1163,7 +1141,8 @@ def _send_prompt_inner(w, pane: str, text: str) -> dict:
     # (its answer lives nowhere else), then clear it so this prompt isn't
     # swallowed by the overlay.
     _archive_open_aside(pane, w.session_id)
-    _dismiss_answer_overlay(pane)
+    _escape_until(pane, lambda t: not btwscreen.overlay_open(t),
+                  _OVERLAY_DISMISS_TRIES, _OVERLAY_DISMISS_SETTLE)
     # A cancellable overlay (/model dialog, permission/choice menu, Rewind panel)
     # can sit over the composer and eat the injected prompt — and some draw their
     # own ❯ cursor, fooling _wait_composer_ready below. Esc it away first,
