@@ -5,6 +5,7 @@ import datetime
 import json
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from typing import Optional
 
 from .search import excerpt, find
@@ -15,21 +16,20 @@ from .transcripts import _SKILL_PATH_RE, event
 OPENCODE_DB = HOME_BASE / ".local/share/opencode/opencode.db"
 
 
-def _get_conn() -> Optional[sqlite3.Connection]:
+def _rows(sql: str, *params) -> Optional[list[tuple]]:
+    """What `sql` selects from OpenCode's database, or None where there is no
+    database or the query fails."""
     if not OPENCODE_DB.exists():
         return None
     try:
-        return sqlite3.connect(str(OPENCODE_DB), timeout=3)
+        with closing(sqlite3.connect(str(OPENCODE_DB), timeout=3)) as conn:
+            return conn.execute(sql, params).fetchall()
     except Exception:
         return None
 
 
 def list_opencode_sessions() -> list[dict]:
-    conn = _get_conn()
-    if not conn:
-        return []
-    try:
-        cur = conn.execute("""
+    rows = _rows("""
             SELECT s.id, s.title, s.directory, s.time_created, s.time_updated,
                    (SELECT substr(json_extract(p.data, '$.text'), 1, 300)
                     FROM part p JOIN message m ON p.message_id = m.id
@@ -46,12 +46,9 @@ def list_opencode_sessions() -> list[dict]:
             FROM session s
             ORDER BY s.time_updated DESC
         """)
-        rows = cur.fetchall()
-        calls = _tool_calls_by_session(conn)
-    except Exception:
+    calls = _tool_calls_by_session()
+    if rows is None or calls is None:
         return []
-    finally:
-        conn.close()
 
     sessions = []
     for row in rows:
@@ -78,40 +75,22 @@ def list_opencode_sessions() -> list[dict]:
 def session_directory(session_id: str) -> Optional[str]:
     """The directory OpenCode session `session_id` ran in ("" if it records
     none), or None when there is no such session."""
-    conn = _get_conn()
-    if not conn:
-        return None
-    try:
-        row = conn.execute("SELECT directory FROM session WHERE id = ?",
-                           (session_id,)).fetchone()
-    except Exception:
-        return None
-    finally:
-        conn.close()
-    return (row[0] or "") if row else None
+    rows = _rows("SELECT directory FROM session WHERE id = ?", session_id)
+    return (rows[0][0] or "") if rows else None
 
 
 def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
-    conn = _get_conn()
-    if not conn:
-        return []
-    try:
-        cur = conn.execute("""
+    rows = _rows("""
             SELECT json_extract(m.data, '$.role') as role,
                    p.data as part_data, p.time_created as part_time
             FROM message m
             JOIN part p ON p.message_id = m.id
             WHERE m.session_id = ?
             ORDER BY p.time_created ASC
-        """, (session_id,))
-        rows = cur.fetchall()
-    except Exception:
-        return []
-    finally:
-        conn.close()
+        """, session_id)
 
     events: list[dict] = []
-    for role, part_data_str, part_time in rows:
+    for role, part_data_str, part_time in rows or []:
         try:
             pd = json.loads(part_data_str)
         except Exception:
@@ -143,26 +122,16 @@ def opencode_timeline(session_id: str, limit: int = 2000) -> list[dict]:
 
 def search_opencode(query: str) -> dict[str, list[str]]:
     """Search OpenCode parts for a query. Returns {session_id: [snippets]}."""
-    conn = _get_conn()
-    if not conn:
-        return {}
-    ql = f"%{query}%"
-    try:
-        cur = conn.execute("""
+    rows = _rows("""
             SELECT p.session_id, substr(p.data, 1, 500)
             FROM part p
             WHERE p.data LIKE ?
             AND json_extract(p.data, '$.type') IN ('text', 'tool')
             LIMIT 100
-        """, (ql,))
-        rows = cur.fetchall()
-    except Exception:
-        return {}
-    finally:
-        conn.close()
+        """, f"%{query}%")
 
     result: dict[str, list[str]] = {}
-    for sid, data_str in rows:
+    for sid, data_str in rows or []:
         try:
             pd = json.loads(data_str)
         except Exception:
@@ -182,15 +151,18 @@ def search_opencode(query: str) -> dict[str, list[str]]:
     return result
 
 
-def _tool_calls_by_session(conn: sqlite3.Connection) -> dict[str, list[tuple[str, dict]]]:
+def _tool_calls_by_session() -> Optional[dict[str, list[tuple[str, dict]]]]:
     """Every tool call OpenCode recorded, as (tool, input) per session id — one
     query for them all, reading only those two fields of each part (a part
-    also holds the call's output)."""
-    out: dict[str, list[tuple[str, dict]]] = {}
-    for sid, tool, inp in conn.execute("""
+    also holds the call's output) — or None as _rows has it."""
+    rows = _rows("""
             SELECT session_id, json_extract(data, '$.tool'), json_extract(data, '$.state.input')
             FROM part WHERE json_extract(data, '$.type') = 'tool'
-    """):
+    """)
+    if rows is None:
+        return None
+    out: dict[str, list[tuple[str, dict]]] = {}
+    for sid, tool, inp in rows:
         try:
             inp = json.loads(inp) if inp else {}
         except ValueError:

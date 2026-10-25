@@ -63,10 +63,6 @@ _MEMORY_PATH_RE = re.compile(
 _SYNTHETIC_USER_RE = re.compile(r'^<[a-z_]+[\s>]')
 
 
-def _is_synthetic_user_text(text: str) -> bool:
-    return bool(_SYNTHETIC_USER_RE.match(text.lstrip()))
-
-
 def _typed_user_parts(payload: dict) -> list[str]:
     """The typed parts of a role=user message — [] when the message is injected.
 
@@ -82,7 +78,7 @@ def _typed_user_parts(payload: dict) -> list[str]:
         txt = (c.get("text") or "").strip()
         if not txt:
             continue
-        if _is_synthetic_user_text(txt):
+        if _SYNTHETIC_USER_RE.match(txt):
             return []
         parts.append(txt)
     return parts
@@ -157,9 +153,11 @@ def _before_clear(ts: str, since_ms: int) -> bool:
     return 0 < t < since_ms
 
 
-def _records(path: Path) -> Iterator[dict]:
-    """A rollout's lines, parsed; one that isn't a JSON object is skipped."""
-    return (d for d in transcripts._iter_lines(path) if isinstance(d, dict))
+def _records(path: Path, tail: int = 0) -> Iterator[dict]:
+    """A rollout's lines — only its last `tail` when set — parsed; one that
+    isn't a JSON object is skipped."""
+    rows = transcripts._tail_lines(path, tail) if tail else transcripts._iter_lines(path)
+    return (d for d in rows if isinstance(d, dict))
 
 
 def _parse_session_meta(path: Path) -> Optional[dict]:
@@ -224,11 +222,6 @@ def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
 # through more rollouts than memo_by_file keeps, so it keeps its own, pruned of
 # the ones that are gone.
 _session_cache: dict[Path, tuple[tuple[int, int], Optional[dict]]] = {}
-
-
-def _clear_caches() -> None:
-    """Forget every parsed rollout (tests / explicit refresh)."""
-    _session_cache.clear()
 
 
 # A live card asks for its activity every 2s tick.
@@ -447,14 +440,9 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
     the timeline reflects the cleared session rather than the untouched rollout.
     `tail`, when set, reads only the rollout's last that many lines.
     """
-    p = Path(path)
-    if not p.exists():
-        return []
     events: list[dict] = []
     try:
-        rows = (d for d in transcripts._tail_lines(p, tail) if isinstance(d, dict)) if tail \
-            else _records(p)
-        for d in rows:
+        for d in _records(Path(path), tail):
             t = d.get("type")
             ts = d.get("timestamp", "")
             if _before_clear(ts, since_ms):
@@ -545,10 +533,9 @@ def live_timeline(w: Window, limit: int) -> dict:
 
 # ---------- live session discovery (running codex TUIs as dashboard cards) ----------
 
-def _read_tail_events(path: Path, max_lines: int = 120) -> list[dict]:
-    """Parse the last `max_lines` JSONL records of a rollout (newest last). A
-    card reads it once a tick and hands it to the helpers below."""
-    return transcripts._tail_lines(path, max_lines)
+# How much of a live card's rollout is read each tick (see _discover), for the
+# helpers below.
+_CARD_TAIL = 120
 
 
 def _last_assistant_text(events: list[dict], since_ms: int = 0) -> str:
@@ -835,7 +822,7 @@ def _discover() -> list[tuple[Window, list[dict]]]:
                 mtime = rp.stat().st_mtime
             except Exception:
                 mtime = None
-            events = _read_tail_events(rp)
+            events = list(_records(rp, _CARD_TAIL))
             status = _infer_codex_status(events, mtime) if mtime else "idle"
             updated_at = int(mtime * 1000) if mtime else started_at
             session_id = meta.get("id", rp.stem)
