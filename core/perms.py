@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import re
-import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +23,7 @@ class PermEvent:
     tty: Optional[str]
     msg: str
     raw_ts: str
-    epoch: float  # seconds; approximate (parsed from file mtime if no good ts)
+    epoch: float  # seconds; the log file's mtime, not the line's own time
 
 
 def _parse_line(line: str, fallback_ts: float) -> Optional[PermEvent]:
@@ -71,9 +70,3 @@ def _pending_by_tty(_log: Path) -> dict[str, PermEvent]:
     return {ev.tty: ev for ev in recent_events(limit=200) if ev.tty}
 
 
-def snapshot() -> dict:
-    return {
-        "log_exists": FOCUS_LOG.exists(),
-        "events": [asdict(e) for e in recent_events(limit=30)],
-        "ts": int(time.time() * 1000),
-    }

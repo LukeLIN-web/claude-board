@@ -45,12 +45,12 @@ def get(path):
     return body
 
 
-def check(path, test=None, what=""):
+def check(path, test, what):
     try:
         body = get(path)
         data = json.loads(body) if path.startswith("/api/") else body.decode()
-        if test is not None and not test(data):
-            raise AssertionError(what or "unexpected payload")
+        if not test(data):
+            raise AssertionError(what)
         print(f"  ✓ {path}")
         return data
     except Exception as e:
@@ -73,8 +73,6 @@ check("/api/history", lambda d: "Cut the 2.4 release" in json.dumps(d),
 check("/api/skills", lambda d: "db-migrate" in json.dumps(d), "seeded skills are missing")
 check("/api/memory", lambda d: "db-guidelines" in json.dumps(d), "seeded memories are missing")
 check("/api/search?q=postgres", lambda d: "ostgres" in json.dumps(d), "search found nothing")
-check("/api/plans")
-check("/api/perms")
 
 if failures:
     sys.exit(1)

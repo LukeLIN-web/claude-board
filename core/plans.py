@@ -10,20 +10,6 @@ from .transcripts import extract_plan_history
 PLANS_DIR = CLAUDE_HOME / "plans"
 
 
-def list_plans() -> list[dict]:
-    if not PLANS_DIR.exists():
-        return []
-    # One stat per file, for both the newest-first order and the row.
-    stats = [(f, f.stat()) for f in PLANS_DIR.glob("*.md")]
-    stats.sort(key=lambda fs: -fs[1].st_mtime)
-    return [{
-        "name": f.stem,
-        "path": str(f),
-        "mtime": int(st.st_mtime * 1000),
-        "size": st.st_size,
-    } for f, st in stats]
-
-
 def plan_for_session(
     name_hint: Optional[str],
     transcript_path: Optional[str] = None,

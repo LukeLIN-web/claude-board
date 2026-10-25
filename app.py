@@ -539,11 +539,6 @@ def api_search(q: str, limit: int = 60) -> dict:
     return {"hits": search.search(q, limit=limit), "q": q}
 
 
-@app.get("/api/plans")
-def api_plans() -> dict:
-    return {"plans": plans.list_plans()}
-
-
 @app.post("/api/windows/{key}/focus")
 def api_focus(key: str) -> dict:
     return _on_card(key, "POST", "focus", lambda w, pid: (
@@ -856,11 +851,6 @@ def api_memory(project: str | None = None) -> dict:
             m["read_sessions"] = reads[stem]
             m["write_sessions"] = writes[stem]
     return result
-
-
-@app.get("/api/perms")
-def api_perms() -> dict:
-    return perms.snapshot()
 
 
 @app.get("/api/events")
