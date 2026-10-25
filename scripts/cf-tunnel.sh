@@ -86,7 +86,10 @@ own_tunnel_running() {
     pgrep -f "$OWN_TUNNEL" >/dev/null
 }
 
+# Its URL goes with it, so `url` never hands out a dead hostname. Succeeds only
+# when there was a tunnel to kill.
 kill_own_tunnel() {
+    rm -f "$URL_FILE"
     pkill -f "$OWN_TUNNEL" 2>/dev/null
 }
 
@@ -94,7 +97,6 @@ case "${1:-start}" in
 stop)
     stop_watchdog
     if kill_own_tunnel; then
-        rm -f "$URL_FILE"
         echo "[cf-tunnel] stopped"
     else
         echo "[cf-tunnel] nothing running"
@@ -110,7 +112,6 @@ __watchdog)
         if [ "$(gate_verdict "$(board_code)")" = "ungated" ]; then
             echo "[cf-tunnel] watchdog: board on 127.0.0.1:$PORT lost its gate — tearing the tunnel down" >&2
             kill_own_tunnel
-            rm -f "$URL_FILE"
             exit 5
         fi
     done
@@ -184,7 +185,6 @@ mkdir -p "$RUN_DIR"
 umask 077
 stop_watchdog
 kill_own_tunnel && sleep 1
-rm -f "$URL_FILE"
 
 setsid cloudflared tunnel --url "http://127.0.0.1:$PORT" \
     --no-autoupdate \
@@ -238,7 +238,6 @@ down)
     echo "[cf-tunnel] DANGER: anonymous request through the tunnel got HTTP $edge, not a login." >&2
     echo "            Stopping the tunnel rather than leaving it published." >&2
     kill_own_tunnel
-    rm -f "$URL_FILE"
     exit 5
     ;;
 esac

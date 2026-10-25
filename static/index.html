@@ -191,18 +191,12 @@
            class="absolute left-0 mt-1 w-80 bg-white border rounded-lg shadow-lg p-3 z-50 flex flex-col gap-2">
         <label class="text-xs text-gray-500">Agent</label>
         <div class="flex gap-1">
-          <button @click="spawnPlatform = 'claude'"
-                  class="flex-1 text-xs px-2 py-1 rounded border transition"
-                  :class="spawnPlatform === 'claude' ? 'border-blue-400 text-blue-700 bg-blue-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
-            Claude Code</button>
-          <button @click="spawnPlatform = 'codex'"
-                  class="flex-1 text-xs px-2 py-1 rounded border transition"
-                  :class="spawnPlatform === 'codex' ? 'border-green-400 text-green-700 bg-green-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
-            Codex</button>
-          <button @click="spawnPlatform = 'hmz'"
-                  class="flex-1 text-xs px-2 py-1 rounded border transition"
-                  :class="spawnPlatform === 'hmz' ? 'border-violet-400 text-violet-700 bg-violet-50 font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'">
-            hmz</button>
+          <template x-for="p in SPAWN_PLATFORMS" :key="p.platform">
+            <button @click="spawnPlatform = p.platform"
+                    class="flex-1 text-xs px-2 py-1 rounded border transition"
+                    :class="spawnPlatform === p.platform ? p.picked + ' font-medium' : 'border-gray-200 text-gray-500 hover:bg-gray-50'"
+                    x-text="p.name"></button>
+          </template>
         </div>
         <template x-if="hosts.length > 1">
           <div>
@@ -1151,6 +1145,10 @@ const STALE_SNAPSHOT_S = 15;
 // no recorded start time).
 const byStartedAt = (a, b) => (a.started_at || 0) - (b.started_at || 0) || a.pid - b.pid;
 
+// A prompt someone typed: a non-empty user row the harness didn't inject (a
+// skill body, a command caveat), which would otherwise stand in for it.
+const isTypedPrompt = (ev) => ev.kind === 'user_text' && !ev.extra?.meta && !!(ev.text || '').trim();
+
 // How the timeline draws each kind of event: the colour of its left rule, its
 // badge (colour, text, hover title), and whether it has a body of its own —
 // the rest show their text in the clamped block at the bottom of the row, under
@@ -1252,7 +1250,13 @@ function fleet() {
     memorySessions: {},
     tmuxAvailable: false,
     showSpawn: false,
-    spawnPlatform: 'claude',   // 'claude' | 'codex' | 'hmz'
+    // The agents a spawn can start, and how the picked one's button reads.
+    SPAWN_PLATFORMS: [
+      { platform: 'claude', name: 'Claude Code', picked: 'border-blue-400 text-blue-700 bg-blue-50' },
+      { platform: 'codex', name: 'Codex', picked: 'border-green-400 text-green-700 bg-green-50' },
+      { platform: 'hmz', name: 'hmz', picked: 'border-violet-400 text-violet-700 bg-violet-50' },
+    ],
+    spawnPlatform: 'claude',
     spawnCwd: '',
     spawnCwdSelect: '',
     spawning: false,
@@ -1722,8 +1726,6 @@ function fleet() {
       const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
       return m ? `${h}h${m}m` : `${h}h`;
     },
-    // A run's clock as hmz words it (core/hmz.py _clock): 45s, 2m 5s, 1h 12m,
-    // 15h, 1d 2h — the largest two units, a zero one dropped.
     gpuMem(c) {
       return c.total_mb ? `${Math.round(c.used_mb / 1024)}/${Math.round(c.total_mb / 1024)}G` : 'N/A';
     },
@@ -1752,6 +1754,8 @@ function fleet() {
               p.ssh_from && 'over ssh from ' + p.ssh_from,
               p.used_mb != null && p.used_mb + ' MiB'].filter(Boolean).join('\n');
     },
+    // A run's clock as hmz words it (core/hmz.py _clock): 45s, 2m 5s, 1h 12m,
+    // 15h, 1d 2h — the largest two units, a zero one dropped.
     runClock(seconds) {
       const s = Math.floor(seconds);
       for (const [big, small, b, l] of [[86400, 3600, 'd', 'h'], [3600, 60, 'h', 'm'], [60, 1, 'm', 's']]) {
@@ -1897,10 +1901,9 @@ function fleet() {
       const a = w.btw?.answer || '';
       return a.split('\n').length > 3 || a.length > 240;
     },
+    // Only an archived aside has a dismiss button, so w.btw.id is set.
     async dismissBtw(w) {
-      const id = w.btw?.id;
-      if (!id) return;
-      const d = await this.apiPost(`/api/windows/${w.key}/btw/dismiss`, { id });
+      const d = await this.apiPost(`/api/windows/${w.key}/btw/dismiss`, { id: w.btw.id });
       if (d.ok) w.btw = null;  // optimistic; the next snapshot agrees
       else this.toast('Dismiss failed: ' + (d.error || ''));
     },
@@ -1926,31 +1929,19 @@ function fleet() {
       if (d?.ok) this.promptDrafts[key] = '';
     },
 
-    // Most recent prompt the user typed into this session (last user_text event).
+    // Most recent prompt the user typed into this session (isTypedPrompt).
     lastUserPrompt() {
-      const events = this.timelineData?.events || [];
-      for (let i = events.length - 1; i >= 0; i--) {
-        // Skip harness-injected rows (skill bodies, command caveats) — nobody
-        // typed those, and one would otherwise stand in for the real prompt.
-        if (events[i].kind === 'user_text' && !events[i].extra?.meta
-            && (events[i].text || '').trim()) {
-          return events[i].text.trim();
-        }
-      }
-      return '';
+      const ev = (this.timelineData?.events || []).findLast(isTypedPrompt);
+      return ev ? ev.text.trim() : '';
     },
 
     // Newest assistant text since that prompt. Stops at the prompt: a reply from
     // before it would read as the answer to it, and while Claude is still on
     // tools there's nothing to show yet.
     lastAssistantReply() {
-      const events = this.timelineData?.events || [];
-      for (let i = events.length - 1; i >= 0; i--) {
-        const ev = events[i];
-        if (ev.kind === 'assistant_text' && (ev.text || '').trim()) return ev.text.trim();
-        if (ev.kind === 'user_text' && !ev.extra?.meta && (ev.text || '').trim()) return '';
-      }
-      return '';
+      const ev = (this.timelineData?.events || []).findLast(
+        e => isTypedPrompt(e) || (e.kind === 'assistant_text' && (e.text || '').trim()));
+      return ev?.kind === 'assistant_text' ? ev.text.trim() : '';
     },
 
     sendClear(key) {
@@ -1968,11 +1959,6 @@ function fleet() {
                         busy: this.promptSending, key });
     },
 
-    // The select snaps back to its idle option, which carries w.model_label — the
-    // model that last answered, or the one the session's welcome banner names
-    // while it hasn't answered at all. Either way the readout follows the
-    // session, not the pick: a switch shows up once the session replies on the
-    // new model, and a switch that didn't land never puts a label on the card.
     // What the model select offers, as {value: '<kind>:<name>', label}. Claude:
     // the two families the board switches between. Codex: its picker's models,
     // and its reasoning levels as a second group — the API takes either alone.
@@ -2048,8 +2034,9 @@ function fleet() {
       this._timelineSig = null;  // force the first refresh to render this session
     },
     closeTimeline() {
+      this._resetTimeline();
       this.expandedKey = null; this.expandedHistoryId = null; this.expandedUpdatedAt = null;
-      this.timelineData = null; this.planData = null;
+      this.timelineData = null;
     },
     // Bring the freshly loaded panel into view, scrolled to its newest event.
     _revealTimeline() {
@@ -2129,17 +2116,8 @@ function fleet() {
 
     async showMemoryDetail(name, operation) {
       this.memoryDetail = { name, viewOp: operation, content: 'Loading...' };
-      try {
-        const r = await fetch(`/api/memory/${encodeURIComponent(name)}`);
-        if (r.ok) {
-          const d = await r.json();
-          this.memoryDetail = { ...d, viewOp: operation };
-        } else {
-          this.memoryDetail = { name, viewOp: operation, description: '', type: '', content: '(memory file not found)' };
-        }
-      } catch(e) {
-        this.memoryDetail = { name, viewOp: operation, description: '', type: '', content: 'Error: ' + e.message };
-      }
+      const d = await this.apiGet(`/api/memory/${encodeURIComponent(name)}`);
+      this.memoryDetail = { ...(d || { name, content: '(memory file not found)' }), viewOp: operation };
     },
 
     async showCurrentPlan() {
