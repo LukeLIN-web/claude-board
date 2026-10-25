@@ -1674,8 +1674,8 @@ class ConfirmTrustPromptTests(unittest.TestCase):
              mock.patch.object(actions.time, "sleep",
                                side_effect=lambda s: order.append(f"sleep{s}")):
             actions.confirm_trust_prompt("%0")
-        self.assertIn(f"sleep{actions._TRUST_ARM_SETTLE}", order)
-        self.assertLess(order.index(f"sleep{actions._TRUST_ARM_SETTLE}"),
+        self.assertIn(f"sleep{actions._DIALOG_ARM_SETTLE}", order)
+        self.assertLess(order.index(f"sleep{actions._DIALOG_ARM_SETTLE}"),
                         order.index("key"))
 
     def test_half_painted_dialog_is_not_mistaken_for_a_composer(self):
