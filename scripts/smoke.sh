@@ -9,8 +9,7 @@
 #      of inline Alpine, and a syntax error in it renders an empty board, which
 #      nothing else catches.
 #
-# No real user data is involved: HOME and CLAUDE_FLEET_HOME both point at the
-# throwaway home, and tmux calls go to a private socket that has no server.
+# No real user data is involved (scripts/demo-board.sh).
 #
 #   bash scripts/smoke.sh                  # uses python3 and the first Chrome found
 #   PYTHON=~/.local/share/claude-fleet/venv/bin/python bash scripts/smoke.sh
@@ -24,36 +23,9 @@ DEMO="$(mktemp -d "${TMPDIR:-/tmp}/claude-board-smoke.XXXXXX")"
 PORT="$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
 BASE="http://127.0.0.1:$PORT"
 
-cleanup() {
-  [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true
-  CLAUDE_FLEET_HOME="$DEMO" "$PY" fixtures/seed.py --stop >/dev/null 2>&1 || true
-  rm -rf "$DEMO"
-}
-trap cleanup EXIT
-
-# What a host's .env.local can set that would change what this run sees: a
-# password gate, peers to aggregate, cwd filters, a pinned tmux target.
-unset FLEET_AUTH_PASSWORD FLEET_API_TOKEN FLEET_PEERS CLAUDE_FLEET_LABEL \
-      CLAUDE_FLEET_CWD_INCLUDE CLAUDE_FLEET_CWD_EXCLUDE FLEET_TMUX_SESSION TMUX
-export HOME="$DEMO" CLAUDE_FLEET_HOME="$DEMO" FLEET_TMUX_SOCKET="claude-board-smoke-$$"
-
-echo "· seeding demo data into $DEMO"
-"$PY" fixtures/seed.py >/dev/null
-
-echo "· starting the board on :$PORT"
-"$PY" -m uvicorn app:app --host 127.0.0.1 --port "$PORT" >"$DEMO/uvicorn.log" 2>&1 &
-SRV_PID=$!
-
-for _ in $(seq 1 60); do
-  curl -sf -o /dev/null "$BASE/api/windows" && break
-  kill -0 "$SRV_PID" 2>/dev/null || break
-  sleep 0.5
-done
-if ! curl -sf -o /dev/null "$BASE/api/windows"; then
-  echo "✗ the board never answered on :$PORT" >&2
-  cat "$DEMO/uvicorn.log" >&2
-  exit 1
-fi
+source scripts/demo-board.sh
+trap 'stop_demo_board; rm -rf "$DEMO"' EXIT
+start_demo_board
 
 echo "· checking the API"
 BASE="$BASE" "$PY" - <<'EOF'
@@ -113,14 +85,7 @@ if [ -n "${SMOKE_NO_BROWSER:-}" ]; then
   exit 0
 fi
 
-CHROME="${CHROME:-}"
-if [ -z "$CHROME" ]; then
-  for c in google-chrome google-chrome-stable chromium chromium-browser chrome-headless-shell \
-           "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"; do
-    if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then CHROME="$c"; break; fi
-  done
-fi
-[ -n "$CHROME" ] || { echo "✗ no Chrome/Chromium found; set CHROME=... or SMOKE_NO_BROWSER=1" >&2; exit 1; }
+find_chrome
 
 echo "· rendering the page in headless Chrome"
 # ?snapshot draws the board once without opening the event stream, so the
