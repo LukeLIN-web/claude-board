@@ -156,8 +156,6 @@ def has_slice(session_id: str, question: str, answer_slice: str) -> bool:
     be able to pry the gate open. A probe that is *only* crumbs fingerprints to
     "" and is rejected rather than matching everything — a false True here would
     swallow a genuinely new aside."""
-    if not session_id:
-        return False
     q = _fingerprint(question)
     a = _fingerprint(answer_slice)
     if not a:
@@ -193,8 +191,6 @@ def latest(session_id: str) -> Optional[dict]:
     None rather than falling back to an older entry — older asides were already
     superseded on the card, and resurrecting one on dismiss would look like a
     bug (one click must clear the card)."""
-    if not session_id:
-        return None
     items = entries(session_id)
     if not items or items[-1].get("dismissed"):
         return None

@@ -52,8 +52,6 @@ def maybe_capture(tty: str, session_id: str) -> str | None:
 
     Returns the question of an aside whose answer is STILL GENERATING (for the
     card's live "answering…" indicator — nothing to archive yet), else None."""
-    if not session_id:
-        return None
     pane = tmux.pane_for_tty(tty)
     if pane is None:
         return None
@@ -82,8 +80,6 @@ def capture_sync(pane: str, session_id: str) -> None:
     it with a second set of ↓ presses; then re-check the archive before doing
     any work of our own. Falls back to latching the visible top slice when the
     full scroll-stitch fails — a truncated answer beats a vanished one."""
-    if not session_id:
-        return
     try:
         slice_ov = btwscreen.get_btw_answer(pane)
     except Exception:
