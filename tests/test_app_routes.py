@@ -95,10 +95,12 @@ class CreateRouteTests(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_dispatches_to_create_session(self):
-        with mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
-            r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp"))
-        m.assert_called_once_with("/tmp", "claude")
-        self.assertTrue(r["ok"])
+        for body, platform in (({}, "claude"), ({"platform": "codex"}, "codex")):
+            with self.subTest(platform=platform), \
+                 mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
+                r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp", **body))
+            m.assert_called_once_with("/tmp", platform)
+            self.assertTrue(r["ok"])
 
     def test_spawn_dirs_keeps_only_existing_dirs(self):
         r = appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp", "/no/such/dir", __file__]))
@@ -117,18 +119,11 @@ class CreateRouteTests(unittest.TestCase):
             appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp"], host="63"))
         m.assert_called_once_with("63", "POST", "/api/spawn-dirs", {"paths": ["/tmp"]})
 
-    def test_dispatches_codex_platform(self):
-        with mock.patch.object(appmod.actions, "create_session", return_value={"ok": True, "pane_id": "%1"}) as m:
-            r = appmod.api_window_create(appmod.CreateBody(cwd="/tmp", platform="codex"))
-        m.assert_called_once_with("/tmp", "codex")
-        self.assertTrue(r["ok"])
-
 
 class CreateRouteVisibilityTests(unittest.TestCase):
     def test_hidden_cwd_is_refused(self):
         # Spawning into a dir the board filters out would create a card that the
         # dashboard then refuses to show.
-        import fastapi
         with mock.patch.object(appmod.sessions, "_cwd_visible", return_value=False), \
              mock.patch.object(appmod.actions, "create_session") as m:
             with self.assertRaises(fastapi.HTTPException) as cm:
@@ -155,7 +150,6 @@ class HistoryTimelineVisibilityTests(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_a_sibling_outside_the_allowlist_is_not_served(self):
-        import fastapi
         with self.assertRaises(fastapi.HTTPException) as cm:
             appmod.api_history_timeline("sid1")
         self.assertEqual(cm.exception.status_code, 404)
@@ -175,7 +169,6 @@ def _allow_only(test, include):
 
 
 def _timeline_404(test, session_id):
-    import fastapi
     with test.assertRaises(fastapi.HTTPException) as cm:
         appmod.api_history_timeline(session_id)
     test.assertEqual(cm.exception.status_code, 404)
@@ -303,7 +296,6 @@ class PromptRouteTests(unittest.TestCase):
         self.assertTrue(r["ok"])
 
     def test_prompt_blocked_for_hidden_window(self):
-        import fastapi
         with mock.patch.object(appmod.sessions, "find_window", return_value=None), \
              mock.patch.object(appmod.actions, "send_prompt") as m:
             with self.assertRaises(fastapi.HTTPException):
@@ -329,7 +321,6 @@ class BtwDismissRouteTests(unittest.TestCase):
         self.assertFalse(r["ok"])
 
     def test_blocked_for_hidden_window(self):
-        import fastapi
         with mock.patch.object(appmod.sessions, "find_window", return_value=None), \
              mock.patch.object(appmod.btwlog, "dismiss") as m:
             with self.assertRaises(fastapi.HTTPException):
@@ -338,16 +329,10 @@ class BtwDismissRouteTests(unittest.TestCase):
 
 
 class SnapshotFlagTests(unittest.TestCase):
-    def test_tmux_available_present_with_zero_windows(self):
-        with _snapshot(available=True):
-            snap = appmod._enriched_snapshot()
-        self.assertIn("tmux_available", snap)
-        self.assertTrue(snap["tmux_available"])
-
-    def test_tmux_available_reflects_false(self):
-        with _snapshot(available=False):
-            snap = appmod._enriched_snapshot()
-        self.assertFalse(snap["tmux_available"])
+    def test_tmux_available_is_reported_with_zero_windows(self):
+        for available in (True, False):
+            with self.subTest(available=available), _snapshot(available=available):
+                self.assertIs(appmod._enriched_snapshot()["tmux_available"], available)
 
 
 class CardModelTests(unittest.TestCase):
@@ -681,7 +666,6 @@ class StaleDialogOpenTests(unittest.TestCase):
     the header; a verifiable picker in the pane keeps the normal behavior."""
 
     def _run(self, dialog):
-        import time
         win = {"pid": 100, "status": "waiting", "waiting_for": "dialog open",
                "hidden": False, "alive": True, "tty": "/dev/pts/9",
                "transcript_path": None, "name": "w", "cwd": "/x",
@@ -748,7 +732,7 @@ class ModelRouteTests(unittest.TestCase):
         self.assertEqual(appmod.ModelBody(model="opus").effort, "")
 
     def test_route_hands_both_fields_to_the_switch(self):
-        with mock.patch.object(appmod, "_require_window") as rw, \
+        with mock.patch.object(appmod.sessions, "find_window") as rw, \
              mock.patch.object(appmod.actions, "switch_model",
                                return_value={"ok": True}) as sw:
             appmod.api_window_model("1234", appmod.ModelBody(model="gpt-5.6-sol", effort="high"))
@@ -761,7 +745,7 @@ class HistoryLaunchRouteTests(unittest.TestCase):
 
     def _launch(self, route, opened=None):
         opened = opened or {"ok": True, "backend": "tmux", "pane_id": "%7"}
-        with mock.patch.object(appmod, "_history_cwd", return_value="/tmp/proj"), \
+        with mock.patch.object(appmod.history, "get", return_value=mock.Mock(project="/tmp/proj")), \
              mock.patch.object(appmod.sessions, "find_window_by_session", return_value=None), \
              mock.patch.object(appmod.actions, "open_claude_window",
                                return_value=dict(opened)) as ocw, \

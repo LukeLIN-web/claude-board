@@ -134,14 +134,6 @@ def _banner_model(w: dict) -> str:
     return label
 
 
-def _prune_banner_models(live_pids: set) -> None:
-    """Drop cached banners for pids that are gone, so the cache tracks the board
-    instead of growing an entry per session for the life of the process."""
-    for key in list(_banner_models):
-        if key[0] not in live_pids:
-            _banner_models.pop(key, None)
-
-
 def _local_snapshot() -> dict:
     """This host's own cards, fully enriched. No peer traffic happens here."""
     snap = sessions.snapshot()
@@ -149,21 +141,18 @@ def _local_snapshot() -> dict:
     # Live Codex sessions arrive pre-enriched (codex transcripts have a different
     # shape than Claude's, so they can't go through the loop below). Shell-process
     # counts are platform-agnostic, so we fold their pids into the single ps walk.
-    codex_windows = codex.codex_window_dicts()
-    hmz_windows = hmz.hmz_window_dicts()
-    every = snap["windows"] + codex_windows + hmz_windows
+    groups = (snap["windows"], codex.codex_window_dicts(), hmz.hmz_window_dicts())
+
+    def pids(ws: list[dict]) -> list[int]:
+        return [w["pid"] for w in ws if isinstance(w.get("pid"), int)]
+
     # Passive helpers belong to their parent workflow. Only suppress cards;
     # discovery, history and session-id lookup still include these sessions.
-    passive = tmux.passive_ttys(
-        [w["pid"] for w in every if isinstance(w.get("pid"), int)]
-    )
-    snap["windows"] = [w for w in snap["windows"] if w.get("tty") not in passive]
-    codex_windows = [w for w in codex_windows if w.get("tty") not in passive]
-    hmz_windows = [w for w in hmz_windows if w.get("tty") not in passive]
+    passive = tmux.passive_ttys(pids([w for ws in groups for w in ws]))
+    snap["windows"], codex_windows, hmz_windows = (
+        [w for w in ws if w.get("tty") not in passive] for ws in groups)
     every = snap["windows"] + codex_windows + hmz_windows
-    shell_counts = sessions.shell_descendant_counts(
-        [w["pid"] for w in every if isinstance(w.get("pid"), int)]
-    )
+    shell_counts = sessions.shell_descendant_counts(pids(every))
     for w in every:
         w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
     for cw in codex_windows:
@@ -229,19 +218,16 @@ def _local_snapshot() -> dict:
         w.update(patrol.classify(w))
         # Queued prompts: reliable dashboard-sent items (reconciled against the
         # transcript) plus best-effort TUI-typed items scraped from the pane.
-        # A queue only exists while busy, which also bounds the extra capture.
+        # A queue only exists while the session is working, which also bounds
+        # the extra capture. Real windows report "busy"; hidden `.slock` agent
+        # sub-sessions never write a status field (it normalizes to "unknown"),
+        # so gate those on being alive instead — their pid+tty still back both
+        # the tracker and the pane scrape.
         pid = w.get("pid")
         status = w.get("status")
-        # A queue only exists while the session is working. Real windows report
-        # "busy"; hidden `.slock` agent sub-sessions never write a status field
-        # (it normalizes to "unknown"), so gate those on being alive instead —
-        # their pid+tty still back both the tracker and the pane scrape.
-        show_queue = isinstance(pid, int) and (
-            status == "busy" or (w.get("hidden") and w.get("alive"))
-        )
         if status == "idle" and isinstance(pid, int):
             promptqueue.clear(pid)  # a queue can't outlive an idle session
-        if show_queue:
+        if isinstance(pid, int) and (status == "busy" or (w.get("hidden") and w.get("alive"))):
             dash = promptqueue.pending(pid, tp)
             queued = [{"text": t, "source": "dashboard"} for t in dash]
             seen = {promptqueue.norm(t) for t in dash}
@@ -259,7 +245,7 @@ def _local_snapshot() -> dict:
         # /btw asides never reach the transcript, so scrape the ephemeral overlay
         # from the pane (best-effort, only while it is on-screen) and latch it to
         # disk. The overlay can be open whether the session is busy or idle, so
-        # this isn't gated on show_queue. w["btw"] shows the latest archived aside
+        # this isn't gated on the queue's condition. w["btw"] shows the latest archived aside
         # and persists after the overlay is dismissed.
         sid = w.get("session_id")
         pending_q = None
@@ -273,7 +259,11 @@ def _local_snapshot() -> dict:
             # An aside whose answer is still generating: show it live so /btw
             # never looks dead while it works (nothing is archived yet).
             w["btw"] = {"question": pending_q, "answer": "", "pending": True}
-    _prune_banner_models({w.get("pid") for w in snap["windows"]})
+    # Drop cached banners for pids that are gone, so the cache tracks the board
+    # instead of growing an entry per session for the life of the process.
+    live = {w.get("pid") for w in snap["windows"]}
+    for key in [k for k in _banner_models if k[0] not in live]:
+        del _banner_models[key]
     # Merge live Codex and hmz windows in, then address every card. `key` — not pid — is
     # what the UI and the action routes carry: once a peer host's cards sit in
     # the same list, pids alone collide (see core/peers.py).
@@ -452,34 +442,25 @@ def api_windows(request: Request, response: Response) -> dict:
     return state.last_snapshot
 
 
-def _split(key: str) -> tuple[str | None, int]:
-    """Card key → (peer host or None, pid on that host). A malformed key is a
-    404, the same answer an unknown pid gets."""
-    try:
-        return peers.split_key(key)
-    except ValueError:
-        raise HTTPException(404, "window not found")
-
-
-def _require_window(pid: int):
-    """Resolve a pid to a *visible* window or 404. `find_window` already honors
-    the CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE filter, so this also blocks actions
-    against hidden sessions, not just unknown pids."""
-    w = sessions.find_window(pid)
-    if not w:
-        raise HTTPException(404, "window not found")
-    return w
-
-
 def _on_card(key: str, method: str, tail: str, local: Callable, body: BaseModel | None = None):
     """Run a per-card route where the card lives. A peer's card is forwarded to
     that board as `/api/windows/<pid>/<tail>` with the request body untouched;
-    a local one is resolved with _require_window and handed to `local(w, pid)`."""
-    host, pid = _split(key)
+    a local one is resolved to its window and handed to `local(w, pid)`.
+
+    A malformed key is a 404, the same answer an unknown pid gets — and a hidden
+    session's: `find_window` honors the CLAUDE_FLEET_CWD_INCLUDE/EXCLUDE filter,
+    so no action reaches a session the board doesn't show."""
+    try:
+        host, pid = peers.split_key(key)
+    except ValueError:
+        raise HTTPException(404, "window not found")
     if host:
         return peers.forward(host, method, f"/api/windows/{pid}/{tail}",
                              body.model_dump() if body is not None else None)
-    return local(_require_window(pid), pid)
+    w = sessions.find_window(pid)
+    if not w:
+        raise HTTPException(404, "window not found")
+    return local(w, pid)
 
 
 def _claude_panels(tp: str) -> dict:
@@ -721,10 +702,9 @@ def api_btw_dismiss(key: str, body: BtwDismissBody) -> dict:
     the archive and the timeline (that's history), it just stops occupying the
     card."""
     def dismiss(w, pid: int) -> dict:
-        sid = getattr(w, "session_id", None)
-        if not sid:
+        if not w.session_id:
             return {"ok": False, "error": "window has no session id"}
-        if not btwlog.dismiss(sid, body.id):
+        if not btwlog.dismiss(w.session_id, body.id):
             return {"ok": False, "error": "aside not found"}
         return {"ok": True}
     return _on_card(key, "POST", "btw/dismiss", dismiss, body)
@@ -759,8 +739,6 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
     # OpenCode, where there is no projects/ dir to list.
     projects = sessions.PROJECTS_DIR
     for proj_dir in (projects.iterdir() if projects.is_dir() else ()):
-        if not proj_dir.is_dir():
-            continue
         f = proj_dir / f"{session_id}.jsonl"
         if f.exists():
             if not sessions.transcript_visible(f):
@@ -801,21 +779,15 @@ def api_history_timeline(session_id: str, limit: int = 2000) -> dict:
     raise HTTPException(404, "transcript not found")
 
 
-def _history_cwd(session_id: str) -> str | None:
-    """The directory a history session ran in (home if the index has none), or
-    None when the history index doesn't know the session."""
-    s = history.get(session_id)
-    return (s.project or str(Path.home())) if s else None
-
-
 def _relaunch(session_id: str, fork: bool) -> dict:
-    """Open history session `session_id` again in the directory it ran in —
-    under a new id with `fork`. Answers the "resume from summary?" picker a
-    large/old session parks on (see actions.resume_claude), so the card isn't
-    left stuck on a menu."""
-    cwd = _history_cwd(session_id)
-    if cwd is None:
+    """Open history session `session_id` again in the directory it ran in (home
+    if the index has none) — under a new id with `fork`. Answers the "resume
+    from summary?" picker a large/old session parks on (see
+    actions.resume_claude), so the card isn't left stuck on a menu."""
+    s = history.get(session_id)
+    if s is None:
         return {"ok": False, "error": "session not found in index"}
+    cwd = s.project or str(Path.home())
     r = actions.resume_claude(cwd, session_id, fork=fork)
     r.update({"action": "forked" if fork else "resumed", "session_id": session_id, "cwd": cwd})
     return r
