@@ -48,6 +48,8 @@ def _rows() -> list[dict]:
         _tools(1, ("s1", "Skill", {"skill": "loop", "args": "5m check the build"}),
                ("r1", "Read", {"file_path": f"{MEM}/style.md"}),
                ("r2", "Read", {"file_path": "/home/u/.claude/skills/deploy/SKILL.md"})),
+        user_row("Run the prompt on an interval.", _ts(1), blocks=True,
+                 isMeta=True, sourceToolUseID="s1"),
         _tools(2, ("w1", "Write", {"file_path": f"{MEM}/notes.md", "content": "remember"}),
                ("p1", "Write", {"file_path": "/home/u/.claude/plans/fold.md", "content": "# v1"}),
                ("a1", "Agent", {"description": "review", "prompt": "look"}),

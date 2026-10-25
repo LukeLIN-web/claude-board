@@ -486,10 +486,11 @@ def _claude_panels(tp: str) -> dict:
     """What a Claude transcript pins beside its timeline — on a live card's
     panel and an archived session's alike."""
     if not tp:
-        return {"skills_used": [], "memory_ops": [], "plan_history": [],
+        return {"skills_used": [], "skill_contents": {}, "memory_ops": [], "plan_history": [],
                 "goal": None, "loop": None}
     return {
         "skills_used": transcripts.extract_skills_used(tp),
+        "skill_contents": transcripts.extract_skill_contents(tp),
         "memory_ops": transcripts.extract_memory_ops(tp),
         "plan_history": transcripts.extract_plan_history(tp),
         # The session's standing goal, pinned above the timeline so it stays put

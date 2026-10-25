@@ -38,6 +38,7 @@ _NEUTRAL = {
     "current_task_hint": (appmod.transcripts, None),
     "current_model": (appmod.transcripts, ""),
     "extract_skills_used": (appmod.transcripts, []),
+    "extract_skill_contents": (appmod.transcripts, {}),
     "extract_memory_ops": (appmod.transcripts, []),
     "extract_background_tasks": (appmod.transcripts, []),
     "session_loop": (appmod.transcripts, None),

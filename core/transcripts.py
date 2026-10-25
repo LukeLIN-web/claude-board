@@ -1110,6 +1110,7 @@ class _SessionActivity:
 
     Returns {
         skills_used: [name] — invoked via the Skill tool, first use first,
+        skill_contents: {name: text} — what the first invocation loaded,
         memory_ops: [{name, operation, content_preview?}] — each (memory, op) once,
         skill_breakdown: {per_skill_invokes, per_skill_reads, per_skill_writes,
                           per_skill_bash_refs},
@@ -1120,6 +1121,10 @@ class _SessionActivity:
 
     def __init__(self) -> None:
         self.invokes: dict[str, int] = {}
+        # A Skill call's result only says "Launching skill"; the body arrives
+        # as the next meta user row, which names the call by its tool_use id.
+        self.skill_calls: dict[str, str] = {}
+        self.skill_contents: dict[str, str] = {}
         self.skill_reads: dict[str, int] = {}
         self.skill_writes: dict[str, int] = {}
         self.bash_refs: dict[str, int] = {}
@@ -1128,11 +1133,21 @@ class _SessionActivity:
         self.seen: set[tuple[str, str]] = set()
 
     def step(self, d: dict) -> None:
-        for name, inp, _ in _tool_uses(d):
+        sk = self.skill_calls.pop(d.get("sourceToolUseID") or "", None)
+        if sk and d.get("isMeta"):
+            content = (d.get("message") or {}).get("content")
+            if isinstance(content, list):
+                content = "\n".join(c.get("text", "") for c in content
+                                    if isinstance(c, dict) and c.get("type") == "text")
+            if isinstance(content, str):
+                self.skill_contents.setdefault(sk, content)
+        for name, inp, block in _tool_uses(d):
             if name == "Skill":
                 sk = inp.get("skill", "")
                 if sk:
                     self.invokes[sk] = self.invokes.get(sk, 0) + 1
+                    if sk not in self.skill_contents:
+                        self.skill_calls[block.get("id", "")] = sk
 
             elif name in ("Read", "Write", "Edit"):
                 fp = str(inp.get("file_path", ""))
@@ -1171,6 +1186,7 @@ class _SessionActivity:
     def result(self) -> dict:
         return {
             "skills_used": list(self.invokes),
+            "skill_contents": dict(self.skill_contents),
             "memory_ops": list(self.mem_ops),
             "skill_breakdown": {
                 "per_skill_invokes": dict(self.invokes),
@@ -1192,6 +1208,11 @@ session_activity = fold_by_file(_SessionActivity)
 def extract_skills_used(path: str | Path) -> list[str]:
     """Unique skill names invoked via the Skill tool, first use first."""
     return session_activity(path)["skills_used"]
+
+
+def extract_skill_contents(path: str | Path) -> dict[str, str]:
+    """{skill name: the text its first Skill-tool invocation loaded}."""
+    return session_activity(path)["skill_contents"]
 
 
 def extract_memory_ops(path: str | Path) -> list[dict]:

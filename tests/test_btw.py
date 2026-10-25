@@ -597,6 +597,7 @@ class TimelineMergeTests(unittest.TestCase):
             mock.patch.object(appmod.transcripts, "timeline", return_value=timeline_ret),
             mock.patch.object(appmod.btwlog, "timeline_events", return_value=btw_ret),
             mock.patch.object(appmod.transcripts, "extract_skills_used", return_value=[]),
+            mock.patch.object(appmod.transcripts, "extract_skill_contents", return_value={}),
             mock.patch.object(appmod.transcripts, "extract_memory_ops", return_value=[]),
             mock.patch.object(appmod.transcripts, "extract_plan_history", return_value=[]),
             mock.patch.object(appmod.actions, "get_pane_menu", return_value=None),

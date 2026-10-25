@@ -826,12 +826,13 @@
         </template>
       </div>
     </div>
-    <!-- Skill/Memory summary (clickable: skill → scroll to event, memory → show content) -->
+    <!-- Skill/Memory summary (clickable: show what the skill loaded / the memory file) -->
     <div class="mb-3 flex flex-wrap gap-2 text-xs"
          x-show="timelineData?.skills_used?.length || timelineData?.memory_ops?.length">
       <template x-for="sk in (timelineData?.skills_used||[])" :key="'s'+sk">
-        <span class="bg-purple-100 text-purple-700 px-2 py-0.5 rounded cursor-pointer hover:bg-purple-200 transition"
-              @click="scrollToSkill(sk)">skill: <span x-text="sk"></span></span>
+        <span class="bg-purple-100 text-purple-700 px-2 py-0.5 rounded transition"
+              :class="timelineData?.skill_contents?.[sk] != null ? 'cursor-pointer hover:bg-purple-200' : 'opacity-50 cursor-default'"
+              @click="if (timelineData?.skill_contents?.[sk] != null) skillDetail = skillDetail === sk ? null : sk">skill: <span x-text="sk"></span></span>
       </template>
       <template x-for="m in (timelineData?.memory_ops||[])" :key="'m'+m.name+m.operation">
         <span class="px-2 py-0.5 rounded cursor-pointer hover:opacity-80 transition"
@@ -839,6 +840,15 @@
               @click="showMemoryDetail(m.name, m.operation)"
               x-text="(m.operation === 'read' ? 'mem↓ ' : 'mem↑ ') + m.name"></span>
       </template>
+    </div>
+    <!-- Skill detail popup: the text the session's Skill call loaded -->
+    <div x-show="skillDetail" class="mb-3 bg-white border rounded-lg shadow-lg p-4 text-sm" x-transition>
+      <div class="flex items-center justify-between mb-2">
+        <span class="font-semibold" x-text="skillDetail || ''"></span>
+        <button @click="skillDetail = null" class="text-gray-400 hover:text-gray-700">&times;</button>
+      </div>
+      <pre class="text-xs text-gray-700 max-h-96 overflow-y-auto whitespace-pre-wrap bg-gray-50 rounded p-2"
+           x-text="timelineData?.skill_contents?.[skillDetail] || ''"></pre>
     </div>
     <!-- Memory detail popup -->
     <div x-show="memoryDetail" class="mb-3 bg-white border rounded-lg shadow-lg p-4 text-sm" x-transition>
@@ -1234,6 +1244,7 @@ function fleet() {
     showMemory: false,
     memoryData: null,
     memoryDetail: null,
+    skillDetail: null,
     showPlanHistory: false,
     expandedSkill: null,
     skillSessions: {},
@@ -2031,6 +2042,7 @@ function fleet() {
     // state that belonged to the last one.
     _resetTimeline() {
       this.planData = null;
+      this.skillDetail = null;
       this.timelineWindow = 200; // fresh session: back to the trailing window
       this.eventExpanded = {};   // indices belong to the old session's events
       this._timelineSig = null;  // force the first refresh to render this session
@@ -2113,26 +2125,6 @@ function fleet() {
     forkHistorySession(s) {
       return this.act(`/api/history/${s.session_id}/fork`,
                       { ok: 'Forked → new session (inherits history)', fail: 'Fork failed: ' });
-    },
-
-    scrollToSkill(skillName) {
-      const events = this.timelineData?.events || [];
-      const idx = events.findIndex(e => e.kind === 'skill_invoke' && e.tool === skillName);
-      if (idx < 0) {
-        this.toast('Skill event not in visible timeline');
-        return;
-      }
-      // The list renders only a trailing window — widen it far enough back that
-      // the target row exists before trying to scroll to it.
-      const needed = events.length - idx;
-      if (needed > this.timelineWindow) this.timelineWindow = needed;
-      this.$nextTick(() => {
-        const el = document.getElementById('tl-ev-' + idx);
-        if (!el) return;
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('bg-purple-50');
-        setTimeout(() => el.classList.remove('bg-purple-50'), 2000);
-      });
     },
 
     async showMemoryDetail(name, operation) {
