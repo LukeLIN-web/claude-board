@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, gpus, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
+from core import actions, agentshark, auth, btwcapture, btwlog, codex, gpus, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -284,6 +284,7 @@ def _local_snapshot() -> dict:
         w["key"] = str(w.get("pid"))
     snap["host"] = label
     snap["gpus"] = gpus.local(label)
+    agentshark.attach(snap["windows"])
     # Capability flag for the UI to gate the tmux-backed controls. `available()`
     # is cached, so this does not spawn a tmux subprocess on every 2s poll.
     snap["tmux_available"] = tmux.available()
@@ -376,6 +377,7 @@ async def _watcher() -> None:
 async def lifespan(app: FastAPI):
     peers.start()
     gpus.start()
+    agentshark.start()
     task = asyncio.create_task(_watcher())
     try:
         yield

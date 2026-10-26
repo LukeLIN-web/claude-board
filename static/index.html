@@ -448,6 +448,29 @@
                GPU rows the snapshot carries (core/gpus.py attach). -->
           <div x-show="w.gpus?.length" class="text-[10px] font-medium text-teal-800 bg-teal-50 rounded px-1.5 py-0.5 truncate"
                x-text="'GPU ' + (w.gpus || []).join(' ')"></div>
+          <!-- Failure episodes AgentShark found in this session (core/agentshark.py).
+               Shown beside triage, never folded into it: AgentShark owns these. -->
+          <div x-show="w.agentshark" x-data="{ open: false }" @click.stop>
+            <div class="text-[10px] font-medium text-rose-800 bg-rose-50 rounded px-1.5 py-0.5 truncate cursor-pointer"
+                 title="AgentShark failure episodes in the last day; click for the list"
+                 @click="open = !open"
+                 x-text="'🦈 ' + Object.entries(w.agentshark?.sections || {}).map(([s, n]) => n + ' ' + s).join(' · ')
+                         + (w.agentshark?.live ? ' · live' : '')"></div>
+            <div x-show="open" class="mt-0.5 space-y-0.5">
+              <template x-for="(e, i) in (w.agentshark?.episodes || [])" :key="i">
+                <div class="text-[10px] text-rose-900 bg-rose-50/60 rounded px-1.5 py-0.5"
+                     :title="e.outcome + (e.subagent ? ' · subagent ' + e.subagent : '') + ' · ' + fmtDateTimeET(e.ts * 1000)">
+                  <span class="font-medium" x-text="e.section + ' · ' + e.family + (e.subagent ? ' · subagent' : '')"></span>:
+                  <span x-text="e.signature"></span>
+                </div>
+              </template>
+              <div x-show="w.agentshark?.count > (w.agentshark?.episodes || []).length" class="text-[10px] text-gray-500"
+                   x-text="'+' + (w.agentshark?.count - (w.agentshark?.episodes || []).length) + ' more'"></div>
+              <button class="text-[10px] font-mono text-gray-700 bg-gray-100 rounded px-1.5 py-0.5 hover:bg-gray-200 w-full text-left truncate"
+                      title="Copy the command; run it on this card's machine for the full report"
+                      @click="copyText(w.agentshark?.command)" x-text="'⧉ ' + w.agentshark?.command"></button>
+            </div>
+          </div>
           <div class="text-gray-600 truncate" x-show="w.current_task" x-text="w.current_task"></div>
           <!-- Latest turn error (codex): the turn died with no reply, so without
                this line the card looks like the session simply never answered -->
