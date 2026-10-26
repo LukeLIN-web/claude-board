@@ -175,21 +175,16 @@ class RedirectTargetTests(unittest.TestCase):
     def test_offsite_next_values_rejected(self):
         for bad in ["//evil.example", "https://evil.example", "http://evil.example",
                     "evil.example", "", None]:
-            self.assertFalse(auth.safe_next(bad), bad)
+            self.assertEqual(auth.next_or_root(bad), "/", bad)
 
     def test_local_paths_accepted(self):
         for good in ["/", "/api/windows", "/?x=1#frag"]:
-            self.assertTrue(auth.safe_next(good), good)
+            self.assertEqual(auth.next_or_root(good), good)
 
     def test_login_url_drops_unsafe_next(self):
         self.assertEqual(auth.login_url("//evil.example"), "/login")
         self.assertEqual(auth.login_url("/"), "/login")
         self.assertIn("next=%2Fapi%2Fwindows", auth.login_url("/api/windows"))
-
-    def test_next_or_root_is_the_single_normalizer(self):
-        self.assertEqual(auth.next_or_root("/api/windows"), "/api/windows")
-        self.assertEqual(auth.next_or_root("//evil.example"), "/")
-        self.assertEqual(auth.next_or_root(""), "/")
 
     def test_challenge_preserves_the_query_string(self):
         req = make_request("/?tab=history")

@@ -63,10 +63,6 @@ _MEMORY_PATH_RE = re.compile(
 _SYNTHETIC_USER_RE = re.compile(r'^<[a-z_]+[\s>]')
 
 
-def _is_synthetic_user_text(text: str) -> bool:
-    return bool(_SYNTHETIC_USER_RE.match(text.lstrip()))
-
-
 def _typed_user_parts(payload: dict) -> list[str]:
     """The typed parts of a role=user message — [] when the message is injected.
 
@@ -82,7 +78,7 @@ def _typed_user_parts(payload: dict) -> list[str]:
         txt = (c.get("text") or "").strip()
         if not txt:
             continue
-        if _is_synthetic_user_text(txt):
+        if _SYNTHETIC_USER_RE.match(txt):
             return []
         parts.append(txt)
     return parts
@@ -157,9 +153,11 @@ def _before_clear(ts: str, since_ms: int) -> bool:
     return 0 < t < since_ms
 
 
-def _records(path: Path) -> Iterator[dict]:
-    """A rollout's lines, parsed; one that isn't a JSON object is skipped."""
-    return (d for d in transcripts._iter_lines(path) if isinstance(d, dict))
+def _records(path: Path, tail: int = 0) -> Iterator[dict]:
+    """A rollout's lines — only its last `tail` when set — parsed; one that
+    isn't a JSON object is skipped."""
+    rows = transcripts._tail_lines(path, tail) if tail else transcripts._iter_lines(path)
+    return (d for d in rows if isinstance(d, dict))
 
 
 def _parse_session_meta(path: Path) -> Optional[dict]:
@@ -226,11 +224,6 @@ def _extract_first_user_input(path: Path, since_ms: int = 0) -> str:
 _session_cache: dict[Path, tuple[tuple[int, int], Optional[dict]]] = {}
 
 
-def _clear_caches() -> None:
-    """Forget every parsed rollout (tests / explicit refresh)."""
-    _session_cache.clear()
-
-
 # A live card asks for its activity every 2s tick.
 @transcripts.memo_by_file
 def extract_codex_session_activity(path: Path | str) -> dict:
@@ -242,13 +235,7 @@ def extract_codex_session_activity(path: Path | str) -> dict:
 
 
 def _scan_activity(p: Path) -> dict:
-    bash_refs: dict[str, int] = {}
-    skill_reads: dict[str, int] = {}
-    skill_writes: dict[str, int] = {}
-    memory_reads: dict[str, int] = {}
-    memory_writes: dict[str, int] = {}
-    memory_ops_seen: set[tuple[str, str]] = set()
-    memory_ops: list[dict] = []
+    tally = transcripts.ActivityTally()
     model = ""
     effort = ""
 
@@ -308,45 +295,20 @@ def _scan_activity(p: Path) -> dict:
             skill_matches.update(_REPO_SKILL_PATH_RE.findall(haystack))
             if skill_matches:
                 write_kw = patch or any(k in cmd for k in ("write_file", " > ", " >> ", "tee ", "echo ", "cat <<", "cp ", "mv ", "mkdir", "apply_patch("))
-                for sk in skill_matches:
-                    bash_refs[sk] = bash_refs.get(sk, 0) + 1
-                    if write_kw:
-                        skill_writes[sk] = skill_writes.get(sk, 0) + 1
-                    else:
-                        skill_reads[sk] = skill_reads.get(sk, 0) + 1
+                tally.bash_refs.update(skill_matches)
+                (tally.skill_writes if write_kw else tally.skill_reads).update(skill_matches)
 
             # Memory path mentions. A command can't say edit from write, so an
             # edit counts as a write.
             write_kw = patch or any(k in cmd for k in (" > ", " >> ", "tee ", "echo ", "cat <<", "apply_patch("))
-            op, counts = ("write", memory_writes) if write_kw else ("read", memory_reads)
             for mem_name in {m.group(1) for m in _MEMORY_PATH_RE.finditer(haystack)
                              if m.group(1) != "MEMORY" or m.group(0).startswith("/.codex/memories/")}:
-                counts[mem_name] = counts.get(mem_name, 0) + 1
-                key = (mem_name, op)
-                if key not in memory_ops_seen:
-                    memory_ops_seen.add(key)
-                    memory_ops.append({"name": mem_name, "operation": op})
+                tally.memory(mem_name, "write" if write_kw else "read")
     except Exception:
         pass
 
-    skills_used = list(set(list(skill_reads.keys()) + list(skill_writes.keys())))
-    return {
-        "skills_used": skills_used,
-        "memory_ops": memory_ops,
-        "model": model,
-        "effort": effort,
-        "skill_breakdown": {
-            "per_skill_invokes": {},
-            "per_skill_reads": skill_reads,
-            "per_skill_writes": skill_writes,
-            "per_skill_bash_refs": bash_refs,
-        },
-        "memory_breakdown": {
-            "per_memory_reads": memory_reads,
-            "per_memory_writes": memory_writes,
-            "per_memory_edits": {},
-        },
-    }
+    return {**tally.result(set(tally.skill_reads) | set(tally.skill_writes)),
+            "model": model, "effort": effort}
 
 
 def list_codex_sessions() -> list[dict]:
@@ -447,14 +409,9 @@ def codex_timeline(path: str | Path, limit: int = 60, since_ms: int = 0,
     the timeline reflects the cleared session rather than the untouched rollout.
     `tail`, when set, reads only the rollout's last that many lines.
     """
-    p = Path(path)
-    if not p.exists():
-        return []
     events: list[dict] = []
     try:
-        rows = (d for d in transcripts._tail_lines(p, tail) if isinstance(d, dict)) if tail \
-            else _records(p)
-        for d in rows:
+        for d in _records(Path(path), tail):
             t = d.get("type")
             ts = d.get("timestamp", "")
             if _before_clear(ts, since_ms):
@@ -545,10 +502,9 @@ def live_timeline(w: Window, limit: int) -> dict:
 
 # ---------- live session discovery (running codex TUIs as dashboard cards) ----------
 
-def _read_tail_events(path: Path, max_lines: int = 120) -> list[dict]:
-    """Parse the last `max_lines` JSONL records of a rollout (newest last). A
-    card reads it once a tick and hands it to the helpers below."""
-    return transcripts._tail_lines(path, max_lines)
+# How much of a live card's rollout is read each tick (see _discover), for the
+# helpers below.
+_CARD_TAIL = 120
 
 
 def _last_assistant_text(events: list[dict], since_ms: int = 0) -> str:
@@ -835,7 +791,7 @@ def _discover() -> list[tuple[Window, list[dict]]]:
                 mtime = rp.stat().st_mtime
             except Exception:
                 mtime = None
-            events = _read_tail_events(rp)
+            events = list(_records(rp, _CARD_TAIL))
             status = _infer_codex_status(events, mtime) if mtime else "idle"
             updated_at = int(mtime * 1000) if mtime else started_at
             session_id = meta.get("id", rp.stem)

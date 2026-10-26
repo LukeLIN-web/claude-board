@@ -167,7 +167,7 @@ class RouteDispatchTests(_OnePeerTest):
     def test_peer_key_forwards_the_action_untouched(self):
         with mock.patch.object(peers, "forward",
                                return_value={"ok": True}) as fwd, \
-             mock.patch.object(appmod, "_require_window") as local:
+             mock.patch.object(appmod.sessions, "find_window") as local:
             got = appmod.api_window_prompt("b:42", appmod.PromptBody(text="hi"))
         self.assertEqual(got, {"ok": True})
         local.assert_not_called()
@@ -176,7 +176,7 @@ class RouteDispatchTests(_OnePeerTest):
 
     def test_local_key_never_leaves_the_host(self):
         with mock.patch.object(peers, "forward") as fwd, \
-             mock.patch.object(appmod, "_require_window"), \
+             mock.patch.object(appmod.sessions, "find_window"), \
              mock.patch("core.actions.send_prompt", return_value={"ok": False}):
             appmod.api_window_prompt("42", appmod.PromptBody(text="hi"))
         fwd.assert_not_called()
@@ -184,7 +184,7 @@ class RouteDispatchTests(_OnePeerTest):
     def test_malformed_key_is_a_404(self):
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as ctx:
-            appmod._split("nonsense")
+            appmod.api_close("nonsense")
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_spawn_on_a_peer_is_forwarded_without_the_host_field(self):

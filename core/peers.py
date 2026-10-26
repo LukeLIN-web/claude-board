@@ -144,9 +144,7 @@ def split_key(key: str) -> tuple[Optional[str], int]:
     label, sep, rest = str(key).partition(":")
     if not sep:
         return None, int(label)
-    if label in _peers:
-        return label, int(rest)
-    return None, int(rest)
+    return (label if label in _peers else None), int(rest)
 
 
 def _request(url: str, method: str, body: Optional[dict], timeout: float) -> tuple[int, Any]:
@@ -244,14 +242,18 @@ def start() -> None:
         t.start()
 
 
+def _entries() -> dict[str, dict]:
+    """A copy of the cache, so readers never hold the lock."""
+    with _lock:
+        return {k: dict(v) for k, v in _cache.items()}
+
+
 def _live_entries() -> list[tuple[dict, bool]]:
     """(cache entry, stale) for each configured peer that answered within
     DROP_AFTER, from the last successful poll. Never blocks."""
     now = time.time()
-    with _lock:
-        entries = {k: dict(v) for k, v in _cache.items()}
     return [(entry, _data_age(entry, now) > STALE_AFTER)
-            for label, entry in entries.items()
+            for label, entry in _entries().items()
             # a peer removed from the config since it was polled is gone
             if label in _peers and now - (entry.get("ts") or 0) <= DROP_AFTER]
 
@@ -277,8 +279,7 @@ def status() -> list[dict]:
     Nothing that moves with the clock (how long ago it answered): the snapshot
     carries this, and a value that ticks would re-send the board every poll."""
     now = time.time()
-    with _lock:
-        entries = {k: dict(v) for k, v in _cache.items()}
+    entries = _entries()
     out = []
     for label in sorted(_peers):
         entry = entries.get(label) or {}
@@ -298,13 +299,11 @@ def forward(label: str, method: str, path: str, body: Optional[dict] = None) -> 
     Errors are surfaced as a normal action result (`{"ok": false, "error": …}`)
     rather than an exception: the buttons on a card all render `error`, so an
     unreachable peer reads as "couldn't reach host b" on the card instead of a
-    stack trace in the log and a silent button."""
-    base = _peers.get(label)
-    if not base:
-        return {"ok": False, "error": f"unknown peer host {label!r}"}
-    timeout = POST_TIMEOUT if method.upper() == "POST" else GET_TIMEOUT
+    stack trace in the log and a silent button. `label` is a configured peer:
+    callers only forward what split_key or is_peer named one."""
+    timeout = POST_TIMEOUT if method == "POST" else GET_TIMEOUT
     try:
-        status_code, payload = _request(f"{base}{path}", method.upper(), body, timeout)
+        status_code, payload = _request(f"{_peers[label]}{path}", method, body, timeout)
     except Exception as e:
         return {"ok": False, "error": f"could not reach host {label}: {type(e).__name__}"}
     if status_code >= 400:

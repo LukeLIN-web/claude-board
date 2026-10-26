@@ -121,12 +121,6 @@ class RunHelperTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("time", r["error"].lower())
 
-    def test_run_invokes_tmux_with_args(self):
-        with _patch_run(returncode=0) as m:
-            tmux._run("list-panes", "-a")
-        argv = m.call_args[0][0]
-        self.assertEqual(argv[:3], ["tmux", "list-panes", "-a"])
-
 
 class SocketArgsTests(unittest.TestCase):
     """FLEET_TMUX_SOCKET routes every call to an isolated tmux server."""
@@ -684,16 +678,21 @@ class SendTextVerifySubmitTests(unittest.TestCase):
         self.assertEqual(len(enters), 1)  # submit Enter only, no resend
 
     def test_resends_enter_until_composer_clears(self):
-        calls = []
-        states = iter([True, False])  # stranded once, then submitted
-        with _patch_run(_recorder(calls)), \
-                mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_composer_has_tail",
-                                  side_effect=lambda *a: next(states)):
-            r = tmux.send_text("%5", "hello", marker="❯")
-        self.assertTrue(r["ok"])
-        enters = [c for c in calls if c[-1] == "Enter"]
-        self.assertEqual(len(enters), 2)  # initial submit + one resend
+        # Slash prompts included: Claude's slash popup can eat the submit Enter
+        # (it selects the highlighted completion instead), silently stranding
+        # e.g. "/clear" in the composer.
+        for text in ("hello", "/clear"):
+            with self.subTest(text):
+                calls = []
+                states = iter([True, False])  # stranded once, then submitted
+                with _patch_run(_recorder(calls)), \
+                        mock.patch.object(tmux.time, "sleep"), \
+                        mock.patch.object(tmux, "_composer_has_tail",
+                                          side_effect=lambda *a: next(states)):
+                    r = tmux.send_text("%5", text, marker="❯")
+                self.assertTrue(r["ok"])
+                enters = [c for c in calls if c[-1] == "Enter"]
+                self.assertEqual(len(enters), 2)  # initial submit + one resend
 
     def test_reports_failure_when_prompt_never_submits(self):
         calls = []
@@ -703,21 +702,6 @@ class SendTextVerifySubmitTests(unittest.TestCase):
             r = tmux.send_text("%5", "hello", marker="❯")
         self.assertFalse(r["ok"])
         self.assertIn("unsent", r["error"])
-
-    def test_slash_prompt_auto_verifies_submit(self):
-        # Claude's slash popup can eat the submit Enter (it selects the
-        # highlighted completion instead), silently stranding e.g. "/clear" in
-        # the composer. Slash prompts must verify-and-resend.
-        calls = []
-        states = iter([True, False])  # stranded once, then submitted
-        with _patch_run(_recorder(calls)), \
-                mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_composer_has_tail",
-                                  side_effect=lambda *a: next(states)):
-            r = tmux.send_text("%5", "/clear", marker="❯")
-        self.assertTrue(r["ok"])
-        enters = [c for c in calls if c[-1] == "Enter"]
-        self.assertEqual(len(enters), 2)  # initial submit + one resend
 
     def test_open_btw_overlay_does_not_trigger_enter_resend(self):
         # A submitted /btw keeps its command text on the composer line while the
@@ -848,6 +832,8 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 1)  # text sent once
+        enters = [c for c in calls if c[-1] == "Enter"]
+        self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
         # Landing first try still costs one clear: the composer is emptied
         # before the text is typed, never after it lands.
         cc.assert_called_once_with("%5", "❯")
@@ -924,18 +910,6 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
         self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
         self.assertGreaterEqual(sum(sleeps), 3.0)  # rides out multi-second lag
-
-    def test_landed_then_verifies_submit_together(self):
-        # The two phases compose: text lands before Enter, composer empties after.
-        calls = []
-        with _patch_run(_recorder(calls)), \
-                mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_tail_in",
-                                  side_effect=[True, False]):  # landed, then submitted
-            r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
-        self.assertTrue(r["ok"])
-        enters = [c for c in calls if c[-1] == "Enter"]
-        self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
 
 
 class SendTextConfirmedTests(unittest.TestCase):

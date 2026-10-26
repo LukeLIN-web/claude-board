@@ -60,8 +60,8 @@ status)
     done
     exit 0
     ;;
-# Internal: the supervisor loop, kept in this file so it shares the ssh options
-# with the check above. Not for direct use.
+# Internal: the supervisor loop `start` runs detached, one per forward. Not for
+# direct use.
 __supervise)
     spec="$2"
     lport="${spec%%:*}"; rest="${spec#*:}"

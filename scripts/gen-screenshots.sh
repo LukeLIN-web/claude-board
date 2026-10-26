@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Regenerate the README screenshots from synthetic demo data.
 #
-#   1. seed fixtures/demo-home with fake "Acme" sessions
-#   2. serve the dashboard against it (CLAUDE_FLEET_HOME)
-#   3. drive headless Chrome to capture each panel via hash deep-links
-#   4. tear everything down
+#   1. serve the board on fixtures/demo-home (scripts/demo-board.sh)
+#   2. drive headless Chrome to capture each panel via hash deep-links
+#   3. tear everything down
 #
 # No real user data is ever involved. Requires Google Chrome / Chromium.
 # Override the browser with CHROME=/path/to/chrome.
@@ -15,47 +14,22 @@ PORT="${SHOT_PORT:-7901}"
 DEMO="$PWD/fixtures/demo-home"
 OUT="$PWD/docs"
 
-CHROME="${CHROME:-}"
-if [ -z "$CHROME" ]; then
-  for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-           "/Applications/Chromium.app/Contents/MacOS/Chromium" \
-           google-chrome chromium chromium-browser; do
-    if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then CHROME="$c"; break; fi
-  done
-fi
-[ -n "$CHROME" ] || { echo "✗ no Chrome/Chromium found; set CHROME=..." >&2; exit 1; }
-
-cleanup() {
-  [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true
-  CLAUDE_FLEET_HOME="$DEMO" python3 fixtures/seed.py --stop >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
 # The board's venv, where run.sh keeps it (VENV in scripts/env.sh, which this
 # doesn't source: it would load .env.local's port and password into the demo).
 # Resolved before HOME moves below.
 VENV="${CLAUDE_FLEET_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-fleet/venv}"
 source "$VENV/bin/activate" 2>/dev/null || { mkdir -p "$(dirname "$VENV")" && python3 -m venv "$VENV" && source "$VENV/bin/activate"; }
 python -c "import fastapi" 2>/dev/null || pip install -q -e .
+PY=python
 
-# Published, so nothing of this host: smoke.sh's isolation, plus only the demo
-# cwd (/proc discovery cards real sessions) and a label that isn't the IP octet.
-unset FLEET_AUTH_PASSWORD FLEET_API_TOKEN FLEET_PEERS \
-      CLAUDE_FLEET_CWD_EXCLUDE FLEET_TMUX_SESSION TMUX
-export HOME="$DEMO" CLAUDE_FLEET_HOME="$DEMO" FLEET_TMUX_SOCKET="claude-board-shots-$$" \
-       CLAUDE_FLEET_CWD_INCLUDE=/home/dev/acme CLAUDE_FLEET_LABEL=laptop
-
-echo "· seeding demo data"
-python3 fixtures/seed.py >/dev/null
-
-echo "· starting dashboard on :$PORT"
-uvicorn app:app --host 127.0.0.1 --port "$PORT" >/tmp/fleet-shots.log 2>&1 &
-SRV_PID=$!
-
-for _ in $(seq 1 30); do
-  curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/windows" && break
-  sleep 0.5
-done
+# Published, so nothing of this host: the demo board's isolation, plus only the
+# demo cwd (/proc discovery cards real sessions) and a label that isn't the IP
+# octet.
+source scripts/demo-board.sh
+export CLAUDE_FLEET_CWD_INCLUDE=/home/dev/acme CLAUDE_FLEET_LABEL=laptop
+find_chrome
+trap stop_demo_board EXIT
+start_demo_board
 
 shot() {  # <hash-or-empty> <height> <outfile>
   local url="http://127.0.0.1:$PORT/?snapshot${1:+#$1}"

@@ -41,6 +41,11 @@ REAL_PROMPT = "检查一下训练代码有没有问题."
 ASSISTANT_REPLY = "我会按代码审查处理…"
 
 
+def _card_tail(path):
+    """What a live card reads of the rollout at `path` each tick."""
+    return list(codex._records(path, codex._CARD_TAIL))
+
+
 def _write_rollout(lines):
     # As Codex writes it: non-ASCII text as raw UTF-8, not \u escapes.
     return write_jsonl(lines, ensure_ascii=False)
@@ -142,7 +147,7 @@ class TestThreadItemRollout(unittest.TestCase):
         # written long enough ago that the mtime shortcut can't answer.
         p = _write_rollout(ITEM_ROLLOUT_LINES[:-2])
         self.assertEqual(
-            codex._infer_codex_status(codex._read_tail_events(p),
+            codex._infer_codex_status(_card_tail(p),
                                       mtime=time.time() - 600), "busy")
 
     def test_goal_injection_with_attributes_is_not_a_prompt(self):
@@ -202,7 +207,7 @@ class TestClearHidesPreClearEvents(unittest.TestCase):
 
     def test_last_assistant_text_skips_pre_clear(self):
         self.assertEqual(
-            codex._last_assistant_text(codex._read_tail_events(self.path),
+            codex._last_assistant_text(_card_tail(self.path),
                                        since_ms=CLEAR_CUTOFF_MS),
             "NEW assistant reply")
 
@@ -284,7 +289,7 @@ class TestLastTurnError(unittest.TestCase):
     latest turn outcome; a later successful turn clears it."""
 
     def _err_of(self, lines, since_ms=0):
-        return codex._last_turn_error(codex._read_tail_events(_write_rollout(lines)), since_ms)
+        return codex._last_turn_error(_card_tail(_write_rollout(lines)), since_ms)
 
     def test_surfaces_latest_turn_error_message(self):
         out = self._err_of([_task_complete("2026-07-26T19:36:10Z", _MODEL_ERR)])
@@ -381,7 +386,7 @@ class TestRolloutsParsedOncePerChange(unittest.TestCase):
 
     def test_list_codex_sessions_reuses_unchanged_rollouts(self):
         root = scratch_dir()
-        self.addCleanup(codex._clear_caches)
+        self.addCleanup(codex._session_cache.clear)
         a, b = root / "rollout-a.jsonl", root / "rollout-b.jsonl"
         for f in (a, b):
             write_jsonl(ROLLOUT_LINES, f)
@@ -616,7 +621,7 @@ class TestCodexCardsFromProcesses(unittest.TestCase):
         table = {pid: sessions.Proc(1, "Sl+", tty, "codex", args) for pid, tty, args in rows}
         argv = argv or {}
         with mock.patch.object(codex, "proc_table", return_value=table), \
-             mock.patch.object(codex, "_proc_argv", create=True,
+             mock.patch.object(codex, "_proc_argv",
                                side_effect=lambda pid, args: argv.get(pid, args)), \
              mock.patch.object(codex, "_pid_alive", return_value=True), \
              mock.patch.object(codex, "_proc_start_ms", return_value=0), \

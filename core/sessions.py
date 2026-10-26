@@ -174,6 +174,15 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def proc_environ(pid: int) -> dict[str, str]:
+    """The environment `pid` was started with, or {} where it can't be read."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return {}
+    return dict(kv.decode(errors="replace").split("=", 1) for kv in env if b"=" in kv)
+
+
 def _ps_tty(raw: str) -> Optional[str]:
     """The device a `ps` tty column names, or None for a process with no
     controlling terminal ("?", "??") — a background job, not a window."""
@@ -255,16 +264,6 @@ def proc_table(max_age: float = _PROC_TTL) -> dict[int, Proc]:
                                    comm.strip().rsplit("/", 1)[-1], args or "")
     _proc_cache = (now, table)
     return table
-
-
-def _dev_tty(table: dict[int, Proc], pid: int) -> Optional[str]:
-    """`/dev/<tty>` of `pid`, None when it isn't in the table. The rule is the
-    one `ps -o tty= -p <pid>` was read with here: only macOS's "??" means no
-    terminal, so a Linux pid without one reads as "/dev/?"."""
-    p = table.get(pid)
-    if not p or not p.tty or p.tty == "??":
-        return None
-    return f"/dev/{p.tty}"
 
 
 # Process names treated as a "shell" when counting background shells per session.
@@ -430,7 +429,7 @@ def list_windows(include_dead: bool = False) -> list[Window]:
                 # from the epoch (which renders as ~494593h ago).
                 updated_at=int(data.get("updatedAt") or data.get("startedAt", 0)),
                 version=str(data.get("version", "")),
-                tty=_dev_tty(table, pid) if alive else None,
+                tty=_ps_tty(table[pid].tty) if alive and pid in table else None,
                 transcript_path=str(transcript) if transcript.exists() else None,
                 alive=alive,
                 hidden=hidden,
@@ -548,15 +547,8 @@ def _discover_proc_transcript(slug: str, start_ms: int, claimed_sids: set[str]):
     window. Returns (session_id, path) or (None, None) when nothing matches yet —
     e.g. the session is still parked on a menu and hasn't written a turn.
     """
-    proj = PROJECTS_DIR / slug
-    if not proj.is_dir():
-        return None, None
     best = None  # (mtime_ms, session_id, path)
-    try:
-        candidates = list(proj.glob("*.jsonl"))
-    except Exception:
-        return None, None
-    for f in candidates:
+    for f in (PROJECTS_DIR / slug).glob("*.jsonl"):
         sid = f.stem
         if sid in claimed_sids:
             continue
@@ -570,9 +562,7 @@ def _discover_proc_transcript(slug: str, start_ms: int, claimed_sids: set[str]):
             continue
         if best is None or mtime_ms > best[0]:
             best = (mtime_ms, sid, str(f))
-    if best is None:
-        return None, None
-    return best[1], best[2]
+    return (best[1], best[2]) if best else (None, None)
 
 
 def list_claude_proc_windows(
@@ -656,12 +646,10 @@ def list_claude_proc_windows(
             claimed_sids.add(session_id)
         # Prefer the (resumed/discovered) transcript's mtime as the activity time
         # when it already exists; otherwise fall back to the process start time.
-        updated = start
-        if transcript and transcript.exists():
-            try:
-                updated = int(transcript.stat().st_mtime * 1000)
-            except Exception:
-                pass
+        try:
+            updated = int(transcript.stat().st_mtime * 1000) if transcript else start
+        except OSError:
+            updated = start
 
         windows.append(Window(
             pid=pid,
@@ -683,7 +671,6 @@ def list_claude_proc_windows(
             transcript_path=str(transcript) if transcript and transcript.exists() else None,
             alive=True,
             hidden=_is_hidden_cwd(cwd),
-            platform="claude",
         ))
     return windows
 

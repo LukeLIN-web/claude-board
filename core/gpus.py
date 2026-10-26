@@ -38,6 +38,8 @@ import threading
 import time
 from typing import Optional
 
+from .sessions import proc_environ
+
 SAMPLE_INTERVAL = 15.0
 SMI_TIMEOUT = 10.0
 # A sample this old means the sampler is stuck (nvidia-smi hung), and the page
@@ -83,7 +85,7 @@ def _boot_time() -> float:
 def _proc(pid: int, boot: float) -> dict:
     """What a process runs and who started it. Times are epoch seconds rather
     than ages, so an unchanged process reads the same in every sample."""
-    env = dict(kv.split("=", 1) for kv in _read(pid, "environ").decode(errors="replace").split("\0") if "=" in kv)
+    env = proc_environ(pid)
     stat = _read(pid, "stat").decode(errors="replace")
     rest = stat[stat.rfind(")") + 2:].split() if stat else []
     try:

@@ -192,16 +192,12 @@ class Gate:
         return RedirectResponse(login_url(path), status_code=303)
 
 
-def safe_next(value: str | None) -> bool:
-    """Whether a post-login redirect target stays on this board. `//evil.example`
-    is a protocol-relative URL, not a local path, which is the classic way an
-    open redirect sneaks through a startswith("/") check."""
-    return bool(value) and value.startswith("/") and not value.startswith("//")
-
-
 def next_or_root(value: str | None) -> str:
-    """The single place an untrusted `next` becomes a usable destination."""
-    return value if safe_next(value) else "/"
+    """The single place an untrusted `next` becomes a usable destination:
+    `value` if it stays on this board, else "/". `//evil.example` is a protocol-relative
+    URL, not a local path, which is the classic way an open redirect sneaks
+    through a startswith("/") check."""
+    return value if value and value.startswith("/") and not value.startswith("//") else "/"
 
 
 def login_url(next_value: str | None) -> str:

@@ -61,7 +61,7 @@ from typing import Callable, Optional
 
 from . import codex, patrol, tmux, transcripts
 from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
-                       _proc_cwd, _proc_start_ms, _ps_tty, proc_table)
+                       _proc_cwd, _proc_start_ms, _ps_tty, proc_environ, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
 
 HMZ_HOME = HOME_BASE / ".hmz"
@@ -117,18 +117,9 @@ def _is_interactive_hmz(args: str) -> bool:
     return False
 
 
-def _environ(pid: int) -> dict[str, str]:
-    """The environment hmz `pid` was started with, or {} where it can't be read."""
-    try:
-        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return {}
-    return dict(kv.decode(errors="replace").split("=", 1) for kv in env if b"=" in kv)
-
-
 def _home(pid: int) -> Path:
     """Where hmz `pid` keeps its runs and its history."""
-    v = _environ(pid).get("HUMANIZE_HOME")
+    v = proc_environ(pid).get("HUMANIZE_HOME")
     return Path(v) if v else _default_home()
 
 
@@ -154,14 +145,10 @@ def _latest_epic(cwd: str, home: Optional[Path] = None) -> Optional[Path]:
 # it changes only as a flow is called or returns.
 @transcripts.memo_by_file
 def _events(path: Path) -> list[dict]:
-    out: list[dict] = []
     try:
-        for d in transcripts._iter_lines(path):
-            if isinstance(d, dict):
-                out.append(d)
+        return list(codex._records(path))
     except OSError:
-        pass
-    return out
+        return []
 
 
 def _began(events: list[dict]) -> dict:
@@ -195,7 +182,7 @@ def _machine(pid: int) -> Path:
     `machine()` has it: humanize-<uid> in its temporary directory — the first
     of $TMPDIR, $TEMP and $TMP that is a directory, else /tmp, as Python's
     tempfile looks for one."""
-    env = _environ(pid)
+    env = proc_environ(pid)
     tmp = next((v for v in (env.get(k) for k in ("TMPDIR", "TEMP", "TMP"))
                 if v and os.path.isdir(v)), "/tmp")
     return Path(tmp) / f"humanize-{os.getuid()}"
@@ -231,15 +218,14 @@ _BILLED = {"claude": "sessions/claude/projects/**/*.jsonl",
            "codex": "sessions/codex/sessions/**/rollout-*.jsonl"}
 
 
+def _logs(epic: Path, pattern: str) -> list[Path]:
+    """The session logs `pattern` names under the run's directory, in name order."""
+    return sorted(p for p in epic.parent.glob(pattern) if p.is_file())
+
+
 def _billed(epic: Path) -> list[tuple[Path, str]]:
     """Every session log the run keeps, with the CLI that wrote it."""
-    out: list[tuple[Path, str]] = []
-    for backend, pattern in _BILLED.items():
-        try:
-            out += [(p, backend) for p in sorted(epic.parent.glob(pattern)) if p.is_file()]
-        except (OSError, ValueError):
-            continue
-    return out
+    return [(p, backend) for backend, pattern in _BILLED.items() for p in _logs(epic, pattern)]
 
 
 # A session log is appended to for hours. It is read from where the last poll
@@ -266,11 +252,7 @@ def _spent_in(log: Path, backend: str) -> dict[str, dict[str, int]]:
             return st["spent"]
         whole = data.rfind(b"\n") + 1  # a line still being written waits for the next poll
         fold = _fold_claude if backend == "claude" else _fold_codex
-        for line in data[:whole].splitlines():
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
+        for d in transcripts._parse_rows(data[:whole].splitlines()):
             if isinstance(d, dict):
                 fold(st, d)
         st["pos"] += whole
@@ -599,7 +581,7 @@ def _discover() -> list[tuple[Window, list[dict]]]:
             if end and transcripts._parse_ts(end.get("at", "")) * 1000 < started_at:
                 epic, events = None, []
         if epic:
-            status = "busy" if _began(events) and not _ended(events) else "idle"
+            status = "busy" if _began(events) and not end else "idle"
             # The epic is written as sessions open and flows are called and
             # return; a long turn leaves it untouched, and `busy` says enough.
             updated_at = max(started_at, int(_mtime(epic) * 1000))
@@ -802,22 +784,16 @@ def answer_reports(exe: str, cwd: str) -> bool:
 
 def _history(path: Path, start: int = 0) -> list[dict]:
     """The lines in hmz's history.jsonl from byte `start` on, each {at, workdir, text}."""
-    out: list[dict] = []
     try:
         with path.open("rb") as f:
             f.seek(start)
             data = f.read().decode("utf-8", errors="replace")
     except OSError:
-        return out
-    for line in data.splitlines():
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(d, dict) and isinstance(d.get("text"), str):
-            out.append({"at": str(d.get("at") or ""), "workdir": str(d.get("workdir") or ""),
-                        "text": d["text"]})
-    return out
+        return []
+    return [{"at": str(d.get("at") or ""), "workdir": str(d.get("workdir") or ""),
+             "text": d["text"]}
+            for d in transcripts._parse_rows(data.splitlines())
+            if isinstance(d, dict) and isinstance(d.get("text"), str)]
 
 
 # Every hmz on a home shares its history, which grows for as long as hmz is used
@@ -939,7 +915,7 @@ def refusal(pane: str, text: str) -> str:
 # What the agents said, for the timeline: each CLI's own sessions under the
 # run's directory for it. Not Claude's sub-agents (projects/*/<id>/subagents/),
 # billed as the run's but not the agents the flow drove.
-_SAID = ("sessions/claude/projects/*/*.jsonl", "sessions/codex/sessions/**/rollout-*.jsonl")
+_SAID = ("sessions/claude/projects/*/*.jsonl", _BILLED["codex"])
 # How much of each log: its newest this many events.
 _SAID_TAIL = 200
 
@@ -969,13 +945,8 @@ def _said(epic: Path, events: list[dict], limit: int) -> list[dict]:
     no prompt of the person's (lastUserPrompt on the page)."""
     whose = {str(e["session"]): str(e.get("agent") or "") for e in events
              if e.get("event") == "opened" and e.get("session")}
-    logs: list[tuple[float, Path]] = []
-    for pattern in _SAID:
-        try:
-            logs += [(_mtime(p), p) for p in epic.parent.glob(pattern) if p.is_file()]
-        except (OSError, ValueError):
-            continue
-    logs.sort(key=lambda found: -found[0])
+    logs = sorted(((_mtime(p), p) for pattern in _SAID for p in _logs(epic, pattern)),
+                  key=lambda found: -found[0])
     out: list[dict] = []
     for mtime, log in logs:
         if len(out) >= limit and mtime < transcripts._parse_ts(out[-limit]["ts"] or ""):

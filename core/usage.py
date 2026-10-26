@@ -62,10 +62,6 @@ _BAR_CHARS = "█▉▊▋▌▍▎▏  \t"
 
 _ACCOUNT_RE = re.compile(r"^\s*(Login method|Email):\s+(\S.*?)\s*$", re.M)
 
-# One probe at a time per CLI, and the answer each last gave (read_usage).
-_locks = {"claude": threading.Lock(), "codex": threading.Lock()}
-_last: dict[str, dict] = {}
-
 
 def parse_limits(text: str) -> list[dict]:
     """[{label, used, resets}] for each limit on the Usage tab, in panel order.
@@ -390,6 +386,9 @@ def _probe_codex() -> dict:
 
 # Looked up when called, so a test that patches a probe gets its patch.
 _PROBES: dict[str, Callable[[], dict]] = {"claude": lambda: _probe(), "codex": lambda: _probe_codex()}
+# One probe at a time per CLI, and the answer each last gave.
+_locks = {cli: threading.Lock() for cli in _PROBES}
+_last: dict[str, dict] = {}
 
 
 def read_usage(cli: str = "claude") -> dict:
