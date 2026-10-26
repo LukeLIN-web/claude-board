@@ -1983,8 +1983,10 @@ function fleet() {
     },
 
     // What the model select offers, as {value: '<kind>:<name>', label}. Claude:
-    // the two families the board switches between. Codex: its picker's models,
-    // and its reasoning levels as a second group — the API takes either alone.
+    // the families of its /model dialog, by name — the server picks the row.
+    // Codex: its picker's models, and its reasoning levels as a second group —
+    // the API takes either alone.
+    claudeModels: ['Opus', 'Fable', 'Sonnet', 'Haiku'],
     codexModels: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
     codexEfforts: ['low', 'medium', 'high', 'xhigh'],
     modelOptions(w) {
@@ -1994,7 +1996,7 @@ function fleet() {
           ...this.codexEfforts.map(e => ({ value: 'effort:' + e, label: 'effort: ' + e })),
         ];
       }
-      return [{ value: 'model:opus', label: 'Opus' }, { value: 'model:fable', label: 'Fable' }];
+      return this.claudeModels.map(m => ({ value: 'model:' + m.toLowerCase(), label: m }));
     },
     modelTitle(w) {
       if (w.platform === 'codex') {

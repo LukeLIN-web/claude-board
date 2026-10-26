@@ -1021,6 +1021,11 @@ class PickModelRowTests(unittest.TestCase):
     def test_the_1m_row_wins_over_the_bare_one(self):
         self.assertEqual(actions._pick_model_row(self._ROWS, "opus"), 2)
 
+    def test_each_dropdown_family_reaches_its_row(self):
+        # static/index.html claudeModels: Opus is covered above.
+        for alias, row in (("fable", 3), ("sonnet", 4), ("haiku", 5)):
+            self.assertEqual(actions._pick_model_row(self._ROWS, alias), row, alias)
+
     def test_first_word_is_the_fallback(self):
         # Nothing is named bare "Default" — the fallback is the only way in.
         self.assertEqual(actions._pick_model_row(self._ROWS, "default"), 1)
