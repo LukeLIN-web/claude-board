@@ -103,8 +103,19 @@ def _socket_args() -> list[str]:
     server is still chosen by `_resolve_target`; the socket only picks the server.
     A thread inside `private_server` goes to that server instead.
     """
-    name = getattr(_private, "server", None) or (os.environ.get("FLEET_TMUX_SOCKET") or "").strip()
+    name = _server_name()
     return ["-L", name] if name else []
+
+
+def _server_name() -> str:
+    """The `-L` name this thread's calls go to; "" is tmux's default server."""
+    return getattr(_private, "server", None) or (os.environ.get("FLEET_TMUX_SOCKET") or "").strip()
+
+
+def _socket_path(name: str) -> str:
+    """The socket file tmux makes for `-L <name>`."""
+    return os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}",
+                        name or "default")
 
 
 # The server a thread's calls go to while it is inside `private_server`. Per
@@ -129,9 +140,8 @@ def private_server(name: str):
     finally:
         _run("kill-server")
         _private.server = prev
-        sock = os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}", name)
         try:
-            os.unlink(sock)
+            os.unlink(_socket_path(name))
         except OSError:
             pass
 
@@ -306,13 +316,16 @@ def list_panes() -> list[dict]:
 
 
 def passive_ttys(pids: list[int]) -> set[str]:
-    """TTYs explicitly marked as parent-controlled helpers, not user cards.
+    """TTYs of parent-controlled helpers, not user cards.
 
-    Set `@fleet-passive` to `1` on the helper's pane. Read its own tmux socket
-    from the process environment too: process discovery can see helpers on a
-    different server from FLEET_TMUX_SOCKET. Missing metadata fails open.
+    Every pane on a tmux server other than the board's is one: whatever drives
+    that server owns it, and the board could not type into it anyway. On the
+    board's own server a helper sets `@fleet-passive` to `1` on its pane. A
+    process names its server in its TMUX environment; missing metadata or an
+    unreachable server fails open.
     """
-    selectors: set[tuple[str, ...]] = {()}
+    own = os.path.realpath(_socket_path(_server_name()))
+    foreign: set[str] = set()
     for pid in pids:
         try:
             entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
@@ -320,19 +333,20 @@ def passive_ttys(pids: list[int]) -> set[str]:
             socket_path, _, _ = os.fsdecode(value).rsplit(",", 2)
         except (OSError, StopIteration, ValueError):
             continue
-        if os.path.isabs(socket_path):
-            selectors.add(("-S", socket_path))
+        if os.path.isabs(socket_path) and os.path.realpath(socket_path) != own:
+            foreign.add(socket_path)
 
     hidden: set[str] = set()
-    for selector in sorted(selectors):
-        result = _run(*selector, "list-panes", "-a", "-F",
-                      "#{pane_tty}\t#{@fleet-passive}")
-        if not result["ok"]:
-            continue
+    result = _run("list-panes", "-a", "-F", "#{pane_tty}\t#{@fleet-passive}")
+    if result["ok"]:
         for line in result["stdout"].splitlines():
             tty, sep, passive = line.partition("\t")
             if sep and tty.startswith("/dev/") and passive == "1":
                 hidden.add(tty)
+    for socket_path in sorted(foreign):
+        result = _run("-S", socket_path, "list-panes", "-a", "-F", "#{pane_tty}")
+        if result["ok"]:
+            hidden.update(t for t in result["stdout"].split() if t.startswith("/dev/"))
     return hidden
 
 

@@ -74,12 +74,26 @@ stop_watchdog() {
     rm -f "$WATCHDOG_PID_FILE"
 }
 
-# Match the process by name. A -f pattern would also match this script's own
-# command line and kill the caller instead of the tunnel.
+# This board's cloudflared, and only that one. Hosts are shared: another
+# service on the same machine may run its own quick tunnel, and matching the
+# bare process name (pkill -x cloudflared) would kill it on every start and
+# stop. The origin URL is what tells ours apart — one board per port. The
+# pattern names cloudflared's own arguments, so this script's command line
+# (cf-tunnel.sh start/__watchdog) can't match it.
+OWN_TUNNEL="cloudflared tunnel --url http://127\.0\.0\.1:$PORT( |\$)"
+
+own_tunnel_running() {
+    pgrep -f "$OWN_TUNNEL" >/dev/null
+}
+
+kill_own_tunnel() {
+    pkill -f "$OWN_TUNNEL" 2>/dev/null
+}
+
 case "${1:-start}" in
 stop)
     stop_watchdog
-    if pkill -x cloudflared 2>/dev/null; then
+    if kill_own_tunnel; then
         rm -f "$URL_FILE"
         echo "[cf-tunnel] stopped"
     else
@@ -92,10 +106,10 @@ stop)
 __watchdog)
     while sleep "$WATCH_INTERVAL"; do
         # Tunnel gone ⇒ nothing left to guard. Exit rather than idle forever.
-        pgrep -x cloudflared >/dev/null || exit 0
+        own_tunnel_running || exit 0
         if [ "$(gate_verdict "$(board_code)")" = "ungated" ]; then
             echo "[cf-tunnel] watchdog: board on 127.0.0.1:$PORT lost its gate — tearing the tunnel down" >&2
-            pkill -x cloudflared
+            kill_own_tunnel
             rm -f "$URL_FILE"
             exit 5
         fi
@@ -107,7 +121,7 @@ url)
     exit 3
     ;;
 status)
-    if ! pgrep -x cloudflared >/dev/null; then echo "[cf-tunnel] not running"; exit 0; fi
+    if ! own_tunnel_running; then echo "[cf-tunnel] not running"; exit 0; fi
     url="$(cat "$URL_FILE" 2>/dev/null)"
     echo "[cf-tunnel] running${url:+ -> $url}"
     # Check the gate before reporting anything reassuring. The watchdog should
@@ -169,7 +183,7 @@ esac
 mkdir -p "$RUN_DIR"
 umask 077
 stop_watchdog
-pkill -x cloudflared 2>/dev/null && sleep 1
+kill_own_tunnel && sleep 1
 rm -f "$URL_FILE"
 
 setsid cloudflared tunnel --url "http://127.0.0.1:$PORT" \
@@ -223,7 +237,7 @@ down)
 *)
     echo "[cf-tunnel] DANGER: anonymous request through the tunnel got HTTP $edge, not a login." >&2
     echo "            Stopping the tunnel rather than leaving it published." >&2
-    pkill -x cloudflared 2>/dev/null
+    kill_own_tunnel
     rm -f "$URL_FILE"
     exit 5
     ;;
