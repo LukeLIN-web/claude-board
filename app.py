@@ -647,7 +647,7 @@ def api_window_clear(key: str) -> dict:
 
 
 class ModelBody(BaseModel):
-    model: str = ""   # Claude: a /model dialog alias ("opus" | "fable"); Codex: a model name
+    model: str = ""   # Claude: a /model dialog family ("opus", "sonnet", …); Codex: a model name
     effort: str = ""  # Codex only: low | medium | high | xhigh
 
 
