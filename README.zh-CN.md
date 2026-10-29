@@ -105,7 +105,7 @@ FLEET_PEER_TUNNELS="7880:hostb:7879"   # <本地端口>:<ssh 主机>:<对端端�
 
 ### GPU
 
-每份 board 每 15 秒读一次本机的 `nvidia-smi`。页头的 **GPUs** 列出每台机器的每张卡上有什么；会话起的进程在哪张卡上，那张卡片上就标出来（`GPU b:3`）。`/api/windows` 的 `gpus` 字段是同一份数据，给排卡的脚本用。设了 `FLEET_GPU_LOCK_DIR`（`gpu_wait.py` 的锁目录），还会列出经它占住的卡和排队等卡的作业。想在页面上看到某台机器的作业，那台就要跑一份 board，哪怕上面没有会话。
+每份 board 每 15 秒读一次本机的 `nvidia-smi`。页头的 **GPUs** 列出每台机器的每张卡上有什么；会话起的进程在哪张卡上，那张卡片上就标出来（`GPU b:3`）。`/api/windows` 的 `gpus` 字段是同一份数据，给排卡的脚本用。经 `scripts/gpu_wait.py`（包住一个作业、等够空卡再起，见它的 docstring；谁的作业先上见 `scripts/gpu_busy.py`）占住的卡和排队等卡的作业也会列出来。想在页面上看到某台机器的作业，那台就要跑一份 board，哪怕上面没有会话。
 
 ## 致谢
 

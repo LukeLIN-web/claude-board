@@ -19,9 +19,16 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import gpu_busy  # noqa: E402
+import gpu_hold  # noqa: E402
+import gpu_wait  # noqa: E402
 
 _fake_home: str | None = None
 _tmux_socket: str | None = None
@@ -53,6 +60,12 @@ def pytest_configure(config):
     # panes — never to the one the user's real sessions (or a live board) run on.
     _tmux_socket = f"claude-board-tests-{os.getpid()}"
     os.environ["FLEET_TMUX_SOCKET"] = _tmux_socket
+    # The GPU tools' lock directories (scripts/gpu_*.py), likewise: on a box that
+    # runs GPU jobs, the real ones hold the claims of jobs that are running. A
+    # test that takes locks points them at a directory of its own.
+    gpu_wait.LOCK_DIR = os.path.join(_fake_home, "gpu_wait_locks")
+    gpu_busy.REG_DIR = os.path.join(_fake_home, "gpu_launches")
+    gpu_hold.HOLD_DIR = os.path.join(_fake_home, "gpu_hold")
 
 
 def pytest_unconfigure(config):

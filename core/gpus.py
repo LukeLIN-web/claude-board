@@ -13,11 +13,11 @@ CLAUDE_CODE_SESSION_ID, and `attach` names the card with that session_id. A job
 started over ssh from another machine carries no session id; what is left to
 go on is where its ssh came from (`ssh_from`), its cwd and its command.
 
-GPU_WAIT CLAIMS: where jobs queue for cards through gpu_wait.py, set
-FLEET_GPU_LOCK_DIR to its lock directory. gpu_wait claims a card by holding a
-flock on gpu<N>.lock (further slots of a shared card: gpu<N>.s<K>.lock), N the
-CUDA ordinal, with "pid=<pid> …" and the command written inside. Each sample
-then lists the held claims and the gpu_wait.py processes still waiting for one.
+GPU_WAIT CLAIMS: where jobs queue for cards through scripts/gpu_wait.py, each
+sample also lists the held claims and the gpu_wait.py processes still waiting
+for one. gpu_wait claims a card by holding a flock on one of its claim locks in
+its LOCK_DIR, with "pid=<pid> …" and the command written inside; the lock
+directory, the lock names and that note are gpu_wait's, read here through it.
 The holder is the pid the kernel lists for the flock, not the pid written in
 the file: another tool can flock the same file without rewriting it, and the
 note left inside then names an earlier holder long gone.
@@ -32,13 +32,17 @@ from __future__ import annotations
 
 import copy
 import os
-import re
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from .sessions import proc_environ
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "scripts"))
+import gpu_wait  # noqa: E402
 
 SAMPLE_INTERVAL = 15.0
 SMI_TIMEOUT = 10.0
@@ -47,7 +51,6 @@ SMI_TIMEOUT = 10.0
 STALE_AFTER = 3 * SAMPLE_INTERVAL
 CMD_CHARS = 300
 
-_CLAIM = re.compile(r"gpu(\d+)(?:\.s\d+)?\.lock$")
 _CLK = os.sysconf("SC_CLK_TCK")
 
 # The last good sample; replaced whole, never edited, so readers need no lock.
@@ -105,39 +108,27 @@ def _proc(pid: int, boot: float) -> dict:
     }
 
 
-def _claims(lock_dir: str, boot: float) -> list[dict]:
+def _claims(boot: float) -> list[dict]:
     """Held gpu_wait claims, one per holding process, with the CUDA ordinals it
     holds. The kernel drops a flock when its last holder dies, so a lock file
     nobody holds is a finished claim, not a live one. The note inside names the
     job only when its holder wrote it."""
-    holder = {}
-    with open("/proc/locks") as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) > 5 and parts[1] == "FLOCK":
-                holder[parts[5]] = int(parts[4])  # maj:min:inode of the locked file -> pid
     by_pid: dict[int, dict] = {}
-    for name in sorted(os.listdir(lock_dir)):
-        m = _CLAIM.match(name)
-        if not m:
-            continue
-        path = os.path.join(lock_dir, name)
-        st = os.stat(path)
-        pid = holder.get(f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}")
-        if pid is None:
-            continue
-        with open(path, errors="replace") as f:
-            words = f.read(CMD_CHARS).split()
+    for card, path, pid in gpu_wait.held_claims():
         claim = by_pid.setdefault(pid, dict(_proc(pid, boot), cuda=[]))
-        if words and words[0] == f"pid={pid}":
-            claim["cmd"] = " ".join(w for w in words[1:] if not w.startswith("slots="))
-        claim["cuda"] = sorted(set(claim["cuda"]) | {int(m.group(1))})
+        written_by, _, job = gpu_wait.read_note(path)
+        if written_by == pid:
+            claim["cmd"] = job[:CMD_CHARS]
+        claim["cuda"] = sorted(set(claim["cuda"]) | {card})
     return list(by_pid.values())
 
 
 def _waiting(claimed: set[int], boot: float) -> list[dict]:
-    """gpu_wait.py processes holding no claim yet. After a claim the wrapper
-    stays on as the job's parent, so its pid is in a claim and drops out."""
+    """gpu_wait.py processes that hold no claim: still waiting for cards. Once
+    it has claimed, gpu_wait.py execs into its job, whose argv is the job's, and
+    its claim holders (``gpu_wait.py claim …``) hold the claims; an older copy
+    that stays on as its job's parent holds the claim locks itself. Either way
+    no pid of a claim is waiting."""
     out = []
     for d in os.listdir("/proc"):
         if d.isdigit() and int(d) not in claimed:
@@ -162,9 +153,9 @@ def sample() -> Optional[dict]:
         # A process in another container's pid namespace shows no pid here.
         p = _proc(int(pid), boot) if pid.isdigit() else {"pid": None, "cmd": "", "session": None}
         by_uuid[uuid]["procs"].append(dict(p, used_mb=_num(mb)))
-    lock_dir = os.environ.get("FLEET_GPU_LOCK_DIR", "").strip()
-    claims = _claims(lock_dir, boot) if lock_dir and os.path.isdir(lock_dir) else []
-    waiting = _waiting({c["pid"] for c in claims}, boot) if lock_dir else []
+    queue = os.path.isdir(gpu_wait.LOCK_DIR)   # gpu_wait makes it before it waits
+    claims = _claims(boot) if queue else []
+    waiting = _waiting({c["pid"] for c in claims}, boot) if queue else []
     return {"ts": time.time(), "cards": cards, "claims": claims, "waiting": waiting}
 
 
