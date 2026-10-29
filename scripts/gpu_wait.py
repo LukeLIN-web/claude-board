@@ -36,10 +36,13 @@ on NFS is a lie), taken and held by the claim's holder, a ``gpu_wait.py claim``
 process in a session of its own that carries the job's command, environment and
 cwd, so whoever looks the lock's holder up in /proc/locks sees whose job it is.
 The holder writes ``pid=<its pid> [slots=<K>] <the job's command>`` into the lock
-(``note``). The holders of a job read one pipe whose write end the job inherits:
-a holder lets go once every process holding that end has exited, so a job whose
-top process was killed while its children run keeps its cards, and a job that is
-gone leaves no claim behind. Whatever gpu_wait itself inherited (a gpu_busy
+(``note``). The holders of a job read one pipe whose write end the job inherits
+on fd 10: a holder lets go once no process holds that end, so a job whose top
+process was killed while children that inherited fd 10 still run (children
+started with Python subprocess's default close_fds=True do not) keeps its cards,
+and a job that is gone leaves no claim behind. A job that closes fd 10 (closes every fd above 2,
+or redirects onto 10 by number) lets go of its cards at once, while it still
+runs on them. Whatever gpu_wait itself inherited (a gpu_busy
 registration among them) the holders keep while the job runs; the job gets the
 pipe and nothing else. Foreign (non-gpu_wait) processes bypass the locks
 entirely; the post-claim free-VRAM recheck narrows that race but nothing can
@@ -337,6 +340,8 @@ def hold_claim(path: str, slots: int, job: list[str]) -> None:
     """``claim <claim lock> <slots> -- <job>``: take the lock for ``job`` and print
     this process's pid, then keep the lock until stdin reads EOF; exit at once if
     somebody else holds it."""
+    signal.signal(END, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {END})
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, signal.SIG_IGN)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
@@ -368,6 +373,9 @@ def claim_card(card: int, slots: int, cmd: list[str], life: int) -> int | None:
         if (holder := try_claim(card, cmd, life, slot, slots)) is not None:
             if slots == 1 and any(held(path) for path in card_locks(card)[1:]):
                 end(holder)   # other jobs share the card
+                return None
+            if slot > 0 and not shared(card):
+                end(holder)   # slot 0 changed hands to a job alone on the card
                 return None
             return holder
         if slot == 0 and not shared(card):

@@ -276,9 +276,12 @@ def test_the_claim_lives_while_any_process_of_the_job_does(run):
     wait_for(unclaimed)
 
 
-def test_a_wait_that_falls_short_keeps_no_claim(cli):
+@pytest.mark.parametrize("caller", [None, lambda: signal.signal(gpu_wait.END, signal.SIG_IGN),
+                                    lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {gpu_wait.END})],
+                         ids=["plain", "caller ignores END", "caller blocks END"])
+def test_a_wait_that_falls_short_keeps_no_claim(cli, caller):
     p = subprocess.Popen([*cli, "--need-gb", "1", "--num-gpus", "4", "--interval-min", "1", "--", "true"],
-                         stdout=subprocess.PIPE, text=True)
+                         stdout=subprocess.PIPE, text=True, preexec_fn=caller)
     try:
         assert "no 4 claimable card(s)" in p.stdout.readline()
         wait_for(unclaimed)
