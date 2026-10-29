@@ -413,3 +413,22 @@ class ClassifyTests(unittest.TestCase):
             {"type": "agent", "description": "long scan", "command": "",
              "state": "running", "ts": 0.0}])
         self.assertEqual(got["triage"], "working")
+
+
+class NfsHungTriageTests(unittest.TestCase):
+    """patrol.classify_nfs_hung — the processes arrive longest-stuck first
+    (sessions.nfs_hung)."""
+
+    SINCE = time.mktime((2026, 10, 29, 9, 1, 42, 0, 0, -1))
+
+    def test_names_when_it_stopped_and_what_is_stuck(self):
+        got = patrol.classify_nfs_hung([(self.SINCE, "bash /shared/x/log_event.sh")])
+        self.assertEqual(got["triage"], "stalled")
+        self.assertEqual(got["triage_reason"],
+                         "NFS 挂住，09:01 起没动过。bash /shared/x/log_event.sh")
+
+    def test_counts_the_stuck_processes_and_names_the_first(self):
+        got = patrol.classify_nfs_hung([(self.SINCE, "bash log_event.sh"),
+                                        (self.SINCE + 600, "claude")])
+        self.assertEqual(got["triage_reason"],
+                         "NFS 挂住（2 个进程），09:01 起没动过。bash log_event.sh")

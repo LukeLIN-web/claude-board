@@ -28,6 +28,7 @@ from tests.helpers import codex_rollout, scratch_dir, user_row, write_jsonl
 _NEUTRAL = {
     "hmz_window_dicts": (appmod.hmz, []),
     "shell_descendant_counts": (appmod.sessions, {}),
+    "nfs_hung": (appmod.sessions, {}),
     "pending_by_tty": (appmod.perms, {}),
     "available": (appmod.tmux, True),
     "passive_ttys": (appmod.tmux, set()),
@@ -654,6 +655,34 @@ class QuietBoardTests(unittest.TestCase):
             snap = appmod._enriched_snapshot()
         self.assertEqual([w["key"] for w in snap["windows"]], ["other:3"])
         self.assertEqual(snap["counts"]["total"], 1)
+
+
+class NfsHungCardTests(unittest.TestCase):
+    """A card whose process tree is asleep on a hung NFS mount reads stalled,
+    whatever its own transcript or rollout says, on every platform."""
+
+    def test_the_hang_outranks_the_card_s_own_triage(self):
+        busy = write_jsonl([{"type": "assistant", "timestamp": "2026-10-29T16:00:00Z",
+                             "message": {"role": "assistant", "stop_reason": "tool_use",
+                                         "content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}])
+        claude = {"pid": 1, "status": "busy", "waiting_for": None, "hidden": False,
+                  "alive": True, "tty": "/dev/pts/1", "transcript_path": str(busy),
+                  "name": "w1", "cwd": "/x", "session_id": "", "updated_at": 1_000,
+                  "idle_seconds": 0}
+        healthy = {**claude, "pid": 2, "tty": "/dev/pts/2", "name": "w2"}
+        codex = {"pid": 7, "platform": "codex", "status": "busy", "hidden": False,
+                 "alive": True, "tty": "pts/7", "cwd": "/x", "name": None,
+                 "updated_at": 0, "triage": "working", "triage_reason": "正在工作"}
+        stuck = [(time.time() - 3600, "bash /shared/x/log_event.sh")]
+        with _snapshot([claude, healthy], codex=[codex], nfs_hung={1: stuck, 7: stuck}):
+            snap = appmod._enriched_snapshot()
+        got = {w["pid"]: w for w in snap["windows"]}
+        for pid in (1, 7):
+            with self.subTest(pid=pid):
+                self.assertEqual(got[pid]["triage"], "stalled")
+                self.assertTrue(got[pid]["triage_reason"].startswith("NFS 挂住"))
+        self.assertEqual(got[2]["triage"], "working")
+        self.assertEqual(snap["counts"]["busy"], 1)
 
 
 class StaleDialogOpenTests(unittest.TestCase):

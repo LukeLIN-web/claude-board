@@ -334,6 +334,55 @@ def uninterruptible_wrappers(claude_pid: int) -> list[int]:
             and any(table[cur].stat.startswith("D") for cur in _subtree(children, child))]
 
 
+# How long a process may wait on NFS without once getting the CPU before its card
+# calls the mount hung. A healthy RPC answers in milliseconds and a slow one in
+# seconds, and either way the process runs again when it does; a hard mount whose
+# client is stuck in state recovery keeps every reader asleep for as long as that
+# lasts — once over an hour, the claude process and every hook it fired with
+# it, while the card went on reading "working".
+NFS_HUNG_AFTER = 120
+
+
+def _nfs_blocked_since(pid: int, boot: float) -> Optional[float]:
+    """When `pid` last ran, as a wall-clock time, if it is asleep on NFS or the
+    RPC layer under it; None if it isn't, or /proc can't say. `boot` is the wall
+    clock at boot: the scheduler stamps se.exec_start in ms since then."""
+    try:
+        wchan = Path(f"/proc/{pid}/wchan").read_text()
+        if "nfs" not in wchan and not wchan.startswith("rpc"):
+            return None
+        m = re.search(r"^se\.exec_start\s*:\s*([\d.]+)",
+                      Path(f"/proc/{pid}/sched").read_text(), re.M)
+    except OSError:
+        return None
+    return boot + float(m.group(1)) / 1000 if m else None
+
+
+def nfs_hung(pids: list[int]) -> dict[int, list[tuple[float, str]]]:
+    """For each pid whose subtree (itself included) holds processes that have
+    waited on NFS for NFS_HUNG_AFTER or longer: those processes as (since, args),
+    longest first. Pids with none are left out. Only D-state processes are read
+    further, so a healthy host costs the walk and nothing else."""
+    table = proc_table()
+    children = _children(table)
+    try:
+        now = time.time()
+        boot = now - float(Path("/proc/uptime").read_text().split()[0])
+    except OSError:
+        return {}
+    out = {}
+    for pid in set(pids):
+        stuck = []
+        for cur in _subtree(children, pid):
+            if cur in table and table[cur].stat.startswith("D"):
+                since = _nfs_blocked_since(cur, boot)
+                if since is not None and now - since >= NFS_HUNG_AFTER:
+                    stuck.append((since, table[cur].args))
+        if stuck:
+            out[pid] = sorted(stuck)
+    return out
+
+
 @dataclass
 class Window:
     pid: int
