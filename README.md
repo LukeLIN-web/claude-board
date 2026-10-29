@@ -141,10 +141,12 @@ History, Skills and Memory show the aggregating host only.
 Each board reads its own host's `nvidia-smi` every 15 s. **GPUs** in the header
 lists every machine's cards with what is on each, and a card whose session
 started a process on a GPU says which (`GPU b:3`); `/api/windows` carries the
-same rows as `gpus`, for scripts deciding who gets which card. To also show
-the claims and the queue of jobs waiting for a card through `gpu_wait.py`, set
-`FLEET_GPU_LOCK_DIR` to its lock directory. A machine whose jobs you want on
-the page needs a board even with no sessions of its own.
+same rows as `gpus`, for scripts deciding who gets which card. The rows also
+show the cards claimed and the jobs waiting for one through
+`scripts/gpu_wait.py`, which holds a job back until enough cards are free (see
+its docstring, and `scripts/gpu_busy.py` for whose launch goes first). A
+machine whose jobs you want on the page needs a board even with no sessions of
+its own.
 
 ## Acknowledgements
 
