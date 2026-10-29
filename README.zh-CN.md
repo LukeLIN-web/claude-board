@@ -46,6 +46,7 @@ cd claude-board && bash run.sh
 ### 搜索
 
 ripgrep 跨 Claude + Codex 全部 transcript，不只搜标题；每条结果带命中的那几行。
+优先用 PATH 上的 `rg`，没有就用 Claude Code 原生版自带的 ripgrep，不用另装。
 
 ![](docs/screenshot-search.png)
 

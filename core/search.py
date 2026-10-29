@@ -1,9 +1,11 @@
 """Cross-session search over Claude + Codex transcripts using ripgrep."""
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -19,14 +21,36 @@ from .transcripts import _parse_ts
 # last counted match's after-context, so the cap is applied again below.
 _HITS_PER_FILE = 5
 _CONTEXT_LINES = 3
-_TIMEOUT = 15  # seconds; a search still running then returns nothing
+_TIMEOUT = 15  # seconds; a search still running then fails
+
+
+@functools.cache
+def ripgrep() -> str:
+    """The executable that runs an rg_command: `rg` on PATH, or else the
+    `claude` on PATH when it answers as ripgrep. Claude Code's native build is
+    ripgrep when started under that name — it is what its own Bash tool
+    searches with — so a host that runs Claude Code can search without
+    installing anything. Raises FileNotFoundError when neither is there.
+
+    Cached once found; a miss is looked for again on the next call."""
+    for exe in filter(None, map(shutil.which, ("rg", "claude"))):
+        try:
+            version = subprocess.run(["rg", "--version"], executable=exe,
+                                     capture_output=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if version.startswith(b"ripgrep"):
+            return exe
+    raise FileNotFoundError("ripgrep (rg) is not installed, and no native "
+                            "Claude Code build is on PATH to stand in for it")
 
 
 def rg_command(query: str, *flags: str,
                paths: Optional[list[str]] = None) -> Optional[list[str]]:
     """ripgrep for `query` over every Claude and Codex transcript (or over just
     `paths`), or None if neither directory exists. `flags` go after the
-    transcript globs, so a glob among them takes precedence over those.
+    transcript globs, so a glob among them takes precedence over those. Its
+    first word is the name rg goes by: run it with executable=ripgrep().
 
     The query is literal text (-F) handed over with -e. What gets typed into a
     search box is words, not a regex: as a bare pattern `foo(` was a regex
@@ -169,11 +193,8 @@ def _newest_files(query: str, limit: int, deadline: float) -> dict[str, float]:
     cmd = rg_command(query, "-l", "--null")
     if not cmd:
         return {}
-    try:
-        out = subprocess.run(cmd, capture_output=True,
-                             timeout=max(0.0, deadline - time.monotonic())).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
+    out = subprocess.run(cmd, executable=ripgrep(), capture_output=True,
+                         timeout=max(0.0, deadline - time.monotonic())).stdout
     mtimes: dict[str, float] = {}
     for raw in out.split(b"\0"):
         if raw:
@@ -199,7 +220,11 @@ def _newest_files(query: str, limit: int, deadline: float) -> dict[str, float]:
 
 def search(query: str, limit: int = 60) -> list[dict]:
     """The `limit` newest hits for `query`, newest first, at most
-    _HITS_PER_FILE of them from any one transcript."""
+    _HITS_PER_FILE of them from any one transcript.
+
+    Raises OSError when rg cannot start and subprocess.TimeoutExpired when it
+    runs past _TIMEOUT. Either had come back as no hits, which a search box
+    shows as "0 hits" — on a host without rg, the answer to every query."""
     if not query.strip():
         return []
     deadline = time.monotonic() + _TIMEOUT
@@ -220,11 +245,8 @@ def search(query: str, limit: int = 60) -> list[dict]:
         return []
     cmd = rg_command(query, "-j1", "--json", "--max-count", str(_HITS_PER_FILE),
                      "-C", str(_CONTEXT_LINES), paths=list(files))
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True)
-    except OSError:
-        return []
+    proc = subprocess.Popen(cmd, executable=ripgrep(), stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
     expired = threading.Event()
     timer = threading.Timer(max(0.0, deadline - time.monotonic()),
                             lambda: (expired.set(), proc.kill()))
@@ -270,7 +292,7 @@ def search(query: str, limit: int = 60) -> list[dict]:
             timer.cancel()
             proc.kill()
     if expired.is_set():
-        return []
+        raise subprocess.TimeoutExpired(cmd, _TIMEOUT)
     hits.sort(key=lambda h: h["ts"], reverse=True)
     return hits[:limit]
 

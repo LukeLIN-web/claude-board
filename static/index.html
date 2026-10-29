@@ -382,7 +382,8 @@
     <div class="flex items-center justify-between mb-3">
       <h2 class="font-semibold text-sm">
         "<span x-text="searchQuery" class="text-blue-600"></span>"
-        — <span x-text="(searchResults||[]).length"></span> hits
+        — <span x-show="!searchError"><span x-text="(searchResults||[]).length"></span> hits</span>
+        <span x-show="searchError" class="font-normal text-red-600" x-text="searchError"></span>
       </h2>
       <button @click="searchResults = null" class="text-gray-400 hover:text-gray-700">&times;</button>
     </div>
@@ -1227,6 +1228,9 @@ function fleet() {
     hosts: [],
     searchQuery: '',
     searchResults: null,
+    // Why the last search found nothing when it failed rather than came up
+    // empty (no rg, or past the server's timeout); '' otherwise.
+    searchError: '',
     expandedKey: null,
     expandedHistoryId: null,
     // Last-seen updated_at of the open live timeline; lets applySnapshot detect
@@ -2098,7 +2102,7 @@ function fleet() {
     async doSearch() {
       if (!this.searchQuery.trim()) { this.searchResults = null; return; }
       const d = await this.apiGet(`/api/search?q=${encodeURIComponent(this.searchQuery)}&limit=40`);
-      if (d) this.searchResults = d.hits || [];
+      if (d) { this.searchResults = d.hits || []; this.searchError = d.error || ''; }
     },
 
     // The archive runs to four figures and nobody pages through it — the rows

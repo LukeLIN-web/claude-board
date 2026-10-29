@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -538,7 +539,12 @@ def api_plan(key: str) -> dict:
 def api_search(q: str, limit: int = 60) -> dict:
     if not q.strip():
         return {"hits": [], "q": q}
-    return {"hits": search.search(q, limit=limit), "q": q}
+    try:
+        return {"hits": search.search(q, limit=limit), "q": q}
+    except subprocess.TimeoutExpired:
+        return {"hits": [], "q": q, "error": f"search ran past {search._TIMEOUT}s"}
+    except OSError as e:
+        return {"hits": [], "q": q, "error": str(e)}
 
 
 @app.post("/api/windows/{key}/focus")
