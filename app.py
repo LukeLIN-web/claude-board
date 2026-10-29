@@ -156,6 +156,7 @@ def _local_snapshot() -> dict:
     shell_counts = sessions.shell_descendant_counts(pids(every))
     for w in every:
         w["shell_proc_count"] = shell_counts.get(w.get("pid"), 0)
+    nfs_hung = sessions.nfs_hung(pids(every))
     for cw in codex_windows:
         # Codex's status line names the model + effort the session is on right
         # now, a /model pick included; the rollout label it arrives with only
@@ -260,6 +261,12 @@ def _local_snapshot() -> dict:
             # An aside whose answer is still generating: show it live so /btw
             # never looks dead while it works (nothing is archived yet).
             w["btw"] = {"question": pending_q, "answer": "", "pending": True}
+    # Over every platform's card, after each has its own triage: a process tree
+    # asleep on a hung NFS mount can't move whatever its transcript says.
+    for w in every:
+        stuck = nfs_hung.get(w.get("pid"))
+        if stuck:
+            w.update(patrol.classify_nfs_hung(stuck))
     # Drop cached banners for pids that are gone, so the cache tracks the board
     # instead of growing an entry per session for the life of the process.
     live = {w.get("pid") for w in snap["windows"]}

@@ -293,3 +293,80 @@ class UninterruptibleWrappersTests(unittest.TestCase):
 
     def test_no_children_returns_empty(self):
         self.assertEqual(self._run([(self.CLAUDE, 1, "Ssl+", "claude")]), [])
+
+
+class NfsHungTests(unittest.TestCase):
+    """nfs_hung names the processes under a card that have waited on NFS without
+    running for NFS_HUNG_AFTER: /proc/<pid>/wchan says what a D-state process
+    sleeps on, se.exec_start in /proc/<pid>/sched when it last ran."""
+
+    CLAUDE = 100
+    NOW = 1_000_000.0
+    UPTIME = 10_000.0   # so boot was at NOW - UPTIME
+
+    def _run(self, rows, procs=None):
+        """`rows` is (pid, ppid, stat, args); `procs` maps a pid to
+        (wchan, seconds since it last ran), or to an OSError it raises."""
+        table = {pid: sessions.Proc(ppid, stat, "?", args.split()[0], args)
+                 for pid, ppid, stat, args in rows}
+        files = {"/proc/uptime": f"{self.UPTIME:.2f} 1.00\n"}
+        for pid, spec in (procs or {}).items():
+            if isinstance(spec, OSError):
+                files[f"/proc/{pid}/wchan"] = spec
+                continue
+            wchan, ago = spec
+            files[f"/proc/{pid}/wchan"] = wchan
+            files[f"/proc/{pid}/sched"] = (
+                f"bash ({pid}, #threads: 1)\n"
+                f"se.exec_start                                :    {(self.UPTIME - ago) * 1000:.6f}\n"
+                f"se.vruntime                                  :    12.5\n")
+
+        def read_text(path):
+            got = files[str(path)]   # a KeyError: a file nfs_hung should not have read
+            if isinstance(got, OSError):
+                raise got
+            return got
+
+        with mock.patch.object(sessions, "proc_table", return_value=table), \
+             mock.patch.object(sessions.Path, "read_text", autospec=True, side_effect=read_text), \
+             mock.patch.object(sessions.time, "time", return_value=self.NOW):
+            return sessions.nfs_hung([self.CLAUDE])
+
+    def test_a_hook_asleep_on_nfs_hangs_its_card(self):
+        # claude(100) -> sh(200) -> log_event.sh(300, D on NFS for 10 minutes)
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (200, self.CLAUDE, "S", "sh -c log_event.sh"),
+                (300, 200, "D", "bash /shared/x/log_event.sh")]
+        self.assertEqual(self._run(rows, {300: ("nfs_wait_bit_killable", 600)}),
+                         {self.CLAUDE: [(self.NOW - 600, "bash /shared/x/log_event.sh")]})
+
+    def test_the_claude_process_itself_counts_and_the_longest_stuck_leads(self):
+        rows = [(self.CLAUDE, 1, "Dsl+", "claude"),
+                (300, self.CLAUDE, "D", "bash log_event.sh")]
+        got = self._run(rows, {self.CLAUDE: ("nfs_wait_bit_killable", 4200),
+                               300: ("rpc_wait_bit_killable", 4600)})
+        self.assertEqual([args for _, args in got[self.CLAUDE]], ["bash log_event.sh", "claude"])
+
+    def test_a_short_nfs_wait_is_ordinary_io(self):
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (300, self.CLAUDE, "D", "python train.py")]
+        self.assertEqual(self._run(rows, {300: ("nfs_wait_bit_killable",
+                                                sessions.NFS_HUNG_AFTER - 1)}), {})
+
+    def test_a_wait_on_anything_but_nfs_is_not_this(self):
+        # e.g. nvidia-smi on a wedged GPU driver: stuck, but not on a mount.
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (300, self.CLAUDE, "D", "nvidia-smi")]
+        self.assertEqual(self._run(rows, {300: ("os_acquire_mutex", 3600)}), {})
+
+    def test_only_d_state_processes_are_read(self):
+        # Nothing in `procs` for the sleeping ones: reading them would KeyError.
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (200, self.CLAUDE, "S", "bash"),
+                (300, 200, "R", "python")]
+        self.assertEqual(self._run(rows), {})
+
+    def test_a_process_gone_before_it_is_read_is_skipped(self):
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (300, self.CLAUDE, "D", "bash log_event.sh")]
+        self.assertEqual(self._run(rows, {300: FileNotFoundError()}), {})
