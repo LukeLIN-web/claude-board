@@ -3,21 +3,70 @@ match, which runs the same rg command (core/history.py) and places snippets the
 same way (core/history.py, core/opencode.py).
 
 The searches run the real ripgrep over transcripts written to a scratch home, so
-those tests skip where `rg` isn't on PATH.
+those tests skip where search.ripgrep() finds none.
 """
 import json
 import os
-import shutil
 import sqlite3
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
+import app as appmod
 from core import history, opencode, search, sessions
 from tests.helpers import scratch_dir, user_row, write_jsonl
 
 
-@unittest.skipUnless(shutil.which("rg"), "ripgrep (rg) is not on PATH")
+def _has_ripgrep() -> bool:
+    try:
+        search.ripgrep()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+class RipgrepTests(unittest.TestCase):
+    """Which executable runs rg, and what a search answers without one."""
+
+    def setUp(self):
+        self.bin = scratch_dir()
+        search.ripgrep.cache_clear()
+        self.addCleanup(search.ripgrep.cache_clear)
+        env = mock.patch.dict(os.environ, {"PATH": str(self.bin)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def executable(self, name, version):
+        """`name` on PATH, printing `version` whatever it is asked."""
+        path = self.bin / name
+        path.write_text(f"#!/bin/sh\necho '{version}'\n")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_claude_stands_in_for_a_missing_rg(self):
+        claude = self.executable("claude", "ripgrep 14.1.1 (rev 0ae49f8b6e)")
+        self.assertEqual(search.ripgrep(), claude)
+
+    def test_rg_on_path_comes_first(self):
+        self.executable("claude", "ripgrep 14.1.1 (rev 0ae49f8b6e)")
+        rg = self.executable("rg", "ripgrep 15.1.0")
+        self.assertEqual(search.ripgrep(), rg)
+
+    def test_a_claude_that_is_not_ripgrep_is_not_run_as_one(self):
+        # An npm install's claude is a node script: argv[0] never reaches it.
+        self.executable("claude", "2.1.312 (Claude Code)")
+        with self.assertRaises(FileNotFoundError):
+            search.ripgrep()
+
+    def test_search_without_ripgrep_says_so(self):
+        # It used to answer [], which the page shows as "0 hits".
+        with mock.patch.object(search, "PROJECTS_DIR", scratch_dir()):
+            r = appmod.api_search("needle")
+        self.assertEqual(r["hits"], [])
+        self.assertIn("ripgrep (rg) is not installed", r["error"])
+
+
+@unittest.skipUnless(_has_ripgrep(), "no ripgrep: neither rg nor a native claude on PATH")
 class _Transcripts(unittest.TestCase):
     """A scratch projects/ and Codex sessions/ for search to run over, with the
     cwd filter off (run.sh exports one, and the board's sessions inherit it)."""
@@ -157,6 +206,14 @@ class NewestHitsTests(_Transcripts):
             hits = search.search("needle", limit=2)
         sessions._reload_cwd_filters()
         self.assertEqual([h["session_id"] for h in hits], ["shown", "shown"])
+
+
+class TimeoutTests(_Transcripts):
+    def test_a_search_past_the_timeout_says_so(self):
+        self.transcript("s1", "needle")
+        with mock.patch.object(search, "_TIMEOUT", 0):
+            r = appmod.api_search("needle")
+        self.assertEqual(r, {"hits": [], "q": "needle", "error": "search ran past 0s"})
 
 
 class ExcerptTests(unittest.TestCase):

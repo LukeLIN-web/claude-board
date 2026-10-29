@@ -12,7 +12,7 @@ from typing import Optional
 
 from .codex import list_codex_sessions
 from .opencode import list_opencode_sessions, search_opencode
-from .search import excerpt, rg_command
+from .search import excerpt, rg_command, ripgrep
 from .sessions import CLAUDE_HOME, PROJECTS_DIR, _cwd_visible, list_windows
 from .transcripts import (
     _iter_lines,
@@ -238,7 +238,8 @@ def _rg_search_sessions(query: str) -> dict[str, list[str]]:
     if not cmd:
         return {}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(cmd, executable=ripgrep(), capture_output=True,
+                              text=True, timeout=5)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return {}
     result: dict[str, list[str]] = {}

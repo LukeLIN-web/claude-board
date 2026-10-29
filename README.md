@@ -52,7 +52,8 @@ busy/idle flag:
 ### Search
 
 ripgrep over every Claude and Codex transcript, not just titles; each hit shows
-the lines that matched.
+the lines that matched. It runs `rg` from PATH, or else the ripgrep bundled in
+Claude Code's native build, so no separate install is needed.
 
 ![](docs/screenshot-search.png)
 
