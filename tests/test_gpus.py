@@ -83,7 +83,7 @@ class SampleTests(unittest.TestCase):
         waiter = _spawn([sys.executable, str(tool), "--need-gb", "40"])
         self.procs += [claimed, foreign, waiter]
         with mock.patch.object(gpus, "_smi", side_effect=_smi_stub([])), \
-             mock.patch.dict(os.environ, {"FLEET_GPU_LOCK_DIR": str(locks)}):
+             mock.patch.object(gpus.gpu_wait, "LOCK_DIR", str(locks)):
             s = gpus.sample()
         claims = {c["pid"]: c for c in s["claims"]}
         self.assertEqual(sorted(claims), sorted([claimed.pid, foreign.pid]))
@@ -96,7 +96,7 @@ class SampleTests(unittest.TestCase):
 
     def test_without_a_lock_dir_there_are_no_claims_or_waiters(self):
         with mock.patch.object(gpus, "_smi", side_effect=_smi_stub([])), \
-             mock.patch.dict(os.environ, {"FLEET_GPU_LOCK_DIR": ""}):
+             mock.patch.object(gpus.gpu_wait, "LOCK_DIR", str(scratch_dir() / "none")):
             s = gpus.sample()
         self.assertEqual((s["claims"], s["waiting"]), ([], []))
 
