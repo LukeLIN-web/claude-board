@@ -283,11 +283,10 @@ def test_a_launch_registered_again_under_its_name_keeps_its_place(tmp_path, cli,
         os.close(fd)
 
 
-def test_a_name_keeps_its_place_as_long_as_a_gpu_wait_waits(cli, launch):
-    """A registration of that name older than gpu_wait's default --timeout-min is a new launch's:
-    it goes behind those registered since."""
-    os.makedirs(gpu_busy.REG_DIR)
-    bound, now = int(gpu_wait.TIMEOUT_MIN * 60e9), time.time_ns()
+def test_a_name_keeps_its_place_for_a_day(cli, launch):
+    """A registration of that name older than ``KEEP_PLACE_NS`` is a new launch's: it goes behind
+    those registered since."""
+    bound, now = gpu_busy.KEEP_PLACE_NS, time.time_ns()
     launch("later")
     for name, at, kept in [("recent", now - bound + 60 * 10**9, True), ("stale", now - bound - 60 * 10**9, False)]:
         Path(gpu_busy.REG_DIR, name).write_text(f"{at} pid 2: bash runner.sh\ncards 1\nholds 1\n")
