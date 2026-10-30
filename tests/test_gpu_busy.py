@@ -189,6 +189,10 @@ def holds_of(name):
     return next((holds for n, _, _, _, holds, _ in gpu_busy.launches() if n == name), None)
 
 
+def ns_of(name):
+    return next((ns for n, ns, *_ in gpu_busy.launches() if n == name), None)
+
+
 def asked(out):
     return [line.split()[0] for line in out.splitlines()]
 
@@ -254,6 +258,44 @@ def test_launches_queue_first_come_first_served(cli, launch):
     finally:
         os.close(fd)
     assert names(gpu_busy.ahead()) == ["earlier", "later"]
+
+
+def test_a_launch_registered_again_under_its_name_keeps_its_place(tmp_path, cli, launch):
+    """Refused while it lives, registered again once it is gone, a launch keeps its registration
+    time: one registered after it stays behind it."""
+    first = launch("resumed")
+    at, text = ns_of("resumed"), Path(gpu_busy.REG_DIR, "resumed").read_text()
+    go = tmp_path / "go"
+    later = launch("later", "sh", "-c", f"until [ -e {go} ]; do sleep 0.05; done; {shlex.join([*cli, 'ahead'])}; echo rc=$?")
+    wait_for(lambda: ns_of("later"))
+    refused = launch("resumed", "true")
+    assert refused.wait(timeout=30) == gpu_busy.ALREADY_ALIVE
+    assert Path(gpu_busy.REG_DIR, "resumed").read_text() == text
+    first.kill()
+    first.wait()
+    wait_for(lambda: ns_of("resumed") is None)
+    fd = gpu_busy.take("resumed", "this test", None)
+    try:
+        assert ns_of("resumed") == at and ns_of("later") > at and gpu_busy.ahead() == []
+        go.touch()
+        assert asked(later.communicate(timeout=30)[0]) == ["resumed", "rc=1"]
+    finally:
+        os.close(fd)
+
+
+def test_a_name_keeps_its_place_for_a_day(cli, launch):
+    """A registration of that name older than ``KEEP_PLACE_NS`` is a new launch's: it goes behind
+    those registered since."""
+    bound, now = gpu_busy.KEEP_PLACE_NS, time.time_ns()
+    launch("later")
+    for name, at, kept in [("recent", now - bound + 60 * 10**9, True), ("stale", now - bound - 60 * 10**9, False)]:
+        Path(gpu_busy.REG_DIR, name).write_text(f"{at} pid 2: bash runner.sh\ncards 1\nholds 1\n")
+        fd = gpu_busy.take(name, "this test", None)
+        try:
+            assert (ns_of(name) == at) == kept and holds_of(name) is None
+            assert names(gpu_busy.ahead()) == ([] if kept else ["later"])
+        finally:
+            os.close(fd)
 
 
 def test_only_earlier_launches_that_may_take_my_cards_are_ahead(cli, launch):
