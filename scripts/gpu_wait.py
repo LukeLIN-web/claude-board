@@ -88,6 +88,7 @@ HOLD = os.path.join(HERE, "gpu_hold.py")
 BUSY = os.path.join(HERE, "gpu_busy.py")
 
 STALL_ALERT_S = 3600.0
+TIMEOUT_MIN = 1440.0   # --timeout-min's default; also how long gpu_busy keeps a launch's place for its name
 LOCKS_READS = 10   # /proc/locks comes a page per read: a held lock's line can slip between pages while other locks come and go
 RELEASE_WAIT_S = 10.0
 HEIR_FD = 10
@@ -621,7 +622,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--slots", type=int, default=1,
                     help="jobs that may share one card, each holding one of its slots (default: the card is the job's alone)")
     ap.add_argument("--interval-min", type=float, default=20.0)
-    ap.add_argument("--timeout-min", type=float, default=1440.0)
+    ap.add_argument("--timeout-min", type=float, default=TIMEOUT_MIN)
     ap.add_argument("--stall-alert-min", type=float, default=60.0,
                     help="after this long waiting, heartbeat lines carry a "
                          "greppable STALLED marker (monitor-alert hook)")

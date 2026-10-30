@@ -43,8 +43,11 @@ launches whose candidate cards meet queue first come, first served, a later one 
 earlier one while that waits for cards. A later launch goes past an earlier one only when it
 cannot take a card that one waits for: their candidate cards do not meet, or that one holds
 its cards already, so it cannot starve it. A launch that has claimed has no place in line
-again, neither between batches or stages that claim one by one nor while a second gpu_wait
-under it waits: run such a series under one ``gpu_wait --hold`` to keep its cards.
+again while it lives, neither between batches or stages that claim one by one nor while a
+second gpu_wait under it waits: run such a series under one ``gpu_wait --hold`` to keep its
+cards. Once it is gone, a launch registered under its name is that launch resumed and keeps
+its registration time, so its place, while that is less than gpu_wait's default
+``--timeout-min`` ago; one that should go to the back takes a new name.
 A service launch script waits on ``ahead`` and does not register: once up, it holds just
 its claimed card, which ``cards`` sees.
 Inside gpu_wait's job the launch is not the caller's own: gpu_wait's claim holders keep
@@ -231,7 +234,8 @@ def claimed(cards: frozenset[int]) -> None:
 
 def take(name: str, note: str, cards: frozenset[int] | None) -> int | None:
     """Register launch ``name`` with its candidate cards (``None``: every card): the held lock
-    fd, or ``None`` while a launch of that name lives."""
+    fd, or ``None`` while a launch of that name lives. It keeps the registration time the last
+    launch of that name left, while that reads and is less than ``gpu_wait.TIMEOUT_MIN`` minutes old."""
     if not name or "/" in name or name in (".", ".."):
         raise ValueError(f"bad launch name {name!r}")
     os.makedirs(REG_DIR, exist_ok=True)
@@ -245,8 +249,11 @@ def take(name: str, note: str, cards: frozenset[int] | None) -> int | None:
     else:
         os.close(fd)
         return None
+    then = os.pread(fd, os.fstat(fd).st_size, 0).partition(b" ")[0]   # the last launch of that name wrote it; that launch is gone, as its lock is ours
+    now = time.time_ns()
+    ns = int(then) if then.isdigit() and now - int(then) < gpu_wait.TIMEOUT_MIN * 60e9 else now
     os.ftruncate(fd, 0)
-    line = f"{time.time_ns()} pid {os.getpid()}: {note}"[:300].replace("\n", " ") + "\n"
+    line = f"{ns} pid {os.getpid()}: {note}"[:300].replace("\n", " ") + "\n"
     os.write(fd, (line + ("" if cards is None else f"{CARDS_TAG} {listed(cards)}\n")).encode())
     return fd
 
