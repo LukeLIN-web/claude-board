@@ -46,8 +46,8 @@ its cards already, so it cannot starve it. A launch that has claimed has no plac
 again while it lives, neither between batches or stages that claim one by one nor while a
 second gpu_wait under it waits: run such a series under one ``gpu_wait --hold`` to keep its
 cards. Once it is gone, a launch registered under its name is that launch resumed and keeps
-its registration time, so its place, while that is less than gpu_wait's default
-``--timeout-min`` ago; one that should go to the back takes a new name.
+its registration time, so its place, while that is less than ``KEEP_PLACE_NS`` ago; one that
+should go to the back takes a new name.
 A service launch script waits on ``ahead`` and does not register: once up, it holds just
 its claimed card, which ``cards`` sees.
 Inside gpu_wait's job the launch is not the caller's own: gpu_wait's claim holders keep
@@ -83,6 +83,7 @@ from gpu_wait import held, key, open_files
 REG_DIR = "/tmp/gpu_launches"   # box-local like gpu_wait.LOCK_DIR: flock on NFS is a lie
 REGISTER_TRIES = 40             # an `ahead` probe holds a registration lock for microseconds, a live launch throughout
 ALREADY_ALIVE = 3
+KEEP_PLACE_NS = 24 * 3600 * 10**9   # a day: a name registered again within it is that launch resumed; a name reused later is a new launch
 CARDS_TAG = "cards"             # starts line 2 of a registration, its candidate cards; older copies read only line 1
 HOLDS_TAG = "holds"             # starts the line ``claimed`` adds after those, the cards the launch last claimed; older copies never take it for cards
 
@@ -235,7 +236,7 @@ def claimed(cards: frozenset[int]) -> None:
 def take(name: str, note: str, cards: frozenset[int] | None) -> int | None:
     """Register launch ``name`` with its candidate cards (``None``: every card): the held lock
     fd, or ``None`` while a launch of that name lives. It keeps the registration time the last
-    launch of that name left, while that reads and is less than ``gpu_wait.TIMEOUT_MIN`` minutes old."""
+    launch of that name left, while that reads and is less than ``KEEP_PLACE_NS`` old."""
     if not name or "/" in name or name in (".", ".."):
         raise ValueError(f"bad launch name {name!r}")
     os.makedirs(REG_DIR, exist_ok=True)
@@ -251,7 +252,7 @@ def take(name: str, note: str, cards: frozenset[int] | None) -> int | None:
         return None
     then = os.pread(fd, os.fstat(fd).st_size, 0).partition(b" ")[0]   # the last launch of that name wrote it; that launch is gone, as its lock is ours
     now = time.time_ns()
-    ns = int(then) if then.isdigit() and now - int(then) < gpu_wait.TIMEOUT_MIN * 60e9 else now
+    ns = int(then) if then.isdigit() and 0 <= now - int(then) < KEEP_PLACE_NS else now
     os.ftruncate(fd, 0)
     line = f"{ns} pid {os.getpid()}: {note}"[:300].replace("\n", " ") + "\n"
     os.write(fd, (line + ("" if cards is None else f"{CARDS_TAG} {listed(cards)}\n")).encode())
