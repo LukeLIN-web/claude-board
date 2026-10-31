@@ -15,7 +15,15 @@ ordinal, as in the claim lock):
 
 * ``use k -- cmd`` takes a shared lock, waiting while the ballast holds the card,
   and execs ``cmd``, which keeps the lock, with every child that inherits the fd
-  (Python's subprocess closes it), for its lifetime;
+  (Python's subprocess closes it), for its lifetime. Before it waits, it starts a
+  ``keep`` on the card, also listed as ``BALLAST_NAME``, and lets it create a
+  bare CUDA context (a few hundred MiB, inside the ``RESERVE_MB`` beside the
+  ballast): the card then lists a process from before the ballast lets go until
+  the job has one there (vLLM's engine comes on ~40 s after ``use``). The keeper
+  leaves once nvidia-smi lists a process of the job (``cmd`` or a descendant) on
+  the card, when the job exits, or after ``KEEP_S``. It is the job's child (the
+  job gets its SIGCHLD); a keeper that is not up within ``KEEP_UP_S`` leaves the
+  job to start without it;
 * the ballast holds the exclusive lock; when a waiter shows in /proc/locks,
   ``hold`` kills the ballast and lets the lock go once the ballast has exited;
 * ``hold`` arms only when nobody holds or waits on the lock and nvidia-smi shows
@@ -46,15 +54,17 @@ dies gets SIGTERM from the kernel.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import fcntl
 import os
+import select
 import signal
 import subprocess
 import sys
 import time
 
-from gpu_wait import claim_lock, flocks
+from gpu_wait import claim_lock, cuda_uuids, flocks
 
 HOLD_DIR = "/tmp/gpu_hold"   # box-local like LOCK_DIR: flock on NFS is a lie
 BALLAST_NAME = "agent-harness:gpu_hold"   # what nvidia-smi lists; the name every copy of gpu_busy knows a ballast by
@@ -65,6 +75,10 @@ RESERVE_MB = 1024            # left free beside the ballast
 CHUNK_MB = 256
 CLAIM_MISSES = 10            # /proc/locks comes a page per read: a line can slip between pages while other locks come and go
 PR_SET_PDEATHSIG = 1
+KEEP_S = 600.0               # the keeper leaves after this long even with no process of the job on the card: jobs come on well within
+                             # it (vLLM's engine ~40 s after use), and one whose card process the keeper cannot see (started outside
+                             # the job's process tree, or graphics-only) has the keeper's context beside it no longer than this
+KEEP_UP_S = 30.0             # use waits this long for the keeper's context (up in about a second), then lets the ballast go without it: cuInit can hang
 FILL_AFTER_S = 240.0         # no fill sooner after the job came on: vLLM takes up to ~200 s to size its KV cache, flat for a minute after compiling
 FILL_STABLE_S = 30.0         # fill once used VRAM has moved by at most FILL_STABLE_MB over this long
 FILL_STABLE_MB = 512
@@ -99,6 +113,26 @@ def card_idle(smi_id: str) -> bool:
         return not smi(smi_id, "compute-apps", "pid") and int(smi(smi_id, "gpu", "memory.used")[0]) <= IDLE_MB
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return False
+
+
+def job_on_card(smi_id: str, job: int) -> int | None:
+    """A process nvidia-smi lists on the card that is ``job`` or a descendant of it, the keeper itself aside."""
+    try:
+        pids = [int(p) for p in smi(smi_id, "compute-apps", "pid") if p.isdigit()]
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return next((p for p in pids if p != os.getpid() and descends(p, job)), None)
+
+
+def descends(pid: int, ancestor: int) -> bool:
+    """``pid`` is ``ancestor`` or a descendant of it, by the parent links in /proc."""
+    while pid not in (ancestor, 0, 1):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rpartition(")")[2].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return pid == ancestor
 
 
 def card_used_mb(smi_id: str) -> int | None:
@@ -260,10 +294,45 @@ def fill(card: int, parent: int, headroom_mb: int) -> None:
         time.sleep(FILL_TICK_S)
 
 
+def keep(card: int, job: int, smi_id: str, up: int) -> None:
+    """Hold a bare CUDA context on the one visible card, telling ``use`` on fd ``up`` once it is up, until
+    nvidia-smi lists a process of ``job`` there, the job exits, or ``KEEP_S`` has passed."""
+    ctypes.CDLL(None).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    if os.getppid() != job:
+        return
+    cuda_on_card(card)
+    with contextlib.suppress(BrokenPipeError):   # use stopped waiting after KEEP_UP_S: keep the card all the same
+        os.write(up, b"up")
+    os.close(up)
+    start = time.monotonic()
+    while (waited := time.monotonic() - start) < KEEP_S:
+        if pid := job_on_card(smi_id, job):
+            log(card, f"keeper left after {waited:.0f} s: pid {pid} of the job is on the card")
+            return
+        time.sleep(TICK_S)
+    log(card, f"keeper left after {KEEP_S:g} s with no process of the job on the card")
+
+
+def start_keeper(card: int) -> None:
+    """Start ``keep`` on the card for this process (the job, once it execs) and wait up to ``KEEP_UP_S`` for its context."""
+    smi_id = cuda_uuids().get(card, str(card))
+    up, up_w = os.pipe()
+    with contextlib.suppress(OSError):   # a keeper that cannot start leaves the pipe closed
+        spawn(smi_id, "keep", str(card), str(os.getpid()), smi_id, str(up_w), pass_fds=(up_w,))
+    os.close(up_w)
+    if not (select.select([up], [], [], KEEP_UP_S)[0] and os.read(up, 2)):
+        log(card, f"no keeper (it exited, or no context after {KEEP_UP_S:g} s); starting the job without it")
+    os.close(up)
+
+
 def use(card: int, cmd: list[str]) -> None:
     os.makedirs(HOLD_DIR, exist_ok=True)
     fd = os.open(lock_path(card), os.O_CREAT | os.O_RDWR, 0o666)
-    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:   # the ballast holds the card: the keeper goes on before waiting lets the ballast go
+        start_keeper(card)
+        fcntl.flock(fd, fcntl.LOCK_SH)
     os.set_inheritable(fd, True)
     for sig in (signal.SIGPIPE, signal.SIGXFSZ):   # Python ignores these; exec would pass that on
         signal.signal(sig, signal.SIG_DFL)
@@ -285,6 +354,11 @@ def main() -> None:
     p = sub.add_parser("ballast", help="started by hold")
     p.add_argument("card", type=int)
     p.add_argument("parent", type=int)
+    p = sub.add_parser("keep", help="started by use")
+    p.add_argument("card", type=int)
+    p.add_argument("job", type=int)
+    p.add_argument("smi_id")
+    p.add_argument("up", type=int)
     p = sub.add_parser("fill", help="started by hold --fill-mb")
     p.add_argument("card", type=int)
     p.add_argument("parent", type=int)
@@ -297,6 +371,8 @@ def main() -> None:
         use(args.card, cmd)
     elif args.mode == "hold":
         hold(args.card, args.claim_pid, args.smi_id, args.fill_mb)
+    elif args.mode == "keep":
+        keep(args.card, args.job, args.smi_id, args.up)
     elif args.mode == "fill":
         fill(args.card, args.parent, args.headroom_mb)
     else:
