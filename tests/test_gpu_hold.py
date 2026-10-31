@@ -1,4 +1,6 @@
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -11,6 +13,44 @@ import gpu_wait
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 CARD = 3
+UUID = "GPU-test"
+
+# The CLI under test, after a header that sets TMP. Neither it nor the keeper it starts touches a card: the keeper runs
+# this same script, where CARD is UUID, a CUDA context is a line "<pid> <CUDA_VISIBLE_DEVICES>" in TMP/ctx (env CUDA=fail
+# exits as a failed cuInit does, CUDA=hang never comes up), and nvidia-smi lists on the card the pids in TMP/apps,
+# adding a line to TMP/reads for every query. Env KEEP_S and KEEP_UP_S stand in for the constants.
+STUBBED_CLI = """
+import gpu_hold, gpu_wait
+gpu_hold.HOLD_DIR = os.path.join(TMP, "hold")
+gpu_hold.__file__ = __file__
+gpu_hold.TICK_S = 0.05
+gpu_hold.KEEP_S = float(os.environ.get("KEEP_S", gpu_hold.KEEP_S))
+gpu_hold.KEEP_UP_S = float(os.environ.get("KEEP_UP_S", gpu_hold.KEEP_UP_S))
+gpu_wait._CUDA_UUIDS = {CARD: UUID}
+
+
+def cuda_on_card(card):
+    if os.environ.get("CUDA") == "fail":
+        sys.exit(f"[gpu_hold] GPU {card}: CUDA init failed")
+    while os.environ.get("CUDA") == "hang":
+        time.sleep(1)
+    with open(os.path.join(TMP, "ctx"), "a") as f:
+        f.write(f"{os.getpid()} {os.environ['CUDA_VISIBLE_DEVICES']}\\n")
+
+
+def smi(smi_id, what, field):
+    with open(os.path.join(TMP, "reads"), "a") as f:
+        f.write(f"{smi_id} {what} {field}\\n")
+    try:
+        with open(os.path.join(TMP, "apps")) as f:
+            return f.read().split()
+    except FileNotFoundError:
+        return []
+
+
+gpu_hold.cuda_on_card, gpu_hold.smi = cuda_on_card, smi
+gpu_hold.main()
+"""
 
 
 def wait_for(cond, timeout=10.0):
@@ -22,14 +62,14 @@ def wait_for(cond, timeout=10.0):
 
 @pytest.fixture(autouse=True)
 def cli(tmp_path, monkeypatch):
-    """``gpu_hold.py`` as a command, with the hold locks in a scratch HOLD_DIR and the claim locks in a scratch LOCK_DIR."""
+    """``gpu_hold.py`` as a command (``STUBBED_CLI``), with the hold locks in a scratch HOLD_DIR and the claim locks in a scratch LOCK_DIR."""
     monkeypatch.setattr(gpu_hold, "HOLD_DIR", str(tmp_path / "hold"))
     monkeypatch.setattr(gpu_wait, "LOCK_DIR", str(tmp_path / "locks"))
     os.makedirs(gpu_hold.HOLD_DIR)
     os.makedirs(gpu_wait.LOCK_DIR)
     script = tmp_path / "gpu_hold_cli.py"
-    script.write_text(f"import sys\nsys.path.insert(0, {str(SCRIPTS)!r})\nimport gpu_hold\n"
-                      f"gpu_hold.HOLD_DIR = {gpu_hold.HOLD_DIR!r}\ngpu_hold.main()\n")
+    script.write_text(f"import os, sys, time\nsys.path.insert(0, {str(SCRIPTS)!r})\n"
+                      f"TMP, CARD, UUID = {str(tmp_path)!r}, {CARD}, {UUID!r}\n" + STUBBED_CLI)
     return [sys.executable, str(script)]
 
 
@@ -50,6 +90,120 @@ def test_use_waits_for_the_ballast_and_keeps_the_card_while_running(cli):
         job.kill()
         job.wait()
     assert gpu_hold.flocks(path) == []
+
+
+def contexts(tmp_path):
+    """``[(pid, CUDA_VISIBLE_DEVICES)]`` of every keeper that created its (stub) context."""
+    path = tmp_path / "ctx"
+    return [(int(pid), cvd) for pid, cvd in (line.split() for line in path.read_text().splitlines())] if path.exists() else []
+
+
+def smi_reads(tmp_path):
+    """One line per nvidia-smi query a keeper made: ``<smi_id> <what> <field>``."""
+    path = tmp_path / "reads"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+@pytest.fixture
+def run_use(cli, tmp_path):
+    """Start ``use CARD -- python -c <code>`` (env on top of ours) while a ballast holds CARD; returns the job,
+    the ballast's lock fd and the file the job's stderr goes to. The job is killed when the test ends."""
+    started = []
+
+    def run(code, **env):
+        ballast = gpu_hold.try_lock(gpu_hold.lock_path(CARD))
+        assert ballast is not None
+        err = tmp_path / "stderr"
+        job = subprocess.Popen([*cli, "use", str(CARD), "--", sys.executable, "-c", code], stdout=subprocess.PIPE,
+                               stderr=err.open("w"), text=True, env=dict(os.environ, **env))
+        started.append(job)
+        return job, ballast, err
+
+    yield run
+    for job in started:
+        job.kill()
+        job.wait()
+
+
+SLEEPER = "import time; print('started', flush=True); time.sleep(30)"
+
+
+def test_use_has_a_keeper_on_the_card_before_it_waits_for_the_ballast(run_use, tmp_path):
+    job, ballast, _ = run_use(SLEEPER)
+    path = gpu_hold.lock_path(CARD)
+    wait_for(lambda: (True, job.pid) in gpu_hold.flocks(path))
+    [(keeper, cvd)] = contexts(tmp_path)   # up before use waited: the ballast lets go only once use waits
+    assert cvd == UUID and gpu_wait.argv_of(keeper)[0] == gpu_hold.BALLAST_NAME
+    assert gpu_hold.descends(keeper, job.pid)
+    os.close(ballast)
+    assert job.stdout.readline() == "started\n"
+    assert gpu_hold.flocks(path) == [(False, job.pid)]   # the job kept use's pid; the keeper holds no lock
+    assert not gpu_wait.exited(keeper)
+
+
+def test_the_keeper_leaves_once_a_process_of_the_job_is_on_the_card(run_use, tmp_path):
+    job, ballast, err = run_use("import subprocess, sys, time\n"
+                                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                                "print(child.pid, flush=True)\ntime.sleep(30)")
+    wait_for(lambda: contexts(tmp_path))
+    [(keeper, _)] = contexts(tmp_path)
+    os.close(ballast)
+    child = int(job.stdout.readline())
+    try:
+        (tmp_path / "apps").write_text(f"{keeper} {os.getpid()} [N/A]\n")   # itself, the job's parent, a pid nvidia-smi cannot read
+        n = len(smi_reads(tmp_path))
+        wait_for(lambda: len(smi_reads(tmp_path)) >= n + 2)
+        assert not gpu_wait.exited(keeper)
+        (tmp_path / "apps").write_text(f"{keeper} {os.getpid()} {child}\n")
+        wait_for(lambda: gpu_wait.exited(keeper))
+        assert re.search(rf"keeper left after \d+ s: pid {child} of the job is on the card", err.read_text())
+        assert set(smi_reads(tmp_path)) == {f"{UUID} compute-apps pid"}
+    finally:
+        os.kill(child, signal.SIGKILL)
+
+
+def test_the_keeper_leaves_when_the_job_exits(run_use, tmp_path):
+    job, ballast, _ = run_use(SLEEPER)
+    wait_for(lambda: contexts(tmp_path))
+    [(keeper, _)] = contexts(tmp_path)
+    os.close(ballast)
+    assert job.stdout.readline() == "started\n"
+    job.kill()
+    wait_for(lambda: gpu_wait.exited(keeper))
+
+
+def test_the_keeper_leaves_after_keep_s_with_nothing_of_the_job_on_the_card(run_use, tmp_path):
+    job, ballast, err = run_use(SLEEPER, KEEP_S="0.5")
+    wait_for(lambda: contexts(tmp_path))
+    [(keeper, _)] = contexts(tmp_path)
+    os.close(ballast)
+    assert job.stdout.readline() == "started\n"
+    wait_for(lambda: gpu_wait.exited(keeper))
+    assert "keeper left after 0.5 s with no process of the job on the card" in err.read_text()
+    assert job.poll() is None
+
+
+@pytest.mark.parametrize("cuda", ["fail", "hang"])
+def test_a_keeper_that_does_not_come_up_leaves_the_job_as_before(run_use, tmp_path, cuda):
+    job, ballast, err = run_use(SLEEPER, CUDA=cuda, KEEP_UP_S="0.5")
+    path = gpu_hold.lock_path(CARD)
+    wait_for(lambda: (True, job.pid) in gpu_hold.flocks(path))
+    assert "no keeper (it exited, or no context after 0.5 s); starting the job without it" in err.read_text()
+    os.close(ballast)
+    assert job.stdout.readline() == "started\n"
+    assert gpu_hold.flocks(path) == [(False, job.pid)]
+    assert contexts(tmp_path) == []
+
+
+def test_use_starts_no_keeper_when_no_ballast_holds_the_card(cli, tmp_path):
+    job = subprocess.Popen([*cli, "use", str(CARD), "--", sys.executable, "-c", SLEEPER], stdout=subprocess.PIPE, text=True)
+    try:
+        assert job.stdout.readline() == "started\n"
+        assert gpu_hold.flocks(gpu_hold.lock_path(CARD)) == [(False, job.pid)]
+        assert contexts(tmp_path) == [] and smi_reads(tmp_path) == []
+    finally:
+        job.kill()
+        job.wait()
 
 
 def test_hold_outlives_a_missed_read_of_the_claim(monkeypatch):
