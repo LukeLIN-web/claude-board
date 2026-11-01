@@ -19,8 +19,8 @@ for one. gpu_wait claims a card by holding a flock on one of its claim locks in
 its LOCK_DIR, with "pid=<pid> …" and the command written inside; the lock
 directory, the lock names and that note are gpu_wait's, read here through it.
 The holder is the pid the kernel lists for the flock, not the pid written in
-the file: another tool can flock the same file without rewriting it, and the
-note left inside then names an earlier holder long gone.
+the file: until a new holder has written its note, the note left inside names
+an earlier holder long gone.
 A CUDA ordinal is not the nvidia-smi index on a box with a card CUDA can't see,
 so claims are listed beside the cards rather than placed on one.
 
@@ -126,9 +126,8 @@ def _claims(boot: float) -> list[dict]:
 def _waiting(claimed: set[int], boot: float) -> list[dict]:
     """gpu_wait.py processes that hold no claim: still waiting for cards. Once
     it has claimed, gpu_wait.py execs into its job, whose argv is the job's, and
-    its claim holders (``gpu_wait.py claim …``) hold the claims; an older copy
-    that stays on as its job's parent holds the claim locks itself. Either way
-    no pid of a claim is waiting."""
+    its claim holders (``gpu_wait.py claim …``) hold the claims: no pid of a
+    claim is waiting."""
     out = []
     for d in os.listdir("/proc"):
         if d.isdigit() and int(d) not in claimed:

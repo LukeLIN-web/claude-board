@@ -3,7 +3,6 @@
 nvidia-smi and the CUDA probe are stubbed; the claims and registrations are real
 flocks, in directories of each test's own.
 """
-import fcntl
 import os
 import shlex
 import subprocess
@@ -20,12 +19,6 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 UUID = {0: "GPU-a", 1: "GPU-b", 2: "GPU-c", 3: "GPU-d"}
 HOLDER = "import fcntl, os, sys, time; fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR); " \
          "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)"
-# A launch under a gpu_wait copy that records nothing and hands its job the lock fd: one process,
-# registered at 1 ns on every card, holds the registration and the claim lock of the card it claimed.
-OLD_LAUNCH = ("import fcntl, os, sys, time; reg = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR); "
-              "fcntl.flock(reg, fcntl.LOCK_EX); os.write(reg, b'1 pid 2: bash train.sh\\ncards 0,1,2,3\\n'); "
-              "lock = os.open(sys.argv[2], os.O_CREAT | os.O_RDWR); fcntl.flock(lock, fcntl.LOCK_EX); "
-              "print('held', flush=True); time.sleep(60)")
 
 
 def wait_for(cond, timeout=10.0):
@@ -105,8 +98,9 @@ def test_a_card_claimed_by_another_gpu_wait_is_out(box, other_holder):
 
 
 def test_a_job_sees_its_own_claimed_card_with_its_ballast_as_free(box):
-    fd = os.open(gpu_wait.claim_lock(3), os.O_CREAT | os.O_RDWR)   # as a gpu_wait copy that hands the lock fd to its job does
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    life, heir = os.pipe()   # as gpu_wait leaves its job the pipe
+    gpu_wait.try_claim(3, ["this job"], life)
+    os.close(life)
     try:
         box["apps"] = [("GPU-d", 99, 44000, gpu_busy.BALLAST_NAME)]
         box["used"]["GPU-d"] = 44500
@@ -120,7 +114,7 @@ def test_a_job_sees_its_own_claimed_card_with_its_ballast_as_free(box):
         box["used"]["GPU-c"] = 44000
         assert gpu_busy.BALLAST_NAME in gpu_busy.card_report()[2]
     finally:
-        os.close(fd)
+        os.close(heir)
 
 
 def test_a_job_owns_the_claims_whose_holders_read_its_pipe(box):
@@ -215,19 +209,15 @@ def launch(cli):
         p.wait()
 
 
-def gpu_wait_cli(path, busy):
-    """``gpu_wait.py`` as a command that finds CUDA 1 free and claims it, in the box's LOCK_DIR,
-    with ``busy`` its gpu_busy.py; its job sleeps a minute."""
-    path.write_text(f"import sys\nsys.path.insert(0, {str(SCRIPTS)!r})\nimport gpu_wait\n"
-                    f"gpu_wait.LOCK_DIR = {gpu_wait.LOCK_DIR!r}\ngpu_wait.BUSY = {str(busy)!r}\n"
-                    "gpu_wait.ecc_bad_gpus = set\ngpu_wait.query_free_mb = lambda: {1: 40000}\ngpu_wait.main()\n")
-    return [sys.executable, str(path), "--need-gb", "1", "--", "sleep", "60"]
-
-
 @pytest.fixture
 def waiter(tmp_path, box, cli):
-    """A gpu_wait whose gpu_busy.py is the command on the scratch launches."""
-    return gpu_wait_cli(tmp_path / "gpu_wait_cli.py", cli[1])
+    """``gpu_wait.py`` as a command that finds CUDA 1 free and claims it, in the box's LOCK_DIR,
+    with the scratch launches' gpu_busy.py; its job sleeps a minute."""
+    path = tmp_path / "gpu_wait_cli.py"
+    path.write_text(f"import sys\nsys.path.insert(0, {str(SCRIPTS)!r})\nimport gpu_wait\n"
+                    f"gpu_wait.LOCK_DIR = {gpu_wait.LOCK_DIR!r}\ngpu_wait.BUSY = {cli[1]!r}\n"
+                    "gpu_wait.ecc_bad_gpus = set\ngpu_wait.query_free_mb = lambda: {1: 40000}\ngpu_wait.main()\n")
+    return [sys.executable, str(path), "--need-gb", "1", "--", "sleep", "60"]
 
 
 def test_a_launch_lives_as_long_as_anything_that_inherited_it(launch):
@@ -379,56 +369,6 @@ def test_a_registration_without_readable_cards_is_on_every_card(cli, other_holde
         assert names(gpu_busy.ahead()) == ["cut-cards", "cut-holds", "cut-time", "empty", "garbled", "garbled-holds", "old"]
     finally:
         os.close(fd)
-
-
-def test_older_copies_read_a_registration_as_before_its_claim(cli):
-    """They read its first line, "<ns> <rest>", and the newer of them the cards on its second."""
-    def as_they_read(name):   # line 2 gives them cards only when it is a whole "cards" line
-        with open(os.path.join(gpu_busy.REG_DIR, name), "rb") as f:
-            first, second = (f.readline().decode(errors="replace") for _ in range(2))
-        tag, _, text = second.partition(" ")
-        return first, gpu_busy.ordinals(text) if tag == "cards" and text.endswith("\n") else None
-    t0 = time.time_ns()
-    fds = [gpu_busy.take("mine", "bash -c 'a\nb'", frozenset({1})), gpu_busy.take("plain", "bash runner.sh", None)]
-    try:
-        before = [as_they_read("mine"), as_they_read("plain")]
-        gpu_busy.claimed(frozenset({1}))
-        assert [as_they_read("mine"), as_they_read("plain")] == before
-        ns, _, rest = before[0][0].strip().partition(" ")
-        assert t0 <= int(ns) <= time.time_ns() and rest.endswith(": bash -c 'a b'") and before[0][1] == frozenset({1})
-        assert [reg[3:5] for reg in gpu_busy.launches()] == [(frozenset({1}), frozenset({1})), (None, frozenset({1}))]
-    finally:
-        for fd in fds:
-            os.close(fd)
-
-
-def test_a_launch_whose_gpu_wait_records_nothing_holds_the_card_it_claimed(box, cli):
-    """An older gpu_wait writes no holds line, but the process holding its claim lock has the
-    registration open: the launch holds that card and is in nobody's way."""
-    os.makedirs(gpu_busy.REG_DIR)
-    old = subprocess.Popen([sys.executable, "-c", OLD_LAUNCH, os.path.join(gpu_busy.REG_DIR, "old"), gpu_wait.claim_lock(1)],
-                           stdout=subprocess.PIPE, text=True)
-    try:
-        assert old.stdout.readline() == "held\n" and holds_of("old") == {1}
-        fd = gpu_busy.take("mine", "this test", None)
-        try:
-            assert gpu_busy.ahead() == []
-        finally:
-            os.close(fd)
-    finally:
-        old.kill()
-        old.wait()
-    wait_for(lambda: gpu_busy.launches() == [])
-
-
-def test_the_claim_holders_keep_the_launch_their_gpu_wait_ran_under(tmp_path, box, launch):
-    """Their gpu_wait gone into its job, the claim holders keep the registration open: with no
-    holds line, the launch still holds their cards."""
-    (tmp_path / "records_nothing.py").write_text("")
-    launch("running", *gpu_wait_cli(tmp_path / "silent_gpu_wait.py", tmp_path / "records_nothing.py"))
-    wait_for(lambda: holds_of("running") == {1})
-    assert "holds" not in Path(gpu_busy.REG_DIR, "running").read_text()
-    assert gpu_wait.claim_holder(gpu_wait.claim_lock(1)) is not None
 
 
 def test_register_refuses_set_aside_that_leaves_no_card(cli):

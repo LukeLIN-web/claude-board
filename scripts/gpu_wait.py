@@ -60,13 +60,11 @@ nothing else: the job runs on with its other cards, and must not start anything
 on a released card again (its ``CUDA_VISIBLE_DEVICES`` still names it). The job
 is named by any of its pids (gpu_wait's own: it became the job); a card is the
 job's when a holder of one of its claim locks reads the pipe the job holds. It
-refuses, releasing none, when a card is not claimed for that job: unclaimed, the
-job of another wrapper, or held by anything but a claim holder (a gpu_wait copy
-that hands the lock fd itself to its job, another tool; such a claim ends only
-with its job).
+refuses, releasing none, when a card is not claimed for that job: unclaimed or
+the job of another wrapper.
 
 ``LOCK_DIR``, the lock names and the note are the claim protocol every copy of
-gpu_wait on a box shares, older copies in other repos among them: changing them
+gpu_wait on a box shares, the copies runs snapshot among them: changing them
 lets two pollers load one card.
 """
 from __future__ import annotations
@@ -389,20 +387,15 @@ def release(job: int, cards: list[int]) -> None:
     holders, refused = [], []
     files = open_files(job)
     for card in cards:
-        claims = [(path, pid, argv_of(pid)) for path in card_locks(card) if (pid := lock_holder(path)) is not None]
-        mine = [(pid, argv) for path, pid, argv in claims if is_holder(argv, path) and reads_pipe_of(pid, files)]
+        claims = [(pid, argv_of(pid)) for path in card_locks(card) if (pid := claim_holder(path)) is not None]
+        mine = [(pid, argv) for pid, argv in claims if reads_pipe_of(pid, files)]
         if mine:
             pid, argv = mine[0]
             holders.append((card, pid, holder_job(argv)))
-        elif not claims:
-            refused.append(f"GPU {card} is not claimed")
-        elif not is_holder(claims[0][2], claims[0][0]):
-            _, pid, argv = claims[0]
-            refused.append(f"GPU {card}: its claim lock is held by pid {pid} ({' '.join(argv)[:160] or 'exited'}), not by "
-                           "a gpu_wait claim holder: a gpu_wait copy that hands the lock fd to its job, or another tool; "
-                           "only the end of that job frees the card")
+        elif claims:
+            refused.append(f"GPU {card} is claimed for another job ({holder_job(claims[0][1])}), not for pid {job}'s")
         else:
-            refused.append(f"GPU {card} is claimed for another job ({holder_job(claims[0][2])}), not for pid {job}'s")
+            refused.append(f"GPU {card} is not claimed")
     if refused:
         sys.exit("\n".join(f"[gpu_wait] not releasing: {why}" for why in refused))
     for _, pid, _ in holders:
