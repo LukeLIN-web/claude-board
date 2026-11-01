@@ -8,9 +8,8 @@ ECC errors, it is not in ``--exclude``, no other gpu_wait holds a claim lock of 
 slot), and nvidia-smi shows nobody on it: no compute process and at most ``IDLE_MB`` used
 (graphics-only processes use memory without being listed). Everyone on these boxes
 runs as one Linux account, so whose process it is cannot be told and does not
-matter. On a card claimed for this process's job (it inherited the claim from
-gpu_wait: the pipe the claim holder reads, or the lock fd itself from a copy that
-hands it to its job), that claim's ballast (``BALLAST_NAME``, from gpu_wait
+matter. On a card claimed for this process's job (it inherited the pipe the
+claim holder reads from gpu_wait), that claim's ballast (``BALLAST_NAME``, from gpu_wait
 --hold) is not somebody else: a job checks the cards it was handed with the same
 call, before it starts anything on them. A failed CUDA or nvidia-smi probe exits 2
 with nothing on stdout: take no card (a failed ECC query screens nothing, as in gpu_wait).
@@ -22,15 +21,12 @@ for as long as the command or anything that inherited the lock fd lives (gpu_wai
 holders keep it while its job runs); the kernel drops it when they are all gone, so a
 finished or killed launch never lingers. Its candidate cards are the ones its waiter may pick: every CUDA
 ordinal on the box minus ``--exclude``, the same string the waiter hands ``cards --exclude``.
-With nothing set aside, or when they cannot be read (a registration from an older copy of
-this script, or one still being written), they are every card. A launch waits for cards
+With nothing set aside, or when they cannot be read (a registration still being written),
+they are every card. A launch waits for cards
 until a gpu_wait that inherited its lock fd has claimed: that gpu_wait runs
 ``claimed <its cards>``, which records them in the registration as the cards the launch last
 claimed, which the claim locks keep while that job runs; the record stays when that job
-ends, until a later claim under the launch records its own. A gpu_wait copy that records
-nothing (an older one) still leaves the registration open in whatever holds its claim
-locks: until a record comes, the launch holds the cards whose claim lock is held by a process
-that has its registration open, and waits while there are none. The
+ends, until a later claim under the launch records its own. The
 launches ahead of a registered caller are the ones registered before its own, still
 waiting, whose candidate cards meet its own; for a caller outside any launch, all of them,
 but it waits only for those still waiting, as if it registered now on every card. Nothing
@@ -84,8 +80,8 @@ REG_DIR = "/tmp/gpu_launches"   # box-local like gpu_wait.LOCK_DIR: flock on NFS
 REGISTER_TRIES = 40             # an `ahead` probe holds a registration lock for microseconds, a live launch throughout
 ALREADY_ALIVE = 3
 KEEP_PLACE_NS = 24 * 3600 * 10**9   # a day: a name registered again within it is that launch resumed; a name reused later is a new launch
-CARDS_TAG = "cards"             # starts line 2 of a registration, its candidate cards; older copies read only line 1
-HOLDS_TAG = "holds"             # starts the line ``claimed`` adds after those, the cards the launch last claimed; older copies never take it for cards
+CARDS_TAG = "cards"             # starts line 2 of a registration, its candidate cards
+HOLDS_TAG = "holds"             # starts the line ``claimed`` adds after those, the cards the launch last claimed
 
 
 class ProbeFailed(RuntimeError):
@@ -110,9 +106,7 @@ def rows(text: str, n: int) -> list[list[str]]:
 
 def own_claim(path: str, mine: dict[tuple[int, int], int]) -> bool:
     """The claim somebody holds on claim lock ``path`` is this process's (``mine``: its open files): it has
-    the lock open (the fd a gpu_wait copy hands its job) or the pipe the lock's claim holder reads."""
-    if key(path) in mine:
-        return True
+    the pipe the lock's claim holder reads."""
     holder = gpu_wait.claim_holder(path)
     return holder is not None and gpu_wait.reads_pipe_of(holder, mine)
 
@@ -166,9 +160,8 @@ def card_report(exclude: frozenset[int] = frozenset()) -> dict[int, str]:
 def launches() -> list[tuple[str, int | None, str, frozenset[int] | None, frozenset[int] | None, tuple[int, int] | None]]:
     """Every live launch on this box: ``(name, registered at (ns), its line, its candidate
     cards (``None``: every card), the cards it holds (``None``: it waits for cards), its file)``.
-    The cards it holds are the ones its holds line names, else those whose claim lock is held
-    by a process that has its registration open (``claim_files``)."""
-    out, claims = [], None
+    The cards it holds are the ones its holds line names."""
+    out = []
     for name in sorted(os.listdir(REG_DIR)) if os.path.isdir(REG_DIR) else []:
         path = os.path.join(REG_DIR, name)
         if held(path):
@@ -176,24 +169,13 @@ def launches() -> list[tuple[str, int | None, str, frozenset[int] | None, frozen
                 lines = [line.decode(errors="replace") for line in f] + ["", ""]
             ns, _, rest = lines[0].strip().partition(" ")
             holds = next((h for line in lines[1:] if (h := tagged(line, HOLDS_TAG))), None)
-            k = key(path)
-            if holds is None:
-                claims = claim_files() if claims is None else claims
-                holds = frozenset(card for card, files in claims if k in files) or None
-            out.append((name, int(ns) if ns.isdigit() else None, rest, tagged(lines[1], CARDS_TAG), holds, k))
+            out.append((name, int(ns) if ns.isdigit() else None, rest, tagged(lines[1], CARDS_TAG), holds, key(path)))
     return out
-
-
-def claim_files() -> list[tuple[int, dict[tuple[int, int], int]]]:
-    """``(card, the files open in the process holding its claim lock)`` for every claim held on the box.
-    A claim holder keeps the registration its gpu_wait inherited, and a copy that hands its job the
-    lock fd leaves the job both: either way the launch's file is among them."""
-    return [(card, open_files(pid)) for card, _, pid in gpu_wait.held_claims()]
 
 
 def tagged(line: str, tag: str) -> frozenset[int] | None:
     """The cards on a registration line starting with ``tag``; ``None`` when there are none to read:
-    another tag (an older copy wrote no cards line), or a line not fully written yet (a whole line
+    another tag (a registration with nothing set aside has no cards line), or a line not fully written yet (a whole line
     ends in a newline)."""
     t, _, text = line.partition(" ")
     if t != tag or not text.endswith("\n"):
