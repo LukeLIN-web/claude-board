@@ -15,15 +15,7 @@ ordinal, as in the claim lock):
 
 * ``use k -- cmd`` takes a shared lock, waiting while the ballast holds the card,
   and execs ``cmd``, which keeps the lock, with every child that inherits the fd
-  (Python's subprocess closes it), for its lifetime. Before it waits, it starts a
-  ``keep`` on the card, also listed as ``BALLAST_NAME``, and lets it create a
-  bare CUDA context (a few hundred MiB, inside the ``RESERVE_MB`` beside the
-  ballast), so the card lists a process while the job comes on (vLLM's engine
-  ~40 s after ``use``). The keeper stays, unchanged, until ``cmd``'s own process
-  exits: leaving sooner frees memory at a moment the job may be sizing itself
-  from free memory (vLLM's KV cache counts every change on the card from its
-  first snapshot to the end of profiling). A keeper not up within ``KEEP_UP_S``
-  is killed and the job starts without it;
+  (Python's subprocess closes it), for its lifetime;
 * the ballast holds the exclusive lock; when a waiter shows in /proc/locks,
   ``hold`` kills the ballast and lets the lock go once the ballast has exited;
 * ``hold`` arms only when nobody holds or waits on the lock and nvidia-smi shows
@@ -57,7 +49,6 @@ import argparse
 import ctypes
 import fcntl
 import os
-import select
 import signal
 import subprocess
 import sys
@@ -74,7 +65,6 @@ RESERVE_MB = 1024            # left free beside the ballast
 CHUNK_MB = 256
 CLAIM_MISSES = 10            # /proc/locks comes a page per read: a line can slip between pages while other locks come and go
 PR_SET_PDEATHSIG = 1
-KEEP_UP_S = 30.0             # use waits this long for the keeper's context (up in about a second), then kills it and lets the ballast go: cuInit can hang
 FILL_AFTER_S = 240.0         # no fill sooner after the job came on: vLLM takes up to ~200 s to size its KV cache, flat for a minute after compiling
 FILL_STABLE_S = 30.0         # fill once used VRAM has moved by at most FILL_STABLE_MB over this long
 FILL_STABLE_MB = 512
@@ -270,42 +260,10 @@ def fill(card: int, parent: int, headroom_mb: int) -> None:
         time.sleep(FILL_TICK_S)
 
 
-def keep(card: int, job: int, up: int) -> None:
-    """Hold a bare CUDA context on the one visible card, telling ``use`` on fd ``up`` once it is up, until ``job`` exits."""
-    ctypes.CDLL(None).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
-    if os.getppid() != job:
-        return
-    cuda_on_card(card)
-    os.write(up, b"up")
-    os.close(up)
-    while True:
-        signal.pause()
-
-
-def start_keeper(card: int) -> None:
-    """Start ``keep`` on the card for this process (the job, once it execs) and wait up to ``KEEP_UP_S`` for its
-    context; a keeper not up by then is killed, so no context comes on later, inside the job's start."""
-    up, up_w = os.pipe()
-    try:
-        keeper = spawn(str(card), "keep", str(card), str(os.getpid()), str(up_w), pass_fds=(up_w,))
-    except OSError:
-        keeper = None
-    os.close(up_w)
-    if not (select.select([up], [], [], KEEP_UP_S)[0] and os.read(up, 2)):
-        log(card, f"no keeper (it exited, or no context after {KEEP_UP_S:g} s); starting the job without it")
-        if keeper is not None:
-            keeper.kill()
-    os.close(up)
-
-
 def use(card: int, cmd: list[str]) -> None:
     os.makedirs(HOLD_DIR, exist_ok=True)
     fd = os.open(lock_path(card), os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except OSError:   # the ballast holds the card: the keeper goes on before waiting lets the ballast go
-        start_keeper(card)
-        fcntl.flock(fd, fcntl.LOCK_SH)
+    fcntl.flock(fd, fcntl.LOCK_SH)
     os.set_inheritable(fd, True)
     for sig in (signal.SIGPIPE, signal.SIGXFSZ):   # Python ignores these; exec would pass that on
         signal.signal(sig, signal.SIG_DFL)
@@ -327,10 +285,6 @@ def main() -> None:
     p = sub.add_parser("ballast", help="started by hold")
     p.add_argument("card", type=int)
     p.add_argument("parent", type=int)
-    p = sub.add_parser("keep", help="started by use")
-    p.add_argument("card", type=int)
-    p.add_argument("job", type=int)
-    p.add_argument("up", type=int)
     p = sub.add_parser("fill", help="started by hold --fill-mb")
     p.add_argument("card", type=int)
     p.add_argument("parent", type=int)
@@ -343,8 +297,6 @@ def main() -> None:
         use(args.card, cmd)
     elif args.mode == "hold":
         hold(args.card, args.claim_pid, args.smi_id, args.fill_mb)
-    elif args.mode == "keep":
-        keep(args.card, args.job, args.up)
     elif args.mode == "fill":
         fill(args.card, args.parent, args.headroom_mb)
     else:
