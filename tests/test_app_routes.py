@@ -36,6 +36,7 @@ _NEUTRAL = {
     "pane_model": (appmod.actions, ""),
     "pane_dialog": (appmod.actions, None),
     "get_pane_queue": (appmod.actions, []),
+    "get_pane_tip": (appmod.actions, None),
     "current_task_hint": (appmod.transcripts, None),
     "current_model": (appmod.transcripts, ""),
     "session_activity": (appmod.transcripts, {"skills_used": [], "skill_contents": {}, "memory_ops": []}),
