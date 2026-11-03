@@ -826,6 +826,48 @@ def get_pane_queue(tty: Optional[str]) -> list[str]:
     return parse_pane_queue(tmux.capture_tty(tty) or "")
 
 
+# The built-in you-should-know plugin draws its suggestion above the input box:
+# a "✦ <tag> · <line>" head at column 0, wrapped lines indented under the star,
+# then an indented "1: Learn more  2: Knew this already  0: Dismiss" row. The
+# layout is read off the plugin's render code (Claude Code 2.1.317).
+_TIP_HEAD = "✦"
+_TIP_BUTTONS_RE = re.compile(r"^\d: \S")
+
+
+def parse_pane_tip(text: str) -> Optional[str]:
+    """The you-should-know suggestion showing above the input box, or None.
+
+    The plugin never writes it to the transcript, so the pane is the only place
+    to read it. Its block is the run of non-blank lines nearest the box's top
+    border; a block not headed by ✦ is something else (spinner, output). Queued
+    messages can share that run and the button row says nothing, so both drop.
+    """
+    if not text:
+        return None
+    lines = text.split("\n")
+    rules = [i for i, ln in enumerate(lines) if _HRULE_RE.match(ln)]
+    if len(rules) < 2:
+        return None
+    i = rules[-2] - 1
+    while i >= 0 and not lines[i].strip():
+        i -= 1
+    end = i + 1
+    while i >= 0 and lines[i].strip():
+        i -= 1
+    block = lines[i + 1:end]
+    if not block or not block[0].startswith(_TIP_HEAD):
+        return None
+    body = [block[0][len(_TIP_HEAD):].strip()]
+    body += [ln.strip() for ln in block[1:]
+             if not _QUEUED_RE.match(ln) and not _TIP_BUTTONS_RE.match(ln.strip())]
+    return " ".join(b for b in body if b) or None
+
+
+def get_pane_tip(tty: Optional[str]) -> Optional[str]:
+    """The you-should-know suggestion on `tty`'s pane (None on any miss)."""
+    return parse_pane_tip(tmux.capture_tty(tty) or "")
+
+
 # Keys the dashboard is allowed to send into an interactive menu (e.g. the
 # AskUserQuestion picker). Restricted to navigation/selection tokens so the
 # endpoint can't be used to type arbitrary input — free text goes through

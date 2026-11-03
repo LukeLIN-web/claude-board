@@ -512,6 +512,10 @@
               </div>
             </template>
           </div>
+          <!-- you-should-know suggestion — scraped from above the input box while it is up. -->
+          <div x-show="w.tip" class="text-[10px] text-amber-800 bg-amber-50 rounded px-1.5 py-0.5"
+               style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;"
+               :title="w.tip" x-text="'✦ ' + (w.tip || '')"></div>
           <!-- Latest /btw aside — scraped from the ephemeral overlay (never in the
                transcript), latched to disk, so it survives the overlay closing. -->
           <!-- !dismissed guard: a snapshot built just before a dismiss can still

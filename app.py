@@ -244,6 +244,9 @@ def _local_snapshot() -> dict:
             w["queued"] = queued
         else:
             w["queued"] = []
+        # The you-should-know plugin's suggestion lives only above the input
+        # box, so the card shows it while it is up there and not after.
+        w["tip"] = actions.get_pane_tip(w.get("tty")) if w.get("alive") else None
         # /btw asides never reach the transcript, so scrape the ephemeral overlay
         # from the pane (best-effort, only while it is on-screen) and latch it to
         # disk. The overlay can be open whether the session is busy or idle, so
