@@ -42,6 +42,22 @@ leaves it empty for under a second, and the fill stays.
 ``CLAIM_MISSES`` reads in a row (the job ended, the card was released with
 ``gpu_wait.py release``, or the chain was killed); a ballast or fill whose ``hold``
 dies gets SIGTERM from the kernel.
+
+A ``bridge`` covers the card between two claims, with or without ``--hold``: a
+claim holder whose claim ends while a gpu_wait waits on the box starts one
+(``start_bridge``) and lets the claim lock go once it is up. Under
+``BALLAST_NAME``, the bridge takes the card's lock shared, as ``use`` does (a
+ballast lets go of the card, and no ``hold`` arms one beside it), waits up to
+``BRIDGE_CLEAR_S`` while every process nvidia-smi lists on the card is exiting,
+stays off a card that still shows in use or that another bridge covers, opens a
+CUDA context and no memory, and reads the card's free VRAM; it is up once
+nvidia-smi lists it, and nobody else, on the card after that read. It leaves as
+soon as the card's free VRAM falls ``BRIDGE_DROP_MB`` below the most it has read,
+which a new context on the card does (the next job's, at its first CUDA call), or
+once no claim has held the card for ``BRIDGE_GRACE_S``. Until it leaves, its
+context sits beside the next job's start. ``hold`` does not take a bridge for the
+job, so no fill starts on its account; its shared lock still keeps a ballast off
+the card.
 """
 from __future__ import annotations
 
@@ -50,11 +66,13 @@ import ctypes
 import fcntl
 import os
 import signal
+import select
 import subprocess
 import sys
 import time
+import uuid
 
-from gpu_wait import claim_lock, flocks
+from gpu_wait import argv_of, claim_lock, flocks, held_claims
 
 HOLD_DIR = "/tmp/gpu_hold"   # box-local like LOCK_DIR: flock on NFS is a lie
 BALLAST_NAME = "agent-harness:gpu_hold"   # what nvidia-smi lists; the name every copy of gpu_busy knows a ballast by
@@ -73,6 +91,10 @@ FILL_BAND_MB = 2048          # fill keeps the card's free VRAM within [headroom,
 FILL_TICK_S = 0.1            # fill's control period
 FILL_DROP_S = 2.0            # the job has left once the lock stays empty this long: before restarting its services (the next batch),
                              # a job leaves it empty FILL_DROP_S + TICK_S, or the fill stays on; Isaac restarting between tasks: under 1 s
+BRIDGE_TICK_S = 0.1
+BRIDGE_DROP_MB = 64          # well under what a CUDA context takes
+BRIDGE_GRACE_S = 30.0        # a waiting gpu_wait claims within its WAKE_S and one try
+BRIDGE_CLEAR_S = 3.0         # how long the bridge waits for the last job's processes to finish exiting
 
 
 def log(card: int, msg: str) -> None:
@@ -81,6 +103,10 @@ def log(card: int, msg: str) -> None:
 
 def lock_path(card: int) -> str:
     return os.path.join(HOLD_DIR, f"gpu{card}")
+
+
+def bridge_lock(card: int) -> str:
+    return os.path.join(HOLD_DIR, f"gpu{card}.bridge")
 
 
 def claim_alive(card: int, claim_pid: int) -> bool:
@@ -93,11 +119,21 @@ def smi(smi_id: str, what: str, field: str) -> list[str]:
                                     "--format=csv,noheader,nounits"], text=True, timeout=30).split()
 
 
-def card_idle(smi_id: str) -> bool:
-    """nvidia-smi shows nothing on the card; an unanswered query is not idle."""
+def card_idle(smi_id: str, mine: int | None = None) -> bool:
+    """nvidia-smi shows nothing on the card, or only process ``mine`` when given; an unanswered query is not idle."""
     try:
-        return not smi(smi_id, "compute-apps", "pid") and int(smi(smi_id, "gpu", "memory.used")[0]) <= IDLE_MB
+        pids = smi(smi_id, "compute-apps", "pid")
+        return (pids == ([] if mine is None else [str(mine)])
+                and int(smi(smi_id, "gpu", "memory.used")[0]) <= IDLE_MB)
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return False
+
+
+def card_clearing(smi_id: str) -> bool:
+    """Every process nvidia-smi lists on the card is exiting or gone (no argv): the last job letting go."""
+    try:
+        return all(pid.isdigit() and not argv_of(int(pid)) for pid in smi(smi_id, "compute-apps", "pid"))
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -133,12 +169,12 @@ def try_lock(path: str) -> int | None:
     return fd
 
 
-def spawn(smi_id: str, *args: str, pass_fds: tuple[int, ...] = ()) -> subprocess.Popen:
+def spawn(smi_id: str, *args: str, pass_fds: tuple[int, ...] = (), **popen) -> subprocess.Popen:
     """Run this script with ``args`` on the one card ``smi_id``, listed by nvidia-smi as ``BALLAST_NAME``."""
     return subprocess.Popen(
         [BALLAST_NAME, os.path.abspath(__file__), *args], executable=sys.executable, pass_fds=pass_fds,
         # a venv interpreter run under another argv[0] cannot find its stdlib without PYTHONHOME
-        env=dict(os.environ, CUDA_VISIBLE_DEVICES=smi_id, PYTHONHOME=sys.base_prefix))
+        env=dict(os.environ, CUDA_VISIBLE_DEVICES=smi_id, PYTHONHOME=sys.base_prefix), **popen)
 
 
 def hold(card: int, claim_pid: int, smi_id: str, fill_mb: int | None = None) -> None:
@@ -149,7 +185,8 @@ def hold(card: int, claim_pid: int, smi_id: str, fill_mb: int | None = None) -> 
     filler, last_user, busy_since, samples, next_sample = None, float("-inf"), None, [], 0.0
     while misses < CLAIM_MISSES:
         misses = 0 if claim_alive(card, claim_pid) else misses + 1
-        users = flocks(path)
+        bridges = {pid for _, pid in flocks(bridge_lock(card))}
+        users = [user for user in flocks(path) if user[1] not in bridges]   # a bridge is not the job
         now = time.monotonic()
         job = proc is None and bool(users)   # while the ballast is armed, its own lock is in users
         if job:
@@ -197,6 +234,15 @@ def hold(card: int, claim_pid: int, smi_id: str, fill_mb: int | None = None) -> 
         if p is not None:
             p.terminate()
             p.wait()
+
+
+def visible_uuid() -> str | None:
+    """The one visible card's UUID, from libcuda without a context (no process shows on the card)."""
+    cuda = ctypes.CDLL("libcuda.so.1")
+    dev, raw = ctypes.c_int(), (ctypes.c_ubyte * 16)()
+    if cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(dev), 0) or cuda.cuDeviceGetUuid(raw, dev):
+        return None
+    return f"GPU-{uuid.UUID(bytes=bytes(raw))}"
 
 
 def cuda_on_card(card: int) -> ctypes.CDLL:
@@ -260,6 +306,61 @@ def fill(card: int, parent: int, headroom_mb: int) -> None:
         time.sleep(FILL_TICK_S)
 
 
+def bridge(card: int, parent: int, up: int) -> None:
+    """Cover CUDA ``card``, the one visible card, until the next claim's job is on it (see the
+    module docstring); write ``up`` to fd ``up`` once it covers the card."""
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):   # the claim holder that started it ignores them
+        signal.signal(sig, signal.SIG_DFL)
+    libc = ctypes.CDLL(None)
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    if os.getppid() != parent or (smi_id := visible_uuid()) is None:
+        return
+    os.makedirs(HOLD_DIR, exist_ok=True)
+    fcntl.flock(os.open(lock_path(card), os.O_CREAT | os.O_RDWR, 0o666), fcntl.LOCK_SH)   # held until it exits
+    clear_by = time.monotonic() + BRIDGE_CLEAR_S
+    while not card_idle(smi_id):
+        if time.monotonic() >= clear_by or not card_clearing(smi_id):
+            return
+        time.sleep(BRIDGE_TICK_S)
+    if try_lock(bridge_lock(card)) is None:
+        return
+    cuda = cuda_on_card(card)
+    most = card_free_mb(cuda, card)
+    if not card_idle(smi_id, os.getpid()):   # somebody came on before that read, or nvidia-smi does not list the bridge
+        return
+    libc.prctl(PR_SET_PDEATHSIG, 0)   # the holder exits once the bridge is up
+    os.write(up, b"up")
+    os.close(up)
+    claimed = time.monotonic()
+    while True:
+        time.sleep(BRIDGE_TICK_S)
+        free = card_free_mb(cuda, card)
+        if most - free > BRIDGE_DROP_MB:
+            return
+        most = max(most, free)
+        now = time.monotonic()
+        if any(c == card for c, _, _ in held_claims()):
+            claimed = now
+        elif now - claimed >= BRIDGE_GRACE_S:
+            return
+
+
+def start_bridge(card: int, by: float) -> bool:
+    """Start a bridge on CUDA ``card`` and wait for it until ``time.monotonic()`` reaches ``by``:
+    True once it is up; False when it stays off or is not up by then (then it is killed, with
+    the nvidia-smi it may be running)."""
+    up, up_w = os.pipe()
+    proc = spawn(str(card), "bridge", str(card), str(os.getpid()), str(up_w), pass_fds=(up_w,), start_new_session=True,
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.close(up_w)
+    ready = bool(select.select([up], [], [], max(0.0, by - time.monotonic()))[0]) and os.read(up, 2) == b"up"
+    os.close(up)
+    if not ready:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    return ready
+
+
 def use(card: int, cmd: list[str]) -> None:
     os.makedirs(HOLD_DIR, exist_ok=True)
     fd = os.open(lock_path(card), os.O_CREAT | os.O_RDWR, 0o666)
@@ -289,6 +390,10 @@ def main() -> None:
     p.add_argument("card", type=int)
     p.add_argument("parent", type=int)
     p.add_argument("headroom_mb", type=int)
+    p = sub.add_parser("bridge", help="started by a gpu_wait claim holder whose claim ends while a gpu_wait waits")
+    p.add_argument("card", type=int)
+    p.add_argument("parent", type=int)
+    p.add_argument("up", type=int)
     args = ap.parse_args()
     if args.mode == "use":
         cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
@@ -299,6 +404,8 @@ def main() -> None:
         hold(args.card, args.claim_pid, args.smi_id, args.fill_mb)
     elif args.mode == "fill":
         fill(args.card, args.parent, args.headroom_mb)
+    elif args.mode == "bridge":
+        bridge(args.card, args.parent, args.up)
     else:
         ballast(args.card, args.parent)
 

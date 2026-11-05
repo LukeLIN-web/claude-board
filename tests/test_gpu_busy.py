@@ -216,6 +216,7 @@ def waiter(tmp_path, box, cli):
     path = tmp_path / "gpu_wait_cli.py"
     path.write_text(f"import sys\nsys.path.insert(0, {str(SCRIPTS)!r})\nimport gpu_wait\n"
                     f"gpu_wait.LOCK_DIR = {gpu_wait.LOCK_DIR!r}\ngpu_wait.BUSY = {cli[1]!r}\n"
+                    f"gpu_wait.SELF = {gpu_wait.SELF!r}\n"
                     "gpu_wait.ecc_bad_gpus = set\ngpu_wait.query_free_mb = lambda: {1: 40000}\ngpu_wait.main()\n")
     return [sys.executable, str(path), "--need-gb", "1", "--", "sleep", "60"]
 
