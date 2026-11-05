@@ -365,20 +365,25 @@ def test_a_card_is_clearing_only_while_every_listed_process_is_exiting(monkeypat
         exiting.wait()
 
 
-@pytest.mark.parametrize("code, ready, rc", [("import os, sys, time; os.write(int(sys.argv[1]), b'up'); time.sleep(30)", True, None),
-                                             ("pass", False, 0), ("import time; time.sleep(30)", False, -9)],
+@pytest.mark.parametrize("code, ready, rc", [("os.write(int(sys.argv[1]), b'up'); time.sleep(30)", True, None),
+                                             ("pass", False, 0), ("time.sleep(30)", False, -9)],
                          ids=["up", "stays off", "not up in time"])
-def test_start_bridge_waits_for_the_bridge(monkeypatch, code, ready, rc):
-    procs = []
+def test_start_bridge_waits_for_the_bridge(monkeypatch, tmp_path, code, ready, rc):
+    """The bridge, and the nvidia-smi it may be running when it is killed, are gone unless it is up."""
+    procs, child = [], tmp_path / "child"
 
     def spawn(smi_id, *args, pass_fds=(), **popen):
-        procs.append(subprocess.Popen([sys.executable, "-c", code, args[-1]], pass_fds=pass_fds, **popen))
+        script = ("import os, subprocess, sys, time\n"
+                  f"open(sys.argv[2], 'w').write(str(subprocess.Popen(['sleep', '30']).pid))\n{code}")
+        procs.append(subprocess.Popen([sys.executable, "-c", script, args[-1], str(child)], pass_fds=pass_fds, **popen))
         return procs[-1]
     monkeypatch.setattr(gpu_hold, "spawn", spawn)
-    monkeypatch.setattr(gpu_hold, "BRIDGE_UP_S", 2.0)
     try:
-        assert gpu_hold.start_bridge(CARD) is ready
+        assert gpu_hold.start_bridge(CARD, time.monotonic() + 2.0) is ready
         assert procs[0].poll() == rc
+        if rc == -9:
+            wait_for(lambda: gpu_wait.exited(int(child.read_text())))
     finally:
-        procs[0].kill()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(procs[0].pid, signal.SIGKILL)
         procs[0].wait()

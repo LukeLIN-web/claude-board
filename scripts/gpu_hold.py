@@ -70,7 +70,7 @@ import sys
 import time
 import uuid
 
-from gpu_wait import RELEASE_WAIT_S, argv_of, claim_lock, flocks, held_claims
+from gpu_wait import argv_of, claim_lock, flocks, held_claims
 
 HOLD_DIR = "/tmp/gpu_hold"   # box-local like LOCK_DIR: flock on NFS is a lie
 BALLAST_NAME = "agent-harness:gpu_hold"   # what nvidia-smi lists; the name every copy of gpu_busy knows a ballast by
@@ -89,7 +89,6 @@ FILL_BAND_MB = 2048          # fill keeps the card's free VRAM within [headroom,
 FILL_TICK_S = 0.1            # fill's control period
 FILL_DROP_S = 2.0            # the job has left once the lock stays empty this long: before restarting its services (the next batch),
                              # a job leaves it empty FILL_DROP_S + TICK_S, or the fill stays on; Isaac restarting between tasks: under 1 s
-BRIDGE_UP_S = RELEASE_WAIT_S - 2.0   # the claim holder waits this long for its bridge, inside the time release gives it
 BRIDGE_TICK_S = 0.1
 BRIDGE_DROP_MB = 64          # well under what a CUDA context takes
 BRIDGE_GRACE_S = 30.0        # a waiting gpu_wait claims within its WAKE_S and one try
@@ -343,17 +342,18 @@ def bridge(card: int, parent: int, up: int) -> None:
             return
 
 
-def start_bridge(card: int) -> bool:
-    """Start a bridge on CUDA ``card`` and wait for it: True once it is up; False when it stays
-    off or is not up within ``BRIDGE_UP_S`` (then it is killed)."""
+def start_bridge(card: int, by: float) -> bool:
+    """Start a bridge on CUDA ``card`` and wait for it until ``time.monotonic()`` reaches ``by``:
+    True once it is up; False when it stays off or is not up by then (then it is killed, with
+    the nvidia-smi it may be running)."""
     up, up_w = os.pipe()
-    proc = spawn(str(card), "bridge", str(card), str(os.getpid()), str(up_w), pass_fds=(up_w,),
+    proc = spawn(str(card), "bridge", str(card), str(os.getpid()), str(up_w), pass_fds=(up_w,), start_new_session=True,
                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.close(up_w)
-    ready = bool(select.select([up], [], [], BRIDGE_UP_S)[0]) and os.read(up, 2) == b"up"
+    ready = bool(select.select([up], [], [], max(0.0, by - time.monotonic()))[0]) and os.read(up, 2) == b"up"
     os.close(up)
     if not ready:
-        proc.kill()
+        os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
     return ready
 

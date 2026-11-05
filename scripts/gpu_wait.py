@@ -101,6 +101,7 @@ BUSY = os.path.join(HERE, "gpu_busy.py")
 STALL_ALERT_S = 3600.0
 LOCKS_READS = 10   # /proc/locks comes a page per read: a held lock's line can slip between pages while other locks come and go
 RELEASE_WAIT_S = 10.0
+HAND_OVER_S = RELEASE_WAIT_S - 2.0   # a holder whose claim ends lets the claim lock go this soon, inside release's wait
 HEIR_FD = 10
 END = signal.SIGUSR1   # ends a claim, handing its card over (release); backing out kills the holder (SIGKILL)
 WAKE_S = 1.0           # a waiting gpu_wait looks this often whether a claim on the box has ended
@@ -367,10 +368,13 @@ def enqueue() -> int:
 
 def hand_over(card: int) -> None:
     """The claim on ``card`` ends. While a gpu_wait waits on the box, start gpu_hold's bridge on
-    the card and return once it is up or stays off, so the claim lock goes only after it is up."""
+    the card and return once it is up or stays off, so the claim lock goes only after it is up;
+    it waits for the bridge until ``HAND_OVER_S`` after it was called, the import and the
+    bridge's start counted in."""
+    by = time.monotonic() + HAND_OVER_S
     if lock_holder(queue_lock()) is not None:
         from gpu_hold import start_bridge   # gpu_hold imports this module
-        if start_bridge(card):
+        if start_bridge(card, by):
             print(f"[gpu_wait] GPU {card}: bridged to the next claim", flush=True)
 
 

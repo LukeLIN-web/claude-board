@@ -48,7 +48,7 @@ def bridged(tmp_path, monkeypatch):
     bin_dir, record = tmp_path / "bin", tmp_path / "bridged"
     bin_dir.mkdir()
     shutil.copy(SCRIPTS / "gpu_wait.py", bin_dir)
-    (bin_dir / "gpu_hold.py").write_text(f"def start_bridge(card):\n"
+    (bin_dir / "gpu_hold.py").write_text(f"def start_bridge(card, by):\n"
                                          f"    with open({str(record)!r}, 'a') as f:\n"
                                          f"        f.write(f'{{card}}\\n')\n"
                                          f"    return True\n")
