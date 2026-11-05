@@ -80,6 +80,10 @@ appear only when tmux is available.
 > Spawned Claude and Codex sessions run with `--dangerously-skip-permissions` /
 > `--yolo`: everything is auto-approved. Don't spawn in directories you don't trust.
 
+Spawned windows open in Fleet's own tmux session, `fleet` (`FLEET_TMUX_SESSION`
+names another), which Fleet creates when it is missing. They never open in
+another session on the same server.
+
 A session in a tmux server other than Fleet's own (`FLEET_TMUX_SOCKET`, or the
 default server) gets no card. To keep a helper on Fleet's own server running
 without a card, mark its tmux pane on the host it runs on. The mark lasts as

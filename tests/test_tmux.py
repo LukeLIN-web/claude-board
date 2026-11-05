@@ -49,11 +49,12 @@ def _recorder(calls, **proc):
     return fake_run
 
 
-def _server(calls=None, *, sessions=("alpha",), pane="%9", panes=None,
+def _server(calls=None, *, sessions=("fleet",), pane="%9", panes=None,
             in_mode=False, window_error=None):
     """A fake tmux server for new_window, recording each argv into `calls`.
 
-    `sessions` is what list-sessions shows (none: no server is running yet);
+    `sessions` is what list-sessions shows (none: no server is running yet; the
+    default: the board's own session is up);
     `pane` is the id a new window or session reports; `panes`, when given, is
     what list-panes prints; `in_mode` opens that pane in view-mode;
     `window_error` makes new-window / new-session fail with that stderr.
@@ -78,6 +79,11 @@ def _server(calls=None, *, sessions=("alpha",), pane="%9", panes=None,
 def _argv(calls, command):
     """The first recorded tmux argv that runs `command`."""
     return next(a for a in calls if command in a)
+
+
+def _mentions(calls, *names):
+    """Whether any recorded tmux argv names any of `names`, as `x` or `x:…`."""
+    return any(arg == n or arg.startswith(f"{n}:") for a in calls for arg in a for n in names)
 
 
 # Stand-in for the resolved CLI. new_window launches by absolute path, so argv
@@ -147,20 +153,18 @@ class SocketArgsTests(unittest.TestCase):
         self.assertEqual(argv, ["tmux", "list-panes"])
 
     def test_new_window_targets_socketed_server(self):
-        # Socket is dedicated (-L board) but the session is NOT pinned: it falls
-        # out of sessions[0] on that server, so cards land wherever that server
-        # already hosts, not a hard-coded name.
+        # The socket picks the server; the session on it is still the board's own.
         calls = []
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board"}, clear=True), \
              _pin_cli(), mock.patch.object(tmux, "_SPAWN_LANDED_WAITS", (0.0,)), \
              mock.patch.object(tmux, "pane_alive", return_value=True):
-            with _patch_run(_server(calls, sessions=["beauty"], pane="%3")):
+            with _patch_run(_server(calls, sessions=["beauty", "fleet"], pane="%3")):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
         self.assertEqual(_argv(calls, "list-sessions")[:3], ["tmux", "-L", "board"])
         new_win_argv = _argv(calls, "new-window")
         self.assertEqual(new_win_argv[:4], ["tmux", "-L", "board", "new-window"])
-        self.assertIn("beauty", new_win_argv)  # sessions[0], not a pin
+        self.assertEqual(new_win_argv[new_win_argv.index("-t") + 1], "fleet:")
 
 
 # Only available() and pane_for_tty() read tmux's module caches, so only their
@@ -332,19 +336,43 @@ class NewWindowTests(unittest.TestCase):
         self.assertEqual(
             _argv(calls, "new-window"),
             ["tmux", "new-window", "-P", "-F", "#{pane_id}",
-             "-t", "mysess", "-c", "/home/u/proj",
+             "-t", "mysess:", "-c", "/home/u/proj",
              _EXE, "--dangerously-skip-permissions"],
         )
         self.assertTrue(r["ok"])
         self.assertEqual(r["pane_id"], "%12")
 
-    def test_falls_back_to_first_listed_session(self):
+    def test_unpinned_spawn_creates_fleet_beside_other_sessions(self):
+        # The server is shared and the board's own session isn't there: the card
+        # gets a new `fleet` session, not a window in a session the board did not
+        # make. A window there becomes that session's active one, so keys sent to
+        # the session by name would land in the card's composer.
         calls = []
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with mock.patch.dict("os.environ", {"PATH": "/opt/bin"}, clear=True), \
+             mock.patch.object(tmux, "_venv_bin_dirs", return_value=set()):
             with _patch_run(_server(calls, sessions=["alpha", "beta"], pane="%20")):
                 r = tmux.new_window("/tmp")
-        self.assertIn("alpha", _argv(calls, "new-window"))
         self.assertTrue(r["ok"])
+        self.assertEqual(
+            _argv(calls, "new-session"),
+            ["tmux", "new-session", "-d", "-s", "fleet",
+             "-P", "-F", "#{pane_id}", "-c", "/tmp",
+             _EXE, "--dangerously-skip-permissions"],
+        )
+        self.assertFalse(any("new-window" in a for a in calls))
+        self.assertFalse(_mentions(calls, "alpha", "beta"))
+
+    def test_unpinned_spawn_opens_its_window_in_existing_fleet(self):
+        # Wherever `fleet` sorts among the other sessions, the window goes there.
+        calls = []
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with _patch_run(_server(calls, sessions=["alpha", "fleet", "beta"], pane="%20")):
+                r = tmux.new_window("/tmp")
+        self.assertTrue(r["ok"])
+        new_win_argv = _argv(calls, "new-window")
+        self.assertEqual(new_win_argv[new_win_argv.index("-t") + 1], "fleet:")
+        self.assertFalse(any("new-session" in a for a in calls))
+        self.assertFalse(_mentions(calls, "alpha", "beta"))
 
     def test_cold_start_creates_session_instead_of_new_window(self):
         # Zero sessions: must bootstrap a host session running cmd directly,
