@@ -1,8 +1,10 @@
+import contextlib
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -228,3 +230,92 @@ def test_hold_stops_the_fill_when_the_claim_ends(monkeypatch):
     children, _ = run_hold(monkeypatch, lambda now: True, claim_end)
     [fill] = children
     assert fill.stopped == [claim_end + gpu_hold.CLAIM_MISSES * gpu_hold.TICK_S] and fill.waits == 1
+
+
+# ── the bridge between two claims ────────────────────────────────────────────────────
+
+
+def run_bridge(monkeypatch, free_mb, claimed=lambda now: False, idle=(True, True)):
+    """``bridge`` on CARD against a fake clock: the card's free VRAM is ``free_mb(now)``, a claim holds
+    it while ``claimed(now)``, and ``idle`` is what nvidia-smi shows before the context, then after it.
+    Returns what it wrote to the up fd, when it left, the contexts it opened, and the hold and
+    bridge locks' flocks while it was up."""
+    clock, contexts, idle, locks = Clock(), [], iter(idle), []
+
+    def free(cuda, card):
+        assert clock.now < 10 * gpu_hold.BRIDGE_GRACE_S, "the bridge never left"
+        if not locks:
+            locks.append([gpu_hold.flocks(path) for path in (gpu_hold.lock_path(CARD), gpu_hold.bridge_lock(CARD))])
+        return free_mb(clock.now)
+
+    monkeypatch.setattr(gpu_hold, "time", clock)
+    monkeypatch.setattr(gpu_hold, "BRIDGE_TICK_S", 0.5)
+    monkeypatch.setattr(gpu_hold, "ctypes", SimpleNamespace(CDLL=lambda name: SimpleNamespace(prctl=lambda *a: 0)))
+    monkeypatch.setattr(gpu_hold, "visible_uuid", lambda: "GPU-c")
+    monkeypatch.setattr(gpu_hold, "card_idle", lambda smi_id, mine=None: next(idle))
+    monkeypatch.setattr(gpu_hold, "cuda_on_card", lambda card: contexts.append(card))
+    monkeypatch.setattr(gpu_hold, "card_free_mb", free)
+    monkeypatch.setattr(gpu_hold, "held_claims", lambda: [(CARD, "lock", 4242)] if claimed(clock.now) else [])
+    r, w = os.pipe()
+    before = set(os.listdir("/proc/self/fd"))
+    gpu_hold.bridge(CARD, os.getppid(), w)
+    opened = [int(fd) for fd in set(os.listdir("/proc/self/fd")) - before
+              if os.path.realpath(f"/proc/self/fd/{fd}") in (gpu_hold.lock_path(CARD), gpu_hold.bridge_lock(CARD))]
+    for fd in [w, *opened]:   # the up fd, unless it closed it, and the locks it holds until it exits
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    with os.fdopen(r, "rb") as up:
+        return up.read(), clock.now, contexts, locks
+
+
+def test_a_bridge_covers_the_card_until_a_new_context_comes_on(monkeypatch):
+    def free_mb(now):   # the last job's context is still going at first; a new one comes on at 5 s
+        return 46000 if now < 2 else 47000 if now < 5 else 47000 - 2 * gpu_hold.BRIDGE_DROP_MB
+    up, left, contexts, [[hold, bridge]] = run_bridge(monkeypatch, free_mb, claimed=lambda now: now >= 1)
+    assert up == b"up" and left == 5.0 and contexts == [CARD]
+    assert hold == [(False, os.getpid())] and bridge == [(False, os.getpid())]
+
+
+def test_a_bridge_no_claim_takes_leaves_after_the_grace(monkeypatch):
+    up, left, _, _ = run_bridge(monkeypatch, lambda now: 47000, claimed=lambda now: now <= 3)
+    assert up == b"up" and left == 3 + gpu_hold.BRIDGE_GRACE_S
+
+
+@pytest.mark.parametrize("idle, other_bridge, opened", [((False,), False, []), ((True,), True, []),
+                                                        ((True, False), False, [CARD])],
+                         ids=["card in use", "another bridge covers it", "somebody came on before it read free VRAM"])
+def test_a_bridge_stays_off(monkeypatch, idle, other_bridge, opened):
+    other = gpu_hold.try_lock(gpu_hold.bridge_lock(CARD)) if other_bridge else None
+    try:
+        up, _, contexts, _ = run_bridge(monkeypatch, lambda now: 47000, idle=idle)
+    finally:
+        if other is not None:
+            os.close(other)
+    assert up == b"" and contexts == opened
+
+
+@pytest.mark.parametrize("apps, used, mine, idle", [("", "300", None, True), ("77", "300", None, False),
+                                                    ("77", "300", 77, True), ("77\n78", "300", 77, False),
+                                                    ("", "2000", None, False)])
+def test_a_card_is_idle_with_no_process_but_mine_and_little_used(monkeypatch, apps, used, mine, idle):
+    monkeypatch.setattr(gpu_hold, "smi", lambda smi_id, what, field: (apps if what == "compute-apps" else used).split())
+    assert gpu_hold.card_idle("GPU-c", mine) is idle
+
+
+@pytest.mark.parametrize("code, ready, rc", [("import os, sys, time; os.write(int(sys.argv[1]), b'up'); time.sleep(30)", True, None),
+                                             ("pass", False, 0), ("import time; time.sleep(30)", False, -9)],
+                         ids=["up", "stays off", "not up in time"])
+def test_start_bridge_waits_for_the_bridge(monkeypatch, code, ready, rc):
+    procs = []
+
+    def spawn(smi_id, *args, pass_fds=(), **popen):
+        procs.append(subprocess.Popen([sys.executable, "-c", code, args[-1]], pass_fds=pass_fds, **popen))
+        return procs[-1]
+    monkeypatch.setattr(gpu_hold, "spawn", spawn)
+    monkeypatch.setattr(gpu_hold, "BRIDGE_UP_S", 2.0)
+    try:
+        assert gpu_hold.start_bridge(CARD) is ready
+        assert procs[0].poll() == rc
+    finally:
+        procs[0].kill()
+        procs[0].wait()
