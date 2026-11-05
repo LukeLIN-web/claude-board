@@ -480,13 +480,16 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
     # the pane the directories `exe` and `runs` were found in if its PATH lacks them.
     cmd = [*_pane_env_prefix(exe, runs), exe, *cmd[1:]]
     target = _resolve_target()
+    # `=name:` is that session and only it. A bare name is first looked up as a
+    # window of the server's current session, which can be someone else's (a
+    # window there named `fleet…` fails the spawn, "index in use"; a numeric
+    # session name opens the window in that other session). Without the `=`,
+    # tmux falls back to a prefix and then a pattern match, so a `fleet` whose
+    # last window closed after list-sessions resolves to `fleet-ops`.
+    window = ("new-window", "-P", "-F", "#{pane_id}",
+              "-t", f"={target['target']}:", "-c", cwd, *cmd)
     if target["exists"]:
-        # `name:` is that session. A bare name is first looked up as a window of
-        # the server's current session, which can be someone else's: a window
-        # there named `fleet…` fails the spawn ("index in use"), and a numeric
-        # session name opens the window in that other session.
-        r = _run("new-window", "-P", "-F", "#{pane_id}",
-                 "-t", f"{target['target']}:", "-c", cwd, *cmd)
+        r = _run(*window)
     else:
         # The session isn't there yet, and the server may or may not be running.
         # Don't let `new-session` be what forks the server: on some tmux builds
@@ -503,6 +506,9 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
         _run("start-server")
         r = _run("new-session", "-d", "-s", target["target"],
                  "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
+        if not r["ok"] and "duplicate session" in r["stderr"]:
+            # A spawn running beside this one created the session first.
+            r = _run(*window)
     if not r["ok"]:
         return _outcome(r)
     pane_id = r["stdout"].strip()

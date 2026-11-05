@@ -103,7 +103,8 @@ sessions without the server.
 
 > **Focus (macOS)** works on Terminal.app and iTerm2, tmux included. For another
 > terminal, an executable `~/.claude/focus-tty.sh <tty>` overrides the bundled
-> [`scripts/focus-tty.sh`](scripts/focus-tty.sh).
+> [`scripts/focus-tty.sh`](scripts/focus-tty.sh). A spawned card has a tab to
+> focus only once a terminal has attached its session (`tmux attach -t fleet`).
 
 ### Remote access
 
