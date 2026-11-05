@@ -168,9 +168,11 @@ class Child:   # a ballast or fill that runs until terminated
         self.waits += 1
 
 
-def run_hold(monkeypatch, job_on, claim_until, fill_mb=4096, used_mb=lambda now: 30000, idle=False):
+def run_hold(monkeypatch, job_on, claim_until, fill_mb=4096, used_mb=lambda now: 30000, idle=False,
+             bridge_on=lambda now: False):
     """``hold`` on CARD against a fake clock: the job holds the lock while ``job_on(now)``, a ballast while it
-    runs, and the claim lives until ``claim_until``. Returns the children started and the times used VRAM was read."""
+    runs, a bridge while ``bridge_on(now)``, and the claim lives until ``claim_until``. Returns the children
+    started and the times used VRAM was read."""
     clock, children, reads = Clock(), [], []
 
     def spawn(smi_id, *args, pass_fds=()):
@@ -178,8 +180,11 @@ def run_hold(monkeypatch, job_on, claim_until, fill_mb=4096, used_mb=lambda now:
         return children[-1]
 
     def flocks(path):
+        bridge = [(False, 4444)] if bridge_on(clock.now) else []
+        if path == gpu_hold.bridge_lock(CARD):
+            return bridge
         ballasts = [(False, 4343) for c in children if c.args[0] == "ballast" and not c.stopped]
-        return ([(False, 4242)] if job_on(clock.now) else []) + ballasts
+        return ([(False, 4242)] if job_on(clock.now) else []) + ballasts + bridge
 
     def card_used_mb(smi_id):
         reads.append(clock.now)
@@ -207,6 +212,15 @@ def test_fill_starts_once_the_job_has_been_on_the_card_fill_after_s_and_settled(
     [fill] = children
     assert fill.args == ("fill", str(CARD), str(os.getpid()), "6000")
     assert fill.at == came_on + gpu_hold.FILL_AFTER_S
+
+
+def test_a_bridge_on_the_card_is_not_the_job(monkeypatch):
+    """The fill waits FILL_AFTER_S from the job's own ``use``, not from the bridge that covered the card before it."""
+    came_on = 100.0
+    children, _ = run_hold(monkeypatch, lambda now: now >= came_on, came_on + gpu_hold.FILL_AFTER_S + 60,
+                           bridge_on=lambda now: now < came_on + 1)
+    [fill] = children
+    assert fill.args[0] == "fill" and fill.at == came_on + gpu_hold.FILL_AFTER_S
 
 
 def test_no_fill_while_used_vram_keeps_moving(monkeypatch):

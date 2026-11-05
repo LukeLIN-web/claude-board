@@ -54,8 +54,10 @@ CUDA context and no memory, and reads the card's free VRAM; it is up once
 nvidia-smi lists it, and nobody else, on the card after that read. It leaves as
 soon as the card's free VRAM falls ``BRIDGE_DROP_MB`` below the most it has read,
 which a new context on the card does (the next job's, at its first CUDA call), or
-once no claim has held the card for ``BRIDGE_GRACE_S``. Until it leaves, its context sits beside the next job's
-start.
+once no claim has held the card for ``BRIDGE_GRACE_S``. Until it leaves, its
+context sits beside the next job's start. ``hold`` does not take a bridge for the
+job, so no fill starts on its account; its shared lock still keeps a ballast off
+the card.
 """
 from __future__ import annotations
 
@@ -183,7 +185,8 @@ def hold(card: int, claim_pid: int, smi_id: str, fill_mb: int | None = None) -> 
     filler, last_user, busy_since, samples, next_sample = None, float("-inf"), None, [], 0.0
     while misses < CLAIM_MISSES:
         misses = 0 if claim_alive(card, claim_pid) else misses + 1
-        users = flocks(path)
+        bridges = {pid for _, pid in flocks(bridge_lock(card))}
+        users = [user for user in flocks(path) if user[1] not in bridges]   # a bridge is not the job
         now = time.monotonic()
         job = proc is None and bool(users)   # while the ballast is armed, its own lock is in users
         if job:
