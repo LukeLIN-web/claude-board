@@ -47,13 +47,14 @@ A ``bridge`` covers the card between two claims, with or without ``--hold``: a
 claim holder whose claim ends while a gpu_wait waits on the box starts one
 (``start_bridge``) and lets the claim lock go once it is up. Under
 ``BALLAST_NAME``, the bridge takes the card's lock shared, as ``use`` does (a
-ballast lets go of the card, and no ``hold`` arms one beside it), stays off a card
-nvidia-smi shows in use or another bridge covers, opens a CUDA context and no
-memory, and reads the card's free VRAM; it is up once nvidia-smi lists it, and
-nobody else, on the card after that read. It leaves as soon as the card's free VRAM falls
-``BRIDGE_DROP_MB`` below the most it has read, which a new context on the card
-does (the next job's, at its first CUDA call), or once no claim has held the card
-for ``BRIDGE_GRACE_S``. Until it leaves, its context sits beside the next job's
+ballast lets go of the card, and no ``hold`` arms one beside it), waits up to
+``BRIDGE_CLEAR_S`` while every process nvidia-smi lists on the card is exiting,
+stays off a card that still shows in use or that another bridge covers, opens a
+CUDA context and no memory, and reads the card's free VRAM; it is up once
+nvidia-smi lists it, and nobody else, on the card after that read. It leaves as
+soon as the card's free VRAM falls ``BRIDGE_DROP_MB`` below the most it has read,
+which a new context on the card does (the next job's, at its first CUDA call), or
+once no claim has held the card for ``BRIDGE_GRACE_S``. Until it leaves, its context sits beside the next job's
 start.
 """
 from __future__ import annotations
@@ -69,7 +70,7 @@ import sys
 import time
 import uuid
 
-from gpu_wait import RELEASE_WAIT_S, claim_lock, flocks, held_claims
+from gpu_wait import RELEASE_WAIT_S, argv_of, claim_lock, flocks, held_claims
 
 HOLD_DIR = "/tmp/gpu_hold"   # box-local like LOCK_DIR: flock on NFS is a lie
 BALLAST_NAME = "agent-harness:gpu_hold"   # what nvidia-smi lists; the name every copy of gpu_busy knows a ballast by
@@ -92,6 +93,7 @@ BRIDGE_UP_S = RELEASE_WAIT_S - 2.0   # the claim holder waits this long for its 
 BRIDGE_TICK_S = 0.1
 BRIDGE_DROP_MB = 64          # well under what a CUDA context takes
 BRIDGE_GRACE_S = 30.0        # a waiting gpu_wait claims within its WAKE_S and one try
+BRIDGE_CLEAR_S = 3.0         # how long the bridge waits for the last job's processes to finish exiting
 
 
 def log(card: int, msg: str) -> None:
@@ -123,6 +125,14 @@ def card_idle(smi_id: str, mine: int | None = None) -> bool:
         return (pids == ([] if mine is None else [str(mine)])
                 and int(smi(smi_id, "gpu", "memory.used")[0]) <= IDLE_MB)
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return False
+
+
+def card_clearing(smi_id: str) -> bool:
+    """Every process nvidia-smi lists on the card is exiting or gone (no argv): the last job letting go."""
+    try:
+        return all(pid.isdigit() and not argv_of(int(pid)) for pid in smi(smi_id, "compute-apps", "pid"))
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -305,7 +315,12 @@ def bridge(card: int, parent: int, up: int) -> None:
         return
     os.makedirs(HOLD_DIR, exist_ok=True)
     fcntl.flock(os.open(lock_path(card), os.O_CREAT | os.O_RDWR, 0o666), fcntl.LOCK_SH)   # held until it exits
-    if not card_idle(smi_id) or try_lock(bridge_lock(card)) is None:
+    clear_by = time.monotonic() + BRIDGE_CLEAR_S
+    while not card_idle(smi_id):
+        if time.monotonic() >= clear_by or not card_clearing(smi_id):
+            return
+        time.sleep(BRIDGE_TICK_S)
+    if try_lock(bridge_lock(card)) is None:
         return
     cuda = cuda_on_card(card)
     most = card_free_mb(cuda, card)

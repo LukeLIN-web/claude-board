@@ -236,12 +236,17 @@ def test_hold_stops_the_fill_when_the_claim_ends(monkeypatch):
 # ── the bridge between two claims ────────────────────────────────────────────────────
 
 
-def run_bridge(monkeypatch, free_mb, claimed=lambda now: False, idle=(True, True)):
+def run_bridge(monkeypatch, free_mb, claimed=lambda now: False, idle=(True, True), clearing=False):
     """``bridge`` on CARD against a fake clock: the card's free VRAM is ``free_mb(now)``, a claim holds
-    it while ``claimed(now)``, and ``idle`` is what nvidia-smi shows before the context, then after it.
+    it while ``claimed(now)``, ``idle`` is what nvidia-smi shows on each look before the context, then
+    after it, and every process it lists is exiting when ``clearing``.
     Returns what it wrote to the up fd, when it left, the contexts it opened, and the hold and
     bridge locks' flocks while it was up."""
     clock, contexts, idle, locks = Clock(), [], iter(idle), []
+
+    def look(smi_id, mine=None):
+        assert clock.now < 10 * gpu_hold.BRIDGE_GRACE_S, "the bridge never gave up"
+        return next(idle)
 
     def free(cuda, card):
         assert clock.now < 10 * gpu_hold.BRIDGE_GRACE_S, "the bridge never left"
@@ -253,7 +258,8 @@ def run_bridge(monkeypatch, free_mb, claimed=lambda now: False, idle=(True, True
     monkeypatch.setattr(gpu_hold, "BRIDGE_TICK_S", 0.5)
     monkeypatch.setattr(gpu_hold, "ctypes", SimpleNamespace(CDLL=lambda name: SimpleNamespace(prctl=lambda *a: 0)))
     monkeypatch.setattr(gpu_hold, "visible_uuid", lambda: "GPU-c")
-    monkeypatch.setattr(gpu_hold, "card_idle", lambda smi_id, mine=None: next(idle))
+    monkeypatch.setattr(gpu_hold, "card_idle", look)
+    monkeypatch.setattr(gpu_hold, "card_clearing", lambda smi_id: clearing)
     monkeypatch.setattr(gpu_hold, "cuda_on_card", lambda card: contexts.append(card))
     monkeypatch.setattr(gpu_hold, "card_free_mb", free)
     monkeypatch.setattr(gpu_hold, "held_claims", lambda: [(CARD, "lock", 4242)] if claimed(clock.now) else [])
@@ -323,6 +329,34 @@ def test_a_bridge_looks_at_the_card_once_a_ballast_has_let_go(monkeypatch):
 def test_a_card_is_idle_with_no_process_but_mine_and_little_used(monkeypatch, apps, used, mine, idle):
     monkeypatch.setattr(gpu_hold, "smi", lambda smi_id, what, field: (apps if what == "compute-apps" else used).split())
     assert gpu_hold.card_idle("GPU-c", mine) is idle
+
+
+def test_a_bridge_waits_while_the_last_jobs_processes_finish_exiting(monkeypatch):
+    up, _, contexts, _ = run_bridge(monkeypatch, lambda now: 47000, idle=(False, False, True, True), clearing=True)
+    assert up == b"up" and contexts == [CARD]
+
+
+def test_a_bridge_gives_up_on_a_card_that_does_not_clear(monkeypatch):
+    up, left, contexts, _ = run_bridge(monkeypatch, lambda now: 47000, idle=iter(lambda: False, None), clearing=True)
+    assert up == b"" and contexts == [] and left >= gpu_hold.BRIDGE_CLEAR_S
+
+
+def test_a_card_is_clearing_only_while_every_listed_process_is_exiting(monkeypatch):
+    listed = []
+    monkeypatch.setattr(gpu_hold, "smi", lambda smi_id, what, field: listed)
+    exiting = subprocess.Popen(["true"])   # left unreaped: a zombie, as an exiting process looks
+    try:
+        wait_for(lambda: gpu_wait.exited(exiting.pid))
+        listed[:] = [str(exiting.pid)]
+        assert gpu_hold.card_clearing("GPU-c")
+        listed[:] = []
+        assert gpu_hold.card_clearing("GPU-c")   # only memory left to free
+        listed[:] = [str(exiting.pid), str(os.getpid())]
+        assert not gpu_hold.card_clearing("GPU-c")   # this process is alive
+        listed[:] = ["[N/A]"]
+        assert not gpu_hold.card_clearing("GPU-c")   # another pid namespace's: cannot tell
+    finally:
+        exiting.wait()
 
 
 @pytest.mark.parametrize("code, ready, rc", [("import os, sys, time; os.write(int(sys.argv[1]), b'up'); time.sleep(30)", True, None),
