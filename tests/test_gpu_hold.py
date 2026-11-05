@@ -1,5 +1,6 @@
 import contextlib
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -265,7 +266,12 @@ def run_bridge(monkeypatch, free_mb, claimed=lambda now: False, idle=(True, True
     monkeypatch.setattr(gpu_hold, "held_claims", lambda: [(CARD, "lock", 4242)] if claimed(clock.now) else [])
     r, w = os.pipe()
     before = set(os.listdir("/proc/self/fd"))
-    gpu_hold.bridge(CARD, os.getppid(), w)
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        gpu_hold.bridge(CARD, os.getppid(), w)
+    finally:   # it resets them, as a process of its own should; this one is pytest
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
     opened = [int(fd) for fd in set(os.listdir("/proc/self/fd")) - before
               if os.path.realpath(f"/proc/self/fd/{fd}") in (gpu_hold.lock_path(CARD), gpu_hold.bridge_lock(CARD))]
     for fd in [w, *opened]:   # the up fd, unless it closed it, and the locks it holds until it exits
