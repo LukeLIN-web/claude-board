@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -140,7 +141,7 @@ class Clock:   # stands in for gpu_wait.time
         pass
 
 
-def test_the_wait_heartbeat_escalates_to_a_stalled_marker(monkeypatch):
+def test_the_wait_heartbeat_escalates_to_a_stalled_marker(locks, monkeypatch):
     """A silent wait is indistinguishable from progress: past stall_alert_s every
     heartbeat line carries a greppable STALLED."""
     lines = []
@@ -297,3 +298,19 @@ def test_a_term_sweep_that_reaches_the_claim_holder_keeps_the_claim(cli, run):
     job.kill()
     job.wait()
     wait_for(unclaimed)
+
+
+def test_a_waiting_gpu_wait_takes_a_card_as_soon_as_its_claim_ends(cli, pipes):
+    others = [gpu_wait.claim_card(card, 1, ["other"], pipes()) for card in CARDS]
+    waiter = subprocess.Popen([*cli, "--need-gb", "1", "--interval-min", "60", "--", "sleep", "60"],
+                              stdout=subprocess.PIPE, text=True)
+    timer = threading.Timer(10, waiter.kill)   # its next poll is an hour away
+    try:
+        assert "no 1 claimable card(s)" in waiter.stdout.readline()
+        timer.start()
+        gpu_wait.end(others[1])
+        assert waiter.stdout.readline() == "[gpu_wait] claimed + running on GPU 1\n"
+    finally:
+        timer.cancel()
+        waiter.kill()
+        waiter.wait()
