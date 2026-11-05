@@ -405,6 +405,7 @@ def hold_claim(path: str, slots: int, job: list[str]) -> None:
     try:
         while os.read(0, 4096):
             pass
+        signal.signal(END, signal.SIG_IGN)   # the claim has ended: an END now must not cut the handover short
     finally:
         hand_over(int(LOCK_NAME.match(os.path.basename(path))[1]))
 

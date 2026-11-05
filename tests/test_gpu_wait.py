@@ -358,6 +358,24 @@ def test_a_claim_that_ends_while_a_gpu_wait_waits_bridges_its_card(locks, bridge
     assert bridged() == ([1] if waiting else [])
 
 
+def test_an_end_while_the_holder_hands_over_does_not_cut_it_short(locks, bridged, monkeypatch):
+    """The job exits, and an END (release's) comes while its holder still waits for the bridge."""
+    monkeypatch.setenv("GPU_WAIT_BRIDGE_S", "1")
+    record = Path(os.environ["GPU_WAIT_BRIDGED"])
+    life, heir = os.pipe()
+    holder = gpu_wait.claim_card(1, 1, ["job"], life)
+    os.close(life)
+    queue = gpu_wait.enqueue()
+    try:
+        os.close(heir)
+        wait_for(lambda: record.exists() and "1 starting" in record.read_text())
+        gpu_wait.end(holder)
+        wait_for(unclaimed)
+    finally:
+        os.close(queue)
+    assert bridged() == [1]
+
+
 def test_a_waiting_gpu_wait_takes_a_card_as_soon_as_its_claim_ends(cli, pipes, bridged):
     others = [gpu_wait.claim_card(card, 1, ["other"], pipes()) for card in CARDS]
     waiter = subprocess.Popen([*cli, "--need-gb", "1", "--interval-min", "60", "--", "sleep", "60"],
