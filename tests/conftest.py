@@ -66,6 +66,15 @@ def pytest_configure(config):
     gpu_wait.LOCK_DIR = os.path.join(_fake_home, "gpu_wait_locks")
     gpu_busy.REG_DIR = os.path.join(_fake_home, "gpu_launches")
     gpu_hold.HOLD_DIR = os.path.join(_fake_home, "gpu_hold")
+    # A claim holder whose claim ends while a gpu_wait waits starts gpu_hold's bridge: a CUDA
+    # context on a real card, with the real HOLD_DIR. Every holder the suite starts runs from a
+    # copy of gpu_wait.py beside a stand-in gpu_hold.py instead (gpu_hold_stand_in.py), and a
+    # gpu_wait a test runs as a command is handed this SELF.
+    bin_dir = os.path.join(_fake_home, "gpu_wait_bin")
+    os.makedirs(bin_dir)
+    shutil.copy(gpu_wait.SELF, bin_dir)
+    shutil.copy(Path(__file__).with_name("gpu_hold_stand_in.py"), os.path.join(bin_dir, "gpu_hold.py"))
+    gpu_wait.SELF = os.path.join(bin_dir, "gpu_wait.py")
 
 
 def pytest_unconfigure(config):

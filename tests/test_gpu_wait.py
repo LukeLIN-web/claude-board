@@ -2,11 +2,10 @@
 
 nvidia-smi and the CUDA probe are stubbed; the claims are real: real holder
 processes holding real flocks, in a lock directory of each test's own. The
-holders run from a copy of gpu_wait.py beside a stand-in gpu_hold.py that only
-records the bridges they start: no test puts a CUDA context on a card.
+holders run beside a stand-in gpu_hold.py that only records the bridges they
+start (conftest): no test puts a CUDA context on a card.
 """
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -44,16 +43,12 @@ def locks(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def bridged(tmp_path, monkeypatch):
-    """``bridged()``: the cards claim holders started a bridge on, in order."""
-    bin_dir, record = tmp_path / "bin", tmp_path / "bridged"
-    bin_dir.mkdir()
-    shutil.copy(SCRIPTS / "gpu_wait.py", bin_dir)
-    (bin_dir / "gpu_hold.py").write_text(f"def start_bridge(card, by):\n"
-                                         f"    with open({str(record)!r}, 'a') as f:\n"
-                                         f"        f.write(f'{{card}}\\n')\n"
-                                         f"    return True\n")
-    monkeypatch.setattr(gpu_wait, "SELF", str(bin_dir / "gpu_wait.py"))
-    return lambda: [int(card) for card in record.read_text().split()] if record.exists() else []
+    """``bridged()``: the cards claim holders started a bridge on, in order (the stand-in records
+    them; see gpu_hold_stand_in.py)."""
+    record = tmp_path / "bridged"
+    monkeypatch.setenv("GPU_WAIT_BRIDGED", str(record))
+    return lambda: ([int(line.split()[0]) for line in record.read_text().splitlines() if line.endswith(" up")]
+                    if record.exists() else [])
 
 
 @pytest.fixture
@@ -329,6 +324,20 @@ def test_a_term_sweep_that_reaches_the_claim_holder_keeps_the_claim(cli, run):
 
 
 # ── handing a card over ────────────────────────────────────────────────────────────────
+
+
+def test_claim_holders_hand_over_to_the_stand_in(locks):
+    """No test starts a real bridge: the holders run beside the stand-in gpu_hold.py (conftest)."""
+    life, heir = os.pipe()
+    try:
+        holder = gpu_wait.claim_card(1, 1, ["job"], life)
+        assert gpu_wait.argv_of(holder)[1] == gpu_wait.SELF
+        assert (Path(gpu_wait.SELF).with_name("gpu_hold.py").read_text()
+                == Path(__file__).with_name("gpu_hold_stand_in.py").read_text())
+    finally:
+        os.close(life)
+        os.close(heir)
+        wait_for(unclaimed)
 
 
 @pytest.mark.parametrize("waiting", [True, False], ids=["a gpu_wait waits", "nobody waits"])
