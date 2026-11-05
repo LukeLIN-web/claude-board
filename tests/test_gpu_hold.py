@@ -365,6 +365,21 @@ def test_a_card_is_clearing_only_while_every_listed_process_is_exiting(monkeypat
         exiting.wait()
 
 
+def test_the_bridge_command_runs_up_to_its_parent_check():
+    """``gpu_hold.py bridge`` as start_bridge runs it (under BALLAST_NAME, with PYTHONHOME, its
+    arguments parsed), given a pid that is not its parent's: it leaves before any CUDA call."""
+    up, up_w = os.pipe()
+    proc = gpu_hold.spawn(str(CARD), "bridge", str(CARD), str(os.getpid() + 1), str(up_w), pass_fds=(up_w,),
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    os.close(up_w)
+    try:
+        assert proc.wait(timeout=30) == 0, proc.stderr.read()
+        assert os.read(up, 2) == b""
+    finally:
+        os.close(up)
+        proc.stderr.close()
+
+
 @pytest.mark.parametrize("code, ready, rc", [("os.write(int(sys.argv[1]), b'up'); time.sleep(30)", True, None),
                                              ("pass", False, 0), ("time.sleep(30)", False, -9)],
                          ids=["up", "stays off", "not up in time"])
