@@ -323,12 +323,14 @@ def test_a_bridge_stays_off(monkeypatch, idle, other_bridge, opened):
 
 def test_a_bridge_looks_at_the_card_once_a_ballast_has_let_go(monkeypatch):
     """The bridge waits on the card's lock, which a ``hold`` sees: it lets its ballast go, and the
-    claim does not end with the ballast on the card."""
-    ballast, let_go, seen = gpu_hold.try_lock(gpu_hold.lock_path(CARD)), [], []
+    claim does not end with the ballast on the card. The bridge takes its bridge lock only after
+    that wait: ``hold`` leaves the bridge lock's holders out of the waiters, and would keep the ballast."""
+    ballast, let_go, seen, bridges = gpu_hold.try_lock(gpu_hold.lock_path(CARD)), [], [], []
 
     def hold():   # what `hold` does when somebody waits on the lock
         try:
             wait_for(lambda: any(waiting for waiting, _ in gpu_hold.flocks(gpu_hold.lock_path(CARD))))
+            bridges.append(gpu_hold.flocks(gpu_hold.bridge_lock(CARD)))
             let_go.append(True)
         finally:
             os.close(ballast)
@@ -340,7 +342,7 @@ def test_a_bridge_looks_at_the_card_once_a_ballast_has_let_go(monkeypatch):
     hold_thread.start()
     run_bridge(monkeypatch, lambda now: 47000, idle=idle())
     hold_thread.join()
-    assert seen == [True]
+    assert seen == [True] and bridges == [[]]
 
 
 @pytest.mark.parametrize("apps, used, mine, idle", [("", "300", None, True), ("77", "300", None, False),
