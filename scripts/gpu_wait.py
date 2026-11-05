@@ -55,6 +55,9 @@ held. With ``--slots K`` up to K jobs share a card, each holding one slot: slot 
 when it is free, recording ``slots=K`` in it, else the first free slot below K
 when slot 0's holder recorded more than one slot.
 
+While it waits, gpu_wait looks every ``WAKE_S`` whether a claim on the box has
+ended, and tries at once when one has.
+
 ``release <job pid> <cards>`` ends the job's claim holders on those cards and
 nothing else: the job runs on with its other cards, and must not start anything
 on a released card again (its ``CUDA_VISIBLE_DEVICES`` still names it). The job
@@ -71,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import math
 import os
 import re
 import signal
@@ -90,6 +94,7 @@ LOCKS_READS = 10   # /proc/locks comes a page per read: a held lock's line can s
 RELEASE_WAIT_S = 10.0
 HEIR_FD = 10
 END = signal.SIGUSR1   # the one signal a claim holder dies of
+WAKE_S = 1.0           # a waiting gpu_wait looks this often whether a claim on the box has ended
 NOTE_CHARS = 200
 
 
@@ -445,20 +450,33 @@ def wait_and_claim_gpus(need_gb: float, *, num_gpus: int = 1, interval_s: float,
                         log=print, stall_alert_s: float = STALL_ALERT_S,
                         cmd: list[str], life: int, slots: int = 1) -> list[tuple[int, int]] | None:
     """Poll until ``num_gpus`` cards are both free AND claimable and claim them for
-    ``cmd`` (``claim_free_gpus``), or ``None`` on timeout."""
+    ``cmd`` (``claim_free_gpus``), or ``None`` on timeout. Between polls it also
+    tries as soon as a claim on the box ends (``nap``)."""
     start = time.monotonic()
     deadline = start + timeout_s
+    next_poll = start
     while True:
+        claims = set(held_claims())
         taken = claim_free_gpus(need_gb, num_gpus, exclude, cmd, life, slots)
         if taken is not None:
             return taken
         now = time.monotonic()
         if now >= deadline:
             return None
-        log(f"{_wait_prefix(now - start, stall_alert_s)} no {num_gpus} "
-            f"claimable card(s) with {need_gb:g} GB free; re-checking in "
-            f"{interval_s / 60:g} min", flush=True)
-        time.sleep(interval_s)
+        if now >= next_poll:
+            next_poll = now + interval_s
+            log(f"{_wait_prefix(now - start, stall_alert_s)} no {num_gpus} "
+                f"claimable card(s) with {need_gb:g} GB free; re-checking in "
+                f"{interval_s / 60:g} min", flush=True)
+        nap(min(next_poll, deadline) - now, claims)
+
+
+def nap(seconds: float, claims: set[tuple[int, str, int]]) -> None:
+    """Sleep ``seconds``, or until one of ``claims`` (as ``held_claims`` lists them) has ended."""
+    for _ in range(math.ceil(seconds / WAKE_S)):
+        time.sleep(WAKE_S)
+        if claims - set(held_claims()):
+            return
 
 
 # ── which card is which ──────────────────────────────────────────────────────────
