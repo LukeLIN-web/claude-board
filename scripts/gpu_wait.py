@@ -60,8 +60,9 @@ and looks every ``WAKE_S`` whether a claim on the box has ended, trying at once
 when one has. A claim that ends while a gpu_wait waits hands its card over in
 place: before its holder lets the claim lock go, it starts gpu_hold.py's bridge,
 a CUDA context on the card that stays until the next claim's job has a process
-of its own there, so launchers that look for a card with no process on it never
-see the card idle (``hand_over``; see gpu_hold.py). Backing out of a claim just
+of its own there. Launchers that look for a card with no process on it then see
+the card idle only from the last job's processes leaving to the bridge's
+context (``hand_over``; see gpu_hold.py). Backing out of a claim just
 taken (``claim_card``, ``claim_free_gpus``) kills its holder instead: the job
 never ran there, and nothing is handed over.
 
