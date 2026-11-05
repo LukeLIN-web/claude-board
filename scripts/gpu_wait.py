@@ -55,8 +55,15 @@ held. With ``--slots K`` up to K jobs share a card, each holding one slot: slot 
 when it is free, recording ``slots=K`` in it, else the first free slot below K
 when slot 0's holder recorded more than one slot.
 
-While it waits, gpu_wait looks every ``WAKE_S`` whether a claim on the box has
-ended, and tries at once when one has.
+While it waits, gpu_wait holds a shared flock on the queue lock (``queue_lock``)
+and looks every ``WAKE_S`` whether a claim on the box has ended, trying at once
+when one has. A claim that ends while a gpu_wait waits hands its card over in
+place: before its holder lets the claim lock go, it starts gpu_hold.py's bridge,
+a CUDA context on the card that stays until the next claim's job has a process
+of its own there, so launchers that look for a card with no process on it never
+see the card idle (``hand_over``; see gpu_hold.py). Backing out of a claim just
+taken (``claim_card``, ``claim_free_gpus``) kills its holder instead: the job
+never ran there, and nothing is handed over.
 
 ``release <job pid> <cards>`` ends the job's claim holders on those cards and
 nothing else: the job runs on with its other cards, and must not start anything
@@ -68,7 +75,9 @@ the job of another wrapper.
 
 ``LOCK_DIR``, the lock names and the note are the claim protocol every copy of
 gpu_wait on a box shares, the copies runs snapshot among them: changing them
-lets two pollers load one card.
+lets two pollers load one card. The queue lock and the handover add to it and
+change none of it: a copy without them waits until its next poll and starts no
+bridge, its claims end at once, and its ``release`` sends the same ``END``.
 """
 from __future__ import annotations
 
@@ -93,7 +102,7 @@ STALL_ALERT_S = 3600.0
 LOCKS_READS = 10   # /proc/locks comes a page per read: a held lock's line can slip between pages while other locks come and go
 RELEASE_WAIT_S = 10.0
 HEIR_FD = 10
-END = signal.SIGUSR1   # the one signal a claim holder dies of
+END = signal.SIGUSR1   # ends a claim, handing its card over (release); backing out kills the holder (SIGKILL)
 WAKE_S = 1.0           # a waiting gpu_wait looks this often whether a claim on the box has ended
 NOTE_CHARS = 200
 
@@ -157,6 +166,11 @@ def _say_once(key: str, msg: str) -> None:
 
 def claim_lock(card: int, slot: int = 0) -> str:
     return os.path.join(LOCK_DIR, f"gpu{card}.lock" if slot == 0 else f"gpu{card}.s{slot}.lock")
+
+
+def queue_lock() -> str:
+    """The lock every waiting gpu_wait holds shared (``enqueue``); its name is no claim lock's."""
+    return os.path.join(LOCK_DIR, "queue")
 
 
 def claim_locks() -> list[tuple[int, int, str]]:
@@ -332,18 +346,46 @@ def detach(argv: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(["setsid", "-f", *argv], check=True, **kw)
 
 
-def end(holder: int) -> None:
+def end(holder: int, sig: int = END) -> None:
     try:
-        os.kill(holder, END)
+        os.kill(holder, sig)
     except ProcessLookupError:
         pass
 
 
+def back_out(holder: int) -> None:
+    """End a claim just taken, before its job ran on the card: no handover."""
+    end(holder, signal.SIGKILL)
+
+
+def enqueue() -> int:
+    """Hold the queue lock shared while the returned fd is open: a claim that ends meanwhile hands its card over."""
+    fd = os.open(queue_lock(), os.O_CREAT | os.O_RDONLY, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    return fd
+
+
+def hand_over(card: int) -> None:
+    """The claim on ``card`` ends. While a gpu_wait waits on the box, start gpu_hold's bridge on
+    the card and return once it is up or stays off, so the claim lock goes only after it is up."""
+    if lock_holder(queue_lock()) is not None:
+        from gpu_hold import start_bridge   # gpu_hold imports this module
+        if start_bridge(card):
+            print(f"[gpu_wait] GPU {card}: bridged to the next claim", flush=True)
+
+
+def _ended(signum, frame) -> None:
+    signal.signal(END, signal.SIG_IGN)   # one handover
+    sys.exit()
+
+
 def hold_claim(path: str, slots: int, job: list[str]) -> None:
     """``claim <claim lock> <slots> -- <job>``: take the lock for ``job`` and print
-    this process's pid, then keep the lock until stdin reads EOF; exit at once if
-    somebody else holds it."""
-    signal.signal(END, signal.SIG_DFL)
+    this process's pid, then keep the lock until stdin reads EOF or ``END`` comes,
+    and hand the card over; exit at once if somebody else holds it."""
+    global LOCK_DIR
+    LOCK_DIR = os.path.dirname(path)   # the claim locks it serves, whichever copy of gpu_wait started it
+    signal.signal(END, _ended)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {END})
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, signal.SIG_IGN)
@@ -356,8 +398,11 @@ def hold_claim(path: str, slots: int, job: list[str]) -> None:
     os.write(fd, note(os.getpid(), slots, job).encode())
     print(os.getpid(), flush=True)
     os.dup2(2, 1)
-    while os.read(0, 4096):
-        pass
+    try:
+        while os.read(0, 4096):
+            pass
+    finally:
+        hand_over(int(LOCK_NAME.match(os.path.basename(path))[1]))
 
 
 def try_claim(card: int, cmd: list[str], life: int, slot: int = 0, slots: int = 1) -> int | None:
@@ -375,10 +420,10 @@ def claim_card(card: int, slots: int, cmd: list[str], life: int) -> int | None:
     for slot in range(slots):
         if (holder := try_claim(card, cmd, life, slot, slots)) is not None:
             if slots == 1 and any(held(path) for path in card_locks(card)[1:]):
-                end(holder)   # other jobs share the card
+                back_out(holder)   # other jobs share the card
                 return None
             if slot > 0 and not shared(card):
-                end(holder)   # slot 0 changed hands to a job alone on the card
+                back_out(holder)   # slot 0 changed hands to a job alone on the card
                 return None
             return holder
         if slot == 0 and not shared(card):
@@ -435,13 +480,13 @@ def claim_free_gpus(need_gb: float, num_gpus: int, exclude: tuple[int, ...],
         if holder is None:
             continue
         if query_free_mb().get(idx, 0) < need_mb:
-            end(holder)
+            back_out(holder)
             continue
         taken.append((idx, holder))
         if len(taken) == num_gpus:
             return taken
     for _, holder in taken:
-        end(holder)
+        back_out(holder)
     return None
 
 
@@ -450,25 +495,31 @@ def wait_and_claim_gpus(need_gb: float, *, num_gpus: int = 1, interval_s: float,
                         log=print, stall_alert_s: float = STALL_ALERT_S,
                         cmd: list[str], life: int, slots: int = 1) -> list[tuple[int, int]] | None:
     """Poll until ``num_gpus`` cards are both free AND claimable and claim them for
-    ``cmd`` (``claim_free_gpus``), or ``None`` on timeout. Between polls it also
-    tries as soon as a claim on the box ends (``nap``)."""
+    ``cmd`` (``claim_free_gpus``), or ``None`` on timeout. Queued after the first
+    try (``enqueue``), it also tries as soon as a claim on the box ends (``nap``)."""
     start = time.monotonic()
     deadline = start + timeout_s
-    next_poll = start
-    while True:
-        claims = set(held_claims())
-        taken = claim_free_gpus(need_gb, num_gpus, exclude, cmd, life, slots)
-        if taken is not None:
-            return taken
-        now = time.monotonic()
-        if now >= deadline:
-            return None
-        if now >= next_poll:
-            next_poll = now + interval_s
-            log(f"{_wait_prefix(now - start, stall_alert_s)} no {num_gpus} "
-                f"claimable card(s) with {need_gb:g} GB free; re-checking in "
-                f"{interval_s / 60:g} min", flush=True)
-        nap(min(next_poll, deadline) - now, claims)
+    next_poll, queue = start, None
+    try:
+        while True:
+            claims = set(held_claims())
+            taken = claim_free_gpus(need_gb, num_gpus, exclude, cmd, life, slots)
+            if taken is not None:
+                return taken
+            now = time.monotonic()
+            if now >= deadline:
+                return None
+            if queue is None:
+                queue = enqueue()
+            if now >= next_poll:
+                next_poll = now + interval_s
+                log(f"{_wait_prefix(now - start, stall_alert_s)} no {num_gpus} "
+                    f"claimable card(s) with {need_gb:g} GB free; re-checking in "
+                    f"{interval_s / 60:g} min", flush=True)
+            nap(min(next_poll, deadline) - now, claims)
+    finally:
+        if queue is not None:
+            os.close(queue)
 
 
 def nap(seconds: float, claims: set[tuple[int, str, int]]) -> None:

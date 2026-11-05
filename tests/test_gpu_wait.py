@@ -1,9 +1,12 @@
-"""Tests for scripts/gpu_wait.py: picking cards, the claim holders, slots, release.
+"""Tests for scripts/gpu_wait.py: picking cards, the claim holders, slots, release, handover.
 
 nvidia-smi and the CUDA probe are stubbed; the claims are real: real holder
-processes holding real flocks, in a lock directory of each test's own.
+processes holding real flocks, in a lock directory of each test's own. The
+holders run from a copy of gpu_wait.py beside a stand-in gpu_hold.py that only
+records the bridges they start: no test puts a CUDA context on a card.
 """
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -39,6 +42,20 @@ def locks(tmp_path, monkeypatch):
     os.makedirs(gpu_wait.LOCK_DIR)
 
 
+@pytest.fixture(autouse=True)
+def bridged(tmp_path, monkeypatch):
+    """``bridged()``: the cards claim holders started a bridge on, in order."""
+    bin_dir, record = tmp_path / "bin", tmp_path / "bridged"
+    bin_dir.mkdir()
+    shutil.copy(SCRIPTS / "gpu_wait.py", bin_dir)
+    (bin_dir / "gpu_hold.py").write_text(f"def start_bridge(card):\n"
+                                         f"    with open({str(record)!r}, 'a') as f:\n"
+                                         f"        f.write(f'{{card}}\\n')\n"
+                                         f"    return True\n")
+    monkeypatch.setattr(gpu_wait, "SELF", str(bin_dir / "gpu_wait.py"))
+    return lambda: [int(card) for card in record.read_text().split()] if record.exists() else []
+
+
 @pytest.fixture
 def pipes():
     """``life()``: a pipe's read end for claim holders to read, as gpu_wait makes one for its
@@ -55,14 +72,15 @@ def pipes():
 
 
 @pytest.fixture
-def cli(tmp_path, locks):
+def cli(tmp_path, locks, bridged):
     """``gpu_wait.py`` as a command on a box whose CUDA 0-2 have 40 GB free, with the claim
-    locks in the test's LOCK_DIR and no launch to record claims on."""
+    locks in the test's LOCK_DIR, the holders of the test and no launch to record claims on."""
     noop = tmp_path / "no_gpu_busy.py"
     noop.write_text("")
     script = tmp_path / "gpu_wait_cli.py"
     script.write_text(f"import sys\nsys.path.insert(0, {str(SCRIPTS)!r})\nimport gpu_wait\n"
                       f"gpu_wait.LOCK_DIR = {gpu_wait.LOCK_DIR!r}\ngpu_wait.BUSY = {str(noop)!r}\n"
+                      f"gpu_wait.SELF = {gpu_wait.SELF!r}\n"
                       f"gpu_wait.ecc_bad_gpus = set\n"
                       f"gpu_wait.query_free_mb = lambda: {dict.fromkeys(CARDS, 40000)!r}\ngpu_wait.main()\n")
     return [sys.executable, str(script)]
@@ -168,13 +186,19 @@ def test_a_claim_is_exclusive_and_all_or_nothing(locks, pipes, monkeypatch):
     assert [card for card, _ in gpu_wait.claim_free_gpus(60, 2, (), ["c"], pipes())] == [0, 1]
 
 
-def test_a_card_that_lost_its_free_vram_after_the_claim_is_let_go(locks, pipes, monkeypatch):
-    """A loader outside gpu_wait can take the card between the scan and the claim."""
+def test_a_card_that_lost_its_free_vram_after_the_claim_is_let_go(locks, pipes, bridged, monkeypatch):
+    """A loader outside gpu_wait can take the card between the scan and the claim. The job never ran
+    there: letting the claim go hands nothing over, though a gpu_wait waits."""
     scans = iter([{0: 90000}, {0: 500}])
     monkeypatch.setattr(gpu_wait, "query_free_mb", lambda: next(scans))
     monkeypatch.setattr(gpu_wait, "ecc_bad_gpus", set)
-    assert gpu_wait.claim_free_gpus(60, 1, (), ["job"], pipes()) is None
-    wait_for(unclaimed)
+    queue = gpu_wait.enqueue()
+    try:
+        assert gpu_wait.claim_free_gpus(60, 1, (), ["job"], pipes()) is None
+        wait_for(unclaimed)
+    finally:
+        os.close(queue)
+    assert bridged() == []
 
 
 # ── slots ──────────────────────────────────────────────────────────────────────────────
@@ -223,8 +247,15 @@ def test_hold_is_for_a_card_of_ones_own(cli):
 # ── the claim holders ──────────────────────────────────────────────────────────────────
 
 
-def test_release_frees_the_cards_named_and_keeps_the_rest_for_the_job(cli, run):
-    job = run("sleep", "60")
+CALLERS = pytest.mark.parametrize(
+    "caller", [None, lambda: signal.signal(gpu_wait.END, signal.SIG_IGN),
+               lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {gpu_wait.END})],
+    ids=["plain", "caller ignores END", "caller blocks END"])
+
+
+@CALLERS
+def test_release_frees_the_cards_named_and_keeps_the_rest_for_the_job(cli, run, caller):
+    job = run("sleep", "60", preexec_fn=caller)
     claimed = holders()
     assert None not in claimed.values()
     r = release(cli, job.pid, 1)
@@ -249,12 +280,9 @@ def test_the_claim_lives_while_any_process_of_the_job_does(run):
     wait_for(unclaimed)
 
 
-@pytest.mark.parametrize("caller", [None, lambda: signal.signal(gpu_wait.END, signal.SIG_IGN),
-                                    lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {gpu_wait.END})],
-                         ids=["plain", "caller ignores END", "caller blocks END"])
-def test_a_wait_that_falls_short_keeps_no_claim(cli, caller):
+def test_a_wait_that_falls_short_keeps_no_claim(cli):
     p = subprocess.Popen([*cli, "--need-gb", "1", "--num-gpus", "4", "--interval-min", "1", "--", "true"],
-                         stdout=subprocess.PIPE, text=True, preexec_fn=caller)
+                         stdout=subprocess.PIPE, text=True)
     try:
         assert "no 4 claimable card(s)" in p.stdout.readline()
         wait_for(unclaimed)
@@ -300,7 +328,28 @@ def test_a_term_sweep_that_reaches_the_claim_holder_keeps_the_claim(cli, run):
     wait_for(unclaimed)
 
 
-def test_a_waiting_gpu_wait_takes_a_card_as_soon_as_its_claim_ends(cli, pipes):
+# ── handing a card over ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("waiting", [True, False], ids=["a gpu_wait waits", "nobody waits"])
+@pytest.mark.parametrize("how", ["the job exits", "release"])
+def test_a_claim_that_ends_while_a_gpu_wait_waits_bridges_its_card(locks, bridged, how, waiting):
+    life, heir = os.pipe()   # as gpu_wait leaves its job the pipe the claim holders read
+    gpu_wait.claim_card(1, 1, ["job"], life)
+    os.close(life)
+    queue = gpu_wait.enqueue() if waiting else None
+    try:
+        if how == "release":
+            gpu_wait.release(os.getpid(), [1])
+        os.close(heir)
+        wait_for(unclaimed)
+    finally:
+        if queue is not None:
+            os.close(queue)
+    assert bridged() == ([1] if waiting else [])
+
+
+def test_a_waiting_gpu_wait_takes_a_card_as_soon_as_its_claim_ends(cli, pipes, bridged):
     others = [gpu_wait.claim_card(card, 1, ["other"], pipes()) for card in CARDS]
     waiter = subprocess.Popen([*cli, "--need-gb", "1", "--interval-min", "60", "--", "sleep", "60"],
                               stdout=subprocess.PIPE, text=True)
@@ -310,6 +359,7 @@ def test_a_waiting_gpu_wait_takes_a_card_as_soon_as_its_claim_ends(cli, pipes):
         timer.start()
         gpu_wait.end(others[1])
         assert waiter.stdout.readline() == "[gpu_wait] claimed + running on GPU 1\n"
+        assert bridged() == [1]
     finally:
         timer.cancel()
         waiter.kill()
