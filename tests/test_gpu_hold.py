@@ -319,7 +319,7 @@ def test_a_bridge_looks_at_the_card_once_a_ballast_has_let_go(monkeypatch):
 
 @pytest.mark.parametrize("apps, used, mine, idle", [("", "300", None, True), ("77", "300", None, False),
                                                     ("77", "300", 77, True), ("77\n78", "300", 77, False),
-                                                    ("", "2000", None, False)])
+                                                    ("", "2000", None, False), ("", "300", 77, False)])
 def test_a_card_is_idle_with_no_process_but_mine_and_little_used(monkeypatch, apps, used, mine, idle):
     monkeypatch.setattr(gpu_hold, "smi", lambda smi_id, what, field: (apps if what == "compute-apps" else used).split())
     assert gpu_hold.card_idle("GPU-c", mine) is idle

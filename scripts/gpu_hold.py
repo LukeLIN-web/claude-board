@@ -49,8 +49,8 @@ claim holder whose claim ends while a gpu_wait waits on the box starts one
 ``BALLAST_NAME``, the bridge takes the card's lock shared, as ``use`` does (a
 ballast lets go of the card, and no ``hold`` arms one beside it), stays off a card
 nvidia-smi shows in use or another bridge covers, opens a CUDA context and no
-memory, and reads the card's free VRAM; it is up once nobody but itself is on the
-card after that read. It leaves as soon as the card's free VRAM falls
+memory, and reads the card's free VRAM; it is up once nvidia-smi lists it, and
+nobody else, on the card after that read. It leaves as soon as the card's free VRAM falls
 ``BRIDGE_DROP_MB`` below the most it has read, which a new context on the card
 does (the next job's, at its first CUDA call), or once no claim has held the card
 for ``BRIDGE_GRACE_S``. Until it leaves, its context sits beside the next job's
@@ -117,9 +117,10 @@ def smi(smi_id: str, what: str, field: str) -> list[str]:
 
 
 def card_idle(smi_id: str, mine: int | None = None) -> bool:
-    """nvidia-smi shows nothing on the card but process ``mine``; an unanswered query is not idle."""
+    """nvidia-smi shows nothing on the card, or only process ``mine`` when given; an unanswered query is not idle."""
     try:
-        return (all(pid == str(mine) for pid in smi(smi_id, "compute-apps", "pid"))
+        pids = smi(smi_id, "compute-apps", "pid")
+        return (pids == ([] if mine is None else [str(mine)])
                 and int(smi(smi_id, "gpu", "memory.used")[0]) <= IDLE_MB)
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return False
@@ -308,7 +309,7 @@ def bridge(card: int, parent: int, up: int) -> None:
         return
     cuda = cuda_on_card(card)
     most = card_free_mb(cuda, card)
-    if not card_idle(smi_id, os.getpid()):   # somebody came on before that read
+    if not card_idle(smi_id, os.getpid()):   # somebody came on before that read, or nvidia-smi does not list the bridge
         return
     libc.prctl(PR_SET_PDEATHSIG, 0)   # the holder exits once the bridge is up
     os.write(up, b"up")
