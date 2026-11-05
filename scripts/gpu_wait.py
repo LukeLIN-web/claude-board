@@ -76,8 +76,14 @@ the job of another wrapper.
 ``LOCK_DIR``, the lock names and the note are the claim protocol every copy of
 gpu_wait on a box shares, the copies runs snapshot among them: changing them
 lets two pollers load one card. The queue lock and the handover add to it and
-change none of it: a copy without them waits until its next poll and starts no
-bridge, its claims end at once, and its ``release`` sends the same ``END``.
+change none of it: a copy without them waits until its next poll, its holders
+hand nothing over, and its ``release`` sends the same ``END``. A gpu_wait that
+was already waiting when this file gained them is the exception until it claims
+or times out: it starts its holders from this file, and backs out of a claim
+with ``END``. While a newer
+gpu_wait waits, such a back-out hands over a card whose job never ran: the
+claim lock stays held up to ``HAND_OVER_S``, and the bridge stays on the card up
+to ``BRIDGE_GRACE_S`` with no claim (see gpu_hold.py).
 """
 from __future__ import annotations
 
