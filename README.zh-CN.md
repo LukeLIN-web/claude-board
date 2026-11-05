@@ -83,7 +83,7 @@ tmux set-option -p -u -t %3 @fleet-passive    # 恢复显示
 
 `GET /api/locate/<session-id>`（≥ 8 位的唯一前缀也行）返回在跑 session 的 window 和 tmux pane。[`scripts/locate-session.sh`](scripts/locate-session.sh) 对 Claude session 做同样的事，不需要 server。
 
-> **Focus（macOS）** 支持 Terminal.app 和 iTerm2，包括跑在 tmux 里的情况。换别的终端，放一个可执行的 `~/.claude/focus-tty.sh <tty>`，它优先于自带的 [`scripts/focus-tty.sh`](scripts/focus-tty.sh)。
+> **Focus（macOS）** 支持 Terminal.app 和 iTerm2，包括跑在 tmux 里的情况。换别的终端，放一个可执行的 `~/.claude/focus-tty.sh <tty>`，它优先于自带的 [`scripts/focus-tty.sh`](scripts/focus-tty.sh)。新建的卡片要等有终端 attach 了它所在的 session（`tmux attach -t fleet`）才有标签页可聚焦。
 
 ### 远程访问
 

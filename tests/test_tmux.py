@@ -82,8 +82,9 @@ def _argv(calls, command):
 
 
 def _mentions(calls, *names):
-    """Whether any recorded tmux argv names any of `names`, as `x` or `x:…`."""
-    return any(arg == n or arg.startswith(f"{n}:") for a in calls for arg in a for n in names)
+    """Whether any recorded tmux argv names any of `names`, as `x`, `x:…` or `=x:…`."""
+    return any(arg.lstrip("=") == n or arg.lstrip("=").startswith(f"{n}:")
+               for a in calls for arg in a for n in names)
 
 
 # Stand-in for the resolved CLI. new_window launches by absolute path, so argv
@@ -164,7 +165,7 @@ class SocketArgsTests(unittest.TestCase):
         self.assertEqual(_argv(calls, "list-sessions")[:3], ["tmux", "-L", "board"])
         new_win_argv = _argv(calls, "new-window")
         self.assertEqual(new_win_argv[:4], ["tmux", "-L", "board", "new-window"])
-        self.assertEqual(new_win_argv[new_win_argv.index("-t") + 1], "fleet:")
+        self.assertEqual(new_win_argv[new_win_argv.index("-t") + 1], "=fleet:")
 
 
 # Only available() and pane_for_tty() read tmux's module caches, so only their
@@ -336,7 +337,7 @@ class NewWindowTests(unittest.TestCase):
         self.assertEqual(
             _argv(calls, "new-window"),
             ["tmux", "new-window", "-P", "-F", "#{pane_id}",
-             "-t", "mysess:", "-c", "/home/u/proj",
+             "-t", "=mysess:", "-c", "/home/u/proj",
              _EXE, "--dangerously-skip-permissions"],
         )
         self.assertTrue(r["ok"])
@@ -370,7 +371,7 @@ class NewWindowTests(unittest.TestCase):
                 r = tmux.new_window("/tmp")
         self.assertTrue(r["ok"])
         new_win_argv = _argv(calls, "new-window")
-        self.assertEqual(new_win_argv[new_win_argv.index("-t") + 1], "fleet:")
+        self.assertEqual(new_win_argv[new_win_argv.index("-t") + 1], "=fleet:")
         self.assertFalse(any("new-session" in a for a in calls))
         self.assertFalse(_mentions(calls, "alpha", "beta"))
 
