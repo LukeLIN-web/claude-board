@@ -70,6 +70,8 @@ Fleet 默认只读。下面这些操作通过 tmux 驱动 session，只有 tmux 
 
 > 新建的 Claude / Codex session 带 `--dangerously-skip-permissions` / `--yolo` 运行，所有操作自动放行。别在你不信任的目录里新建。
 
+新建的窗口开在 Fleet 自己的 tmux session `fleet` 里（`FLEET_TMUX_SESSION` 可以换个名字），没有就先建，不会开进同一 server 上别的 session。
+
 跑在 Fleet 自己的 tmux server（`FLEET_TMUX_SOCKET`，不设就是默认 server）以外的 session 不出卡片。Fleet 自己 server 上的辅助 session 想继续运行但不占卡片，就在它所在的机器上给它的 tmux pane 加标记，标记随 pane 存在：
 
 ```bash
@@ -81,7 +83,7 @@ tmux set-option -p -u -t %3 @fleet-passive    # 恢复显示
 
 `GET /api/locate/<session-id>`（≥ 8 位的唯一前缀也行）返回在跑 session 的 window 和 tmux pane。[`scripts/locate-session.sh`](scripts/locate-session.sh) 对 Claude session 做同样的事，不需要 server。
 
-> **Focus（macOS）** 支持 Terminal.app 和 iTerm2，包括跑在 tmux 里的情况。换别的终端，放一个可执行的 `~/.claude/focus-tty.sh <tty>`，它优先于自带的 [`scripts/focus-tty.sh`](scripts/focus-tty.sh)。
+> **Focus（macOS）** 支持 Terminal.app 和 iTerm2，包括跑在 tmux 里的情况。换别的终端，放一个可执行的 `~/.claude/focus-tty.sh <tty>`，它优先于自带的 [`scripts/focus-tty.sh`](scripts/focus-tty.sh)。新建的卡片要等有终端 attach 了它所在的 session（`tmux attach -t fleet`）才有标签页可聚焦。
 
 ### 远程访问
 

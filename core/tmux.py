@@ -415,22 +415,19 @@ _DEFAULT_SESSION = "fleet"
 
 
 def _resolve_target() -> dict:
-    """Resolve the tmux session to host fleet windows.
+    """The tmux session that hosts the windows the board opens: {target, exists}.
 
-    Returns {target, exists}. `exists=False` means the chosen session name does
-    not exist yet and the caller must create it — this is the cold-start case
-    (zero sessions) or a pinned `$FLEET_TMUX_SESSION` that hasn't been made yet.
-    A `new-window` needs a host session to attach to; spawning/resuming from a
-    fleet with no live sessions must create that host rather than dead-end.
+    `$FLEET_TMUX_SESSION` when set, else the board's own session, `fleet`, and
+    never another session on the server. The server may be shared with sessions
+    the board did not make, and a window opened in one becomes its active window:
+    keys sent to that session by name (`send-keys -t <session>`) then land in the
+    new card's composer and run as a prompt. `exists=False` means the session is
+    not there yet and the caller creates it.
     """
+    target = os.environ.get("FLEET_TMUX_SESSION") or _DEFAULT_SESSION
     r = _run("list-sessions", "-F", "#{session_name}")
     sessions = [ln.strip() for ln in r["stdout"].splitlines() if ln.strip()] if r["ok"] else []
-    env_target = os.environ.get("FLEET_TMUX_SESSION")
-    if env_target:
-        return {"target": env_target, "exists": env_target in sessions}
-    if sessions:
-        return {"target": sessions[0], "exists": True}
-    return {"target": _DEFAULT_SESSION, "exists": False}
+    return {"target": target, "exists": target in sessions}
 
 
 # A pane id printed by `new-window` says the window was created, not that
@@ -461,9 +458,10 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
     existing session — pass `cmd` explicitly. `runs` names the CLIs `cmd` starts
     in turn, for the pane's PATH (see _pane_env_prefix).
 
-    When no host session exists yet, `cmd` is launched as a fresh detached
-    session (running directly, with no placeholder shell) so spawn/resume/fork
-    work from a cold start instead of failing on an empty tmux server.
+    The window goes into the session `_resolve_target` names. When that session
+    doesn't exist yet, `cmd` is launched as it: a fresh detached session (running
+    directly, with no placeholder shell), whether the server is already running
+    other sessions or not running at all.
     """
     cmd = cmd or ["claude", "--dangerously-skip-permissions"]
     # Launch by absolute path: the pane gets the board's PATH, not the server's
@@ -482,23 +480,35 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
     # the pane the directories `exe` and `runs` were found in if its PATH lacks them.
     cmd = [*_pane_env_prefix(exe, runs), exe, *cmd[1:]]
     target = _resolve_target()
+    # `=name:` is that session and only it. A bare name is first looked up as a
+    # window of the server's current session, which can be someone else's (a
+    # window there named `fleet…` fails the spawn, "index in use"; a numeric
+    # session name opens the window in that other session). Without the `=`,
+    # tmux falls back to a prefix and then a pattern match, so a `fleet` whose
+    # last window closed after list-sessions resolves to `fleet-ops`.
+    window = ("new-window", "-P", "-F", "#{pane_id}",
+              "-t", f"={target['target']}:", "-c", cwd, *cmd)
     if target["exists"]:
-        r = _run("new-window", "-P", "-F", "#{pane_id}",
-                 "-t", target["target"], "-c", cwd, *cmd)
+        r = _run(*window)
     else:
-        # Cold start (no tmux server yet). Don't let `new-session` be what forks
-        # the server: on some tmux builds that daemon — and the long-lived pane
-        # process under it — inherits the stdout/stderr pipe `_run`'s
-        # subprocess.run is reading, so the read blocks waiting for an EOF that
-        # never comes (the dashboard's "Spawning…" hang on a host with no tmux
-        # server). Starting the server in its own call lets it daemonize and
-        # close those fds first; the subsequent new-session then only attaches.
+        # The session isn't there yet, and the server may or may not be running.
+        # Don't let `new-session` be what forks the server: on some tmux builds
+        # that daemon — and the long-lived pane process under it — inherits the
+        # stdout/stderr pipe `_run`'s subprocess.run is reading, so the read
+        # blocks waiting for an EOF that never comes (the dashboard's
+        # "Spawning…" hang on a host with no tmux server). Starting the server in
+        # its own call lets it daemonize and close those fds first (on a running
+        # server it does nothing); the subsequent new-session then only attaches.
         # A new server numbers its panes from %0 again, so a tty→pane map read
-        # off the old one could name a live pane of the new one — drop it.
+        # off the old one could name a live pane of the new one — drop it. On a
+        # running server that only costs the next lookup one re-list.
         _pane_map_cache.clear()
         _run("start-server")
         r = _run("new-session", "-d", "-s", target["target"],
                  "-P", "-F", "#{pane_id}", "-c", cwd, *cmd)
+        if not r["ok"] and "duplicate session" in r["stderr"]:
+            # A spawn running beside this one created the session first.
+            r = _run(*window)
     if not r["ok"]:
         return _outcome(r)
     pane_id = r["stdout"].strip()
@@ -509,10 +519,11 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
                 "error": f"the spawned pane exited immediately: {' '.join(cmd)}"}
     # A tmux server whose config has an error shows that error in the first pane
     # it opens, in view-mode, and view-mode eats every key sent to the pane: the
-    # trust prompt's Down, the resume picker's, the first prompt's text. The cold
-    # start above is exactly that first pane, so a board whose server had exited
-    # (its own socket, after the last card closed) spawned a card it could not
-    # drive. Leave the mode now, before anyone types into it.
+    # trust prompt's Down, the resume picker's, the first prompt's text. A
+    # new-session above that also started the server opens exactly that first
+    # pane, so a board whose server had exited (its own socket, after the last
+    # card closed) spawned a card it could not drive. Leave the mode now, before
+    # anyone types into it.
     exit_copy_mode(pane_id)
     return {"ok": True, "pane_id": pane_id}
 
