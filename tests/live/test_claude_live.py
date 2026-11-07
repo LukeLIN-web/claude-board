@@ -8,9 +8,10 @@ text. These tests take sessions through the board's own code paths:
 
   a spawn into a never-trusted directory gets its trust prompt answered;
   then one session, in file order: card found → banner read → prompt lands and
-  is answered → a prompt sent over an open Rewind panel lands → the /model
-  dialog commits a pick. Apart from those, the usage probe starts a throwaway
-  session of its own and reads /status and /usage off it.
+  is answered → a prompt sent over an open Rewind panel lands → a repaint
+  keeps a long draft → the /model dialog commits a pick. Apart from those, the
+  usage probe starts a throwaway session of its own and reads /status and
+  /usage off it.
 
 Per CLAUDE.md, sessions run on haiku and every prompt here goes to one of them.
 They run on a tmux server of their own (`tmux -L claude-board-live-<pid>`), so
@@ -208,6 +209,22 @@ def test_send_clears_an_open_rewind_panel(live):
     assert _wait_for(lambda: actions._rewind_panel_open(_pane_text(live)), 5), \
         "Esc Esc did not draw a Rewind panel the board recognises"
     _ask(live)
+
+
+def test_repaint_keeps_the_draft(live):
+    # A landed check that misses is read again after Claude repaints
+    # (tmux._REPAINT_KEY): its screen can drift from what it drew, and no
+    # retype repairs that. The repaint must leave the draft in place.
+    # Nothing is submitted, so no model is called.
+    assert _wait_for(lambda: _composer(live), 20), "no composer to type into"
+    draft = "这是一段用来测试的长提示，" * 30 + "ENDOFDRAFT"
+    try:
+        assert tmux._send_until_landed(live.pane, draft, "❯"), "the draft never landed"
+        tmux.send_keys(live.pane, tmux._REPAINT_KEY)
+        time.sleep(1)
+        assert tmux._tail_in(_pane_text(live), draft, "❯"), "the repaint lost the draft"
+    finally:
+        tmux._clear_composer(live.pane, "❯")
 
 
 def test_model_dialog_commits_a_pick(live):

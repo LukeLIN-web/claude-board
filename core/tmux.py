@@ -592,6 +592,17 @@ _SUBMIT_VERIFY_WAIT = 0.4
 # and a fixed short wait misreports that lag as a dropped prompt.
 _LANDED_VERIFY_WAITS = (0.15, 0.5, 1.2, 2.5)
 
+# Claude Code's redraw key: on Ctrl+L it repaints its whole frame from its own
+# state and leaves the draft alone (seen live on v2.1.319, in both the main-
+# screen and the fullscreen renderer, and with the slash popup open). Between
+# repaints it writes only the cells it believes changed, so once the pane's
+# screen has drifted from what it drew, the drift stays: clearing and retyping
+# put the same diff onto the same stale cells, and every capture shows the same
+# wrong frame. A repaint shows what the composer really holds.
+_REPAINT_KEY = "C-l"
+# An idle CLI has repainted within ~0.03s of the key; the rest is for a busy one.
+_REPAINT_SETTLE = 0.3
+
 
 def codex_enter_settle(text_len: int) -> float:
     """Length-scaled settle before Codex's submit Enter (see _CODEX_ENTER_SETTLE)."""
@@ -812,6 +823,15 @@ def _send_debug(msg: str) -> None:
         pass
 
 
+def _debug_frame(cap: str, marker: str) -> str:
+    """The part of a captured screen a send-debug line records: the composer
+    region, whitespace-squeezed and whole (a clipped draft and a stale one
+    differ only past the head of the draft), or the screen's foot when no
+    composer is on it."""
+    idx = cap.rfind(marker)
+    return "".join(cap[idx:].split()) if idx != -1 else f"NO-MARKER tail={cap[-120:]!r}"
+
+
 def _literal_key_arg(text: str) -> str:
     """Escape a trailing semicolon for `send-keys -l`.
 
@@ -880,10 +900,12 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     wipes the late-landing text, so "never landed" stays truthful and the
     stranded prompt can't concatenate into the next send.
 
-    The check reads the screen, so it is only as good as the CLI's idea of the
-    pane's size: one that missed a shrink draws a long draft's end below the
-    last row, where it never shows (see _resync_size). The size is resynced
-    before anything is read.
+    The check reads the screen, and the screen can be out of step with the CLI
+    in two ways. A CLI that missed a shrink draws a long draft's end below the
+    last row, where it never shows (see _resync_size), so the size is resynced
+    before anything is read. And a screen can drift from the frame the CLI last
+    drew, which no retype repairs (see _REPAINT_KEY), so a miss is read again
+    after a repaint before it counts.
     """
     _resync_size(pane)
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
@@ -904,16 +926,20 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
                         f"send-keys FAILED: {literal.get('error')!r}")
             return False
         time.sleep(wait)
+        before = capture_pane(pane).get("text", "")
+        if _tail_in(before, text, marker):
+            return True
+        send_keys(pane, _REPAINT_KEY)
+        time.sleep(_REPAINT_SETTLE)
         # One capture, both judged and logged: a miss records the very frame it
         # was decided on, not a later one the pane has since redrawn.
         cap = capture_pane(pane).get("text", "")
         if _tail_in(cap, text, marker):
+            _send_debug(f"landed pane={pane} attempt={attempt} only after a repaint, "
+                        f"frame before it={_debug_frame(before, marker)!r}")
             return True
-        idx = cap.rfind(marker)
-        frame = ("".join(cap[idx:].split())[:200] if idx != -1
-                 else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
-                    f"needle={_needle(text)!r} frame={frame!r}")
+                    f"needle={_needle(text)!r} frame={_debug_frame(cap, marker)!r}")
     _clear_composer(pane, marker)  # wipe the buffered text on wake
     _send_debug(f"landed pane={pane} gave up after "
                 f"{len(_LANDED_VERIFY_WAITS)} attempts")
