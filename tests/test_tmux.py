@@ -818,6 +818,14 @@ _CLAUDE_TASK_LIST = (
 )
 
 
+def _clear_presses(argv):
+    """How many clearing presses (tmux._CLEAR_KEYS) one tmux argv sends."""
+    n = len(tmux._CLEAR_KEYS)
+    if "send-keys" not in argv or tuple(argv[-n:]) != tmux._CLEAR_KEYS:
+        return 0
+    return len(argv[argv.index("-t") + 2:]) // n
+
+
 def _claude_pane_with_tasks(composer=""):
     """A Claude pane holding `composer` in its composer, task list below."""
     return f"────────────\n❯ {composer}\n────────────\n" + _CLAUDE_TASK_LIST
@@ -827,11 +835,10 @@ class SendTextVerifyLandedTests(unittest.TestCase):
     """verify_landed confirms the literal text reached the composer before Enter,
     re-sending it (clearing the composer first) when a busy-pane re-render dropped it."""
 
-    def test_empty_composer_over_a_task_list_is_not_cleared_blind(self):
-        # Read with Codex's glyph too, the empty composer "held" the last task
-        # line's "blocked by #2": no clearing press could empty that, so every
-        # landed-verify attempt ended in the blind fallback — forty clearing
-        # presses into a composer that held nothing.
+    def test_a_task_list_below_the_composer_does_not_hide_a_landing(self):
+        # Read with Codex's glyph too, the composer "held" the last task line's
+        # "blocked by #2", which no typing changes: our landed text has to be
+        # found above it, in the composer the Claude glyph opens.
         typed = [""]
         calls = []
 
@@ -849,13 +856,13 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"):
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertTrue(r["ok"])
-        self.assertEqual(ClearComposerTests._presses(calls), [])
+        self.assertEqual(len([c for c in calls if "-l" in c]), 1)  # landed first try
 
     def test_no_resend_when_text_lands_first_try(self):
         calls = []
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_clear_composer") as cc, \
+                mock.patch.object(tmux, "_queue_clear") as qc, \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
@@ -866,9 +873,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertEqual(len(enters), 1)  # submitted on first Enter, no resend
         # Landing first try still costs one clear: the composer is emptied
         # before the text is typed, never after it lands.
-        cc.assert_called_once_with("%5", "❯")
-        # A screen that shows the text is believed: no repaint.
-        self.assertNotIn(tmux._REPAINT_KEY, [c[-1] for c in calls])
+        qc.assert_called_once_with("%5")
 
     def test_composer_is_cleared_before_the_first_keystroke(self):
         # Regression: the clear used to run only on RETRIES, so whatever a
@@ -886,7 +891,7 @@ class SendTextVerifyLandedTests(unittest.TestCase):
 
         with _patch_run(fake_run), \
                 mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_clear_composer",
+                mock.patch.object(tmux, "_queue_clear",
                                   side_effect=lambda *a: order.append("clear")), \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=[True, False]):  # landed, then submitted
@@ -900,7 +905,6 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         landed = iter([False, True, False])  # dropped once, lands, submits
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_queue_clear") as qc, \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=lambda *a: next(landed)):
@@ -909,16 +913,13 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 2)  # initial + one resend
         # Every attempt clears first, so neither a leftover from an earlier send
-        # nor a partial paste can concatenate into a corrupted prompt: the first
-        # by the screen, the resend blind, behind the text it may not show yet.
-        cc.assert_called_once_with("%5", "❯")
-        qc.assert_called_once_with("%5")
+        # nor a partial paste can concatenate into a corrupted prompt.
+        self.assertEqual(qc.call_args_list, [mock.call("%5")] * 2)
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
-                mock.patch.object(tmux, "_clear_composer") as cc, \
                 mock.patch.object(tmux, "_queue_clear") as qc, \
                 mock.patch.object(tmux, "_tail_in", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
@@ -930,9 +931,8 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         # land AFTER we give up and would strand in the composer, corrupting the
         # next send. Giving up must end with a cleanup clear so the buffered
         # text is wiped whenever the pane wakes: one clear per attempt plus the
-        # final cleanup, all but the first queued blind.
-        cc.assert_called_once_with("%5", "❯")
-        self.assertEqual(qc.call_count, len(tmux._LANDED_VERIFY_WAITS))
+        # final cleanup.
+        self.assertEqual(qc.call_count, len(tmux._LANDED_VERIFY_WAITS) + 1)
 
     def test_landed_waits_escalate_for_laggy_panes(self):
         # A busy pane can take well over 0.15s to echo the paste; the between-
@@ -969,7 +969,6 @@ class _MissedShrinkPane:
         self.stale = True
         self.draft = ""
         self.typed = 0
-        self.presses = 0
         self.enters = 0
 
     def screen(self):
@@ -990,9 +989,9 @@ class _MissedShrinkPane:
         if "-l" in argv:
             self.draft += argv[-1]
             self.typed += 1
-        elif tuple(argv[-3:]) == tmux._CLEAR_KEYS:
-            self.presses += 1
-            self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
+        elif _clear_presses(argv):
+            for _ in range(_clear_presses(argv)):
+                self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
         elif argv[-1] == "Enter":
             self.enters += 1
             self.draft = ""
@@ -1023,10 +1022,7 @@ class MissedShrinkTests(unittest.TestCase):
         pane = _MissedShrinkPane()
         r = pane.send(self.TEXT)
         self.assertTrue(r["ok"])
-        self.assertEqual(pane.typed, 1)
-        # Resynced before the first read, the empty composer read as empty: no
-        # clearing press went into the status line drawn on the marker row.
-        self.assertEqual(pane.presses, 0)
+        self.assertEqual(pane.typed, 1)  # resynced before the first read
 
     def test_a_cli_the_signal_does_not_help_still_never_gets_enter(self):
         pane = _MissedShrinkPane(resyncs=False)
@@ -1047,7 +1043,8 @@ class _OutOfStepPane:
     Ctrl+L makes the CLI repaint (`repaints=False`: not even then). The CLI
     writes only the cells it believes changed, so clearing and retyping change
     its draft but not that frame.
-    `draft`: what the composer holds when the send starts.
+    `draft`: what the composer holds when the send starts; `hidden=True`: the
+    screen shows its cells blank, and everything typed after it, until Ctrl+L.
 
     `submitted` records each draft Enter sent."""
 
@@ -1055,16 +1052,21 @@ class _OutOfStepPane:
     PANEL = "  ◯ general-purpose  Collecting logs   1h 38m 42s · ↓ 383.1k tokens"
     CLEAR = "clear"
 
-    def __init__(self, *, stalled_for=0.0, drifted=None, repaints=True, draft=""):
+    def __init__(self, *, stalled_for=0.0, drifted=None, repaints=True, draft="",
+                 hidden=False):
         self.now, self.wakes = 0.0, stalled_for
         self.drifted, self.repaints = drifted, repaints
         self.draft = draft
+        self.hidden = draft if hidden else ""
         self.pending = []  # keys the CLI has not read yet
         self.drawn = self.frame()
         self.submitted = []
 
     def frame(self):
-        rows = [self.draft[i:i + 30] for i in range(0, len(self.draft), 30)] or [""]
+        shown = self.draft
+        if self.hidden and shown.startswith(self.hidden):
+            shown = " " * len(self.hidden) + shown[len(self.hidden):]
+        rows = [shown[i:i + 30] for i in range(0, len(shown), 30)] or [""]
         return (f"● earlier turn\n{self.RULE}\n❯ " + "\n  ".join(rows)
                 + f"\n{self.RULE}\n  ⏵⏵ bypass permissions on\n\n{self.PANEL}\n")
 
@@ -1076,7 +1078,7 @@ class _OutOfStepPane:
                 self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
             elif key == tmux._REPAINT_KEY:
                 if self.repaints:
-                    self.drifted = None
+                    self.drifted, self.hidden = None, ""
             elif key == "Enter":
                 self.submitted.append(self.draft)
                 self.draft = ""
@@ -1091,8 +1093,8 @@ class _OutOfStepPane:
             return FakeProc(stdout=self.drawn if self.drifted is None else self.drifted)
         if "-l" in argv:
             self.pending.append(argv[-1])
-        elif tuple(argv[-3:]) == tmux._CLEAR_KEYS:
-            self.pending.append(self.CLEAR)
+        elif _clear_presses(argv):
+            self.pending += [self.CLEAR] * _clear_presses(argv)
         elif argv[-1] in (tmux._REPAINT_KEY, "Enter"):
             self.pending.append(argv[-1])
         return FakeProc()
@@ -1127,10 +1129,9 @@ class OutOfStepScreenTests(unittest.TestCase):
 
     def test_a_leftover_a_drifted_screen_hides_does_not_go_out_with_the_prompt(self):
         # The screen shows an empty composer that in fact holds an earlier
-        # send's leftover. Typed after it, the prompt's tail is there once the
-        # CLI repaints, but so is the leftover in front of it.
-        empty = f"● earlier turn\n{_OutOfStepPane.RULE}\n❯ \n{_OutOfStepPane.RULE}\n"
-        pane = _OutOfStepPane(drifted=empty, draft="/clear")
+        # send's leftover, and draws what is typed after it: the prompt's tail
+        # shows, with the leftover unseen in front of it.
+        pane = _OutOfStepPane(draft="/clear", hidden=True)
         self.assertTrue(pane.send(self.TEXT)["ok"])
         self.assertEqual(pane.submitted, [self.TEXT])
 
@@ -1519,8 +1520,7 @@ class ClearComposerTests(unittest.TestCase):
 
     @staticmethod
     def _presses(calls):
-        n = len(tmux._CLEAR_KEYS)
-        return [c for c in calls if tuple(c[-n:]) == tmux._CLEAR_KEYS]
+        return sum(_clear_presses(c) for c in calls)
 
     def test_press_is_end_then_ctrl_u_then_backspace(self):
         # Ctrl-U alone only kills LEFT of the cursor on its visual row (live on
@@ -1552,7 +1552,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux, "capture_pane",
                                   side_effect=lambda *a, **k: {"ok": True, "text": next(screens)}):
             tmux._clear_composer("%5", "❯")
-        self.assertEqual(len(self._presses(calls)), 2)  # one per non-empty read, none once empty
+        self.assertEqual(self._presses(calls), 2)  # one per non-empty read, none once empty
 
     def test_already_empty_composer_sends_nothing(self):
         for name, screen in (("bare", "❯ \n────────────\n"),
@@ -1564,7 +1564,7 @@ class ClearComposerTests(unittest.TestCase):
                         mock.patch.object(tmux, "capture_pane",
                                           return_value={"ok": True, "text": screen}):
                     tmux._clear_composer("%5", "❯")
-                self.assertEqual(self._presses(calls), [])
+                self.assertEqual(self._presses(calls), 0)
 
     def test_stalled_pane_falls_back_to_blind_presses(self):
         # A stalled TUI never redraws: the same screen comes back after a press
@@ -1576,7 +1576,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux, "capture_pane",
                                   return_value={"ok": True, "text": "❯ stuck text\n────────────\n"}):
             tmux._clear_composer("%5", "❯")
-        self.assertGreaterEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
+        self.assertGreaterEqual(self._presses(calls), tmux._CLEAR_BLIND_PRESSES)
 
     def test_capture_failure_falls_back_to_blind_presses(self):
         calls = []
@@ -1584,7 +1584,7 @@ class ClearComposerTests(unittest.TestCase):
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "capture_pane", return_value={"ok": False}):
             tmux._clear_composer("%5", "❯")
-        self.assertEqual(len(self._presses(calls)), tmux._CLEAR_BLIND_PRESSES)
+        self.assertEqual(self._presses(calls), tmux._CLEAR_BLIND_PRESSES)
 
 
 class CodexEnterSettleTests(unittest.TestCase):
