@@ -1,5 +1,6 @@
 """Pure-logic tests for core/tmux.py — subprocess.run is always faked."""
 import os
+import signal
 import subprocess
 import unittest
 from unittest import mock
@@ -939,6 +940,116 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
         self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
         self.assertGreaterEqual(sum(sleeps), 3.0)  # rides out multi-second lag
+
+
+# /proc/<pid>/stat of a pane whose terminal's foreground process group is 4250.
+_STAT_FG_4250 = "4242 (claude) S 1 4242 4242 34816 4250 4194560 0\n"
+
+
+class _MissedShrinkPane:
+    """A Claude pane whose CLI missed a shrink: it still lays its frame out
+    for a taller window than the pane until a SIGWINCH makes it re-read the
+    size. The stale screens are the shapes a live reproduction showed (a frame
+    laid out for 32 rows on a 24-row pane): the composer's viewport is 11 rows
+    tall instead of 7, so a long draft's end, the rule and the status line run
+    past the last row; with an empty composer the status line is drawn onto
+    the marker row."""
+
+    STATUS = "⏵⏵ bypass permissions on · 4 shells, 1 monitor · ← 4 agents"
+
+    def __init__(self, resyncs=True):
+        self.resyncs = resyncs  # False: a CLI the signal doesn't help
+        self.stale = True
+        self.draft = ""
+        self.typed = 0
+        self.presses = 0
+
+    def screen(self):
+        rule = "─" * 40
+        rows = [self.draft[i:i + 30] for i in range(0, len(self.draft), 30)] or [""]
+        top = "● earlier turn\n" * 8 + rule + "\n❯ "
+        if not self.stale:
+            return top + "\n  ".join(rows[-7:]) + f"\n{rule}\n  {self.STATUS}\n"
+        if not self.draft:
+            return top + self.STATUS + "\n"
+        return top + "\n  ".join(rows[-11:][:9]) + "\n"  # pane ends here
+
+    def run(self, argv, **kw):
+        if "capture-pane" in argv:
+            return FakeProc(stdout=self.screen())
+        if "display-message" in argv:
+            return FakeProc(stdout="4242\n")
+        if "-l" in argv:
+            self.draft += argv[-1]
+            self.typed += 1
+        elif tuple(argv[-3:]) == tmux._CLEAR_KEYS:
+            self.presses += 1
+            self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
+        elif argv[-1] == "Enter":
+            self.draft = ""
+        return FakeProc()
+
+    def winch(self, pgid, sig):
+        assert (pgid, sig) == (4250, signal.SIGWINCH)
+        if self.resyncs:
+            self.stale = False
+
+    def send(self, text):
+        with _patch_run(self.run), \
+                mock.patch.object(tmux.time, "sleep"), \
+                mock.patch("core.tmux.open", mock.mock_open(read_data=_STAT_FG_4250),
+                           create=True), \
+                mock.patch.object(tmux.os, "killpg", side_effect=self.winch):
+            return tmux.send_text("%5", text, verify_landed=True, marker="❯")
+
+
+class MissedShrinkTests(unittest.TestCase):
+    """A CLI that missed a shrink draws a long draft's end below the pane's
+    last row: no wait and no retype shows it, so the landed check resyncs the
+    CLI's size before reading the composer."""
+
+    TEXT = "这是一段很长的中文提示，用来模拟一次多行的输入。" * 16 + "结尾标记END"
+
+    def test_resync_before_reading_lands_a_long_draft_first_try(self):
+        pane = _MissedShrinkPane()
+        r = pane.send(self.TEXT)
+        self.assertTrue(r["ok"])
+        self.assertEqual(pane.typed, 1)
+        # Resynced before the first read, the empty composer read as empty: no
+        # clearing press went into the status line drawn on the marker row.
+        self.assertEqual(pane.presses, 0)
+
+    def test_a_cli_the_signal_does_not_help_still_never_gets_enter(self):
+        pane = _MissedShrinkPane(resyncs=False)
+        r = pane.send(self.TEXT)
+        self.assertFalse(r["ok"])
+        self.assertEqual(pane.typed, len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(pane.draft, "")  # the give-up clear wiped it
+
+
+class ResyncSizeTests(unittest.TestCase):
+    """_resync_size sends the SIGWINCH a resize sends to the pane terminal's
+    foreground process group, and leaves a pane it can't resolve alone."""
+
+    def _resync(self, stat="", pid="4242", read=None):
+        opener = (mock.mock_open(read_data=stat) if read is None
+                  else mock.Mock(side_effect=read))
+        with mock.patch.object(tmux, "_display", return_value=pid), \
+                mock.patch("core.tmux.open", opener, create=True), \
+                mock.patch.object(tmux.os, "killpg") as killpg:
+            tmux._resync_size("%5")
+        return killpg
+
+    def test_signals_the_foreground_group_not_the_panes_process(self):
+        # The pane's process is a shell that started the CLI as a job; the
+        # foreground group is the CLI's. A ")" in the name doesn't shift fields.
+        stat = "4242 (odd) name) S 1 4242 4242 34816 4250 4194560 0\n"
+        self._resync(stat).assert_called_once_with(4250, signal.SIGWINCH)
+
+    def test_unresolvable_pane_signals_nothing(self):
+        self._resync(pid=None).assert_not_called()
+        self._resync("4242 (claude) S 1 4242 4242 0 -1 0\n").assert_not_called()  # no terminal
+        self._resync(read=FileNotFoundError).assert_not_called()  # process gone
 
 
 class SendTextConfirmedTests(unittest.TestCase):
