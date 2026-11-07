@@ -592,16 +592,17 @@ _SUBMIT_VERIFY_WAIT = 0.4
 # and a fixed short wait misreports that lag as a dropped prompt.
 _LANDED_VERIFY_WAITS = (0.15, 0.5, 1.2, 2.5)
 
-# Claude Code's redraw key: on Ctrl+L it repaints its whole frame from its own
-# state and leaves the draft alone (seen live on v2.1.319, in both the main-
-# screen and the fullscreen renderer, and with the slash popup open). Between
-# repaints it writes only the cells it believes changed, so once the pane's
-# screen has drifted from what it drew, the drift stays: clearing and retyping
-# put the same diff onto the same stale cells, and every capture shows the same
-# wrong frame. A repaint shows what the composer really holds.
+# Claude Code's redraw key. Between repaints the CLI writes only the cells it
+# believes changed, so a screen that has come to differ from what it drew stays
+# wrong: a retype puts the same diff onto the same wrong cells (seen live: a
+# screen changed behind the CLI's back kept failing the landed check through
+# every retype, and landed once repainted). Ctrl+L is bound to
+# chat:clearInput, whose handler in v2.1.319 is the same as chat:clearScreen's:
+# a full repaint from the CLI's own state, the draft kept (seen live in the
+# main-screen and the fullscreen renderer, and with the slash popup open; an
+# idle CLI repaints in ~0.03s). A retry sends it before its clear, so a release
+# that made the key clear the draft as its name says would cost nothing.
 _REPAINT_KEY = "C-l"
-# An idle CLI has repainted within ~0.03s of the key; the rest is for a busy one.
-_REPAINT_SETTLE = 0.3
 
 
 def codex_enter_settle(text_len: int) -> float:
@@ -773,8 +774,8 @@ def _composer_text(cap_text: str, marker: str) -> Optional[str]:
 
 
 def _clear_composer(pane: str, marker: str) -> None:
-    """Empty `pane`'s composer — the one `marker` opens — before a retry /
-    after giving up on a send.
+    """Empty `pane`'s composer — the one `marker` opens — going by what the
+    screen shows of it.
 
     Claude's composer removes at most one visual LINE per clearing press (see
     _CLEAR_KEYS), so a single press leaves most of a partial paste in place —
@@ -784,6 +785,9 @@ def _clear_composer(pane: str, marker: str) -> None:
     the pane can't be captured, fall back to queueing blind presses: a stalled
     pty delivers them after the buffered text whenever it wakes, clearing it
     line by line, and every extra press is a no-op on an empty composer.
+
+    The screen shows only what the CLI has drawn, never text still on its way
+    in, so once a send has typed, its retries clear with _queue_clear instead.
     """
     prev = None
     for _ in range(_CLEAR_VERIFY_TRIES):
@@ -796,6 +800,14 @@ def _clear_composer(pane: str, marker: str) -> None:
         prev = content
         send_keys(pane, *_CLEAR_KEYS)
         time.sleep(_CLEAR_POLL)
+    _queue_clear(pane)
+
+
+def _queue_clear(pane: str) -> None:
+    """Queue enough clearing presses to empty the fullest composer, without
+    reading the screen. The pty hands them to the CLI in order, after whatever
+    was sent before them, so they wipe text the CLI has not read yet as surely
+    as text it has drawn; on an empty composer each is a no-op."""
     for _ in range(_CLEAR_BLIND_PRESSES):
         send_keys(pane, *_CLEAR_KEYS)
 
@@ -821,15 +833,6 @@ def _send_debug(msg: str) -> None:
             f.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n")
     except OSError:
         pass
-
-
-def _debug_frame(cap: str, marker: str) -> str:
-    """The part of a captured screen a send-debug line records: the composer
-    region, whitespace-squeezed and whole (a clipped draft and a stale one
-    differ only past the head of the draft), or the screen's foot when no
-    composer is on it."""
-    idx = cap.rfind(marker)
-    return "".join(cap[idx:].split()) if idx != -1 else f"NO-MARKER tail={cap[-120:]!r}"
 
 
 def _literal_key_arg(text: str) -> str:
@@ -893,54 +896,61 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     Returns False if the text never lands after the retries — the caller then
     reports the failure rather than pressing Enter on a lost prompt.
 
-    A fully stalled TUI (frozen spinner, event loop wedged) never drops the
-    keystrokes at all — the pty buffers them and they land whenever the pane
-    wakes, possibly minutes after we've given up. Giving up therefore ends with
-    a cleanup clear queued behind everything we sent: when the pane wakes it
-    wipes the late-landing text, so "never landed" stays truthful and the
-    stranded prompt can't concatenate into the next send.
-
     The check reads the screen, and the screen can be out of step with the CLI
-    in two ways. A CLI that missed a shrink draws a long draft's end below the
-    last row, where it never shows (see _resync_size), so the size is resynced
-    before anything is read. And a screen can drift from the frame the CLI last
-    drew, which no retype repairs (see _REPAINT_KEY), so a miss is read again
-    after a repaint before it counts.
+    in three ways:
+
+    * A CLI that missed a shrink draws a long draft's end below the last row,
+      where it never shows (see _resync_size), so the size is resynced before
+      anything is read.
+    * A screen can differ from what the CLI drew, which no retype repairs (see
+      _REPAINT_KEY), so every retry starts with a repaint.
+    * A busy or stalled CLI has not drawn what it has not read: the pty buffers
+      our text, possibly for seconds, while the screen still shows the empty
+      composer. Cleared by the screen, a retry would send no clearing press
+      and type a second copy behind the first, and the check, which matches a
+      tail, would pass the doubled draft to Enter (seen live: a CLI stalled
+      for a second got three copies). So a retry clears blind (_queue_clear),
+      queued behind everything already sent, and so does giving up: when the
+      CLI wakes, the late text is wiped, "never landed" stays true, and
+      nothing is left to join the next send.
     """
     _resync_size(pane)
+    # Clear before the FIRST attempt too. Whatever is in the composer when we
+    # arrive takes the lead and our text lands appended to it — and the landed
+    # check below matches a TAIL, so the concatenation reads as a clean landing
+    # and the Enter submits the corrupted prompt. The leftover is usually the
+    # board's own previous send: submit-verify gives up with the text still
+    # sitting there, so pressing the card's Clear on a wedged session typed
+    # "/clear", failed to submit it, and the next Clear submitted the literal
+    # text "/clear/clear" — which Claude answers as prose ("type /clear on its
+    # own line") instead of clearing, leaving the session unclearable from the
+    # board for good.
+    _clear_composer(pane, marker)
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
-        # Clear before every attempt, the FIRST one included. Whatever is in the
-        # composer when we arrive takes the lead and our text lands appended to
-        # it — and the landed check below matches a TAIL, so the concatenation
-        # reads as a clean landing and the Enter submits the corrupted prompt.
-        # The leftover is usually the board's own previous send: submit-verify
-        # gives up with the text still sitting there, so pressing the card's
-        # Clear on a wedged session typed "/clear", failed to submit it, and the
-        # next Clear submitted the literal text "/clear/clear" — which Claude
-        # answers as prose ("type /clear on its own line") instead of clearing,
-        # leaving the session unclearable from the board for good.
-        _clear_composer(pane, marker)
+        if attempt:
+            send_keys(pane, _REPAINT_KEY)
+            _queue_clear(pane)
         literal = _send_literal(pane, text)
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
                         f"send-keys FAILED: {literal.get('error')!r}")
             return False
         time.sleep(wait)
-        before = capture_pane(pane).get("text", "")
-        if _tail_in(before, text, marker):
-            return True
-        send_keys(pane, _REPAINT_KEY)
-        time.sleep(_REPAINT_SETTLE)
         # One capture, both judged and logged: a miss records the very frame it
         # was decided on, not a later one the pane has since redrawn.
         cap = capture_pane(pane).get("text", "")
         if _tail_in(cap, text, marker):
-            _send_debug(f"landed pane={pane} attempt={attempt} only after a repaint, "
-                        f"frame before it={_debug_frame(before, marker)!r}")
+            if attempt:
+                _send_debug(f"landed pane={pane} attempt={attempt}")
             return True
+        # The composer region whole: a draft cut off by the pane's last row and
+        # one cut off by a stale screen differ only past the draft's head.
+        idx = cap.rfind(marker)
+        frame = ("".join(cap[idx:].split()) if idx != -1
+                 else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
-                    f"needle={_needle(text)!r} frame={_debug_frame(cap, marker)!r}")
-    _clear_composer(pane, marker)  # wipe the buffered text on wake
+                    f"needle={_needle(text)!r} frame={frame!r}")
+    _queue_clear(pane)  # wipe the buffered text on wake
     _send_debug(f"landed pane={pane} gave up after "
                 f"{len(_LANDED_VERIFY_WAITS)} attempts")
     return False

@@ -897,11 +897,11 @@ class SendTextVerifyLandedTests(unittest.TestCase):
 
     def test_resends_text_after_clearing_when_dropped_once(self):
         calls = []
-        # Dropped once (a miss, still a miss once repainted), lands, submits.
-        landed = iter([False, False, True, False])
+        landed = iter([False, True, False])  # dropped once, lands, submits
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
+                mock.patch.object(tmux, "_queue_clear") as qc, \
                 mock.patch.object(tmux, "_tail_in",
                                   side_effect=lambda *a: next(landed)):
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
@@ -909,14 +909,17 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         literals = [c for c in calls if "-l" in c]
         self.assertEqual(len(literals), 2)  # initial + one resend
         # Every attempt clears first, so neither a leftover from an earlier send
-        # nor a partial paste can concatenate into a corrupted prompt.
-        self.assertEqual(cc.call_args_list, [mock.call("%5", "❯")] * 2)
+        # nor a partial paste can concatenate into a corrupted prompt: the first
+        # by the screen, the resend blind, behind the text it may not show yet.
+        cc.assert_called_once_with("%5", "❯")
+        qc.assert_called_once_with("%5")
 
     def test_reports_failure_when_text_never_lands(self):
         calls = []
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
+                mock.patch.object(tmux, "_queue_clear") as qc, \
                 mock.patch.object(tmux, "_tail_in", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertFalse(r["ok"])
@@ -927,8 +930,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         # land AFTER we give up and would strand in the composer, corrupting the
         # next send. Giving up must end with a cleanup clear so the buffered
         # text is wiped whenever the pane wakes: one clear per attempt plus the
-        # final cleanup.
-        self.assertEqual(cc.call_count, len(tmux._LANDED_VERIFY_WAITS) + 1)
+        # final cleanup, all but the first queued blind.
+        cc.assert_called_once_with("%5", "❯")
+        self.assertEqual(qc.call_count, len(tmux._LANDED_VERIFY_WAITS))
 
     def test_landed_waits_escalate_for_laggy_panes(self):
         # A busy pane can take well over 0.15s to echo the paste; the between-
@@ -940,11 +944,9 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux, "_tail_in", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertFalse(r["ok"])
-        waits, settles = sleeps[0::2], sleeps[1::2]  # each miss is repainted
-        self.assertEqual(tuple(waits), tmux._LANDED_VERIFY_WAITS)
-        self.assertEqual(settles, [tmux._REPAINT_SETTLE] * len(waits))
-        self.assertEqual(waits, sorted(waits))  # never shrinks
-        self.assertGreaterEqual(sum(waits), 3.0)  # rides out multi-second lag
+        self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
+        self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
+        self.assertGreaterEqual(sum(sleeps), 3.0)  # rides out multi-second lag
 
 
 # /proc/<pid>/stat of a pane whose terminal's foreground process group is 4250.
@@ -1035,74 +1037,127 @@ class MissedShrinkTests(unittest.TestCase):
         self.assertEqual(pane.draft, "")  # the give-up clear wiped it
 
 
-class _DriftedScreenPane:
-    """A Claude pane whose screen has drifted from the frame the CLI last drew,
-    in the shape the failing sends logged: the marker, the head of the draft,
-    and the agents panel where the rest of the draft should be. The CLI writes
-    only the cells it believes changed, so clearing and retyping change its
-    draft but not that screen; every capture shows the same frame until Ctrl+L
-    makes it repaint."""
+class _OutOfStepPane:
+    """A Claude pane whose screen is out of step with what its CLI holds.
 
+    `stalled_for`: the CLI reads no input for that many seconds (of the send's
+    own sleeps). The pty keeps every key in order meanwhile, and the screen
+    keeps the frame it last drew.
+    `drifted`: the screen shows this frame instead of what the CLI drew, until
+    Ctrl+L makes the CLI repaint (`repaints=False`: not even then). The CLI
+    writes only the cells it believes changed, so clearing and retyping change
+    its draft but not that frame.
+    `draft`: what the composer holds when the send starts.
+
+    `submitted` records each draft Enter sent."""
+
+    RULE = "─" * 40
     PANEL = "  ◯ general-purpose  Collecting logs   1h 38m 42s · ↓ 383.1k tokens"
+    CLEAR = "clear"
 
-    def __init__(self, head, repaints=True):
-        self.repaints = repaints  # False: a screen even a repaint leaves wrong
-        self.drifted = f"● earlier turn\n{'─' * 40}\n❯ {head}\n{self.PANEL}\n"
-        self.draft = ""
-        self.typed = 0
-        self.repainted = 0
-        self.enters = 0
+    def __init__(self, *, stalled_for=0.0, drifted=None, repaints=True, draft=""):
+        self.now, self.wakes = 0.0, stalled_for
+        self.drifted, self.repaints = drifted, repaints
+        self.draft = draft
+        self.pending = []  # keys the CLI has not read yet
+        self.drawn = self.frame()
+        self.submitted = []
 
-    def screen(self):
-        if self.drifted is not None:
-            return self.drifted
-        rule = "─" * 40
+    def frame(self):
         rows = [self.draft[i:i + 30] for i in range(0, len(self.draft), 30)] or [""]
-        return (f"● earlier turn\n{rule}\n❯ " + "\n  ".join(rows)
-                + f"\n{rule}\n  ⏵⏵ bypass permissions on\n\n{self.PANEL}\n")
+        return (f"● earlier turn\n{self.RULE}\n❯ " + "\n  ".join(rows)
+                + f"\n{self.RULE}\n  ⏵⏵ bypass permissions on\n\n{self.PANEL}\n")
+
+    def read_input(self):
+        if self.now < self.wakes:
+            return
+        for key in self.pending:
+            if key == self.CLEAR:
+                self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
+            elif key == tmux._REPAINT_KEY:
+                if self.repaints:
+                    self.drifted = None
+            elif key == "Enter":
+                self.submitted.append(self.draft)
+                self.draft = ""
+            else:
+                self.draft += key
+        self.pending = []
+        self.drawn = self.frame()
 
     def run(self, argv, **kw):
         if "capture-pane" in argv:
-            return FakeProc(stdout=self.screen())
+            self.read_input()
+            return FakeProc(stdout=self.drawn if self.drifted is None else self.drifted)
         if "-l" in argv:
-            self.draft += argv[-1]
-            self.typed += 1
+            self.pending.append(argv[-1])
         elif tuple(argv[-3:]) == tmux._CLEAR_KEYS:
-            self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
-        elif argv[-1] == tmux._REPAINT_KEY:
-            self.repainted += 1
-            if self.repaints:
-                self.drifted = None
-        elif argv[-1] == "Enter":
-            self.enters += 1
-            self.draft = ""
+            self.pending.append(self.CLEAR)
+        elif argv[-1] in (tmux._REPAINT_KEY, "Enter"):
+            self.pending.append(argv[-1])
         return FakeProc()
 
+    def sleep(self, seconds):
+        self.now += seconds
+
     def send(self, text):
-        with _patch_run(self.run), mock.patch.object(tmux.time, "sleep"):
+        with _patch_run(self.run), mock.patch.object(tmux.time, "sleep", side_effect=self.sleep):
             return tmux.send_text("%5", text, verify_landed=True, marker="❯")
 
+    def wake(self):
+        """Let the CLI read whatever is still queued, as it does when it wakes."""
+        self.now = float("inf")
+        self.read_input()
 
-class DriftedScreenTests(unittest.TestCase):
-    """A screen out of step with the CLI shows the same wrong frame however
-    often the draft is cleared and retyped, so a miss is read again after the
-    CLI repaints before it counts."""
+
+class OutOfStepScreenTests(unittest.TestCase):
+    """The landed check reads the screen, and the screen can trail the CLI: a
+    retry repaints before it reads, and clears blind, behind whatever it has
+    already typed, so a prompt goes out once, whole and alone, or not at all."""
 
     TEXT = "这是一段很长的中文提示，用来模拟一次多行的输入。" * 16 + "结尾标记END"
 
-    def test_a_miss_is_reread_after_a_repaint_and_the_prompt_goes_out(self):
-        pane = _DriftedScreenPane(head=self.TEXT[:40])
-        r = pane.send(self.TEXT)
-        self.assertTrue(r["ok"])
-        self.assertEqual((pane.typed, pane.repainted, pane.enters), (1, 1, 1))
+    def test_a_drifted_screen_is_repainted_and_the_prompt_goes_out(self):
+        # The shape the failing sends logged: the marker and the draft's head,
+        # then the agents panel where the rest of the draft should be.
+        pane = _OutOfStepPane(drifted=f"● earlier turn\n{_OutOfStepPane.RULE}\n"
+                                      f"❯ {self.TEXT[:40]}\n{_OutOfStepPane.PANEL}\n")
+        self.assertTrue(pane.send(self.TEXT)["ok"])
+        self.assertEqual(pane.submitted, [self.TEXT])
+
+    def test_a_leftover_a_drifted_screen_hides_does_not_go_out_with_the_prompt(self):
+        # The screen shows an empty composer that in fact holds an earlier
+        # send's leftover. Typed after it, the prompt's tail is there once the
+        # CLI repaints, but so is the leftover in front of it.
+        empty = f"● earlier turn\n{_OutOfStepPane.RULE}\n❯ \n{_OutOfStepPane.RULE}\n"
+        pane = _OutOfStepPane(drifted=empty, draft="/clear")
+        self.assertTrue(pane.send(self.TEXT)["ok"])
+        self.assertEqual(pane.submitted, [self.TEXT])
 
     def test_a_screen_the_repaint_leaves_wrong_never_gets_enter(self):
-        pane = _DriftedScreenPane(head=self.TEXT[:40], repaints=False)
-        r = pane.send(self.TEXT)
-        self.assertFalse(r["ok"])
-        self.assertEqual(pane.typed, len(tmux._LANDED_VERIFY_WAITS))
-        self.assertEqual(pane.repainted, len(tmux._LANDED_VERIFY_WAITS))
-        self.assertEqual(pane.enters, 0)
+        pane = _OutOfStepPane(drifted=f"● earlier turn\n❯ {self.TEXT[:40]}\n", repaints=False)
+        self.assertFalse(pane.send(self.TEXT)["ok"])
+        pane.wake()
+        self.assertEqual(pane.submitted, [])
+        self.assertEqual(pane.draft, "")  # the give-up clear wiped it
+
+    def test_a_stalled_cli_gets_the_prompt_once(self):
+        # Stalled past the first checks, the screen shows an empty composer
+        # while our text waits in the pty. A retry that went by that screen
+        # pressed nothing and typed a second copy behind the first, and the
+        # tail check passed the doubled draft to Enter.
+        for text in (self.TEXT, "/goal " + self.TEXT):
+            with self.subTest(text[:6]):
+                pane = _OutOfStepPane(stalled_for=1.0)
+                self.assertTrue(pane.send(text)["ok"])
+                self.assertEqual(pane.submitted, [text])
+
+    def test_a_cli_stalled_past_every_check_is_left_nothing_to_wake_to(self):
+        pane = _OutOfStepPane(stalled_for=60.0)
+        self.assertFalse(pane.send(self.TEXT)["ok"])
+        pane.wake()
+        self.assertEqual(pane.submitted, [])
+        self.assertEqual(pane.draft, "")  # every copy typed was wiped behind it
 
 
 class ResyncSizeTests(unittest.TestCase):
