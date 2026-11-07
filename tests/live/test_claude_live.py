@@ -9,9 +9,10 @@ text. These tests take sessions through the board's own code paths:
   a spawn into a never-trusted directory gets its trust prompt answered;
   then one session, in file order: card found → banner read → prompt lands and
   is answered → a prompt sent over an open Rewind panel lands → a repaint
-  keeps a long draft → the /model dialog commits a pick. Apart from those, the
-  usage probe starts a throwaway session of its own and reads /status and
-  /usage off it.
+  brings back a screen wiped behind the CLI's back → the /model dialog
+  commits a pick.
+  Apart from those, the usage probe starts a throwaway session of its own and
+  reads /status and /usage off it.
 
 Per CLAUDE.md, sessions run on haiku and every prompt here goes to one of them.
 They run on a tmux server of their own (`tmux -L claude-board-live-<pid>`), so
@@ -211,18 +212,23 @@ def test_send_clears_an_open_rewind_panel(live):
     _ask(live)
 
 
-def test_repaint_keeps_the_draft(live):
-    # A landed check that misses is read again after Claude repaints
-    # (tmux._REPAINT_KEY): its screen can drift from what it drew, and no
-    # retype repairs that. The repaint must leave the draft in place.
-    # Nothing is submitted, so no model is called.
+def test_a_repaint_brings_back_a_screen_out_of_step_with_the_cli(live):
+    # Claude writes only the cells it believes changed, so a screen that differs
+    # from what it drew (here: wiped behind its back) stays wrong until it
+    # repaints. Every landed-check retry counts on tmux._REPAINT_KEY doing
+    # that. Nothing is submitted, so no model is called.
     assert _wait_for(lambda: _composer(live), 20), "no composer to type into"
     draft = "这是一段用来测试的长提示，" * 30 + "ENDOFDRAFT"
     try:
         assert tmux._send_until_landed(live.pane, draft, "❯"), "the draft never landed"
-        tmux.send_keys(live.pane, tmux._REPAINT_KEY)
+        with open(live.tty, "w") as tty:
+            tty.write("\033[H\033[2J")
         time.sleep(1)
-        assert tmux._tail_in(_pane_text(live), draft, "❯"), "the repaint lost the draft"
+        assert not tmux._tail_in(_pane_text(live), draft, "❯"), \
+            "the CLI redrew the wiped screen by itself"
+        tmux.send_keys(live.pane, tmux._REPAINT_KEY)
+        assert _wait_for(lambda: tmux._tail_in(_pane_text(live), draft, "❯"), 5), \
+            "the repaint did not bring the draft back"
     finally:
         tmux._clear_composer(live.pane, "❯")
 
