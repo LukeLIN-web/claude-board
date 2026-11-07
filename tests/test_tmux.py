@@ -963,6 +963,7 @@ class _MissedShrinkPane:
         self.draft = ""
         self.typed = 0
         self.presses = 0
+        self.enters = 0
 
     def screen(self):
         rule = "─" * 40
@@ -978,7 +979,7 @@ class _MissedShrinkPane:
         if "capture-pane" in argv:
             return FakeProc(stdout=self.screen())
         if "display-message" in argv:
-            return FakeProc(stdout="4242\n")
+            return FakeProc(stdout="4242\n" if argv[-1] == "#{pane_pid}" else "")
         if "-l" in argv:
             self.draft += argv[-1]
             self.typed += 1
@@ -986,6 +987,7 @@ class _MissedShrinkPane:
             self.presses += 1
             self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
         elif argv[-1] == "Enter":
+            self.enters += 1
             self.draft = ""
         return FakeProc()
 
@@ -1024,6 +1026,7 @@ class MissedShrinkTests(unittest.TestCase):
         r = pane.send(self.TEXT)
         self.assertFalse(r["ok"])
         self.assertEqual(pane.typed, len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(pane.enters, 0)
         self.assertEqual(pane.draft, "")  # the give-up clear wiped it
 
 
@@ -1038,6 +1041,8 @@ class ResyncSizeTests(unittest.TestCase):
                 mock.patch("core.tmux.open", opener, create=True), \
                 mock.patch.object(tmux.os, "killpg") as killpg:
             tmux._resync_size("%5")
+        if pid:  # the pane's process's stat, never the board's own
+            opener.assert_called_once_with(f"/proc/{pid}/stat")
         return killpg
 
     def test_signals_the_foreground_group_not_the_panes_process(self):
