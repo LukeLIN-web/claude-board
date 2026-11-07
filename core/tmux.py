@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -829,6 +830,37 @@ def _send_literal(pane: str, text: str) -> dict:
     return _outcome(_run("send-keys", "-t", pane, "-l", "--", _literal_key_arg(text)))
 
 
+def _resync_size(pane: str) -> None:
+    """Have the program in `pane` re-read the window size, by sending it the
+    SIGWINCH a resize sends.
+
+    A program that misses a resize keeps drawing for the old size, and a missed
+    shrink hides a long draft from the landed check: Claude Code gives its
+    composer a share of the rows it believes it has, so laid out for a taller
+    window, its frame runs past the pane's last row. The draft's end, the rule
+    and the status line under it all land on that last row, so no wait and no
+    retype ever shows the end _tail_in looks for, and an empty composer reads as
+    holding the status line. A program already at the right size re-reads the
+    same size and redraws nothing.
+
+    The kernel signals a resize to the terminal's foreground process group,
+    which is the CLI even when a shell started it; so does this. Linux-only
+    (reads /proc) and best-effort: a pane whose process can't be resolved or
+    signalled is left as it is."""
+    pid = _display(pane, "#{pane_pid}")
+    if not pid:
+        return
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            # The fields after "(comm)" (which may hold spaces or parens):
+            # state ppid pgrp session tty_nr tpgid ...
+            tpgid = int(f.read().rsplit(")", 1)[1].split()[5])
+        if tpgid > 0:
+            os.killpg(tpgid, signal.SIGWINCH)
+    except (OSError, ValueError, IndexError):
+        pass
+
+
 def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
@@ -847,7 +879,13 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     a cleanup clear queued behind everything we sent: when the pane wakes it
     wipes the late-landing text, so "never landed" stays truthful and the
     stranded prompt can't concatenate into the next send.
+
+    The check reads the screen, so it is only as good as the CLI's idea of the
+    pane's size: one that missed a shrink draws a long draft's end below the
+    last row, where it never shows (see _resync_size). The size is resynced
+    before anything is read.
     """
+    _resync_size(pane)
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         # Clear before every attempt, the FIRST one included. Whatever is in the
         # composer when we arrive takes the lead and our text lands appended to
