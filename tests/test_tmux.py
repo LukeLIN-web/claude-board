@@ -867,6 +867,8 @@ class SendTextVerifyLandedTests(unittest.TestCase):
         # Landing first try still costs one clear: the composer is emptied
         # before the text is typed, never after it lands.
         cc.assert_called_once_with("%5", "❯")
+        # A screen that shows the text is believed: no repaint.
+        self.assertNotIn(tmux._REPAINT_KEY, [c[-1] for c in calls])
 
     def test_composer_is_cleared_before_the_first_keystroke(self):
         # Regression: the clear used to run only on RETRIES, so whatever a
@@ -895,7 +897,8 @@ class SendTextVerifyLandedTests(unittest.TestCase):
 
     def test_resends_text_after_clearing_when_dropped_once(self):
         calls = []
-        landed = iter([False, True, False])  # dropped once, lands, submits
+        # Dropped once (a miss, still a miss once repainted), lands, submits.
+        landed = iter([False, False, True, False])
         with _patch_run(_recorder(calls)), \
                 mock.patch.object(tmux.time, "sleep"), \
                 mock.patch.object(tmux, "_clear_composer") as cc, \
@@ -937,9 +940,11 @@ class SendTextVerifyLandedTests(unittest.TestCase):
                 mock.patch.object(tmux, "_tail_in", return_value=False):
             r = tmux.send_text("%5", "hello", verify_landed=True, marker="❯")
         self.assertFalse(r["ok"])
-        self.assertEqual(tuple(sleeps), tmux._LANDED_VERIFY_WAITS)
-        self.assertEqual(sleeps, sorted(sleeps))  # never shrinks
-        self.assertGreaterEqual(sum(sleeps), 3.0)  # rides out multi-second lag
+        waits, settles = sleeps[0::2], sleeps[1::2]  # each miss is repainted
+        self.assertEqual(tuple(waits), tmux._LANDED_VERIFY_WAITS)
+        self.assertEqual(settles, [tmux._REPAINT_SETTLE] * len(waits))
+        self.assertEqual(waits, sorted(waits))  # never shrinks
+        self.assertGreaterEqual(sum(waits), 3.0)  # rides out multi-second lag
 
 
 # /proc/<pid>/stat of a pane whose terminal's foreground process group is 4250.
@@ -1028,6 +1033,76 @@ class MissedShrinkTests(unittest.TestCase):
         self.assertEqual(pane.typed, len(tmux._LANDED_VERIFY_WAITS))
         self.assertEqual(pane.enters, 0)
         self.assertEqual(pane.draft, "")  # the give-up clear wiped it
+
+
+class _DriftedScreenPane:
+    """A Claude pane whose screen has drifted from the frame the CLI last drew,
+    in the shape the failing sends logged: the marker, the head of the draft,
+    and the agents panel where the rest of the draft should be. The CLI writes
+    only the cells it believes changed, so clearing and retyping change its
+    draft but not that screen; every capture shows the same frame until Ctrl+L
+    makes it repaint."""
+
+    PANEL = "  ◯ general-purpose  Collecting logs   1h 38m 42s · ↓ 383.1k tokens"
+
+    def __init__(self, head, repaints=True):
+        self.repaints = repaints  # False: a screen even a repaint leaves wrong
+        self.drifted = f"● earlier turn\n{'─' * 40}\n❯ {head}\n{self.PANEL}\n"
+        self.draft = ""
+        self.typed = 0
+        self.repainted = 0
+        self.enters = 0
+
+    def screen(self):
+        if self.drifted is not None:
+            return self.drifted
+        rule = "─" * 40
+        rows = [self.draft[i:i + 30] for i in range(0, len(self.draft), 30)] or [""]
+        return (f"● earlier turn\n{rule}\n❯ " + "\n  ".join(rows)
+                + f"\n{rule}\n  ⏵⏵ bypass permissions on\n\n{self.PANEL}\n")
+
+    def run(self, argv, **kw):
+        if "capture-pane" in argv:
+            return FakeProc(stdout=self.screen())
+        if "-l" in argv:
+            self.draft += argv[-1]
+            self.typed += 1
+        elif tuple(argv[-3:]) == tmux._CLEAR_KEYS:
+            self.draft = self.draft[:(len(self.draft) - 1) // 30 * 30]  # one row
+        elif argv[-1] == tmux._REPAINT_KEY:
+            self.repainted += 1
+            if self.repaints:
+                self.drifted = None
+        elif argv[-1] == "Enter":
+            self.enters += 1
+            self.draft = ""
+        return FakeProc()
+
+    def send(self, text):
+        with _patch_run(self.run), mock.patch.object(tmux.time, "sleep"):
+            return tmux.send_text("%5", text, verify_landed=True, marker="❯")
+
+
+class DriftedScreenTests(unittest.TestCase):
+    """A screen out of step with the CLI shows the same wrong frame however
+    often the draft is cleared and retyped, so a miss is read again after the
+    CLI repaints before it counts."""
+
+    TEXT = "这是一段很长的中文提示，用来模拟一次多行的输入。" * 16 + "结尾标记END"
+
+    def test_a_miss_is_reread_after_a_repaint_and_the_prompt_goes_out(self):
+        pane = _DriftedScreenPane(head=self.TEXT[:40])
+        r = pane.send(self.TEXT)
+        self.assertTrue(r["ok"])
+        self.assertEqual((pane.typed, pane.repainted, pane.enters), (1, 1, 1))
+
+    def test_a_screen_the_repaint_leaves_wrong_never_gets_enter(self):
+        pane = _DriftedScreenPane(head=self.TEXT[:40], repaints=False)
+        r = pane.send(self.TEXT)
+        self.assertFalse(r["ok"])
+        self.assertEqual(pane.typed, len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(pane.repainted, len(tmux._LANDED_VERIFY_WAITS))
+        self.assertEqual(pane.enters, 0)
 
 
 class ResyncSizeTests(unittest.TestCase):
