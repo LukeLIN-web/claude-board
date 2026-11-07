@@ -592,6 +592,19 @@ _SUBMIT_VERIFY_WAIT = 0.4
 # and a fixed short wait misreports that lag as a dropped prompt.
 _LANDED_VERIFY_WAITS = (0.15, 0.5, 1.2, 2.5)
 
+# Claude Code's redraw key. Between repaints the CLI writes only the cells it
+# believes changed, so a screen that has come to differ from what it drew stays
+# wrong: a retype puts the same diff onto the same wrong cells (seen live: a
+# screen changed behind the CLI's back kept failing the landed check through
+# every retype, and landed once repainted). Ctrl+L is bound to
+# chat:clearInput, whose handler in v2.1.319 is the same as chat:clearScreen's:
+# a full repaint from the CLI's own state, the draft kept (seen live in the
+# main-screen and the fullscreen renderer, and with the slash popup open; an
+# idle CLI repaints in ~0.03s). Every landed-check attempt sends it before its
+# clear, so a release that made the key clear the draft as its name says would
+# cost nothing.
+_REPAINT_KEY = "C-l"
+
 
 def codex_enter_settle(text_len: int) -> float:
     """Length-scaled settle before Codex's submit Enter (see _CODEX_ENTER_SETTLE)."""
@@ -762,8 +775,8 @@ def _composer_text(cap_text: str, marker: str) -> Optional[str]:
 
 
 def _clear_composer(pane: str, marker: str) -> None:
-    """Empty `pane`'s composer — the one `marker` opens — before a retry /
-    after giving up on a send.
+    """Empty `pane`'s composer — the one `marker` opens — going by what the
+    screen shows of it.
 
     Claude's composer removes at most one visual LINE per clearing press (see
     _CLEAR_KEYS), so a single press leaves most of a partial paste in place —
@@ -773,6 +786,10 @@ def _clear_composer(pane: str, marker: str) -> None:
     the pane can't be captured, fall back to queueing blind presses: a stalled
     pty delivers them after the buffered text whenever it wakes, clearing it
     line by line, and every extra press is a no-op on an empty composer.
+
+    The screen shows only what the CLI has drawn: not text still on its way in,
+    and not text a screen out of step with the CLI has lost. Claude's send path
+    clears with _queue_clear instead (see _send_until_landed).
     """
     prev = None
     for _ in range(_CLEAR_VERIFY_TRIES):
@@ -785,8 +802,17 @@ def _clear_composer(pane: str, marker: str) -> None:
         prev = content
         send_keys(pane, *_CLEAR_KEYS)
         time.sleep(_CLEAR_POLL)
-    for _ in range(_CLEAR_BLIND_PRESSES):
-        send_keys(pane, *_CLEAR_KEYS)
+    _queue_clear(pane)
+
+
+def _queue_clear(pane: str) -> None:
+    """Queue enough clearing presses to empty the fullest composer, without
+    reading the screen. The pty hands them to the CLI in order, after whatever
+    was sent before them, so they wipe text the CLI has not read yet as surely
+    as text it has drawn; on an empty composer each is a no-op. One send-keys
+    carries them all: the CLI takes keys that arrive together in order, one
+    after another."""
+    send_keys(pane, *(_CLEAR_KEYS * _CLEAR_BLIND_PRESSES))
 
 
 # Post-mortem trace for the send path: landed-verify attempts append what the
@@ -797,6 +823,10 @@ def _clear_composer(pane: str, marker: str) -> None:
 _SEND_DEBUG_LOG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     f"send_debug.{os.uname().nodename}.log")
+
+
+# How much of a missed frame a send-debug line keeps.
+_DEBUG_FRAME_MAX = 4000
 
 
 def _send_debug(msg: str) -> None:
@@ -868,22 +898,29 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     never arrives and a following Enter submits nothing — the prompt vanishes
     with no transcript trace (the dashboard then shows a phantom "Queued"). Re-
     send until the composer holds our text, clearing the composer before EVERY
-    attempt (see _clear_composer) so nothing already sitting there can
+    attempt (see _queue_clear) so nothing already sitting there can
     concatenate into a corrupted prompt.
     Returns False if the text never lands after the retries — the caller then
     reports the failure rather than pressing Enter on a lost prompt.
 
-    A fully stalled TUI (frozen spinner, event loop wedged) never drops the
-    keystrokes at all — the pty buffers them and they land whenever the pane
-    wakes, possibly minutes after we've given up. Giving up therefore ends with
-    a cleanup clear queued behind everything we sent: when the pane wakes it
-    wipes the late-landing text, so "never landed" stays truthful and the
-    stranded prompt can't concatenate into the next send.
+    The check reads the screen, and the screen can be out of step with the CLI
+    in three ways:
 
-    The check reads the screen, so it is only as good as the CLI's idea of the
-    pane's size: one that missed a shrink draws a long draft's end below the
-    last row, where it never shows (see _resync_size). The size is resynced
-    before anything is read.
+    * A CLI that missed a shrink draws a long draft's end below the last row,
+      where it never shows (see _resync_size), so the size is resynced before
+      anything is read.
+    * A screen can differ from what the CLI drew, which no retype repairs (see
+      _REPAINT_KEY), so every attempt starts with a repaint.
+    * A busy or stalled CLI has not drawn what it has not read: the pty buffers
+      our text, possibly for seconds, while the screen still shows the empty
+      composer. Cleared by the screen, a retry would send no clearing press
+      and type a second copy behind the first, and the check, which matches a
+      tail, would pass the doubled draft to Enter (seen live: a CLI stalled
+      for a second got three copies). So every attempt clears blind
+      (_queue_clear), queued behind everything already sent, and so does
+      giving up: when the CLI wakes, the late text is wiped, "never landed"
+      stays true, and nothing is left to join the next send. A blind clear
+      also wipes a leftover that a screen out of step shows as empty.
     """
     _resync_size(pane)
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
@@ -897,7 +934,8 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
         # next Clear submitted the literal text "/clear/clear" — which Claude
         # answers as prose ("type /clear on its own line") instead of clearing,
         # leaving the session unclearable from the board for good.
-        _clear_composer(pane, marker)
+        send_keys(pane, _REPAINT_KEY)
+        _queue_clear(pane)
         literal = _send_literal(pane, text)
         if not literal["ok"]:
             _send_debug(f"landed pane={pane} attempt={attempt} "
@@ -908,13 +946,18 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
         # was decided on, not a later one the pane has since redrawn.
         cap = capture_pane(pane).get("text", "")
         if _tail_in(cap, text, marker):
+            if attempt:
+                _send_debug(f"landed pane={pane} attempt={attempt}")
             return True
+        # The composer region, bounded since the log is never rotated: a draft
+        # cut off by the pane's last row and one cut off by a stale screen
+        # differ only past the draft's head.
         idx = cap.rfind(marker)
-        frame = ("".join(cap[idx:].split())[:200] if idx != -1
+        frame = ("".join(cap[idx:].split())[:_DEBUG_FRAME_MAX] if idx != -1
                  else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
                     f"needle={_needle(text)!r} frame={frame!r}")
-    _clear_composer(pane, marker)  # wipe the buffered text on wake
+    _queue_clear(pane)  # wipe the buffered text on wake
     _send_debug(f"landed pane={pane} gave up after "
                 f"{len(_LANDED_VERIFY_WAITS)} attempts")
     return False
