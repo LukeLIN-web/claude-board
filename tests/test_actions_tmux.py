@@ -1528,63 +1528,83 @@ _TRUST_PROMPT_ON_YES = _TRUST_PROMPT.replace(
     " \u276f No, exit\n   Yes", "   No, exit\n \u276f Yes")
 
 
-class TrustPromptTests(unittest.TestCase):
-    """The folder-trust prompt: recognizing it, and answering it by its cursor.
+# Claude's Bypass Permissions warning (2.1.319, captured off a live pane): the
+# other startup gate, raised by --dangerously-skip-permissions until the host
+# has accepted it once. Same shape as the trust prompt — no numbers, cursor
+# opening on "No, exit".
+_BYPASS_WARNING = fixture_text("claude_bypass_warning.txt")
+_BYPASS_WARNING_ON_YES = _BYPASS_WARNING.replace(
+    "\u276f No, exit\n    Yes", "  No, exit\n  \u276f Yes")
+
+# Each gate as it opens and after one Down, with the name and Yes row it has.
+_GATES = (("trust prompt", _TRUST_PROMPT, _TRUST_PROMPT_ON_YES, "Yes, I trust this folder"),
+          ("bypass warning", _BYPASS_WARNING, _BYPASS_WARNING_ON_YES, "Yes, I accept"))
+
+
+class StartupGateTests(unittest.TestCase):
+    """Claude's startup gates: recognizing them, and answering them by cursor.
 
     Every other dialog the board answers is a numbered list, so "approve" is the
-    digit 1. This one has no numbers — the digit lands on nothing and the card
+    digit 1. These have no numbers — the digit lands on nothing and the card
     stays waiting — and Enter commits whatever the cursor is on, which starts on
     "No, exit". Both halves are load-bearing: reach the Yes row, and never press
     Enter without having read the cursor onto it.
     """
 
-    def test_recognizes_the_prompt(self):
-        self.assertTrue(actions.trust_prompt_up(_TRUST_PROMPT))
-        self.assertTrue(actions.trust_prompt_up(_TRUST_PROMPT_ON_YES))
+    def test_recognizes_each_gate(self):
+        for gate, opened, on_yes, _ in _GATES:
+            with self.subTest(gate):
+                self.assertEqual(actions.gate_up(opened), gate)
+                self.assertEqual(actions.gate_up(on_yes), gate)
 
-    def test_other_dialogs_are_not_the_trust_prompt(self):
-        self.assertFalse(actions.trust_prompt_up(_PICKER_TEXT))
-        self.assertFalse(actions.trust_prompt_up(_LIVE_TEXT))
+    def test_other_screens_are_not_gates(self):
+        self.assertEqual(actions.gate_up(_PICKER_TEXT), "")
+        self.assertEqual(actions.gate_up(_LIVE_TEXT), "")
         # One label alone is a session that printed the words, not the dialog.
-        self.assertFalse(actions.trust_prompt_up("I said: Yes, I trust this folder"))
+        self.assertEqual(actions.gate_up("I said: Yes, I trust this folder"), "")
+        self.assertEqual(actions.gate_up("Yes, I accept"), "")
 
     def test_cursor_label_reads_the_selected_option(self):
-        self.assertEqual(actions._trust_cursor_label(_TRUST_PROMPT), "No, exit")
-        self.assertEqual(actions._trust_cursor_label(_TRUST_PROMPT_ON_YES),
-                         "Yes, I trust this folder")
+        for gate, opened, on_yes, yes in _GATES:
+            with self.subTest(gate):
+                self.assertEqual(actions._gate_cursor_label(opened), "No, exit")
+                self.assertEqual(actions._gate_cursor_label(on_yes), yes)
 
     def test_cursor_label_ignores_the_composer_prompt(self):
         # The composer and every queued message draw "\u276f " too; neither is an
         # option, and mistaking one for the cursor would commit the wrong row.
-        self.assertEqual(actions._trust_cursor_label(_LIVE_TEXT), "")
-        self.assertEqual(actions._trust_cursor_label("\u276f do the thing"), "")
+        self.assertEqual(actions._gate_cursor_label(_LIVE_TEXT), "")
+        self.assertEqual(actions._gate_cursor_label("\u276f do the thing"), "")
 
     def test_steps_onto_yes_then_confirms(self):
         # Cursor on No, then on Yes after the Down, then the dialog is gone.
-        with _pane(_TRUST_PROMPT, _TRUST_PROMPT_ON_YES, _LIVE_TEXT) as p:
-            r = actions.answer_trust_prompt("%0")
-        self.assertTrue(r["ok"])
-        self.assertTrue(r["answered"])
-        self.assertEqual(p.sent, [("Down",), ("Enter",)])
+        for gate, opened, on_yes, yes in _GATES:
+            with self.subTest(gate), _pane(opened, on_yes, _LIVE_TEXT) as p:
+                r = actions.answer_gate("%0", gate)
+                self.assertTrue(r["ok"])
+                self.assertTrue(r["answered"])
+                self.assertEqual(r["label"], yes)
+                self.assertEqual(p.sent, [("Down",), ("Enter",)])
 
     def test_never_confirms_a_cursor_it_could_not_move(self):
         # A dialog whose cursor never reaches Yes must be left alone: Enter here
         # would commit "No, exit" and kill the session.
-        with _pane(_TRUST_PROMPT) as p:
-            r = actions.answer_trust_prompt("%0")
-        self.assertFalse(r["ok"])
-        self.assertNotIn(("Enter",), p.sent)
+        for gate, opened, _, _ in _GATES:
+            with self.subTest(gate), _pane(opened) as p:
+                r = actions.answer_gate("%0", gate)
+                self.assertFalse(r["ok"])
+                self.assertNotIn(("Enter",), p.sent)
 
     def test_unreadable_pane_sends_nothing(self):
         with _pane() as p:
             p.capture_pane.side_effect = lambda *a, **k: {"ok": False}
-            r = actions.answer_trust_prompt("%0")
+            r = actions.answer_gate("%0", "trust prompt")
         self.assertFalse(r["ok"])
         p.send_keys.assert_not_called()
 
-    def test_already_answered_prompt_is_a_no_op(self):
+    def test_already_answered_gate_is_a_no_op(self):
         with _pane(_LIVE_TEXT) as p:
-            r = actions.answer_trust_prompt("%0")
+            r = actions.answer_gate("%0", "trust prompt")
         self.assertTrue(r["ok"])
         self.assertFalse(r["answered"])
         p.send_keys.assert_not_called()
@@ -1593,8 +1613,8 @@ class TrustPromptTests(unittest.TestCase):
 class RespondPermissionRoutingTests(unittest.TestCase):
     """Which dialog is on screen decides how "approve" is delivered."""
 
-    def _respond(self, pane_text, choice="approve"):
-        with _pane(pane_text, window=_fake_window("/dev/pts/9"), pane="%0") as p:
+    def _respond(self, *screens, choice="approve"):
+        with _pane(*screens, window=_fake_window("/dev/pts/9"), pane="%0") as p:
             r = actions.respond_permission(p.card, choice)
         return r, p.sent
 
@@ -1603,32 +1623,48 @@ class RespondPermissionRoutingTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(sent, [("1",)])
 
-    def test_trust_prompt_is_not_answered_with_a_digit(self):
-        # The bug this guards: "1" is swallowed by the trust dialog, so the card
-        # went on reading "waiting for your input" no matter how often it was
-        # clicked. Here the pane never leaves the prompt, so the attempt fails —
-        # what matters is that it never sent a digit that does nothing.
-        r, sent = self._respond(_TRUST_PROMPT)
-        self.assertFalse(r["ok"])
-        self.assertNotIn(("1",), sent)
+    def test_gate_is_not_answered_with_a_digit(self):
+        # The bug this guards: "1" is swallowed by a gate, so the card went on
+        # reading "waiting for your input" no matter how often it was clicked.
+        # Here the pane never leaves the gate, so the attempt fails — what
+        # matters is that it never sent a digit that does nothing.
+        for gate, opened, _, _ in _GATES:
+            with self.subTest(gate):
+                r, sent = self._respond(opened)
+                self.assertFalse(r["ok"])
+                self.assertNotIn(("1",), sent)
 
-    def test_deny_is_escape_on_the_trust_prompt(self):
-        r, sent = self._respond(_TRUST_PROMPT, choice="deny")
-        self.assertEqual(sent, [("Escape",)])
+    def test_approve_answers_the_gate_on_screen(self):
+        # The route reads the pane once to pick the gate, then answer_gate reads
+        # it again before every key.
+        for gate, opened, on_yes, _ in _GATES:
+            with self.subTest(gate):
+                r, sent = self._respond(opened, opened, on_yes, _LIVE_TEXT)
+                self.assertTrue(r["answered"])
+                self.assertEqual(r["choice"], "approve")
+                self.assertEqual(sent, [("Down",), ("Enter",)])
+
+    def test_deny_is_escape_on_a_gate(self):
+        for gate, opened, _, _ in _GATES:
+            with self.subTest(gate):
+                r, sent = self._respond(opened, choice="deny")
+                self.assertEqual(sent, [("Escape",)])
 
 
 class PaneDialogTests(unittest.TestCase):
     """One capture, both facts the snapshot needs about an open dialog. (No tty,
     no pane and a failed capture are PaneMenuActiveTests'.)"""
 
-    def test_trust_prompt_is_a_menu_and_names_itself(self):
-        self.assertEqual(_pane_dialog(_TRUST_PROMPT), {"menu": True, "trust": True})
+    def test_a_gate_is_a_menu_and_names_itself(self):
+        for gate, opened, _, _ in _GATES:
+            with self.subTest(gate):
+                self.assertEqual(_pane_dialog(opened), {"menu": True, "gate": gate})
 
-    def test_other_picker_is_a_menu_but_not_trust(self):
-        self.assertEqual(_pane_dialog(_PICKER_TEXT), {"menu": True, "trust": False})
+    def test_other_picker_is_a_menu_but_not_a_gate(self):
+        self.assertEqual(_pane_dialog(_PICKER_TEXT), {"menu": True, "gate": ""})
 
     def test_live_pane_has_no_dialog(self):
-        self.assertEqual(_pane_dialog(_LIVE_TEXT), {"menu": False, "trust": False})
+        self.assertEqual(_pane_dialog(_LIVE_TEXT), {"menu": False, "gate": ""})
 
 
 class ConfirmTrustPromptTests(unittest.TestCase):
@@ -1702,6 +1738,15 @@ class ConfirmTrustPromptTests(unittest.TestCase):
     def test_budget_runs_out_without_sending_keys(self):
         # A pane that never paints anything: give up, quietly.
         r, sent = self._run([], default="", attempts=2)
+        self.assertFalse(r["answered"])
+        self.assertEqual(r["reason"], "no prompt")
+        self.assertEqual(sent, [])
+
+    def test_bypass_warning_is_left_for_the_user(self):
+        # Accepting it writes a standing setting on the host; that is the user's
+        # to give, from the card. The spawn neither answers it nor mistakes its
+        # "\u276f No, exit" row for a composer.
+        r, sent = self._run([], default=_BYPASS_WARNING, attempts=3)
         self.assertFalse(r["answered"])
         self.assertEqual(r["reason"], "no prompt")
         self.assertEqual(sent, [])

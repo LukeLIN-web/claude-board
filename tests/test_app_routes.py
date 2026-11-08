@@ -702,12 +702,12 @@ class StaleDialogOpenTests(unittest.TestCase):
             return appmod._enriched_snapshot()["windows"][0]
 
     def test_dialog_without_menu_is_not_waiting(self):
-        w = self._run({"menu": False, "trust": False})
+        w = self._run({"menu": False, "gate": ""})
         self.assertNotEqual(w["triage"], "waiting_perm")
         self.assertNotEqual(w["status"], "waiting")
 
     def test_dialog_with_real_menu_stays_waiting(self):
-        w = self._run({"menu": True, "trust": False})
+        w = self._run({"menu": True, "gate": ""})
         self.assertEqual(w["triage"], "waiting_perm")
         self.assertEqual(w["status"], "waiting")
 
@@ -717,13 +717,15 @@ class StaleDialogOpenTests(unittest.TestCase):
         self.assertEqual(w["triage"], "waiting_perm")
         self.assertEqual(w["status"], "waiting")
 
-    def test_trust_prompt_is_named_on_the_card(self):
-        # "dialog open" tells the user nothing, and the trust prompt is answered
+    def test_startup_gate_is_named_on_the_card(self):
+        # "dialog open" tells the user nothing, and a startup gate is answered
         # by its own route — so the card has to say which dialog it is stuck on.
-        w = self._run({"menu": True, "trust": True})
-        self.assertEqual(w["triage"], "waiting_perm")
-        self.assertEqual(w["waiting_for"], "trust prompt")
-        self.assertEqual(w["triage_reason"], "trust prompt")
+        for gate in ("trust prompt", "bypass warning"):
+            with self.subTest(gate):
+                w = self._run({"menu": True, "gate": gate})
+                self.assertEqual(w["triage"], "waiting_perm")
+                self.assertEqual(w["waiting_for"], gate)
+                self.assertEqual(w["triage_reason"], gate)
 
 
 class CodexCardModelTests(unittest.TestCase):

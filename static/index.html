@@ -597,21 +597,21 @@
           <!-- Waiting on a prompt: open the timeline to see the actual options and respond -->
           <div class="flex items-center gap-2 w-full mt-1 bg-red-50 border border-red-200 rounded px-2 py-1.5"
                x-show="w.triage === 'waiting_perm' && tmuxAvailable">
-            <!-- The folder-trust prompt is the one dialog whose options carry no
-                 numbers, so it gets its own label and its own button text: the
-                 timeline can't render it as a menu, and "Quick Approve (1)" would
-                 promise a keypress that does nothing there. -->
+            <!-- A startup gate (GATES) is a dialog whose options carry no
+                 numbers, so it gets its own question and its own button text:
+                 the timeline can't render it as a menu, and "Quick Approve (1)"
+                 would promise a keypress that does nothing there. -->
             <span class="text-xs text-red-700 font-medium shrink-0"
-                  x-text="w.waiting_for === 'trust prompt' ? '⏳ Trust this folder?' : '⏳ Waiting for your input'"></span>
-            <button @click="toggleExpand(w.key)" x-show="w.waiting_for !== 'trust prompt'"
+                  x-text="GATES[w.waiting_for]?.ask || '⏳ Waiting for your input'"></span>
+            <button @click="toggleExpand(w.key)" x-show="!GATES[w.waiting_for]"
                     class="text-xs border border-red-300 text-red-700 px-2 py-1 rounded hover:bg-red-100 transition">
               Open & respond ↓</button>
             <button @click="respondPermission(w.key, 'approve')" :disabled="!!permSending[w.key]"
                     class="text-xs border border-emerald-300 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-50 transition disabled:opacity-50"
-                    :title="w.waiting_for === 'trust prompt'
-                            ? 'Answers Claude\'s folder-trust prompt with “Yes, I trust this folder”'
+                    :title="GATES[w.waiting_for]
+                            ? 'Moves the dialog\'s cursor onto its Yes option and confirms it'
                             : 'Sends key 1 (Yes / first option)'"
-                    x-text="w.waiting_for === 'trust prompt' ? 'Trust folder' : 'Quick Approve (1)'"></button>
+                    x-text="GATES[w.waiting_for]?.yes || 'Quick Approve (1)'"></button>
           </div>
           <!-- Send a single prompt into this session's tmux pane (hidden when tmux unavailable) -->
           <div class="flex items-end gap-2 w-full mt-1" x-show="tmuxAvailable">
@@ -1282,6 +1282,13 @@ function fleet() {
     promptDrafts: {},
     promptSending: {},
     permSending: {},
+    // Claude's startup gates, by the waiting_for name the board gives each
+    // (core/actions.py _GATES): the question the card asks, and its approve
+    // button. Approving one steps the cursor onto Yes; there is no digit to send.
+    GATES: {
+      'trust prompt': { ask: '⏳ Trust this folder?', yes: 'Trust folder' },
+      'bypass warning': { ask: '⏳ Accept Bypass Permissions mode?', yes: 'Accept bypass mode' },
+    },
     // Per-aside expand state for long /btw answers, keyed by card-key:entry-id so a
     // new aside on the same card starts collapsed again.
     btwExpanded: {},

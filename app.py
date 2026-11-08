@@ -210,11 +210,11 @@ def _local_snapshot() -> dict:
             if dlg is not None and not dlg["menu"]:
                 w["status"] = "busy"
                 w["waiting_for"] = None
-            elif dlg is not None and dlg["trust"]:
+            elif dlg is not None and dlg["gate"]:
                 # Name the dialog rather than leave the card on "dialog open":
-                # the folder-trust prompt is answered by its own route, and it
-                # is the one a spawn into a never-opened directory always hits.
-                w["waiting_for"] = "trust prompt"
+                # a startup gate is answered by its own route (see
+                # actions.answer_gate), and its card asks its own question.
+                w["waiting_for"] = dlg["gate"]
         # After background_tasks, not before: that list is how patrol tells a
         # session waiting on background work from one waiting on a person.
         w.update(patrol.classify(w))

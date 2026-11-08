@@ -288,26 +288,35 @@ def create_session(cwd: str, platform: str = "claude") -> dict:
     return r
 
 
-# Claude's first-run folder-trust prompt ("Quick safety check: Is this a project
-# you created or one you trust?"), raised the first time a session opens a
-# directory — a `--dangerously-skip-permissions` spawn included, which is how the
-# board's own cards land on it. It is the one blocking dialog whose options carry
-# no numbers: arrows move the cursor, Enter commits it. Both labels are required
-# to call it, so a session that merely printed one of these strings in its output
-# isn't mistaken for the dialog.
-_TRUST_YES = "Yes, I trust this folder"
-_TRUST_NO = "No, exit"
-_TRUST_MARKERS = (_TRUST_YES, _TRUST_NO)
+# Claude's startup gates: the blocking dialogs whose options carry no numbers.
+# Arrows move the cursor, Enter commits it, and the cursor opens on "No, exit" —
+# the row that quits the session. Each gate pairs that row with one affirmative
+# row, keyed by the name a card shows while it waits on the gate:
+#   trust prompt    "Quick safety check: Is this a project you created or one you
+#                   trust?", raised the first time a session opens a directory —
+#                   a `--dangerously-skip-permissions` spawn included, which is
+#                   how the board's own cards land on it.
+#   bypass warning  "Claude Code running in Bypass Permissions mode", raised by
+#                   `--dangerously-skip-permissions` on a host whose
+#                   ~/.claude/settings.json doesn't yet carry
+#                   skipDangerousModePermissionPrompt — accepting it writes that.
+# Both rows are required to call a gate, so a session that merely printed one of
+# these strings in its output isn't mistaken for the dialog.
+_GATE_NO = "No, exit"
+_GATES = {
+    "trust prompt": "Yes, I trust this folder",
+    "bypass warning": "Yes, I accept",
+}
 
 # The option the cursor sits on, e.g. "❯ No, exit" (nbsp-padded on some builds).
-_TRUST_CURSOR_RE = re.compile(r"^[\s ]*[❯>][\s ]+(\S.*?)\s*$")
+_GATE_CURSOR_RE = re.compile(r"^[\s ]*[❯>][\s ]+(\S.*?)\s*$")
 
-# Any one of these means the prompt is on screen or still painting — enough to
-# keep waiting, not enough to answer. A half-drawn dialog shows its cursor row
+# Any one of these means a gate is on screen or still painting — enough to keep
+# waiting, not enough to answer. A half-drawn dialog shows its cursor row
 # ("❯ No, exit") before the Yes row below it, and that ❯ is indistinguishable
 # from a live composer's: without this, a poll landing in that one-paint gap
 # would call the directory trusted and walk away from the dialog it came for.
-_TRUST_HINTS = (_TRUST_YES, _TRUST_NO, "Quick safety check")
+_GATE_HINTS = (_GATE_NO, *_GATES.values(), "Quick safety check")
 
 _TRUST_KEY_SETTLE = 0.12   # between cursor keypresses, so the TUI keeps up
 _TRUST_WAIT = 6.0          # seconds to wait for the dialog to close after Enter
@@ -316,10 +325,10 @@ _TRUST_POLL = 0.2
 
 def composer_drawn(text: str, marker: str) -> bool:
     """Whether `text` shows a drawn composer: its CLI's `marker` (see
-    tmux.COMPOSER_MARKERS), and no part of Claude's folder-trust prompt, whose
-    cursor row draws the same "❯" (see _TRUST_HINTS), nor a numbered picker in
-    the composer's place (see picker_cursor_row)."""
-    return (marker in text and not _trust_prompt_painting(text)
+    tmux.COMPOSER_MARKERS), and no part of a Claude startup gate, whose cursor
+    row draws the same "❯" (see _GATE_HINTS), nor a numbered picker in the
+    composer's place (see picker_cursor_row)."""
+    return (marker in text and not _gate_painting(text)
             and not picker_cursor_row(text, marker))
 
 
@@ -361,61 +370,66 @@ def _escape_until(pane: str, is_closed, tries: int, settle: float) -> None:
         time.sleep(settle)
 
 
-def trust_prompt_up(text: str) -> bool:
-    """Whether a captured pane currently shows the folder-trust prompt."""
-    return all(m in text for m in _TRUST_MARKERS)
+def gate_up(text: str) -> str:
+    """Which startup gate a captured pane shows (a _GATES name); "" for none."""
+    if _GATE_NO in text:
+        for gate, yes in _GATES.items():
+            if yes in text:
+                return gate
+    return ""
 
 
-def _trust_prompt_painting(text: str) -> bool:
-    """Whether any part of the trust prompt is on screen (see _TRUST_HINTS)."""
-    return any(h in text for h in _TRUST_HINTS)
+def _gate_painting(text: str) -> bool:
+    """Whether any part of a startup gate is on screen (see _GATE_HINTS)."""
+    return any(h in text for h in _GATE_HINTS)
 
 
-def _trust_cursor_label(text: str) -> str:
-    """Which trust option the cursor sits on; "" if it isn't on one.
+def _gate_cursor_label(text: str) -> str:
+    """Which gate option the cursor sits on; "" if it isn't on one.
 
-    Only the dialog's own two labels count. The pane draws "❯ " for the composer
-    and for every queued message too, and neither is an option to commit.
+    Only the gates' own labels count. The pane draws "❯ " for the composer and
+    for every queued message too, and neither is an option to commit.
     """
     for ln in text.split("\n"):
-        m = _TRUST_CURSOR_RE.match(ln)
-        if m and m.group(1) in _TRUST_MARKERS:
+        m = _GATE_CURSOR_RE.match(ln)
+        if m and (m.group(1) == _GATE_NO or m.group(1) in _GATES.values()):
             return m.group(1)
     return ""
 
 
-def answer_trust_prompt(pane: str) -> dict:
-    """Answer the folder-trust prompt in `pane` with "Yes, I trust this folder".
+def answer_gate(pane: str, gate: str) -> dict:
+    """Answer startup gate `gate` (a _GATES name) in `pane` with its Yes row.
 
-    Enter commits whatever the cursor is on, and this dialog opens on "No, exit"
-    — the option that quits the session — so this never presses Enter on faith.
+    Enter commits whatever the cursor is on, and a gate opens on "No, exit" —
+    the option that quits the session — so this never presses Enter on faith.
     Down steps the cursor (the list wraps), the pane is re-read after every
     press, and Enter goes only once the pane itself shows the cursor on the Yes
     row. A pane that never gets there is left as it was found, dialog and all: a
     card stuck waiting is recoverable, a session killed by a blind Enter is not.
     """
-    for _ in range(len(_TRUST_MARKERS) + 1):
+    yes = _GATES[gate]
+    for _ in range(3):  # two rows: any cursor reaches Yes within two Downs
         cap = tmux.capture_pane(pane)
         if not cap.get("ok"):
             return {"ok": False, "error": "could not read the pane"}
-        if not trust_prompt_up(cap["text"]):
+        if gate_up(cap["text"]) != gate:
             # Answered already — by an earlier click of ours, or in the terminal.
-            return {"ok": True, "answered": False, "note": "no trust prompt on screen"}
-        if _trust_cursor_label(cap["text"]) == _TRUST_YES:
+            return {"ok": True, "answered": False, "note": f"no {gate} on screen"}
+        if _gate_cursor_label(cap["text"]) == yes:
             break
         tmux.send_keys(pane, "Down")
         time.sleep(_TRUST_KEY_SETTLE)
     else:
-        return {"ok": False, "error": f"could not move the cursor onto '{_TRUST_YES}'"}
+        return {"ok": False, "error": f"could not move the cursor onto '{yes}'"}
 
     r = tmux.send_keys(pane, "Enter")
     if not r.get("ok"):
         return r
     # An unreadable pane ("") is not a closed dialog.
-    if _wait_pane(pane, lambda t: bool(t) and not trust_prompt_up(t),
+    if _wait_pane(pane, lambda t: bool(t) and gate_up(t) != gate,
                   _TRUST_WAIT, _TRUST_POLL) is not None:
-        return {"ok": True, "answered": True, "label": _TRUST_YES}
-    return {"ok": False, "error": "the trust prompt did not close"}
+        return {"ok": True, "answered": True, "label": yes}
+    return {"ok": False, "error": f"the {gate} did not close"}
 
 
 _TRUST_PROMPT_POLL = 0.3
@@ -433,19 +447,26 @@ def confirm_trust_prompt(pane_id: str, attempts: int = 20, platform: str = "clau
     the directory was one the dashboard's cwd filter admitted and the user typed
     or picked, launched with --dangerously-skip-permissions either way.
 
+    Claude's other startup gate, the Bypass Permissions warning, is left on
+    screen: accepting it writes a standing setting into the host's
+    ~/.claude/settings.json, which is the user's to give — once per host, from
+    the card's button (respond_permission).
+
     Polling ends at the first of three things: the prompt (answer it), a drawn
     composer (this directory is already trusted — no prompt is coming), or the
     attempt budget. The composer test is the delicate one: the dialog's cursor
-    row draws the same "❯", so a pane showing any part of the prompt is never
-    read as a composer (see _TRUST_HINTS). Erring that way costs a slow spawn;
-    erring the other way is the stuck card this exists to prevent.
+    row draws the same "❯", so a pane showing any part of a gate is never read
+    as a composer (see _GATE_HINTS). Erring that way costs a slow spawn; erring
+    the other way is the stuck card this exists to prevent.
 
     Returns {answered, waited, reason}; never raises.
     """
     if not pane_id:
         return {"answered": False, "waited": 0.0, "reason": "no pane"}
     prompt_up, answer = ((codex_trust_prompt_up, answer_codex_trust_prompt)
-                         if platform == "codex" else (trust_prompt_up, answer_trust_prompt))
+                         if platform == "codex" else
+                         (lambda t: gate_up(t) == "trust prompt",
+                          lambda p: answer_gate(p, "trust prompt")))
     waited = 0.0
     for _ in range(attempts):
         text = tmux.capture_pane(pane_id).get("text", "")
@@ -494,12 +515,13 @@ def _pane_of(w) -> tuple[Optional[str], Optional[dict]]:
 def respond_permission(w, choice: str) -> dict:
     """Answer the dialog in window `w`'s tmux pane.
 
-    Usually that is the numbered permission prompt, answered with its digit. The
-    folder-trust prompt is the exception: it has no numbers, so the digit lands
-    on nothing and the card keeps reading "waiting for your input" however often
-    the button is clicked. Approving there means driving its cursor (see
-    answer_trust_prompt). "deny" stays Escape for both — cancelling the trust
-    prompt does end the session, which is what refusing to trust a folder means.
+    Usually that is the numbered permission prompt, answered with its digit. A
+    startup gate (the folder-trust prompt, the Bypass Permissions warning) is
+    the exception: it has no numbers, so the digit lands on nothing and the card
+    keeps reading "waiting for your input" however often the button is clicked.
+    Approving there means driving its cursor (see answer_gate). "deny" stays
+    Escape for all of them — cancelling a gate does end the session, which is
+    what refusing to trust a folder, or to run unguarded, means.
     """
     keys = _PERM_KEYS.get(choice)
     if keys is None:
@@ -509,8 +531,9 @@ def respond_permission(w, choice: str) -> dict:
         return err
     if choice in ("approve", "approve_always"):
         cap = tmux.capture_pane(pane)
-        if cap.get("ok") and trust_prompt_up(cap["text"]):
-            r = answer_trust_prompt(pane)
+        gate = gate_up(cap["text"]) if cap.get("ok") else ""
+        if gate:
+            r = answer_gate(pane, gate)
             r["choice"] = choice
             return r
     r = tmux.send_keys(pane, *keys)
@@ -747,15 +770,15 @@ def _menu_markers_present(text: str) -> bool:
 
 
 def pane_dialog(tty: Optional[str]) -> Optional[dict]:
-    """What `tty`'s pane is showing: {menu, trust}. None if unknowable.
+    """What `tty`'s pane is showing: {menu, gate}. None if unknowable.
 
     Claude's session registry reports waitingFor="dialog open" for ANY open
     overlay — including informational ones like the /goal panel, which has no
     options and doesn't block the agent. `menu` is the pane-level ground truth
-    the triage uses to tell a real picker from such an overlay. `trust` names
-    the one picker that is answered differently from all the others (see
-    answer_trust_prompt), so a card can say which dialog it is stuck on instead
-    of the useless "dialog open". Both come from a single capture.
+    the triage uses to tell a real picker from such an overlay. `gate` names
+    the startup gate on screen ("" for none) — the pickers answered differently
+    from all the others (see answer_gate) — so a card can say which dialog it is
+    stuck on instead of the useless "dialog open". Both come from one capture.
 
     None (no tty / no pane / failed capture) means "can't verify", and callers
     should keep trusting the registry.
@@ -763,7 +786,7 @@ def pane_dialog(tty: Optional[str]) -> Optional[dict]:
     text = tmux.capture_tty(tty)
     if text is None:
         return None
-    return {"menu": _menu_markers_present(text), "trust": trust_prompt_up(text)}
+    return {"menu": _menu_markers_present(text), "gate": gate_up(text)}
 
 
 def get_pane_menu(w) -> Optional[dict]:
@@ -1648,7 +1671,7 @@ def codex_trust_prompt_up(text: str) -> bool:
 def answer_codex_trust_prompt(pane: str) -> dict:
     """Answer Codex's trust prompt in `pane` with "Trust and continue": the
     cursor is stepped onto that row and seen there before Enter, as with
-    answer_trust_prompt."""
+    answer_gate."""
     picked = _codex_pick(pane, _CODEX_TRUST_HEAD, _CODEX_TRUST_YES, "trust")
     if not picked["ok"]:
         return picked

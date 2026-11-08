@@ -73,7 +73,7 @@ def _pane_text(live: Live) -> str:
 
 def _composer(live: Live) -> str:
     text = _pane_text(live)
-    return text if "❯" in text and not actions._trust_prompt_painting(text) else ""
+    return text if "❯" in text and not actions._gate_painting(text) else ""
 
 
 @pytest.fixture(scope="module")
