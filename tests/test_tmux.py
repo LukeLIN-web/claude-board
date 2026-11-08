@@ -1,7 +1,10 @@
 """Pure-logic tests for core/tmux.py — subprocess.run is always faked."""
 import os
+import pty
 import signal
 import subprocess
+import time
+import tty
 import unittest
 from unittest import mock
 
@@ -1046,15 +1049,18 @@ class _OutOfStepPane:
     `draft`: what the composer holds when the send starts; `hidden=True`: the
     screen shows its cells blank, and everything typed after it, until Ctrl+L.
 
+    `enter_lag`: the CLI reads no input for that many seconds after each Enter.
     `submitted` records each draft Enter sent."""
 
     RULE = "─" * 40
     PANEL = "  ◯ general-purpose  Collecting logs   1h 38m 42s · ↓ 383.1k tokens"
     CLEAR = "clear"
 
-    def __init__(self, *, stalled_for=0.0, drifted=None, repaints=True, draft="",
-                 hidden=False):
+    def __init__(self, *, stalled_for=0.0, enter_lag=0.0, drifted=None, repaints=True,
+                 draft="", hidden=False):
         self.now, self.wakes = 0.0, stalled_for
+        self.enter_lag = enter_lag
+        self.typed, self.enters = 0, 0
         self.drifted, self.repaints = drifted, repaints
         self.draft = draft
         self.hidden = draft if hidden else ""
@@ -1091,19 +1097,31 @@ class _OutOfStepPane:
         if "capture-pane" in argv:
             self.read_input()
             return FakeProc(stdout=self.drawn if self.drifted is None else self.drifted)
+        if "display-message" in argv:
+            return FakeProc(stdout="/dev/pts/9\n" if argv[-1] == "#{pane_tty}" else "")
         if "-l" in argv:
             self.pending.append(argv[-1])
+            self.typed += 1
         elif _clear_presses(argv):
             self.pending += [self.CLEAR] * _clear_presses(argv)
         elif argv[-1] in (tmux._REPAINT_KEY, "Enter"):
             self.pending.append(argv[-1])
+            if argv[-1] == "Enter":
+                self.enters += 1
+                self.wakes = self.now + self.enter_lag
         return FakeProc()
 
     def sleep(self, seconds):
         self.now += seconds
 
+    def unread(self, _tty):
+        self.read_input()
+        return len(self.pending)
+
     def send(self, text):
-        with _patch_run(self.run), mock.patch.object(tmux.time, "sleep", side_effect=self.sleep):
+        with _patch_run(self.run), \
+                mock.patch.object(tmux.time, "sleep", side_effect=self.sleep), \
+                mock.patch.object(tmux, "_pty_unread", side_effect=self.unread):
             return tmux.send_text("%5", text, verify_landed=True, marker="❯")
 
     def wake(self):
@@ -1153,12 +1171,51 @@ class OutOfStepScreenTests(unittest.TestCase):
                 self.assertTrue(pane.send(text)["ok"])
                 self.assertEqual(pane.submitted, [text])
 
+    def test_a_cli_behind_for_longer_than_every_wait_gets_the_prompt_once(self):
+        # A session on a CPU-throttled host: judged by the clock alone, the
+        # attempt read as a miss and the retry's clear wiped the copy on its way.
+        pane = _OutOfStepPane(stalled_for=sum(tmux._LANDED_VERIFY_WAITS) + 1)
+        self.assertTrue(pane.send(self.TEXT)["ok"])
+        self.assertEqual(pane.submitted, [self.TEXT])
+        self.assertEqual(pane.typed, 1)
+
+    def test_a_late_enter_is_not_pressed_again_or_reported_unsent(self):
+        pane = _OutOfStepPane(enter_lag=sum(tmux._LANDED_VERIFY_WAITS))
+        self.assertTrue(pane.send(self.TEXT)["ok"])
+        self.assertEqual(pane.submitted, [self.TEXT])
+        self.assertEqual(pane.enters, 1)
+
     def test_a_cli_stalled_past_every_check_is_left_nothing_to_wake_to(self):
         pane = _OutOfStepPane(stalled_for=60.0)
         self.assertFalse(pane.send(self.TEXT)["ok"])
+        self.assertEqual(pane.typed, 1)  # nothing piled on a CLI that isn't reading
         pane.wake()
         self.assertEqual(pane.submitted, [])
         self.assertEqual(pane.draft, "")  # every copy typed was wiped behind it
+
+
+class PtyUnreadTests(unittest.TestCase):
+    """_pty_unread reads a real terminal's input queue, in the raw mode a TUI
+    runs in."""
+
+    def test_counts_what_the_program_has_not_read(self):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        tty.setraw(slave)
+        path = os.ttyname(slave)
+        self.assertEqual(tmux._pty_unread(path), 0)
+        os.write(master, b"abc")
+        for _ in range(200):  # the kernel moves the bytes across asynchronously
+            if tmux._pty_unread(path):
+                break
+            time.sleep(0.01)
+        self.assertEqual(tmux._pty_unread(path), 3)
+        os.read(slave, 3)
+        self.assertEqual(tmux._pty_unread(path), 0)
+
+    def test_a_terminal_that_cannot_be_opened_counts_as_read(self):
+        self.assertEqual(tmux._pty_unread("/nonexistent/tty"), 0)
 
 
 class ResyncSizeTests(unittest.TestCase):

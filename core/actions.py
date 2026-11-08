@@ -1105,6 +1105,12 @@ def _diagnose_blocker(text: str) -> Optional[dict]:
     return None
 
 
+_NOT_READING_ERROR = ("prompt text never landed: the CLI has stopped reading its "
+                      "input — it is hung (a stalled filesystem, a blocking call) "
+                      "or its host is overloaded. Nothing was sent; the typed text "
+                      "clears itself when the CLI wakes.")
+
+
 def _unlanded_error(text: str, marker: str) -> str:
     """Specific error for a landed-verify failure with no classifiable blocker,
     read off the composer `marker` opens.
@@ -1270,6 +1276,8 @@ def _send_prompt_inner(w, pane: str, text: str) -> dict:
                         "error": f"send blocked: {b['label']} is open on this "
                                  "pane — press Esc on the card, then resend."}
             if res.get("reason") == "unlanded":
+                if not tmux._cli_read_all(pane):
+                    return {"ok": False, "error": _NOT_READING_ERROR}
                 return {"ok": False, "error": _unlanded_error(cap["text"], marker)}
         return res
     # Delivered. If we had to auto-close a blocker to get here, say so.

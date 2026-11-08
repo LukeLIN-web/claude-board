@@ -5,6 +5,8 @@ raises out to its caller. Higher layers (actions, routes) rely on that contract.
 """
 from __future__ import annotations
 
+import array
+import fcntl
 import os
 import re
 import shutil
@@ -12,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
 from contextlib import contextmanager
@@ -592,6 +595,12 @@ _SUBMIT_VERIFY_WAIT = 0.4
 # and a fixed short wait misreports that lag as a dropped prompt.
 _LANDED_VERIFY_WAITS = (0.15, 0.5, 1.2, 2.5)
 
+# How long a CLI gets to read what was typed at it before it counts as having
+# stopped reading (polls; a CLI that keeps up costs none of this). A session on
+# a host throttled to ~200 MHz took seconds to get through one attempt's keys.
+_CLI_READ_POLLS = 200
+_CLI_READ_POLL = 0.05
+
 # Claude Code's redraw key. Between repaints the CLI writes only the cells it
 # believes changed, so a screen that has come to differ from what it drew stays
 # wrong: a retype puts the same diff onto the same wrong cells (seen live: a
@@ -891,6 +900,36 @@ def _resync_size(pane: str) -> None:
         pass
 
 
+def _pty_unread(tty: str) -> int:
+    """Bytes typed at terminal `tty` that its program has not read yet. Linux-
+    only and best-effort: 0 when the queue can't be read."""
+    try:
+        fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            queued = array.array("i", [0])
+            fcntl.ioctl(fd, termios.FIONREAD, queued)
+            return queued[0]
+        finally:
+            os.close(fd)
+    except OSError:
+        return 0
+
+
+def _cli_read_all(pane: str) -> bool:
+    """Wait for the CLI in `pane` to read everything typed at it; False if it
+    still hasn't after _CLI_READ_POLLS.
+
+    The screen says nothing about keys the CLI has not read: until then an
+    empty composer means only that it is behind. A pane whose terminal can't be
+    resolved counts as read, leaving the caller's own wait to cover it."""
+    tty = _display(pane, "#{pane_tty}")
+    for _ in range(_CLI_READ_POLLS):
+        if not tty or not _pty_unread(tty):
+            return True
+        time.sleep(_CLI_READ_POLL)
+    return False
+
+
 def _send_until_landed(pane: str, text: str, marker: str) -> bool:
     """Send `text` literally into `pane`, confirming it reached the composer.
 
@@ -913,14 +952,20 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
       _REPAINT_KEY), so every attempt starts with a repaint.
     * A busy or stalled CLI has not drawn what it has not read: the pty buffers
       our text, possibly for seconds, while the screen still shows the empty
-      composer. Cleared by the screen, a retry would send no clearing press
-      and type a second copy behind the first, and the check, which matches a
-      tail, would pass the doubled draft to Enter (seen live: a CLI stalled
-      for a second got three copies). So every attempt clears blind
-      (_queue_clear), queued behind everything already sent, and so does
-      giving up: when the CLI wakes, the late text is wiped, "never landed"
-      stays true, and nothing is left to join the next send. A blind clear
-      also wipes a leftover that a screen out of step shows as empty.
+      composer. So an attempt is judged only once the CLI has read it
+      (_cli_read_all). Judged sooner it reads as a miss, and the retry's clear
+      wipes the copy the CLI was about to draw: on a host throttled to ~200 MHz
+      each attempt's keys outlasted the early waits, and only the last wait
+      could ever see the text. A CLI that stops reading ends the send, with
+      nothing more piled on it.
+      Cleared by the screen, a retry would send no clearing press and type a
+      second copy behind the first, and the check, which matches a tail, would
+      pass the doubled draft to Enter (seen live: a CLI stalled for a second
+      got three copies). So every attempt clears blind (_queue_clear), queued
+      behind everything already sent, and so does giving up: when the CLI
+      wakes, the late text is wiped, "never landed" stays true, and nothing is
+      left to join the next send. A blind clear also wipes a leftover that a
+      screen out of step shows as empty.
     """
     _resync_size(pane)
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
@@ -941,6 +986,9 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
             _send_debug(f"landed pane={pane} attempt={attempt} "
                         f"send-keys FAILED: {literal.get('error')!r}")
             return False
+        if not _cli_read_all(pane):
+            _send_debug(f"landed pane={pane} attempt={attempt} CLI is not reading its input")
+            break
         time.sleep(wait)
         # One capture, both judged and logged: a miss records the very frame it
         # was decided on, not a later one the pane has since redrawn.
@@ -958,8 +1006,7 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
                     f"needle={_needle(text)!r} frame={frame!r}")
     _queue_clear(pane)  # wipe the buffered text on wake
-    _send_debug(f"landed pane={pane} gave up after "
-                f"{len(_LANDED_VERIFY_WAITS)} attempts")
+    _send_debug(f"landed pane={pane} gave up after {attempt + 1} attempts")
     return False
 
 
@@ -1010,6 +1057,7 @@ def send_text(
     if not enter["ok"]:
         return enter
     for _ in range(_SUBMIT_VERIFY_RETRIES):
+        _cli_read_all(pane)  # a composer the Enter hasn't reached proves nothing
         time.sleep(_SUBMIT_VERIFY_WAIT)
         if not _composer_has_tail(pane, text, marker):
             break

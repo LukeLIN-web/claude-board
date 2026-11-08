@@ -98,11 +98,12 @@ def _pane(*screens, then=None, window=_CARD, pane="%5", foreground="node"):
                            side_effect=_screens(*screens, then=then)) as cp, \
          mock.patch.object(actions.tmux, "send_keys", side_effect=send_keys) as sk, \
          mock.patch.object(actions.tmux, "send_text", return_value={"ok": True}) as st, \
+         mock.patch.object(actions.tmux, "_cli_read_all", return_value=True) as cra, \
          mock.patch.object(actions.time, "sleep", side_effect=clock.sleep) as sl, \
          mock.patch.object(actions.time, "time", side_effect=clock.time):
         yield types.SimpleNamespace(
             card=window, sent=sent, pane_for_tty=pf, exit_copy_mode=ecm, capture_pane=cp,
-            send_keys=sk, send_text=st, sleep=sl, wrappers=uw)
+            send_keys=sk, send_text=st, cli_read_all=cra, sleep=sl, wrappers=uw)
 
 
 class CreateSessionTests(unittest.TestCase):
@@ -472,11 +473,12 @@ class SendPromptReadinessTests(unittest.TestCase):
         self.assertEqual(p.send_text.call_args.kwargs["marker"], "»")
 
 
-def _fail_send(after_text):
+def _fail_send(after_text, cli_reading=True):
     """send_prompt on a pane whose composer looks clean until the send, which
     doesn't land; `after_text` is on the pane by the time the failure is
     diagnosed. Returns the result and the send_text mock."""
     with _pane() as p:
+        p.cli_read_all.return_value = cli_reading
         p.capture_pane.side_effect = lambda *a, **k: {
             "ok": True, "text": after_text if p.send_text.called else _LIVE_TEXT}
         p.send_text.return_value = {"ok": False, "reason": "unlanded",
@@ -585,6 +587,14 @@ class SendFailureDiagnosisTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("never landed", r["error"])
         self.assertIn("empty", r["error"])
+
+    def test_a_cli_that_stopped_reading_is_named(self):
+        # An empty composer here means our text is still unread in the pty, so
+        # "dropped the keystrokes or an overlay ate them" sends you the wrong way.
+        r, _ = _fail_send(_LIVE_TEXT, cli_reading=False)
+        self.assertFalse(r["ok"])
+        self.assertIn("stopped reading", r["error"])
+        self.assertNotIn("stayed empty", r["error"])
 
     def test_composer_holding_other_text_is_quoted(self):
         r, _ = _fail_send("❯ some other draft\n⏵⏵ bypass permissions on")
