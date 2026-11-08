@@ -334,35 +334,55 @@ def uninterruptible_wrappers(claude_pid: int) -> list[int]:
             and any(table[cur].stat.startswith("D") for cur in _subtree(children, child))]
 
 
-# How long a process may wait on NFS without once getting the CPU before its card
-# calls the mount hung. A healthy RPC answers in milliseconds and a slow one in
-# seconds, and either way the process runs again when it does; a hard mount whose
-# client is stuck in state recovery keeps every reader asleep for as long as that
-# lasts — once over an hour, the claude process and every hook it fired with
-# it, while the card went on reading "working".
-NFS_HUNG_AFTER = 120
+# How long a process may wait on a network mount without once getting the CPU
+# before its card calls the mount hung. A healthy request answers in milliseconds
+# and a slow one in seconds, and either way the process runs again when it does.
+# A hard NFS mount whose client is stuck in state recovery keeps every reader
+# asleep for as long as that lasts — once over an hour, the claude process and
+# every hook it fired with it, while the card went on reading "working". A FUSE
+# request to an sshfs whose ssh is gone is never answered at all (kernels before
+# 6.14 have no FUSE request timeout): two claude processes once sat 5-6 h in
+# request_wait_answer, past SIGKILL, until the FUSE connection was aborted.
+MOUNT_HUNG_AFTER = 120
+
+# Where a process sleeps while its request to a FUSE daemon is out. Not the
+# daemon's own side (fuse_dev_do_read): an idle sshfs sleeps there by design.
+_FUSE_WAITS = ("request_wait_answer", "fuse_wait")
 
 
-def _nfs_blocked_since(pid: int, boot: float) -> Optional[float]:
-    """When `pid` last ran, as a wall-clock time, if it is asleep on NFS or the
-    RPC layer under it; None if it isn't, or /proc can't say. `boot` is the wall
+def _mount_kind(wchan: str) -> Optional[str]:
+    """"NFS" or "FUSE" when `wchan` is a wait on that kind of mount, else None."""
+    if "nfs" in wchan or wchan.startswith("rpc"):
+        return "NFS"
+    if wchan.startswith(_FUSE_WAITS):
+        return "FUSE"
+    return None
+
+
+def _mount_blocked_since(pid: int, boot: float) -> Optional[tuple[float, str]]:
+    """(when `pid` last ran as a wall-clock time, the mount kind) if it is asleep
+    on a network mount; None if it isn't, or /proc can't say. `boot` is the wall
     clock at boot: the scheduler stamps se.exec_start in ms since then."""
     try:
-        wchan = Path(f"/proc/{pid}/wchan").read_text()
-        if "nfs" not in wchan and not wchan.startswith("rpc"):
+        kind = _mount_kind(Path(f"/proc/{pid}/wchan").read_text())
+        if kind is None:
             return None
         m = re.search(r"^se\.exec_start\s*:\s*([\d.]+)",
                       Path(f"/proc/{pid}/sched").read_text(), re.M)
     except OSError:
         return None
-    return boot + float(m.group(1)) / 1000 if m else None
+    return (boot + float(m.group(1)) / 1000, kind) if m else None
 
 
-def nfs_hung(pids: list[int]) -> dict[int, list[tuple[float, str]]]:
+def mount_hung(pids: list[int]) -> dict[int, list[tuple[float, str, str]]]:
     """For each pid whose subtree (itself included) holds processes that have
-    waited on NFS for NFS_HUNG_AFTER or longer: those processes as (since, args),
-    longest first. Pids with none are left out. Only D-state processes are read
-    further, so a healthy host costs the walk and nothing else."""
+    waited on a network mount for MOUNT_HUNG_AFTER or longer: those processes as
+    (since, args, kind), longest first. Pids with none are left out.
+
+    Read further are the D-state processes and the card's own process in any
+    state: a FUSE wait starts out interruptible (S), and it was the claude
+    process's main thread that sat there. So a healthy host costs the walk and
+    one wchan read per card."""
     table = proc_table()
     children = _children(table)
     try:
@@ -374,10 +394,10 @@ def nfs_hung(pids: list[int]) -> dict[int, list[tuple[float, str]]]:
     for pid in set(pids):
         stuck = []
         for cur in _subtree(children, pid):
-            if cur in table and table[cur].stat.startswith("D"):
-                since = _nfs_blocked_since(cur, boot)
-                if since is not None and now - since >= NFS_HUNG_AFTER:
-                    stuck.append((since, table[cur].args))
+            if cur in table and (cur == pid or table[cur].stat.startswith("D")):
+                got = _mount_blocked_since(cur, boot)
+                if got is not None and now - got[0] >= MOUNT_HUNG_AFTER:
+                    stuck.append((got[0], table[cur].args, got[1]))
         if stuck:
             out[pid] = sorted(stuck)
     return out

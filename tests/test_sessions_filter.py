@@ -295,10 +295,11 @@ class UninterruptibleWrappersTests(unittest.TestCase):
         self.assertEqual(self._run([(self.CLAUDE, 1, "Ssl+", "claude")]), [])
 
 
-class NfsHungTests(unittest.TestCase):
-    """nfs_hung names the processes under a card that have waited on NFS without
-    running for NFS_HUNG_AFTER: /proc/<pid>/wchan says what a D-state process
-    sleeps on, se.exec_start in /proc/<pid>/sched when it last ran."""
+class MountHungTests(unittest.TestCase):
+    """mount_hung names the processes under a card that have waited on a network
+    mount (NFS or FUSE) without running for MOUNT_HUNG_AFTER: /proc/<pid>/wchan
+    says what a D-state process — or the card's own, in any state — sleeps on,
+    se.exec_start in /proc/<pid>/sched when it last ran."""
 
     CLAUDE = 100
     NOW = 1_000_000.0
@@ -309,7 +310,10 @@ class NfsHungTests(unittest.TestCase):
         (wchan, seconds since it last ran), or to an OSError it raises."""
         table = {pid: sessions.Proc(ppid, stat, "?", args.split()[0], args)
                  for pid, ppid, stat, args in rows}
-        files = {"/proc/uptime": f"{self.UPTIME:.2f} 1.00\n"}
+        files = {"/proc/uptime": f"{self.UPTIME:.2f} 1.00\n",
+                 # The card's own process is always read; unless a test says
+                 # otherwise it is a healthy event loop.
+                 f"/proc/{self.CLAUDE}/wchan": "ep_poll"}
         for pid, spec in (procs or {}).items():
             if isinstance(spec, OSError):
                 files[f"/proc/{pid}/wchan"] = spec
@@ -322,7 +326,7 @@ class NfsHungTests(unittest.TestCase):
                 f"se.vruntime                                  :    12.5\n")
 
         def read_text(path):
-            got = files[str(path)]   # a KeyError: a file nfs_hung should not have read
+            got = files[str(path)]   # a KeyError: a file mount_hung should not have read
             if isinstance(got, OSError):
                 raise got
             return got
@@ -330,7 +334,7 @@ class NfsHungTests(unittest.TestCase):
         with mock.patch.object(sessions, "proc_table", return_value=table), \
              mock.patch.object(sessions.Path, "read_text", autospec=True, side_effect=read_text), \
              mock.patch.object(sessions.time, "time", return_value=self.NOW):
-            return sessions.nfs_hung([self.CLAUDE])
+            return sessions.mount_hung([self.CLAUDE])
 
     def test_a_hook_asleep_on_nfs_hangs_its_card(self):
         # claude(100) -> sh(200) -> log_event.sh(300, D on NFS for 10 minutes)
@@ -338,20 +342,20 @@ class NfsHungTests(unittest.TestCase):
                 (200, self.CLAUDE, "S", "sh -c log_event.sh"),
                 (300, 200, "D", "bash /shared/x/log_event.sh")]
         self.assertEqual(self._run(rows, {300: ("nfs_wait_bit_killable", 600)}),
-                         {self.CLAUDE: [(self.NOW - 600, "bash /shared/x/log_event.sh")]})
+                         {self.CLAUDE: [(self.NOW - 600, "bash /shared/x/log_event.sh", "NFS")]})
 
     def test_the_claude_process_itself_counts_and_the_longest_stuck_leads(self):
         rows = [(self.CLAUDE, 1, "Dsl+", "claude"),
                 (300, self.CLAUDE, "D", "bash log_event.sh")]
         got = self._run(rows, {self.CLAUDE: ("nfs_wait_bit_killable", 4200),
                                300: ("rpc_wait_bit_killable", 4600)})
-        self.assertEqual([args for _, args in got[self.CLAUDE]], ["bash log_event.sh", "claude"])
+        self.assertEqual([args for _, args, _ in got[self.CLAUDE]], ["bash log_event.sh", "claude"])
 
     def test_a_short_nfs_wait_is_ordinary_io(self):
         rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
                 (300, self.CLAUDE, "D", "python train.py")]
         self.assertEqual(self._run(rows, {300: ("nfs_wait_bit_killable",
-                                                sessions.NFS_HUNG_AFTER - 1)}), {})
+                                                sessions.MOUNT_HUNG_AFTER - 1)}), {})
 
     def test_a_wait_on_anything_but_nfs_is_not_this(self):
         # e.g. nvidia-smi on a wedged GPU driver: stuck, but not on a mount.
@@ -359,7 +363,26 @@ class NfsHungTests(unittest.TestCase):
                 (300, self.CLAUDE, "D", "nvidia-smi")]
         self.assertEqual(self._run(rows, {300: ("os_acquire_mutex", 3600)}), {})
 
-    def test_only_d_state_processes_are_read(self):
+    def test_the_claude_process_asleep_on_fuse_hangs_its_card_while_still_s(self):
+        # A dead sshfs: the CLI's main thread waits on the request
+        # interruptibly, so the card's process reads S, not D.
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude")]
+        self.assertEqual(self._run(rows, {self.CLAUDE: ("request_wait_answer", 7200)}),
+                         {self.CLAUDE: [(self.NOW - 7200, "claude", "FUSE")]})
+
+    def test_a_child_in_d_on_fuse_hangs_its_card(self):
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (300, self.CLAUDE, "D", "cat /shared/x/a")]
+        self.assertEqual(self._run(rows, {300: ("request_wait_answer", 600)}),
+                         {self.CLAUDE: [(self.NOW - 600, "cat /shared/x/a", "FUSE")]})
+
+    def test_a_fuse_daemon_waiting_for_work_is_not_this(self):
+        # sshfs's own side of /dev/fuse: idle by design.
+        rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
+                (300, self.CLAUDE, "D", "sshfs host:/x /x")]
+        self.assertEqual(self._run(rows, {300: ("fuse_dev_do_read", 3600)}), {})
+
+    def test_only_d_state_processes_and_the_card_s_own_are_read(self):
         # Nothing in `procs` for the sleeping ones: reading them would KeyError.
         rows = [(self.CLAUDE, 1, "Ssl+", "claude"),
                 (200, self.CLAUDE, "S", "bash"),

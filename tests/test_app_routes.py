@@ -28,7 +28,7 @@ from tests.helpers import codex_rollout, scratch_dir, user_row, write_jsonl
 _NEUTRAL = {
     "hmz_window_dicts": (appmod.hmz, []),
     "shell_descendant_counts": (appmod.sessions, {}),
-    "nfs_hung": (appmod.sessions, {}),
+    "mount_hung": (appmod.sessions, {}),
     "pending_by_tty": (appmod.perms, {}),
     "available": (appmod.tmux, True),
     "passive_ttys": (appmod.tmux, set()),
@@ -658,8 +658,8 @@ class QuietBoardTests(unittest.TestCase):
         self.assertEqual(snap["counts"]["total"], 1)
 
 
-class NfsHungCardTests(unittest.TestCase):
-    """A card whose process tree is asleep on a hung NFS mount reads stalled,
+class MountHungCardTests(unittest.TestCase):
+    """A card whose process tree is asleep on a hung network mount reads stalled,
     whatever its own transcript or rollout says, on every platform."""
 
     def test_the_hang_outranks_the_card_s_own_triage(self):
@@ -674,8 +674,8 @@ class NfsHungCardTests(unittest.TestCase):
         codex = {"pid": 7, "platform": "codex", "status": "busy", "hidden": False,
                  "alive": True, "tty": "pts/7", "cwd": "/x", "name": None,
                  "updated_at": 0, "triage": "working", "triage_reason": "正在工作"}
-        stuck = [(time.time() - 3600, "bash /shared/x/log_event.sh")]
-        with _snapshot([claude, healthy], codex=[codex], nfs_hung={1: stuck, 7: stuck}):
+        stuck = [(time.time() - 3600, "bash /shared/x/log_event.sh", "NFS")]
+        with _snapshot([claude, healthy], codex=[codex], mount_hung={1: stuck, 7: stuck}):
             snap = appmod._enriched_snapshot()
         got = {w["pid"]: w for w in snap["windows"]}
         for pid in (1, 7):

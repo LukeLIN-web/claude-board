@@ -154,16 +154,24 @@ def classify_idle(status: str, idle: int, task: str) -> dict:
     return _triage("completed", f"空闲 {IDLE}{tail}")
 
 
-def classify_nfs_hung(stuck: list[tuple[float, str]]) -> dict:
-    """Triage for a card whose process tree is asleep on a hung NFS mount
-    (sessions.nfs_hung, longest first). It outranks whatever the transcript or
+# What frees a card stuck on each kind of mount. Neither is a signal: a process
+# asleep on the mount is past SIGKILL.
+_MOUNT_FIX = {
+    "NFS": "主机的 NFS 挂载要 root 修",
+    "FUSE": "中止这个 FUSE 连接（/sys/fs/fuse/connections/<id>/abort）才放得出来，kill -9 没用",
+}
+
+
+def classify_mount_hung(stuck: list[tuple[float, str, str]]) -> dict:
+    """Triage for a card whose process tree is asleep on a hung network mount
+    (sessions.mount_hung, longest first). It outranks whatever the transcript or
     rollout says: nothing the session runs can move until the host's mount
     recovers, and nothing typed at its terminal changes that."""
-    since, args = stuck[0]
+    since, args, kind = stuck[0]
     many = f"（{len(stuck)} 个进程）" if len(stuck) > 1 else ""
     return _triage("stalled",
-                   f"NFS 挂住{many}，{time.strftime('%H:%M', time.localtime(since))} 起没动过。{args[:80]}",
-                   "主机的 NFS 挂载要 root 修")
+                   f"{kind} 挂住{many}，{time.strftime('%H:%M', time.localtime(since))} 起没动过。{args[:80]}",
+                   _MOUNT_FIX[kind])
 
 
 def _count(tasks: list) -> str:

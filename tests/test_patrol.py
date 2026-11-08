@@ -415,20 +415,27 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(got["triage"], "working")
 
 
-class NfsHungTriageTests(unittest.TestCase):
-    """patrol.classify_nfs_hung — the processes arrive longest-stuck first
-    (sessions.nfs_hung)."""
+class MountHungTriageTests(unittest.TestCase):
+    """patrol.classify_mount_hung — the processes arrive longest-stuck first
+    (sessions.mount_hung)."""
 
     SINCE = time.mktime((2026, 10, 29, 9, 1, 42, 0, 0, -1))
 
     def test_names_when_it_stopped_and_what_is_stuck(self):
-        got = patrol.classify_nfs_hung([(self.SINCE, "bash /shared/x/log_event.sh")])
+        got = patrol.classify_mount_hung([(self.SINCE, "bash /shared/x/log_event.sh", "NFS")])
         self.assertEqual(got["triage"], "stalled")
         self.assertEqual(got["triage_reason"],
                          "NFS 挂住，09:01 起没动过。bash /shared/x/log_event.sh")
+        self.assertEqual(got["triage_suggestion"], "主机的 NFS 挂载要 root 修")
 
     def test_counts_the_stuck_processes_and_names_the_first(self):
-        got = patrol.classify_nfs_hung([(self.SINCE, "bash log_event.sh"),
-                                        (self.SINCE + 600, "claude")])
+        got = patrol.classify_mount_hung([(self.SINCE, "bash log_event.sh", "NFS"),
+                                          (self.SINCE + 600, "claude", "NFS")])
         self.assertEqual(got["triage_reason"],
                          "NFS 挂住（2 个进程），09:01 起没动过。bash log_event.sh")
+
+    def test_a_fuse_hang_says_fuse_and_that_signals_will_not_free_it(self):
+        got = patrol.classify_mount_hung([(self.SINCE, "claude", "FUSE")])
+        self.assertEqual(got["triage_reason"], "FUSE 挂住，09:01 起没动过。claude")
+        self.assertIn("abort", got["triage_suggestion"])
+        self.assertIn("kill -9 没用", got["triage_suggestion"])
