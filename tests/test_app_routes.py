@@ -115,9 +115,10 @@ class CreateRouteTests(unittest.TestCase):
 
     def test_spawn_dirs_asks_the_peer_it_would_spawn_on(self):
         with mock.patch.dict(appmod.peers._peers, {"63": "http://x"}, clear=True), \
-             mock.patch.object(appmod.peers, "forward", return_value={"ok": True, "paths": []}) as m:
+             mock.patch.object(appmod.peers, "_request",
+                               return_value=(200, {"ok": True, "paths": []})) as m:
             appmod.api_spawn_dirs(appmod.SpawnDirsBody(paths=["/tmp"], host="63"))
-        m.assert_called_once_with("63", "POST", "/api/spawn-dirs", {"paths": ["/tmp"]})
+        self.assertEqual(m.call_args[0][:3], ("http://x/api/spawn-dirs", "POST", {"paths": ["/tmp"]}))
 
 
 class CreateRouteVisibilityTests(unittest.TestCase):

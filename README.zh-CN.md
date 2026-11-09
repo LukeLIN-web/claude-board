@@ -105,6 +105,10 @@ FLEET_PEER_TUNNELS="7880:hostb:7879"   # <本地端口>:<ssh 主机>:<对端端�
 
 然后 `scripts/peer-tunnel.sh start`、`bash run.sh restart`。共享 `.env.local` 里的 `FLEET_API_TOKEN` 用来通过对端的密码门。搜索 / History / Skills / Memory 只显示聚合机本身的数据。
 
+别的机器也能显示整个集群、操作其中任何一张卡：设 `FLEET_UPSTREAM=http://127.0.0.1:<端口>` 指向聚合机（照上面经端口转发），对别台卡片的操作经聚合机转过去。只被别人轮询的机器会在页头标出「全集群在 …」。只能经一台已经登录着的网关进去时，在条目后加第 4 段 `"<本地端口>:<主机>:<对端端口>:<网关>"`：转发走那台网关现有的 ssh ControlMaster（`FLEET_SSH_CONTROL_DIR`，或它的 `ControlPath`），第二跳从网关上发起，不对网关新开登录。
+
+在 shell 里 `python3 scripts/board-send.py <会话名 | 会话 ID 前缀 | key> <文字>` 把一句 prompt 打进那张卡，不管它在哪台机器上。
+
 ### GPU
 
 每份 board 每 15 秒读一次本机的 `nvidia-smi`。页头的 **GPUs** 列出每台机器的每张卡上有什么；会话起的进程在哪张卡上，那张卡片上就标出来（`GPU b:3`）。`/api/windows` 的 `gpus` 字段是同一份数据，给排卡的脚本用。经 `scripts/gpu_wait.py`（包住一个作业、等够空卡再起，见它的 docstring；谁的作业先上见 `scripts/gpu_busy.py`）占住的卡和排队等卡的作业也会列出来。想在页面上看到某台机器的作业，那台就要跑一份 board，哪怕上面没有会话。

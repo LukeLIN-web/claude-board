@@ -73,13 +73,20 @@
                        !h.online ? 'bg-red-50 text-red-700 border-red-200'
                        : h.stale ? 'bg-amber-50 text-amber-800 border-amber-200'
                                  : 'bg-slate-100 text-slate-700 border-slate-200']"
-              :title="!h.online ? ('no answer from ' + h.host + (h.error ? ' — ' + h.error : ''))
-                      : h.stale ? (h.host + ' 的 board 在应答，但卡片已经一阵没刷新了（卡在刷新中途）')
-                                : (h.host + ' · ' + h.count + ' cards')"
+              :title="(!h.online ? ('no answer from ' + h.host + (h.error ? ' — ' + h.error : ''))
+                       : h.stale ? (h.host + ' 的 board 在应答，但卡片已经一阵没刷新了（卡在刷新中途）')
+                                 : (h.host + ' · ' + h.count + ' cards'))
+                      + (h.via ? '（经 ' + h.via + ' 的 board）' : '')"
               @click="hostFilter = (hostFilter === h.host ? '' : h.host)"
               x-text="h.host + ' · ' + h.count"></span>
       </template>
     </div>
+    <!-- A board that other boards poll but that reads none itself shows only
+         its own cards; say where the whole fleet is (core/peers.py POLLED BY). -->
+    <span x-show="polledBy.length && hosts.length <= 1" x-cloak
+          class="text-xs bg-sky-50 text-sky-800 border border-sky-200 px-2 py-0.5 rounded-full"
+          :title="'这里只有本机的卡。' + polledBy.join('、') + ' 的 board 在汇总这台；设 FLEET_UPSTREAM 指向它，就能在这里看全集群'"
+          x-text="'只显示本机 · 全集群在 ' + polledBy.join('、')"></span>
     <!-- Skills / Memory buttons -->
     <button @click="showSkills = !showSkills; if(showSkills) loadSkills()"
             class="text-xs border px-2 py-1 rounded hover:bg-blue-50 transition"
@@ -1204,6 +1211,8 @@ function fleet() {
     // This board's own host label, and the peer health rows it reports.
     localHost: '',
     peers: [],
+    // Boards that poll this one as a peer (snapshot.polled_by).
+    polledBy: [],
     // Every machine this board is showing, one row each (see _hostRows).
     // Kept rather than derived on read: every card and the spawn picker ask.
     hosts: [],
@@ -1318,7 +1327,7 @@ function fleet() {
                       count: counts[this.localHost] || 0 }];
       for (const p of this.peers) {
         rows.push({ host: p.host, online: !!p.online, stale: !!p.stale, error: p.error,
-                    count: counts[p.host] || 0 });
+                    via: p.via || '', count: counts[p.host] || 0 });
       }
       return rows.filter(r => r.host);
     },
@@ -1621,6 +1630,7 @@ function fleet() {
         if (!this.spawnHost) this.spawnHost = snap.host;
       }
       this.peers = snap.peers || [];
+      this.polledBy = snap.polled_by || [];
       this.hosts = this._hostRows();
       this.gpus = snap.gpus || [];
       if (this.showUsage) this.loadUsage(true);

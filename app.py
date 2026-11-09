@@ -325,6 +325,9 @@ def _enriched_snapshot() -> dict:
     nothing here waits on the network, so a wedged peer costs its own cards
     going stale and nothing else."""
     local = _local_snapshot()
+    # Who reads this board as a peer (peers.POLLED BY): a host that is only
+    # someone's peer shows its own cards, and says where the fleet view is.
+    local["polled_by"] = peers.polled_by()
     state.last_local_snapshot = local
     if not peers.enabled():
         return local
@@ -442,11 +445,16 @@ def api_windows(request: Request, response: Response) -> dict:
     # because it skips a body identical to the one it last drew
     # (_applySnapshotText) and a field that grows by the second would make
     # every poll a redraw.
+    #
+    # A board reading this one as its upstream (peers.VIEW_HEADER) gets the
+    # fleet instead: the local half plus the direct peers' cards.
     if request.headers.get(peers.PEER_HEADER):
+        peers.note_polled_by(request.headers.get(peers.FROM_HEADER) or "")
         if not state.last_local_snapshot["ts"]:
             state.last_local_snapshot = _local_snapshot()
         local = state.last_local_snapshot
-        return {**local, "age": _snapshot_age(local)}
+        answer = peers.fleet_view(local) if request.headers.get(peers.VIEW_HEADER) else local
+        return {**answer, "age": _snapshot_age(local)}
     if not state.last_snapshot["ts"]:
         state.last_snapshot = _enriched_snapshot()
     response.headers["X-Snapshot-Age"] = str(_snapshot_age(state.last_snapshot))
@@ -466,8 +474,8 @@ def _on_card(key: str, method: str, tail: str, local: Callable, body: BaseModel 
     except ValueError:
         raise HTTPException(404, "window not found")
     if host:
-        return peers.forward(host, method, f"/api/windows/{pid}/{tail}",
-                             body.model_dump() if body is not None else None)
+        return peers.forward_card(host, pid, method, tail,
+                                  body.model_dump() if body is not None else None)
     w = sessions.find_window(pid)
     if not w:
         raise HTTPException(404, "window not found")
@@ -563,12 +571,10 @@ def api_focus(key: str) -> dict:
 
 
 def _on_host(body: BaseModel, path: str, local: Callable[[], dict]) -> dict:
-    """Run a route that names a `host` on that host's board. A configured peer's
-    label forwards the request there, with the host stripped: the peer runs it
-    locally, and a peer list that ever names this board back can't bounce the
-    request around. Anything else — empty, or this host's own label — runs here."""
+    """Run a route that names a `host` on the board that runs that host
+    (peers.forward_host). Anything else — empty, or this host's own label — runs here."""
     if peers.is_peer(body.host):
-        return peers.forward(body.host, "POST", path, body.model_dump(exclude={"host"}))
+        return peers.forward_host(body.host, path, body.model_dump())
     return local()
 
 

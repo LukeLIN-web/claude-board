@@ -117,7 +117,7 @@ class ForwardTests(_OnePeerTest):
     def test_forward_calls_the_peer_and_returns_its_body(self):
         with mock.patch.object(peers, "_request",
                                return_value=(200, {"ok": True})) as req:
-            got = peers.forward("b", "POST", "/api/windows/42/prompt", {"text": "hi"})
+            got = peers.forward_card("b", 42, "POST", "prompt", {"text": "hi"})
         self.assertEqual(got, {"ok": True})
         url, method, body, _timeout = req.call_args[0]
         self.assertEqual(url, "http://127.0.0.1:7880/api/windows/42/prompt")
@@ -127,14 +127,14 @@ class ForwardTests(_OnePeerTest):
         """The card renders `error`; a raised exception would leave the button
         silently dead instead."""
         with mock.patch.object(peers, "_request", side_effect=OSError("no route")):
-            got = peers.forward("b", "POST", "/api/windows/42/close")
+            got = peers.forward_card("b", 42, "POST", "close")
         self.assertFalse(got["ok"])
         self.assertIn("host b", got["error"], "the card has to say which host")
 
     def test_peer_http_error_is_passed_through_as_an_error(self):
         with mock.patch.object(peers, "_request",
                                return_value=(404, {"detail": "window not found"})):
-            got = peers.forward("b", "POST", "/api/windows/42/close")
+            got = peers.forward_card("b", 42, "POST", "close")
         self.assertFalse(got["ok"])
         self.assertIn("window not found", got["error"])
 
@@ -165,17 +165,17 @@ class RouteDispatchTests(_OnePeerTest):
     """The routes decide local-or-forward from the card key alone."""
 
     def test_peer_key_forwards_the_action_untouched(self):
-        with mock.patch.object(peers, "forward",
-                               return_value={"ok": True}) as fwd, \
+        with mock.patch.object(peers, "_request",
+                               return_value=(200, {"ok": True})) as req, \
              mock.patch.object(appmod.sessions, "find_window") as local:
             got = appmod.api_window_prompt("b:42", appmod.PromptBody(text="hi"))
         self.assertEqual(got, {"ok": True})
         local.assert_not_called()
-        self.assertEqual(fwd.call_args[0][:3],
-                         ("b", "POST", "/api/windows/42/prompt"))
+        self.assertEqual(req.call_args[0][:3],
+                         ("http://127.0.0.1:7880/api/windows/42/prompt", "POST", {"text": "hi"}))
 
     def test_local_key_never_leaves_the_host(self):
-        with mock.patch.object(peers, "forward") as fwd, \
+        with mock.patch.object(peers, "_request") as fwd, \
              mock.patch.object(appmod.sessions, "find_window"), \
              mock.patch("core.actions.send_prompt", return_value={"ok": False}):
             appmod.api_window_prompt("42", appmod.PromptBody(text="hi"))
@@ -190,10 +190,10 @@ class RouteDispatchTests(_OnePeerTest):
     def test_spawn_on_a_peer_is_forwarded_without_the_host_field(self):
         """The peer spawns locally; leaving `host` in the body would let a peer
         list that names this board back bounce the request around."""
-        with mock.patch.object(peers, "forward", return_value={"ok": True}) as fwd:
+        with mock.patch.object(peers, "_request", return_value=(200, {"ok": True})) as req:
             appmod.api_window_create(appmod.CreateBody(cwd="/tmp", host="b"))
-        self.assertEqual(fwd.call_args[0][2], "/api/windows/create")
-        self.assertEqual(fwd.call_args[0][3], {"cwd": "/tmp", "platform": "claude"})
+        self.assertEqual(req.call_args[0][0], "http://127.0.0.1:7880/api/windows/create")
+        self.assertEqual(req.call_args[0][2], {"cwd": "/tmp", "platform": "claude"})
 
 
 class MergeTests(unittest.TestCase):
@@ -238,3 +238,130 @@ class MergeTests(unittest.TestCase):
         with mock.patch.object(appmod, "_local_snapshot", return_value=local), \
              mock.patch.object(peers, "enabled", return_value=False):
             self.assertIs(appmod._enriched_snapshot(), local)
+
+
+class _UpstreamTest(unittest.TestCase):
+    """This board is "a6000": no direct peers but "b", and an upstream "71"
+    that shows 71, 63, b and a6000 itself."""
+
+    UP = "http://127.0.0.1:50957"
+
+    def setUp(self):
+        for patch in (mock.patch.dict(peers._peers, {"b": "http://127.0.0.1:7880"}, clear=True),
+                      mock.patch.object(peers, "_upstream", self.UP),
+                      mock.patch.object(peers, "local_label", return_value="a6000"),
+                      mock.patch.dict(peers._cache, clear=True),
+                      mock.patch.dict(peers._polled_by, clear=True)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def poll_upstream(self):
+        view = {
+            "host": "71",
+            "hosts": ["71", "63", "b", "a6000"],
+            "windows": [
+                {"pid": 1, "key": "71:1", "host": "71"},
+                {"pid": 2, "key": "63:2", "host": "63"},
+                {"pid": 3, "key": "b:3", "host": "b"},          # reached directly here
+                {"pid": 4, "key": "a6000:4", "host": "a6000"},  # this board's own
+            ],
+            "gpus": [{"host": "63", "index": 0}, {"host": "a6000", "index": 0}],
+            "peers": [{"host": "63", "online": False, "error": "HTTP 502"}],
+        }
+        with mock.patch.object(peers, "_request", return_value=(200, view)) as req:
+            peers._poll_once(peers._UPSTREAM, self.UP)
+        return req
+
+
+class UpstreamTests(_UpstreamTest):
+
+    def test_upstream_is_read_with_the_view_header(self):
+        req = self.poll_upstream()
+        self.assertTrue(req.call_args.kwargs.get("view"))
+
+    def test_merges_only_hosts_this_board_cannot_reach_itself(self):
+        """Its own cards and a direct peer's would otherwise show twice."""
+        self.poll_upstream()
+        keys = sorted(w["key"] for w in peers.remote_windows())
+        self.assertEqual(keys, ["63:2", "71:1"])
+        self.assertEqual([g["host"] for g in peers.remote_gpus()], ["63"])
+
+    def test_upstream_card_routes_through_the_upstream_by_full_key(self):
+        self.poll_upstream()
+        self.assertEqual(peers.split_key("63:2"), ("63", 2))
+        with mock.patch.object(peers, "_request", return_value=(200, {"ok": True})) as req:
+            peers.forward_card("63", 2, "POST", "prompt", {"text": "hi"})
+        self.assertEqual(req.call_args[0][0], f"{self.UP}/api/windows/63:2/prompt")
+
+    def test_own_label_and_direct_peer_never_detour(self):
+        self.poll_upstream()
+        self.assertEqual(peers.split_key("a6000:4"), (None, 4))
+        with mock.patch.object(peers, "_request", return_value=(200, {"ok": True})) as req:
+            peers.forward_card("b", 3, "POST", "close")
+        self.assertEqual(req.call_args[0][0], "http://127.0.0.1:7880/api/windows/3/close")
+
+    def test_host_route_through_upstream_keeps_the_host(self):
+        """The upstream needs it to know where to send the request on."""
+        self.poll_upstream()
+        with mock.patch.object(peers, "_request", return_value=(200, {"ok": True})) as req:
+            peers.forward_host("63", "/api/usage", {"host": "63", "cli": "claude"})
+        self.assertEqual(req.call_args[0][:3],
+                         (f"{self.UP}/api/usage", "POST", {"host": "63", "cli": "claude"}))
+
+    def test_host_unknown_everywhere_runs_here(self):
+        self.poll_upstream()
+        self.assertFalse(peers.is_peer("99"))
+
+    def test_status_rows_for_upstream_hosts_carry_the_upstreams_view(self):
+        self.poll_upstream()
+        rows = {r["host"]: r for r in peers.status()}
+        self.assertEqual(set(rows), {"b", "63", "71"})
+        self.assertEqual(rows["71"]["via"], "71")
+        self.assertTrue(rows["71"]["online"])
+        self.assertFalse(rows["63"]["online"], "the upstream says 63 is down")
+        self.assertEqual(rows["63"]["error"], "HTTP 502")
+
+    def test_unanswered_upstream_is_one_offline_row(self):
+        rows = [r for r in peers.status() if r.get("via")]
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["online"])
+
+
+class FleetViewTests(_UpstreamTest):
+    """What this board answers a downstream board that reads it as upstream."""
+
+    def test_local_cards_are_keyed_by_host_and_upstream_cards_left_out(self):
+        self.poll_upstream()
+        with mock.patch.object(peers, "_request",
+                               return_value=(200, {"windows": [{"pid": 9}], "gpus": []})):
+            peers._poll_once("b", "http://127.0.0.1:7880")
+        local = {"host": "a6000", "windows": [{"pid": 5, "key": "5", "host": "a6000"}],
+                 "gpus": []}
+        view = peers.fleet_view(local)
+        self.assertEqual(sorted(w["key"] for w in view["windows"]), ["a6000:5", "b:9"])
+        self.assertEqual(view["hosts"], ["a6000", "b"])
+        self.assertEqual(local["windows"][0]["key"], "5", "the local snapshot is not mutated")
+
+    def test_api_windows_answers_the_view_and_notes_the_poller(self):
+        local = {"host": "a6000", "windows": [{"pid": 5, "key": "5", "host": "a6000"}],
+                 "gpus": [], "ts": 1.0}
+        req = mock.Mock()
+        req.headers = {peers.PEER_HEADER: "1", peers.VIEW_HEADER: "1", peers.FROM_HEADER: "x1"}
+        with mock.patch.object(appmod.state, "last_local_snapshot", local):
+            got = appmod.api_windows(req, mock.Mock())
+        self.assertEqual([w["key"] for w in got["windows"]], ["a6000:5"])
+        self.assertEqual(peers.polled_by(), ["x1"])
+
+    def test_plain_peer_poll_still_gets_the_local_half(self):
+        local = {"host": "a6000", "windows": [{"pid": 5, "key": "5", "host": "a6000"}],
+                 "gpus": [], "ts": 1.0}
+        req = mock.Mock()
+        req.headers = {peers.PEER_HEADER: "1"}
+        with mock.patch.object(appmod.state, "last_local_snapshot", local):
+            got = appmod.api_windows(req, mock.Mock())
+        self.assertEqual([w["key"] for w in got["windows"]], ["5"])
+
+    def test_polled_by_forgets_old_pollers(self):
+        peers.note_polled_by("x1")
+        peers._polled_by["x1"] -= peers.POLLED_FOR + 1
+        self.assertEqual(peers.polled_by(), [])

@@ -141,6 +141,18 @@ then `scripts/peer-tunnel.sh start` and `bash run.sh restart`. `FLEET_API_TOKEN`
 from the shared `.env.local` gets through the peers' password gate. Search,
 History, Skills and Memory show the aggregating host only.
 
+Any other machine can show the whole fleet too, and drive any card in it: point
+it at the aggregator with `FLEET_UPSTREAM=http://127.0.0.1:<port>` (over a
+forward, as above). Its actions on another host's card go through the
+aggregator. A machine that is only polled says so in its header ("全集群在 …").
+When the only way in is a gateway you are already logged in to, add the
+gateway as a 4th field, `"<lport>:<host>:<rport>:<gateway>"`: the forward rides
+that gateway's existing ssh ControlMaster (`FLEET_SSH_CONTROL_DIR`, or its
+`ControlPath`) and the second hop runs from the gateway, with no new login to it.
+
+From a shell, `python3 scripts/board-send.py <name | session-id prefix | key> <text>`
+types a prompt into that card wherever it runs.
+
 ### GPUs
 
 Each board reads its own host's `nvidia-smi` every 15 s. **GPUs** in the header
