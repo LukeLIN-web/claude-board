@@ -102,10 +102,15 @@ __supervise)
         # it after every drop and on stop.
         cancel() { ssh -o ControlPath="$sock" -O cancel -L "$lport:127.0.0.1:$lport" "$via" 2>/dev/null; }
         trap 'cancel; exit 0' TERM INT
+        # When the master dies with the network, gateway's sshd may never see
+        # the hangup, and the second-hop ssh it ran lives on holding $lport
+        # there, so every reconnect fails "cannot listen to port". Each attempt
+        # first ends our own earlier one: an ssh process (not the shell running
+        # this, whose command line carries the same text) with that forward.
+        hop="ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o BatchMode=yes -L $lport:127.0.0.1:$rport $sshhost"
         cmd=(ssh -tt -o ControlPath="$sock" -o ControlMaster=no -o ProxyJump=none
              -o ProxyCommand=/bin/false -L "$lport:127.0.0.1:$lport" "$via"
-             ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-             -o BatchMode=yes -L "$lport:127.0.0.1:$rport" "$sshhost")
+             "for p in \$(pgrep -u \$(id -u) -f -- '-L $lport:127.0.0.1:$rport $sshhost\$'); do [ \"\$(cat /proc/\$p/comm)\" = ssh ] && kill \$p; done; sleep 1; exec $hop")
     fi
     delay=5
     while true; do
