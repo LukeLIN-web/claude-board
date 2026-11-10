@@ -340,9 +340,18 @@ def picker_cursor_row(text: str, marker: str) -> str:
     too ("› 1. Trust and continue", "❯ 1. Yes"), and a picker takes the
     composer's place at the bottom of the pane — so the last line carrying
     `marker` is the composer only while it isn't a numbered row. Typing there
-    and pressing Enter commits whatever row the cursor is on."""
-    last = next((ln for ln in reversed(text.splitlines()) if marker in ln), "")
-    m = re.match(rf"^[\s\xa0]*{re.escape(marker)}[\s\xa0]*(\d+\.[\s\xa0]+\S.*?)\s*$", last)
+    and pressing Enter commits whatever row the cursor is on.
+
+    A numbered row directly under a rule is still Claude's composer: its box
+    opens with that rule, and a picker's cursor row always sits below the
+    question it answers. The composer holds such a row whenever the last reply
+    ended on a numbered choice — Claude then draws a dim "1. … 2. …" suggestion
+    there (dim is lost in a plain capture) — or when a draft starts "1."."""
+    lines = text.splitlines()
+    i = next((i for i in range(len(lines) - 1, -1, -1) if marker in lines[i]), None)
+    if i is None or (i > 0 and _HRULE_RE.match(lines[i - 1])):
+        return ""
+    m = re.match(rf"^[\s\xa0]*{re.escape(marker)}[\s\xa0]*(\d+\.[\s\xa0]+\S.*?)\s*$", lines[i])
     return m.group(1) if m else ""
 
 

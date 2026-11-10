@@ -34,9 +34,10 @@ from typing import Callable
 from . import actions, tmux
 from .sessions import PROBE_CWD
 
-# Tall enough for the Usage tab's limit rows below its per-session block: at a
-# detached pane's 80x24 the third row is under the fold.
-_COLS, _ROWS = 120, 50
+# Tall enough for the whole Usage tab, whose length varies with the machine's
+# recent skills and MCP servers (63 rows seen on v2.1.321). What doesn't fit
+# scrolls off the top: first the tab bar _panel_open looks for, then the limits.
+_COLS, _ROWS = 120, 120
 
 _START_WAIT = 30.0   # a cold start with MCP servers to connect can be slow
 _PANEL_WAIT = 8.0

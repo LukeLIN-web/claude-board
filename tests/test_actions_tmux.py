@@ -472,6 +472,20 @@ class SendPromptReadinessTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertEqual(p.send_text.call_args.kwargs["marker"], "»")
 
+    def test_a_numbered_suggestion_in_the_composer_is_not_a_picker(self):
+        # A reply ending on "1. … 2. …" leaves that choice as Claude's dim
+        # suggestion in the empty composer. Read as a picker's cursor row, every
+        # send to the card failed "a picker is open on this pane".
+        screen = ("  要么回复里不写 7.5 pt。\n\n"
+                  "────────────\n"
+                  "❯ 1. 确认，先发 JkVw 2. 按词云重写，下限提到 7.5 重画\n"
+                  "────────────\n"
+                  "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n")
+        with _pane(screen) as p:
+            r = actions.send_prompt(p.card, "hello")
+        self.assertTrue(r["ok"], r)
+        p.send_text.assert_called_once()
+
 
 def _fail_send(after_text, cli_reading=True):
     """send_prompt on a pane whose composer looks clean until the send, which
