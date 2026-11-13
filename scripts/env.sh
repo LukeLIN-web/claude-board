@@ -55,13 +55,11 @@ board_code() {
 }
 
 # exec_board — replace this shell with the board's uvicorn on $PORT. Never
-# returns. This repo often lives on a network/shared mount (e.g. /shared) where
-# inotify events don't fire, so uvicorn's default --reload silently never
-# detects edits; force watchfiles into polling mode so reload works here.
-# Polling walks the whole tree, .git included: with the venv still in it (~5k
-# paths on NFS), watchfiles' default 300ms cost ~24% of a core, and 2s a sixth
-# of that. The venv is outside it now (VENV), which leaves well under half.
+# returns. Called from the repo root; the board runs from $RUN_DIR instead. The
+# repo is often an NFS mount, and every tmux the board runs resolves its working
+# directory: on a congested NFS server each 2s refresh stalled on that.
 exec_board() {
-    export WATCHFILES_FORCE_POLLING=1 WATCHFILES_POLL_DELAY_MS=2000
-    exec "$VENV/bin/uvicorn" app:app --host 127.0.0.1 --port "$PORT" --reload --reload-dir .
+    local repo="$PWD"
+    mkdir -p "$RUN_DIR" && cd "$RUN_DIR" || return
+    exec "$VENV/bin/uvicorn" app:app --app-dir "$repo" --host 127.0.0.1 --port "$PORT"
 }

@@ -3,7 +3,8 @@
 #
 # The supervisor is deliberately a plain detached process instead of a systemd
 # unit: this project is also run on machines where the user has no systemd
-# session. It owns uvicorn's process group and starts it again whenever it exits.
+# session. It owns uvicorn's process group and starts it again whenever it exits,
+# and restarts it when the Python it imports changes (code_stamp).
 # A board started by an older run.sh is left alone; the supervisor waits for its
 # port to become free and takes over then.
 #
@@ -54,6 +55,14 @@ pid_gone() {
     ! kill -0 "$1" 2>/dev/null
 }
 
+# The board's code as of now; a different answer means reload. Only what it
+# imports — static/ is read per request. Not uvicorn's --reload: that polls the
+# whole tree, ~6.5k paths on the shared mount, from every host's board, and was
+# most of the NFS server's load.
+code_stamp() {
+    stat -c '%n %y %s' app.py core/*.py 2>/dev/null
+}
+
 # What `status` prints, and what `start` prints once the supervisor is up. $1 is
 # the wording for a running supervisor whose port is silent: just after `start`
 # the board is still booting; any other time it is between restarts.
@@ -80,8 +89,8 @@ stop_supervisor() {
         return 0
     fi
 
-    # `start` uses setsid, so this reaches both the loop and every uvicorn
-    # reloader/worker it owns. TERM lets uvicorn finish in-flight requests.
+    # `start` uses setsid, so this reaches both the loop and the uvicorn it
+    # owns. TERM lets uvicorn finish in-flight requests.
     kill -TERM -- "-$pid" 2>/dev/null || true
     if ! wait_for 20 0.25 pid_gone "$pid"; then
         echo "[board-supervisor] pid $pid did not stop after 5s" >&2
@@ -108,8 +117,17 @@ __supervise)
         while port_listening; do sleep 2; done
 
         echo "[board-supervisor] $(date -Is) starting board on 127.0.0.1:$PORT"
+        stamp="$(code_stamp)"
         exec_board &
         child="$!"
+        while kill -0 "$child" 2>/dev/null; do
+            sleep 2
+            if [ "$(code_stamp)" != "$stamp" ]; then
+                echo "[board-supervisor] $(date -Is) code changed; reloading"
+                kill -TERM "$child"
+                break
+            fi
+        done
         wait "$child"
         code="$?"
         echo "[board-supervisor] $(date -Is) board exited with status $code; restarting in ${RESTART_DELAY}s"
