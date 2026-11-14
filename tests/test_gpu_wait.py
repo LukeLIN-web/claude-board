@@ -106,6 +106,16 @@ def test_free_vram_is_keyed_by_cuda_ordinal_not_smi_index(monkeypatch):
     assert gpu_wait.query_free_mb() == {0: 13645, 1: 95320, 2: 1024, 3: 94900}
 
 
+def test_only_an_unrepaired_ecc_error_screens_a_card(monkeypatch):
+    smi = ("0, GPU-aaa, 0, No\n"              # rows remapped long ago: lifetime count only
+           "1, GPU-bbb, 2, No\n"              # error since the last reset, row not yet remapped
+           "2, GPU-ccc, 0, Yes\n"             # a row the card could not remap
+           "3, GPU-ddd, [N/A], [N/A]\n")      # ECC off / no row remapper
+    monkeypatch.setattr(gpu_wait, "_smi", lambda q: smi)
+    monkeypatch.setattr(gpu_wait, "cuda_uuids", lambda: {0: "GPU-aaa", 1: "GPU-bbb", 2: "GPU-ccc", 3: "GPU-ddd"})
+    assert gpu_wait.ecc_bad_gpus() == {1, 2}
+
+
 def test_without_a_cuda_enumeration_no_card_is_claimable(monkeypatch):
     monkeypatch.setattr(gpu_wait, "cuda_uuids", dict)
     monkeypatch.setattr(gpu_wait, "_smi", lambda q: "0, 100\n1, 200\n")   # smi indices are never used

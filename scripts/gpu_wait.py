@@ -124,20 +124,19 @@ def parse_free_mb(text: str) -> dict[int, int]:
     return {int(k): v for k, v in _pairs(text)}
 
 
-ECC_QUERY = ("index,uuid,ecc.errors.uncorrected.volatile.total,"
-             "ecc.errors.uncorrected.aggregate.total")
+ECC_QUERY = "index,uuid,ecc.errors.uncorrected.volatile.total,remapped_rows.failure"
 
 
-def parse_ecc(text: str) -> list[tuple[int, str, int, int]]:
+def parse_ecc(text: str) -> list[tuple[int, str, int, bool]]:
     """Parse ``nvidia-smi --query-gpu=<ECC_QUERY> --format=csv,noheader,nounits``
-    into ``[(smi_index, uuid, volatile, aggregate)]``. A non-numeric counter
-    (``[N/A]`` / ``[Not Supported]``: ECC off or unsupported) counts as 0."""
+    into ``[(smi_index, uuid, volatile, remap_failed)]``. ``[N/A]`` /
+    ``[Not Supported]`` (ECC off, no row remapper) counts as no error."""
     rows = []
     for line in text.splitlines():
         if line.strip():
-            index, uuid, *counts = (f.strip() for f in line.split(","))
-            volatile, aggregate = (int(c) if c.isdigit() else 0 for c in counts)
-            rows.append((int(index), uuid, volatile, aggregate))
+            index, uuid, volatile, failure = (f.strip() for f in line.split(","))
+            rows.append((int(index), uuid, int(volatile) if volatile.isdigit() else 0,
+                         failure == "Yes"))
     return rows
 
 
@@ -580,9 +579,11 @@ def query_free_mb() -> dict[int, int]:
 
 
 def ecc_bad_gpus() -> set[int]:
-    """Cards with uncorrectable ECC errors (volatile OR aggregate count > 0),
-    keyed like ``query_free_mb``: CUDA ordinals joined by UUID; a CUDA-invisible
-    card is already out of the pool.
+    """Cards with an unrepaired uncorrectable ECC error, keyed like
+    ``query_free_mb``: CUDA ordinals joined by UUID; a CUDA-invisible card is
+    already out of the pool. Unrepaired: one since the last GPU reset (the reset
+    remaps its row), or a row the card could not remap. The lifetime count is no
+    screen: a card whose rows were all remapped keeps it forever and is healthy.
 
     Such a card reads 0 MiB used, so most-free-first picks it first and the job
     dies (``cudaErrorECCUncorrectable``, NCCL init) or hangs. A failed query
@@ -600,13 +601,13 @@ def ecc_bad_gpus() -> set[int]:
         return set()
     ordinal_of = {u: i for i, u in cuda_uuids().items()}
     bad = set()
-    for index, uuid, volatile, aggregate in rows:
+    for index, uuid, volatile, remap_failed in rows:
         gpu = ordinal_of.get(uuid)
-        if gpu is not None and (volatile or aggregate):
+        if gpu is not None and (volatile or remap_failed):
             bad.add(gpu)
             _say_once(uuid, f"skipping GPU {gpu} (nvidia-smi index {index}, {uuid}) "
-                      f"for uncorrectable ECC errors: volatile {volatile}, "
-                      f"aggregate {aggregate}")
+                      f"for uncorrectable ECC errors: {volatile} since its last reset, "
+                      f"row remap failed: {remap_failed}")
     return bad
 
 
