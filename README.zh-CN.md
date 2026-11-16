@@ -79,6 +79,8 @@ tmux set-option -p -t %3 @fleet-passive 1     # 隐藏
 tmux set-option -p -u -t %3 @fleet-passive    # 恢复显示
 ```
 
+启动时环境里带 `FLEET_PASSIVE=1` 的辅助进程在哪台机器上都不出卡片，经 ssh 开到别的机器上、不在任何 pane 里的也一样。
+
 ### 按 session id 反查
 
 `GET /api/locate/<session-id>`（≥ 8 位的唯一前缀也行）返回在跑 session 的 window 和 tmux pane。[`scripts/locate-session.sh`](scripts/locate-session.sh) 对 Claude session 做同样的事，不需要 server。

@@ -94,6 +94,10 @@ tmux set-option -p -t %3 @fleet-passive 1     # hide
 tmux set-option -p -u -t %3 @fleet-passive    # show again
 ```
 
+A helper started with `FLEET_PASSIVE=1` in its environment gets no card on any
+host, which covers one launched onto another host over ssh, where it sits in no
+pane.
+
 ### Locate a session by id
 
 `GET /api/locate/<session-id>` (a unique prefix of ≥ 8 chars works too) returns

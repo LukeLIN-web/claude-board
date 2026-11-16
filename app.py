@@ -149,7 +149,8 @@ def _local_snapshot() -> dict:
 
     # Passive helpers belong to their parent workflow. Only suppress cards;
     # discovery, history and session-id lookup still include these sessions.
-    passive = tmux.passive_ttys(pids([w for ws in groups for w in ws]))
+    passive = tmux.passive_ttys({w["pid"]: w.get("tty") for ws in groups for w in ws
+                                 if isinstance(w.get("pid"), int)})
     snap["windows"], codex_windows, hmz_windows = (
         [w for w in ws if w.get("tty") not in passive] for ws in groups)
     every = snap["windows"] + codex_windows + hmz_windows

@@ -226,7 +226,23 @@ class ListPanesTests(unittest.TestCase):
                "/dev/pts/6\ttrue\nmissing-column\n\t1\n")
         with mock.patch("pathlib.Path.read_bytes", return_value=b""), \
              _patch_run(returncode=0, stdout=out):
-            self.assertEqual(tmux.passive_ttys([101]), {"/dev/pts/3"})
+            self.assertEqual(tmux.passive_ttys({101: "/dev/pts/7"}), {"/dev/pts/3"})
+
+    def test_a_process_started_passive_is_hidden_with_no_pane_anywhere(self):
+        # A helper moved to this host over ssh: its tty is sshd's, in no tmux
+        # pane, and no server is reachable — its environment alone marks it.
+        envs = {"/proc/101/environ": b"FLEET_PASSIVE=1\0",
+                "/proc/102/environ": b"FLEET_PASSIVE=true\0",
+                "/proc/103/environ": b"FLEET_PASSIVE=0\0"}
+
+        def read_bytes(path):
+            return envs[str(path)]
+
+        with mock.patch("pathlib.Path.read_bytes", autospec=True, side_effect=read_bytes), \
+             _patch_run(side_effect=FileNotFoundError("tmux")):
+            self.assertEqual(
+                tmux.passive_ttys({101: "/dev/pts/7", 102: "/dev/pts/8", 103: "/dev/pts/9"}),
+                {"/dev/pts/7"})
 
     def test_every_pane_on_another_server_is_passive(self):
         # The board uses its private socket, while two helper processes share
@@ -247,7 +263,7 @@ class ListPanesTests(unittest.TestCase):
              mock.patch("pathlib.Path.read_bytes", return_value=
                         f"PATH=/bin\0TMUX={socket},123,0\0".encode()), \
              _patch_run(side_effect=servers):
-            self.assertEqual(tmux.passive_ttys([101, 102]),
+            self.assertEqual(tmux.passive_ttys({101: "/dev/pts/7", 102: "/dev/pts/8"}),
                              {"/dev/pts/3", "/dev/pts/9", "/dev/pts/10"})
         self.assertEqual(len(calls), 2)
 
@@ -256,7 +272,7 @@ class ListPanesTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"FLEET_TMUX_SOCKET": "board", "TMUX_TMPDIR": "/tmp"}), \
              mock.patch("pathlib.Path.read_bytes", return_value=f"TMUX={own},123,0\0".encode()), \
              _patch_run(returncode=0, stdout="/dev/pts/3\t\n") as run:
-            self.assertEqual(tmux.passive_ttys([101]), set())
+            self.assertEqual(tmux.passive_ttys({101: "/dev/pts/7"}), set())
         self.assertEqual(run.call_count, 1)
 
     def test_unreadable_process_environment_keeps_the_configured_server(self):
@@ -266,7 +282,7 @@ class ListPanesTests(unittest.TestCase):
                 kwargs = {"side_effect": env} if isinstance(env, Exception) else {"return_value": env}
                 with mock.patch("pathlib.Path.read_bytes", **kwargs), \
                      _patch_run(returncode=0, stdout="/dev/pts/3\t1\n") as run:
-                    self.assertEqual(tmux.passive_ttys([101]), {"/dev/pts/3"})
+                    self.assertEqual(tmux.passive_ttys({101: "/dev/pts/7"}), {"/dev/pts/3"})
                 self.assertEqual(run.call_count, 1)
 
     def test_an_unreachable_process_socket_does_not_hide_its_sessions(self):
@@ -278,10 +294,10 @@ class ListPanesTests(unittest.TestCase):
         with mock.patch("pathlib.Path.read_bytes", return_value=
                         b"TMUX=/tmp/tmux-1/gone,123,0\0"), \
              _patch_run(side_effect=servers):
-            self.assertEqual(tmux.passive_ttys([101]), {"/dev/pts/3"})
+            self.assertEqual(tmux.passive_ttys({101: "/dev/pts/7"}), {"/dev/pts/3"})
         with mock.patch("pathlib.Path.read_bytes", return_value=b""), \
              _patch_run(side_effect=FileNotFoundError("tmux")):
-            self.assertEqual(tmux.passive_ttys([101]), set())
+            self.assertEqual(tmux.passive_ttys({101: "/dev/pts/7"}), set())
 
 
 class PaneForTtyTests(unittest.TestCase):

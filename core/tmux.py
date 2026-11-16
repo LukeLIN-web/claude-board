@@ -314,26 +314,32 @@ def list_panes() -> list[dict]:
     return panes
 
 
-def passive_ttys(pids: list[int]) -> set[str]:
-    """TTYs of parent-controlled helpers, not user cards.
+def passive_ttys(cards: dict[int, str]) -> set[str]:
+    """TTYs of parent-controlled helpers, not user cards; `cards` maps each
+    card's pid to its tty.
 
-    Every pane on a tmux server other than the board's is one: whatever drives
-    that server owns it, and the board could not type into it anyway. On the
-    board's own server a helper sets `@fleet-passive` to `1` on its pane. A
-    process names its server in its TMUX environment; missing metadata or an
-    unreachable server fails open.
+    A process started with FLEET_PASSIVE=1 in its environment is one: that mark
+    goes wherever the process does, onto another host over ssh too. Every pane
+    on a tmux server other than the board's is one: whatever drives that server
+    owns it, and the board could not type into it anyway. On the board's own
+    server a pane marked `@fleet-passive` `1` is one. A process names its
+    server in its TMUX environment; missing metadata or an unreachable server
+    fails open.
     """
     own = os.path.realpath(_socket_path(_server_name()))
     foreign: set[str] = set()
-    for pid in pids:
+    hidden: set[str] = set()
+    for pid, tty in cards.items():
+        env = proc_environ(pid)
+        if env.get("FLEET_PASSIVE") == "1" and tty:
+            hidden.add(tty)
         try:
-            socket_path, _, _ = proc_environ(pid)["TMUX"].rsplit(",", 2)
+            socket_path, _, _ = env["TMUX"].rsplit(",", 2)
         except (KeyError, ValueError):
             continue
         if os.path.isabs(socket_path) and os.path.realpath(socket_path) != own:
             foreign.add(socket_path)
 
-    hidden: set[str] = set()
     result = _run("list-panes", "-a", "-F", "#{pane_tty}\t#{@fleet-passive}")
     if result["ok"]:
         for line in result["stdout"].splitlines():
