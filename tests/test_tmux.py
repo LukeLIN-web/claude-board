@@ -1399,6 +1399,10 @@ class ShownAboveComposerTests(unittest.TestCase):
         self.assertFalse(self._shown(self.PANE, text="something else entirely"))
 
 
+# The draft typed into fixtures/composer_scrolled.txt.
+_SCROLLED_DRAFT = "这是一段用来测试的长提示，" * 30 + "ENDOFDRAFT"
+
+
 class ComposerHasTailTests(unittest.TestCase):
     """_composer_has_tail anchors on the DRIVEN platform's composer marker only —
     Claude's `❯` by default, Codex's `›` when passed. The other TUI's glyph is
@@ -1409,6 +1413,11 @@ class ComposerHasTailTests(unittest.TestCase):
         with mock.patch.object(tmux, "capture_pane",
                                return_value={"ok": True, "text": cap_text}):
             return tmux._composer_has_tail("%5", text, marker)
+
+    def test_a_draft_scrolled_inside_the_composer_has_landed(self):
+        # v2.1.326, 80x24: the draft outgrew the composer, which scrolled its ❯
+        # row off the top and wrote "↑ 4 more" into its top rule.
+        self.assertTrue(self._tail(fixture_text("composer_scrolled.txt"), _SCROLLED_DRAFT))
 
     def test_claude_text_landed_with_tasklist_below_composer(self):
         # Claude renders the todo summary BELOW the input composer, and each
@@ -1568,6 +1577,16 @@ class ComposerTextTests(unittest.TestCase):
             "────────────\n"
         )
         self.assertEqual(tmux._composer_text(cap, "›"), "run the benchmark suite")
+
+    def test_a_scrolled_composer_reads_the_rows_on_screen(self):
+        text = tmux._composer_text(fixture_text("composer_scrolled.txt"), "❯")
+        self.assertTrue(text.startswith("长提示，"), text)
+        self.assertTrue(text.endswith("ENDOFDRAFT"), text)
+
+    def test_a_scrolled_composer_is_read_below_an_echoed_turn(self):
+        # The last ❯ on screen opens a turn echoed above the composer.
+        cap = "❯ an earlier prompt\n● done\n" + fixture_text("composer_scrolled.txt")
+        self.assertNotIn("earlier", tmux._composer_text(cap, "❯"))
 
 
 class ComposerMarkerTests(unittest.TestCase):

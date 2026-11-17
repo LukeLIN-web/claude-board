@@ -698,6 +698,25 @@ def composer_marker(platform: str, screen: str = "") -> str:
     return max(glyphs, key=screen.rfind)
 
 
+# A draft taller than the composer's share of the pane scrolls inside it to keep
+# the cursor in view: its first row, the one the marker opens, goes off the top,
+# and the composer's top rule reads "─── ↑ N more ───" (v2.1.326: past 7 rows on
+# a 24-row pane, ~350 CJK chars at 80 columns). Read on the marker alone, every
+# long prompt that landed in a detached 80x24 card read as "no composer marker
+# on screen", and the send gave up.
+_SCROLLED_TOP_RE = re.compile(r"^─+ ↑ \d+ more ─.*\n?", re.M)
+
+
+def _composer_region(cap: str, marker: str) -> Optional[str]:
+    """`cap` from the composer's first row on screen to the end: from the last
+    `marker`, or from under a scrolled composer's top rule (_SCROLLED_TOP_RE)
+    when that comes later. None when neither is on screen: no composer."""
+    start = cap.rfind(marker)
+    for m in _SCROLLED_TOP_RE.finditer(cap):
+        start = max(start, m.end())
+    return cap[start:] if start != -1 else None
+
+
 def _composer_has_tail(pane: str, text: str, marker: str) -> bool:
     """_tail_in over a fresh capture of `pane`."""
     return _tail_in(capture_pane(pane).get("text", ""), text, marker)
@@ -707,9 +726,10 @@ def _tail_in(cap: str, text: str, marker: str) -> bool:
     """True if a distinctive tail of `text` still sits in the composer of the
     captured screen `cap`, stranded and awaiting a submit Enter.
 
-    The composer is the region after the last `marker` (see COMPOSER_MARKERS:
-    anchored on a Claude task line's `›` instead, the region starts below the
-    real composer and a landed prompt reads as "never landed"). A submitted
+    The composer is _composer_region: from the last `marker` (see
+    COMPOSER_MARKERS: anchored on a Claude task line's `›` instead, the region
+    starts below the real composer and a landed prompt reads as "never
+    landed"), or from under a scrolled composer's top rule. A submitted
     prompt is echoed as a turn ABOVE the marker (same glyph, hence "last") and
     leaves the composer empty (a dim ghost suggestion, never our text).
     Whitespace is squeezed on both sides so the needle survives the composer's
@@ -720,18 +740,17 @@ def _tail_in(cap: str, text: str, marker: str) -> bool:
     means the prompt DID submit (see _BTW_OVERLAY_FOOTER). So does an open
     /goal panel, whose `/goal …` hint would otherwise match (goal_panel_open).
 
-    No marker on screen means there is NO composer — the TUI exited or was
-    suspended and its parent shell owns the pty. The injected text still echoes
-    there (line-discipline echo at a bash prompt), and matching that echo would
-    make send_text press Enter and EXECUTE the prompt as a shell command.
+    No composer on screen means the TUI exited or was suspended and its parent
+    shell owns the pty. The injected text still echoes there (line-discipline
+    echo at a bash prompt), and matching that echo would make send_text press
+    Enter and EXECUTE the prompt as a shell command.
     """
     needle = _needle(text)
     if not needle:
         return False
-    idx = cap.rfind(marker)
-    if idx == -1:
+    region = _composer_region(cap, marker)
+    if region is None:
         return False
-    region = cap[idx:]
     if _BTW_OVERLAY_FOOTER in region or goal_panel_open(cap):
         return False
     squeezed = "".join(region.split())
@@ -767,21 +786,18 @@ _CHROME_CHARS = set("─│╭╮╰╯▔ ")
 
 
 def _composer_text(cap_text: str, marker: str) -> Optional[str]:
-    """What is sitting in the composer: the last `marker` line (after the
+    """What is sitting in the composer: its first row on screen (after the
     marker) plus wrapped continuation lines, stopping at the chrome below it
-    (rule / box border / blank / the ⏵⏵ status line). None when no marker is
-    on screen — there is no composer to read. `marker` is the driven CLI's
-    glyph alone (see COMPOSER_MARKERS)."""
-    lines = cap_text.splitlines()
-    last = None
-    for i, ln in enumerate(lines):
-        if marker in ln:
-            last = i
-    if last is None:
+    (rule / box border / blank / the ⏵⏵ status line); of a scrolled composer,
+    the rows still on screen. None when no composer is on screen
+    (_composer_region). `marker` is the driven CLI's glyph alone (see
+    COMPOSER_MARKERS)."""
+    region = _composer_region(cap_text, marker)
+    if region is None:
         return None
-    head = lines[last]
-    parts = [head[head.rfind(marker) + 1:].strip("│")]
-    for ln in lines[last + 1:]:
+    head, *rest = region.splitlines() or [""]
+    parts = [head.removeprefix(marker).strip("│")]
+    for ln in rest:
         s = ln.strip()
         if not s or set(s) <= _CHROME_CHARS or s.startswith("⏵⏵"):
             break
@@ -1006,8 +1022,8 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
         # The composer region, bounded since the log is never rotated: a draft
         # cut off by the pane's last row and one cut off by a stale screen
         # differ only past the draft's head.
-        idx = cap.rfind(marker)
-        frame = ("".join(cap[idx:].split())[:_DEBUG_FRAME_MAX] if idx != -1
+        region = _composer_region(cap, marker)
+        frame = ("".join(region.split())[:_DEBUG_FRAME_MAX] if region is not None
                  else f"NO-MARKER tail={cap[-120:]!r}")
         _send_debug(f"landed pane={pane} attempt={attempt} wait={wait} MISS "
                     f"needle={_needle(text)!r} frame={frame!r}")
