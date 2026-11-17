@@ -1261,6 +1261,38 @@ class ResyncSizeTests(unittest.TestCase):
         self._resync(read=FileNotFoundError).assert_not_called()  # process gone
 
 
+class GrowDetachedTests(unittest.TestCase):
+    """_grow_detached grows a detached card's window to the send minimum and
+    leaves it unpinned; a window someone is attached to is theirs."""
+
+    def _grow(self, display):
+        """The tmux commands _grow_detached runs, past the size query it is
+        answered `display` to."""
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv[argv.index("tmux") + 1:])
+            return FakeProc(stdout=display if "display-message" in argv else "")
+
+        with _patch_run(fake_run):
+            tmux._grow_detached("%5")
+        return [c for c in calls if "display-message" not in c]
+
+    def test_a_detached_80x24_window_grows_and_stays_unpinned(self):
+        self.assertEqual(self._grow("0 80 24"), [
+            ["resize-window", "-t", "%5", "-x", "200", "-y", "50"],
+            ["set-option", "-wu", "-t", "%5", "window-size"],
+        ])
+
+    def test_a_dimension_already_past_the_minimum_is_kept(self):
+        self.assertEqual(self._grow("0 220 24")[0][-4:], ["-x", "220", "-y", "50"])
+
+    def test_left_alone_when_attached_big_enough_or_unreadable(self):
+        self.assertEqual(self._grow("1 80 24"), [])
+        self.assertEqual(self._grow("0 200 50"), [])
+        self.assertEqual(self._grow(""), [])
+
+
 class SendTextConfirmedTests(unittest.TestCase):
     """send_text_confirmed (hmz) pastes once, waits out a slow intake, and
     succeeds only on the caller's evidence that the line was taken."""

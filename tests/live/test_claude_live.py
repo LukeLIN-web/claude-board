@@ -9,8 +9,8 @@ text. These tests take sessions through the board's own code paths:
   a spawn into a never-trusted directory gets its trust prompt answered;
   then one session, in file order: card found → banner read → prompt lands and
   is answered → a prompt sent over an open Rewind panel lands → a repaint
-  brings back a screen wiped behind the CLI's back → the /model dialog
-  commits a pick.
+  brings back a screen wiped behind the CLI's back → a draft lands in a pane
+  too short for the frame → the /model dialog commits a pick.
   Apart from those, the usage probe starts a throwaway session of its own and
   reads /status and /usage off it.
 
@@ -229,6 +229,19 @@ def test_a_repaint_brings_back_a_screen_out_of_step_with_the_cli(live):
         tmux.send_keys(live.pane, tmux._REPAINT_KEY)
         assert _wait_for(lambda: tmux._tail_in(_pane_text(live), draft, "❯"), 5), \
             "the repaint did not bring the draft back"
+    finally:
+        tmux._clear_composer(live.pane, "❯")
+
+
+def test_a_send_grows_a_pane_too_short_for_the_frame(live):
+    # Claude cuts a frame taller than the pane off at its last row, the draft's
+    # end with it; a detached card is grown before the landed check reads it.
+    # Nothing is submitted, so no model is called.
+    assert _wait_for(lambda: _composer(live), 20), "no composer to type into"
+    tmux.resize_window(live.pane, 80, 7)
+    draft = "这是一段用来测试的长提示，" * 30 + "ENDOFDRAFT"
+    try:
+        assert tmux._send_until_landed(live.pane, draft, "❯"), "the draft never landed"
     finally:
         tmux._clear_composer(live.pane, "❯")
 

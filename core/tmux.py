@@ -540,8 +540,34 @@ def new_window(cwd: str, cmd: Optional[list[str]] = None,
 
 def resize_window(pane: str, cols: int, rows: int) -> dict:
     """Size the window holding `pane`. A detached session's window is 80x24, and
-    nothing attached will ever widen it."""
-    return _outcome(_run("resize-window", "-t", pane, "-x", str(cols), "-y", str(rows)))
+    nothing attached will ever widen it. resize-window also pins the window at
+    that size (window-size manual); unpinned, it keeps the size while detached
+    and takes the size of the next client that attaches."""
+    r = _outcome(_run("resize-window", "-t", pane, "-x", str(cols), "-y", str(rows)))
+    _run("set-option", "-wu", "-t", pane, "window-size")
+    return r
+
+
+# What a send grows a detached card's window to. Claude Code lays out for the
+# rows it has and, when its frame is taller than that, cuts it off at the last
+# row instead of scrolling. On tmux's 80x24 a frame topped by the last turn and
+# a notice box (a "Bug report drafted" box, 7 rows) had room for two rows of
+# draft: the draft's end went below the pane, and every landed check missed it
+# (v2.1.326). 80 columns also wrap a draft into the most rows.
+_SEND_MIN_COLS, _SEND_MIN_ROWS = 200, 50
+
+
+def _grow_detached(pane: str) -> None:
+    """Grow `pane`'s window to at least _SEND_MIN_COLS x _SEND_MIN_ROWS while no
+    client is attached to its session: one that is sizes it, and shows its
+    owner the screen at that size."""
+    got = (_display(pane, "#{session_attached} #{window_width} #{window_height}") or "").split()
+    try:
+        attached, cols, rows = map(int, got)
+    except ValueError:
+        return
+    if not attached and (cols < _SEND_MIN_COLS or rows < _SEND_MIN_ROWS):
+        resize_window(pane, max(cols, _SEND_MIN_COLS), max(rows, _SEND_MIN_ROWS))
 
 
 def capture_pane(pane: str, scrollback: int = 0) -> dict:
@@ -969,7 +995,9 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
 
     * A CLI that missed a shrink draws a long draft's end below the last row,
       where it never shows (see _resync_size), so the size is resynced before
-      anything is read.
+      anything is read. A pane too short for the CLI's frame cuts the draft's
+      end off the same way (see _SEND_MIN_ROWS), so a detached one is grown
+      first.
     * A screen can differ from what the CLI drew, which no retype repairs (see
       _REPAINT_KEY), so every attempt starts with a repaint.
     * A busy or stalled CLI has not drawn what it has not read: the pty buffers
@@ -989,6 +1017,7 @@ def _send_until_landed(pane: str, text: str, marker: str) -> bool:
       left to join the next send. A blind clear also wipes a leftover that a
       screen out of step shows as empty.
     """
+    _grow_detached(pane)
     _resync_size(pane)
     for attempt, wait in enumerate(_LANDED_VERIFY_WAITS):
         # Clear before every attempt, the FIRST one included. Whatever is in the
