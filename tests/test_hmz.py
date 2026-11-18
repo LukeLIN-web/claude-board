@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from core import hmz, sessions
@@ -188,6 +189,23 @@ class TestRefusal(unittest.TestCase):
     def _refusal(self, screen, text=TYPED):
         with mock.patch.object(hmz.tmux, "capture_pane", return_value={"ok": True, "text": screen}):
             return hmz.refusal("%1", text)
+
+    def _refused(self, events):
+        screen = self._screen(["hmz: cannot choose a flow while one is running", "A1 · actor · claude/m:high"])
+        epic = write_jsonl(events)
+        with mock.patch.object(hmz.tmux, "capture_pane", return_value={"ok": True, "text": screen}), \
+             mock.patch.object(hmz, "_latest_epic", return_value=epic), \
+             mock.patch.object(hmz, "_home", return_value=Path("/nowhere")):
+            return hmz.refused(7, "/home/u/robot", "%1", self.TYPED)
+
+    def test_a_second_copy_refused_by_the_run_the_first_started_is_not_a_refusal(self):
+        task = self.TYPED.split(" ", 1)[1]
+        began = {"event": "began", "at": "2026-10-02T00:50:30.513Z", "flow": "parallel_flame_chase"}
+        self.assertEqual(self._refused([{**began, "task": task}]), "")
+        # …but it is one while another task's run is what is going, or none is.
+        self.assertIn("while one is running", self._refused([{**began, "task": "something else"}]))
+        self.assertIn("while one is running", self._refused(
+            [{**began, "task": task}, {"event": "ended", "at": "2026-10-02T00:51:30.513Z", "how": "done"}]))
 
     def test_the_red_line_under_the_echo(self):
         self.assertEqual(self._refusal(self._screen(["hmz: no such flow: parallel_flame_chase"])),
@@ -640,6 +658,19 @@ class TestClear(_HmzHomeTest):
             # A repeat hmz didn't write down is on the board's stamp of it.
             hmz.codex._cleared_at_ms[7] = int(self._ms(self.CLEARED)) + 60_000
             self.assertEqual(hmz.list_hmz_windows()[0].updated_at, int(self._ms(self.CLEARED)) + 60_000)
+
+    def test_a_helper_hmz_started_under_the_interface_is_not_a_second_card(self):
+        table = {7: sessions.Proc(1, "Sl+", "pts/1", "hmz", TUI), 8: sessions.Proc(7, "Sl+", "pts/1", "hmz", TUI)}
+        env = {"CLAUDE_FLEET_CWD_INCLUDE": "", "CLAUDE_FLEET_CWD_EXCLUDE": ""}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(hmz, "proc_table", return_value=table), \
+             mock.patch.object(hmz, "_pid_alive", return_value=True), \
+             mock.patch.object(hmz, "_proc_start_ms", return_value=0), \
+             mock.patch.object(hmz, "_latest_epic", return_value=None), \
+             mock.patch.object(hmz.os, "readlink", return_value=self.CWD):
+            sessions._reload_cwd_filters()
+            self.addCleanup(sessions._reload_cwd_filters)
+            self.assertEqual([w.pid for w in hmz.list_hmz_windows()], [7])
 
     def _discovered(self, events, started_ms):
         epic = write_jsonl(events, scratch_dir() / "20261002T005030.513Z-a779c6" / "epic.jsonl")

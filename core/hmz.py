@@ -557,9 +557,16 @@ def _discover() -> list[tuple[Window, list[dict]]]:
     if not Path("/proc").is_dir():
         return []
     windows: list[tuple[Window, list[dict]]] = []
-    for pid, info in proc_table().items():
+    table = proc_table()
+    for pid, info in table.items():
         tty = _ps_tty(info.tty)
         if not tty or not _is_interactive_hmz(info.args):
+            continue
+        # hmz starts helpers of its own under the same command line and terminal
+        # (seen live: three `hmz` pids for one interface); the card is the one
+        # that started them, or a helper shows as a second card on its pane.
+        parent = table.get(info.ppid)
+        if parent is not None and _is_interactive_hmz(parent.args):
             continue
         if not _pid_alive(pid):
             continue
@@ -910,6 +917,30 @@ def refusal(pane: str, text: str) -> str:
         if len(said) == 3:  # a long one wraps; the composer's own chrome follows it
             break
     return " ".join(said)
+
+
+# hmz's answer to a flow named while another runs.
+_ONE_RUNNING = "cannot choose a flow while one is running"
+
+
+def refused(pid: int, cwd: str, pane: str, text: str) -> str:
+    """refusal(), for a send: "" too where hmz said no only to a second copy of `text`.
+
+    hmz slow to act on Enter (its first start on a host) still shows the line in
+    its composer, so the send presses Enter again (tmux.send_text_confirmed), and
+    hmz then takes the line twice: the first copy starts the flow, the second is
+    refused because that flow runs. Seen live: the run began, and the send was
+    reported as "taken but not run". A run going in `cwd` on the task this line
+    ends with is the line having run.
+    """
+    said = refusal(pane, text)
+    if _ONE_RUNNING in said:
+        epic = _latest_epic(cwd, _home(pid))
+        events = _events(epic) if epic else []
+        task = _squeeze(str(_began(events).get("task") or ""))
+        if task and not _ended(events) and _squeeze(text).endswith(task):
+            return ""
+    return said
 
 
 # What the agents said, for the timeline: each CLI's own sessions under the

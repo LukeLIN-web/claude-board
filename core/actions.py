@@ -1267,7 +1267,7 @@ def _send_prompt_inner(w, pane: str, text: str) -> dict:
         # whatever hmz then says on screen instead of running it.
         res = tmux.send_text_confirmed(
             pane, collapsed, hmz.prompt_taken(w.pid, w.cwd, collapsed, pane), marker,
-            refused=lambda: hmz.refusal(pane, collapsed),
+            refused=lambda: hmz.refused(w.pid, w.cwd, pane, collapsed),
         )
     else:
         res = tmux.send_text(pane, collapsed, verify_landed=True, marker=marker)
