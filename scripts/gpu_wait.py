@@ -535,6 +535,10 @@ def cuda_uuids() -> dict[int, str]:
     call asserts. Reading UUIDs creates no context. When the whole enumeration
     fails (one bad card can fail it), each ordinal is asked in a process of its
     own; an empty answer is not cached, so the next poll asks again.
+
+    The keys are the machine's ordinals whatever this process's own
+    ``CUDA_VISIBLE_DEVICES`` says: a job running under a claim that wants its own
+    card asks ``visible_uuids()``, never ``cuda_uuids()[0]``.
     """
     global _CUDA_UUIDS
     if not _CUDA_UUIDS:
@@ -545,6 +549,18 @@ def cuda_uuids() -> dict[int, str]:
                     found[i] = one[0]
         _CUDA_UUIDS = found
     return _CUDA_UUIDS
+
+
+def visible_uuids() -> list[str]:
+    """The cards this process's ``CUDA_VISIBLE_DEVICES`` selects, as UUIDs in its
+    order: what a job started by ``gpu_wait`` calls to name the card(s) it was
+    given. Unset means every card; an entry that is already a UUID is kept."""
+    uuid_of = cuda_uuids()
+    pin = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if pin is None:
+        return [uuid_of[i] for i in sorted(uuid_of)]
+    return [e if e.startswith("GPU-") else uuid_of[int(e)]
+            for e in (x.strip() for x in pin.split(",")) if e]
 
 
 def query_free_mb() -> dict[int, int]:

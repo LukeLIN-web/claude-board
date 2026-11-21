@@ -140,6 +140,16 @@ def test_the_enumeration_asks_card_by_card_when_the_whole_fails_and_again_when_n
     assert gpu_wait.cuda_uuids() == {0: "GPU-a", 1: "GPU-b"}   # once found, cached
 
 
+def test_a_job_under_a_claim_names_its_own_cards_not_the_machines_first(monkeypatch):
+    monkeypatch.setattr(gpu_wait, "cuda_uuids", lambda: {0: "GPU-a", 1: "GPU-b", 2: "GPU-c"})
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2, GPU-a")
+    assert gpu_wait.visible_uuids() == ["GPU-c", "GPU-a"]
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert gpu_wait.visible_uuids() == []
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    assert gpu_wait.visible_uuids() == ["GPU-a", "GPU-b", "GPU-c"]
+
+
 class Clock:   # stands in for gpu_wait.time
     def __init__(self, times):
         self.times = iter(times)
