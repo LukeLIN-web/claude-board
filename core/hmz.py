@@ -1040,11 +1040,15 @@ def hmz_timeline(path: str | Path | None, limit: int = 60,
         events.append(transcripts.event(ts, "assistant_text", text, role="assistant",
                                         extra=extra))
     # A typed line the run took is already here, in the line it began on —
-    # `$<flow> <task>`, so a line typed without its `$<flow>` is looked for inside.
-    shown = [_squeeze(ev.get("text") or "") for ev in events if ev.get("kind") == "user_text"]
+    # `$<flow> <task>`, so a line typed without its `$<flow>` is that line's task.
+    # Only the whole task: a short answer to the run's question ("A") is no copy of
+    # a task that mentions it ("Which one, A or B?").
+    shown = {_squeeze(cap_text(t, MESSAGE_CHARS)) for e in run
+             if e.get("event") == "began" and not _before(e.get("at", ""), since_ms)
+             for t in (f"${e.get('flow', '')} {e.get('task', '')}", str(e.get("task", "")))}
     for d in typed:
         line = _squeeze(cap_text(d["text"], MESSAGE_CHARS))
-        if line and not _before(d["at"], since_ms) and not any(line in s for s in shown):
+        if line and not _before(d["at"], since_ms) and line not in shown:
             events.append(transcripts.event(d["at"], "user_text",
                                             cap_text(d["text"], MESSAGE_CHARS), role="user"))
     if path:

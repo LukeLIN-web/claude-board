@@ -1190,3 +1190,25 @@ class TestDaemonQuestions(unittest.TestCase):
     def test_an_idle_card_does_not_ask_the_daemon(self):
         _, asked = self._card([self.ASKED], status="idle")
         asked.assert_not_called()
+
+
+class TestTypedAnswers(unittest.TestCase):
+    """A line typed to answer a run's question is on the timeline, even when the
+    task that started the run happens to contain it."""
+
+    def test_a_short_answer_is_not_taken_for_the_task(self):
+        run = [{"event": "began", "at": "2026-11-22T19:12:17.100Z", "flow": "@user/ask_probe",
+                "task": "Which one, A or B?", "agents": []}]
+        typed = [{"at": "2026-11-22T19:12:17.008Z", "workdir": "/w", "text": "$@user/ask_probe Which one, A or B?"},
+                 {"at": "2026-11-22T19:19:41.909Z", "workdir": "/w", "text": "A"}]
+        rows = [e["text"] for e in hmz.hmz_timeline(str(write_jsonl(run)), typed=typed)
+                if e["kind"] == "user_text"]
+        self.assertEqual(rows, ["$@user/ask_probe Which one, A or B?", "A"])
+
+    def test_the_task_typed_without_its_flow_is_still_one_line(self):
+        run = [{"event": "began", "at": "2026-11-22T19:12:17.100Z", "flow": "chat",
+                "task": "fix the tests", "agents": []}]
+        typed = [{"at": "2026-11-22T19:12:17.008Z", "workdir": "/w", "text": "fix the tests"}]
+        rows = [e["text"] for e in hmz.hmz_timeline(str(write_jsonl(run)), typed=typed)
+                if e["kind"] == "user_text"]
+        self.assertEqual(len(rows), 1)
