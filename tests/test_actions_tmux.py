@@ -486,6 +486,18 @@ class SendPromptReadinessTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         p.send_text.assert_called_once()
 
+    def test_a_numbered_suggestion_under_a_named_rule_is_not_a_picker(self):
+        # A renamed session's composer opens with a rule that carries its name.
+        screen = ("  8. 附录 K 的两个占比用哪种判法。\n\n"
+                  "──────────────────────── agent-harness-dispatcher ─\n"
+                  "❯ 1. 按 wba 推荐 2. 换 4. 不换\n"
+                  "───────────────────────────────────────────────────\n"
+                  "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n")
+        with _pane(screen) as p:
+            r = actions.send_prompt(p.card, "hello")
+        self.assertTrue(r["ok"], r)
+        p.send_text.assert_called_once()
+
 
 def _fail_send(after_text, cli_reading=True):
     """send_prompt on a pane whose composer looks clean until the send, which

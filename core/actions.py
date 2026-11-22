@@ -818,8 +818,10 @@ def get_pane_menu(w) -> Optional[dict]:
     return parse_pane_menu(full["text"] if full["ok"] else vis)
 
 
-# A horizontal rule (the input box's top/bottom border); ≥8 box/dash chars only.
-_HRULE_RE = re.compile(r"^\s*[─—\-]{8,}\s*$")
+# A horizontal rule (the input box's top/bottom border): ≥8 box/dash chars, and
+# on a renamed session the top border carries the name near its right end
+# ("──────── my-card ─").
+_HRULE_RE = re.compile(r"^\s*[─—\-]{8,}(?: \S.*? [─—\-]+)?\s*$")
 # A queued message line: indented "❯ <text>". The leading whitespace is what
 # distinguishes it from the column-0 active prompt and the in-box input line.
 _QUEUED_RE = re.compile(r"^\s+❯[ \t]+(\S.*?)\s*$")
