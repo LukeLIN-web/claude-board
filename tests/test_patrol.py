@@ -439,3 +439,28 @@ class MountHungTriageTests(unittest.TestCase):
         self.assertEqual(got["triage_reason"], "FUSE 挂住，09:01 起没动过。claude")
         self.assertIn("abort", got["triage_suggestion"])
         self.assertIn("kill -9 没用", got["triage_suggestion"])
+
+
+class AskedInWordsTests(unittest.TestCase):
+    """A turn that ends on a question only the person can answer is waiting on them,
+    when the session marks it (patrol.ASK_MARK); a turn that merely ends is done."""
+
+    def _classify(self, text):
+        return patrol.classify({"status": "idle", "idle_seconds": 120,
+                                "transcript_path": str(write_jsonl([_end_turn(text)]))})
+
+    def test_a_marked_question_is_asking(self):
+        got = self._classify(f"改完了两处。\n\n{patrol.ASK_MARK}A 还是 B？\n\n理由见上。")
+        self.assertEqual(got["triage"], "asking")
+        self.assertEqual(got["triage_reason"], "在问：A 还是 B？")
+
+    def test_the_mark_may_open_a_bullet_or_bold_line(self):
+        for line in (f"- {patrol.ASK_MARK} 要不要合并？", f"**{patrol.ASK_MARK}** 要不要合并？"):
+            with self.subTest(line):
+                self.assertEqual(patrol.asked_in(line), "要不要合并？")
+
+    def test_a_question_without_the_mark_is_a_finished_turn(self):
+        self.assertEqual(self._classify("要不要合并？")["triage"], "completed")
+
+    def test_the_mark_quoted_mid_line_asks_nothing(self):
+        self.assertEqual(self._classify(f"卡片认 {patrol.ASK_MARK} 开头的行")["triage"], "completed")

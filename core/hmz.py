@@ -59,7 +59,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import codex, patrol, tmux, transcripts
+from . import codex, hmzwire, patrol, tmux, transcripts
 from .sessions import (HOME_BASE, Window, _cwd_to_project_slug, _cwd_visible, _pid_alive,
                        _proc_cwd, _proc_start_ms, _ps_tty, proc_environ, proc_table)
 from .textcap import MESSAGE_CHARS, cap_text
@@ -720,8 +720,17 @@ def hmz_window_dicts() -> list[dict]:
             epic, events = None, []
         tri = patrol.classify_idle(w.status, d.get("idle_seconds", 0), current_task)
         asked, keys, crumb = held(w)
+        # A flow waiting on its person: the question is the daemon's alone, never
+        # on disk (see hmzwire). A line typed at the prompt answers one asked in
+        # words; a form opens on enter, so that one is answered at the terminal.
+        waiting = hmzwire.pending(w.cwd) if w.status == "busy" else None
+        if waiting:
+            q = waiting[0]
+            more = f"（还有 {len(waiting) - 1} 个）" if len(waiting) > 1 else ""
+            tri = patrol._triage("asking", f"{q.get('role') or 'flow'} 在问：{q.get('text', '')[:200]}{more}",
+                                 "在下面输入框回答" if q.get("mode") == "listen" else "去终端填表回答")
         # Not waiting_perm: that card's Quick Approve would type "1" into it.
-        if asked:
+        elif asked:
             tri = patrol._triage("stalled", f"在问：{asked}", f"去终端回答（{keys}）")
         elif crumb:
             tri = patrol._triage("stalled", f"停在菜单：{crumb}", "去终端填完并 Save")

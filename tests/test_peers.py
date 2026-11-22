@@ -6,6 +6,7 @@ caching and the route forwarding without a second board.
 """
 import os
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -168,17 +169,17 @@ class RouteDispatchTests(_OnePeerTest):
         with mock.patch.object(peers, "_request",
                                return_value=(200, {"ok": True})) as req, \
              mock.patch.object(appmod.sessions, "find_window") as local:
-            got = appmod.api_window_prompt("b:42", appmod.PromptBody(text="hi"))
+            got = appmod.api_window_prompt("b:42", appmod.PromptBody(text="hi"), types.SimpleNamespace(headers={}))
         self.assertEqual(got, {"ok": True})
         local.assert_not_called()
         self.assertEqual(req.call_args[0][:3],
-                         ("http://127.0.0.1:7880/api/windows/42/prompt", "POST", {"text": "hi"}))
+                         ("http://127.0.0.1:7880/api/windows/42/prompt", "POST", {"text": "hi", "by": "web"}))
 
     def test_local_key_never_leaves_the_host(self):
         with mock.patch.object(peers, "_request") as fwd, \
              mock.patch.object(appmod.sessions, "find_window"), \
              mock.patch("core.actions.send_prompt", return_value={"ok": False}):
-            appmod.api_window_prompt("42", appmod.PromptBody(text="hi"))
+            appmod.api_window_prompt("42", appmod.PromptBody(text="hi"), types.SimpleNamespace(headers={}))
         fwd.assert_not_called()
 
     def test_malformed_key_is_a_404(self):

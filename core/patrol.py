@@ -24,11 +24,29 @@ IDLE = "{idle}"
 
 TRIAGE_PRIORITY = {
     "waiting_perm": 0,
+    "asking": 0,
     "stalled": 1,
     "completed": 2,
     "working": 3,
     "closeable": 4,
 }
+
+# A session that ends its turn on a choice only the person can make starts a line of
+# its last message with this, and says the question after it. Without it a question
+# asked in words is one more finished turn: nothing tells "what should I do?" from
+# "done". (Claude's own picker, AskUserQuestion, is a dialog and reads as waiting;
+# this is for a question asked in words.)
+ASK_MARK = "【等 user 定】"
+
+
+def asked_in(text: str) -> str:
+    """What `text` asks the person, from its first line that starts with ASK_MARK,
+    or "" when it asks nothing."""
+    for line in (text or "").splitlines():
+        line = line.strip().lstrip("*#>- ").strip()
+        if line.startswith(ASK_MARK):
+            return line[len(ASK_MARK):].strip(" ：:*") or "等 user 定"
+    return ""
 
 
 def _triage(triage: str, reason: str, suggestion: str = "") -> dict:
@@ -73,6 +91,7 @@ def _last_assistant_info(transcript_path: str) -> Optional[dict]:
         "stop_reason": stop_reason,
         "last_text": last_text[:200],
         "last_tool": last_tool,
+        "asked": asked_in(last_text),
     }
 
 
@@ -120,6 +139,9 @@ def classify(window_dict: dict) -> dict:
         return _triage("closeable", "transcript 为空", "可以关闭")
 
     stop = info["stop_reason"]
+
+    if stop == "end_turn" and info["asked"]:
+        return _triage("asking", f"在问：{info['asked'][:200]}", "在下面输入框回答")
 
     if stop == "end_turn":
         summary = info["last_text"].split("\n")[0][:80]

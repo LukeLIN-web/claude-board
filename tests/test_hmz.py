@@ -1087,3 +1087,106 @@ class TestRunOfCalledFlows(unittest.TestCase):
             said = hmz._said(self.epic, hmz._events(self.epic), 2)
         self.assertEqual(seen, [self.lane_log])
         self.assertEqual([e["text"] for e in said], ["You are lane-2-actor-a", "…"])
+
+
+class FakeDaemon:
+    """hmz's daemon as far as the board talks to it: a Unix socket answering
+    session.hello and then each call from `answers` (method -> result), with a
+    notification sent ahead of every answer, the way the daemon pushes them."""
+
+    def __init__(self, answers):
+        import socket
+        import threading
+        self.answers, self.seen = answers, []
+        # A short path: a Unix socket's must fit in about a hundred bytes.
+        import tempfile
+        self.path = os.path.join(tempfile.mkdtemp(prefix="hmzd"), "d.sock")
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        import struct
+        from core import hmzwire
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    while True:
+                        req = json.loads(hmzwire._recv(conn, struct.unpack(">I", hmzwire._recv(conn, 4))[0]))
+                        self.seen.append((req["method"], req.get("params")))
+                        hmzwire._frame(conn, {"jsonrpc": "2.0", "method": "notice", "params": {}})
+                        if req["method"] == "session.hello":
+                            hmzwire._frame(conn, {"jsonrpc": "2.0", "id": req["id"], "result": {"protocol": "3.0.0"}})
+                        elif req["method"] in self.answers:
+                            hmzwire._frame(conn, {"jsonrpc": "2.0", "id": req["id"], "result": self.answers[req["method"]]})
+                        else:
+                            hmzwire._frame(conn, {"jsonrpc": "2.0", "id": req["id"],
+                                                  "error": {"code": -32601, "message": "no such method"}})
+                except (ConnectionError, OSError):
+                    pass
+
+    def close(self):
+        self.srv.close()
+
+
+class TestDaemonQuestions(unittest.TestCase):
+    """A flow waiting on its person (an Outworlder's question) is known to the daemon
+    alone; the card asks the daemon and says the question."""
+
+    ASKED = {"role": "user", "text": "Which one, A or B?", "mode": "listen"}
+
+    def setUp(self):
+        from core import hmzwire
+        self.hmzwire = hmzwire
+
+    def _daemon(self, answers):
+        d = FakeDaemon(answers)
+        self.addCleanup(d.close)
+        return mock.patch.object(self.hmzwire, "sock_path", return_value=d.path), d
+
+    def test_the_question_comes_from_hosts_status_of_the_workspace(self):
+        patch, d = self._daemon({"hosts.status": {"state": "running", "pending": [self.ASKED]}})
+        with patch:
+            self.assertEqual(self.hmzwire.pending("/home/u/proj"), [self.ASKED])
+        self.assertEqual(d.seen[0][0], "session.hello")
+        self.assertEqual(d.seen[1], ("hosts.status", {"workspace": "/home/u/proj"}))
+
+    def test_no_daemon_is_no_answer(self):
+        with mock.patch.object(self.hmzwire, "sock_path", return_value=str(scratch_dir() / "none.sock")):
+            self.assertIsNone(self.hmzwire.pending("/home/u/proj"))
+
+    def test_a_refused_call_is_no_answer(self):
+        patch, _ = self._daemon({})
+        with patch:
+            self.assertIsNone(self.hmzwire.pending("/home/u/proj"))
+
+    def _card(self, pending, status="busy"):
+        w = _window(status=status)
+        with mock.patch.object(hmz, "_discover", return_value=[(w, RUN)]), \
+                mock.patch.object(hmz.tmux, "pane_for_tty", return_value=None), \
+                mock.patch.object(self.hmzwire, "pending", return_value=pending) as asked:
+            return hmz.hmz_window_dicts()[0], asked
+
+    def test_a_running_flow_waiting_on_its_person_is_asking(self):
+        d, _ = self._card([self.ASKED, {**self.ASKED, "text": "And C?"}])
+        self.assertEqual(d["triage"], "asking")
+        self.assertEqual(d["triage_reason"], "user 在问：Which one, A or B?（还有 1 个）")
+        self.assertEqual(d["triage_suggestion"], "在下面输入框回答")
+
+    def test_a_form_is_answered_at_the_terminal(self):
+        d, _ = self._card([{**self.ASKED, "mode": "form"}])
+        self.assertEqual(d["triage_suggestion"], "去终端填表回答")
+
+    def test_nothing_pending_or_no_daemon_leaves_it_working(self):
+        for pending in ([], None):
+            with self.subTest(pending):
+                self.assertEqual(self._card(pending)[0]["triage"], "working")
+
+    def test_an_idle_card_does_not_ask_the_daemon(self):
+        _, asked = self._card([self.ASKED], status="idle")
+        asked.assert_not_called()

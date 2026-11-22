@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from core import actions, auth, btwcapture, btwlog, codex, gpus, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sessions, skills, transcripts, tmux, usage
+from core import actions, auth, btwcapture, btwlog, codex, gpus, history, hmz, memory, opencode, patrol, peers, perms, plans, promptqueue, search, sentlog, sessions, skills, transcripts, tmux, usage
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -304,7 +304,8 @@ def _finalize_snapshot(snap: dict) -> None:
     beside the local ones instead of being appended after them."""
     visible = [w for w in snap["windows"] if not w.get("hidden")]
     busy = [w for w in visible if w.get("triage") == "working"]
-    waiting = [w for w in visible if w.get("triage") == "waiting_perm"]
+    # Waiting on a person: a prompt to approve, or a question to answer.
+    waiting = [w for w in visible if w.get("triage") in ("waiting_perm", "asking")]
     snap["counts"] = {
         "total": len(visible),
         "busy": len(busy),
@@ -523,27 +524,31 @@ def _timeline(w, pid: int, limit: int) -> dict:
         "menu": None,
     }
     if w.platform == "codex":
-        return {**out, **codex.live_timeline(w, limit)}
-    if w.platform == "hmz":
-        return {**out, **hmz.live_timeline(w, limit)}
-    tp = w.transcript_path or ""
-    events = transcripts.timeline(tp, limit=limit) if tp else []
-    # Merge in /btw asides — they live only in the fleet's archive (never the
-    # transcript). Re-sort by timestamp so they interleave with real turns;
-    # only sort when there is something to merge, to avoid perturbing the
-    # transcript's own ordering otherwise.
-    btw_evs = btwlog.timeline_events(w.session_id) if w.session_id else []
-    if btw_evs:
-        events = sorted(events + btw_evs,
-                        key=lambda e: transcripts._parse_ts(e.get("ts", "")))[-limit:]
-    return {
-        **out,
-        "events": events,
-        **_claude_panels(tp),
-        # Live interactive menu (AskUserQuestion / permission prompt) parsed from
-        # the tmux pane — the transcript doesn't record it until it's resolved.
-        "menu": actions.get_pane_menu(w),
-    }
+        tl = {**out, **codex.live_timeline(w, limit)}
+    elif w.platform == "hmz":
+        tl = {**out, **hmz.live_timeline(w, limit)}
+    else:
+        tp = w.transcript_path or ""
+        events = transcripts.timeline(tp, limit=limit) if tp else []
+        # Merge in /btw asides — they live only in the fleet's archive (never the
+        # transcript). Re-sort by timestamp so they interleave with real turns;
+        # only sort when there is something to merge, to avoid perturbing the
+        # transcript's own ordering otherwise.
+        btw_evs = btwlog.timeline_events(w.session_id) if w.session_id else []
+        if btw_evs:
+            events = sorted(events + btw_evs,
+                            key=lambda e: transcripts._parse_ts(e.get("ts", "")))[-limit:]
+        tl = {
+            **out,
+            "events": events,
+            **_claude_panels(tp),
+            # Live interactive menu (AskUserQuestion / permission prompt) parsed from
+            # the tmux pane — the transcript doesn't record it until it's resolved.
+            "menu": actions.get_pane_menu(w),
+        }
+    # Who sent each line the board typed in; a line without one was typed at the terminal.
+    tl["events"] = sentlog.label(w.session_id, tl.get("events") or [])
+    return tl
 
 
 @app.get("/api/windows/{key}/plan")
@@ -589,6 +594,9 @@ class CreateBody(BaseModel):
 
 class PromptBody(BaseModel):
     text: str
+    # Who is sending it, shown on the line in the timeline (core/sentlog.py). A script
+    # names itself; left out, the request says: `api` with the bearer token, else `web`.
+    by: str = ""
 
 
 @app.post("/api/windows/create")
@@ -630,10 +638,10 @@ def api_usage(body: UsageBody) -> dict:
     return _on_host(body, "/api/usage", lambda: usage.read_usage(body.cli))
 
 
-def _send_recorded(w, pid: int, text: str) -> dict:
+def _send_recorded(w, pid: int, text: str, by: str = "web") -> dict:
     """Type `text` into window `w`'s session and, if that worked, record it as
     sent from the dashboard — what the card's Queued list is built from
-    (promptqueue)."""
+    (promptqueue) — and for whom (sentlog)."""
     # Stamp the send time before the keystrokes: send_prompt types, verifies the
     # composer and verifies the submit, which takes long enough that Claude's own
     # transcript row for the prompt can predate a post-send stamp (see record_sent).
@@ -641,13 +649,17 @@ def _send_recorded(w, pid: int, text: str) -> dict:
     r = actions.send_prompt(w, text)
     if r.get("ok"):
         promptqueue.record_sent(pid, text, ts=sent_at)
+        sentlog.record(w.session_id, text, by, ts=sent_at)
     return r
 
 
 @app.post("/api/windows/{key}/prompt")
-def api_window_prompt(key: str, body: PromptBody) -> dict:
+def api_window_prompt(key: str, body: PromptBody, request: Request) -> dict:
+    # Named before a peer's card is forwarded: the peer sees this board's token, not
+    # the page or script that sent it.
+    body.by = body.by or ("api" if request.headers.get("authorization") else "web")
     return _on_card(key, "POST", "prompt",
-                    lambda w, pid: _send_recorded(w, pid, body.text), body)
+                    lambda w, pid: _send_recorded(w, pid, body.text, body.by), body)
 
 
 @app.post("/api/windows/{key}/clear")

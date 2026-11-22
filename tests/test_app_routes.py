@@ -17,7 +17,7 @@ import fastapi
 import pydantic
 
 import app as appmod
-from tests.helpers import codex_rollout, scratch_dir, user_row, write_jsonl
+from tests.helpers import codex_rollout, make_window, scratch_dir, user_row, write_jsonl
 
 # Everything _enriched_snapshot reads besides the cards themselves, each at a
 # value that adds nothing to a card: no hmz runs, no shells, no permission
@@ -286,13 +286,17 @@ class OpenCodeHistoryTimelineTests(unittest.TestCase):
         self.assertEqual([e["text"] for e in r["events"]], ["the plans"])
 
 
+def _request(**headers):
+    return types.SimpleNamespace(headers=headers)
+
+
 class PromptRouteTests(unittest.TestCase):
     def test_dispatches_to_send_prompt(self):
         # The route now guards on a visible window before sending.
-        w = object()
+        w = make_window(session_id="s-dispatch")
         with mock.patch.object(appmod.sessions, "find_window", return_value=w), \
              mock.patch.object(appmod.actions, "send_prompt", return_value={"ok": True}) as m:
-            r = appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"))
+            r = appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"), _request())
         m.assert_called_once_with(w, "hi there")
         self.assertTrue(r["ok"])
 
@@ -300,8 +304,53 @@ class PromptRouteTests(unittest.TestCase):
         with mock.patch.object(appmod.sessions, "find_window", return_value=None), \
              mock.patch.object(appmod.actions, "send_prompt") as m:
             with self.assertRaises(fastapi.HTTPException):
-                appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"))
+                appmod.api_window_prompt(4321, appmod.PromptBody(text="hi there"), _request())
         m.assert_not_called()
+
+
+class SenderTests(unittest.TestCase):
+    """Each line the board types into a session says on the timeline who sent it."""
+
+    def _send(self, w, body, request):
+        with mock.patch.object(appmod.sessions, "find_window", return_value=w), \
+             mock.patch.object(appmod.actions, "send_prompt", return_value={"ok": True}):
+            appmod.api_window_prompt(4321, body, request)
+
+    def _timeline(self, w):
+        with mock.patch.object(appmod.sessions, "find_window", return_value=w), \
+             mock.patch.object(appmod.actions, "get_pane_menu", return_value=None):
+            return [(e["text"], e.get("extra", {}).get("by"))
+                    for e in appmod.api_timeline("4321")["events"] if e["kind"] == "user_text"]
+
+    def test_the_page_a_script_and_the_terminal_are_told_apart(self):
+        w = make_window(session_id="s-senders")
+        t0 = time.time()
+        self._send(w, appmod.PromptBody(text="from the page"), _request())
+        self._send(w, appmod.PromptBody(text="from a script"), _request(authorization="Bearer x"))
+        self._send(w, appmod.PromptBody(text="from the dispatcher", by="dispatcher"),
+                   _request(authorization="Bearer x"))
+        stamp = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0 + dt))
+        w.transcript_path = str(write_jsonl([
+            user_row("from the page", ts=stamp(1)), user_row("from a script", ts=stamp(2)),
+            user_row("from the dispatcher", ts=stamp(3)), user_row("at the terminal", ts=stamp(4))]))
+        self.assertEqual(self._timeline(w), [
+            ("from the page", "web"), ("from a script", "api"),
+            ("from the dispatcher", "dispatcher"), ("at the terminal", None)])
+
+    def test_a_line_typed_before_the_send_is_not_the_sent_one(self):
+        w = make_window(session_id="s-earlier")
+        t0 = time.time()
+        stamp = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0 + dt))
+        self._send(w, appmod.PromptBody(text="again"), _request())
+        w.transcript_path = str(write_jsonl([user_row("again", ts=stamp(-60)),
+                                             user_row("again", ts=stamp(1))]))
+        self.assertEqual(self._timeline(w), [("again", None), ("again", "web")])
+
+    def test_a_peer_is_told_who_sent_it_not_the_board_that_passed_it_on(self):
+        with mock.patch.object(appmod.peers, "is_peer", return_value=True), \
+             mock.patch.object(appmod.peers, "forward_card", return_value={"ok": True}) as fwd:
+            appmod.api_window_prompt("nnmc99:4321", appmod.PromptBody(text="hi"), _request())
+        self.assertEqual(fwd.call_args.args[-1], {"text": "hi", "by": "web"})
 
 
 class BtwDismissRouteTests(unittest.TestCase):
