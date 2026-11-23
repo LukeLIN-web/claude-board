@@ -32,10 +32,11 @@ TRIAGE_PRIORITY = {
 }
 
 # A session that ends its turn on a choice only the person can make starts a line of
-# its last message with this, and says the question after it. Without it a question
-# asked in words is one more finished turn: nothing tells "what should I do?" from
-# "done". (Claude's own picker, AskUserQuestion, is a dialog and reads as waiting;
-# this is for a question asked in words.)
+# its last message with this, and says the question after it; the card then says the
+# question where a finished turn says its first line. It stays a finished turn — no red
+# bar, no notification (user 2026-11-22: shown on the card, never as a browser alert);
+# the answer goes in the send box like any prompt. (Claude's own picker,
+# AskUserQuestion, is a dialog and reads as waiting.)
 ASK_MARK = "【等 user 定】"
 
 
@@ -141,7 +142,7 @@ def classify(window_dict: dict) -> dict:
     stop = info["stop_reason"]
 
     if stop == "end_turn" and info["asked"]:
-        return _triage("asking", f"在问：{info['asked'][:200]}", "在下面输入框回答")
+        return _triage("completed", f"在问：{info['asked'][:200]}", "在下面输入框回答")
 
     if stop == "end_turn":
         summary = info["last_text"].split("\n")[0][:80]

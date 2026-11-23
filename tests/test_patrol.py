@@ -442,16 +442,17 @@ class MountHungTriageTests(unittest.TestCase):
 
 
 class AskedInWordsTests(unittest.TestCase):
-    """A turn that ends on a question only the person can answer is waiting on them,
-    when the session marks it (patrol.ASK_MARK); a turn that merely ends is done."""
+    """A turn that ends on a question only the person can answer says the question on
+    its card when the session marks it (patrol.ASK_MARK), and is still a finished turn:
+    nothing that alarms (the red bar, a notification) fires for it."""
 
     def _classify(self, text):
         return patrol.classify({"status": "idle", "idle_seconds": 120,
                                 "transcript_path": str(write_jsonl([_end_turn(text)]))})
 
-    def test_a_marked_question_is_asking(self):
+    def test_a_marked_question_shows_on_a_finished_card(self):
         got = self._classify(f"改完了两处。\n\n{patrol.ASK_MARK}A 还是 B？\n\n理由见上。")
-        self.assertEqual(got["triage"], "asking")
+        self.assertEqual(got["triage"], "completed")
         self.assertEqual(got["triage_reason"], "在问：A 还是 B？")
 
     def test_the_mark_may_open_a_bullet_or_bold_line(self):
