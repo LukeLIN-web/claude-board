@@ -1347,7 +1347,8 @@ function fleet() {
         rows.push({ host: p.host, online: !!p.online, stale: !!p.stale, error: p.error,
                     via: p.via || '', count: counts[p.host] || 0 });
       }
-      return rows.filter(r => r.host);
+      // By label, this board's own among the rest (plain compare, as peers.py sorts).
+      return rows.filter(r => r.host).sort((a, b) => (a.host > b.host) - (a.host < b.host));
     },
 
     // The distinct directories of the cards `keep` accepts, in card order.
