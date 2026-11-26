@@ -1676,13 +1676,15 @@ function fleet() {
       this.windows = snap.windows || [];
       this.notifyChanges(this.windows);
       this.now = this._snapAt = Date.now();
-      if (snap.host) {
-        this.localHost = snap.host;
-        if (!this.spawnHost) this.spawnHost = snap.host;
-      }
+      if (snap.host) this.localHost = snap.host;
       this.peers = snap.peers || [];
       this.polledBy = snap.polled_by || [];
       this.hosts = this._hostRows();
+      if (!this.spawnHost) {
+        // FLEET_SPAWN_HOST when this board shows that machine, else this board's own.
+        const pref = snap.spawn_host;
+        this.spawnHost = this.hosts.some(h => h.host === pref) ? pref : snap.host;
+      }
       this.gpus = snap.gpus || [];
       if (this.showUsage) this.loadUsage(true);
       this.counts = snap.counts || this.counts;

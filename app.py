@@ -340,6 +340,8 @@ def _enriched_snapshot() -> dict:
     merged["windows"] = list(local["windows"]) + remote
     merged["gpus"] = local["gpus"] + peers.remote_gpus()
     merged["peers"] = peers.status()
+    # The machine the new-session picker starts on, when not this board's own.
+    merged["spawn_host"] = os.environ.get("FLEET_SPAWN_HOST", "").strip()
     # The UI gates the tmux controls on one flag. A card whose own host has no
     # tmux still gets buttons; pressing one returns that host's error, which is
     # a clearer answer than a control that silently isn't there.

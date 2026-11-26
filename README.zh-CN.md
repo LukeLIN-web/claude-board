@@ -105,7 +105,7 @@ FLEET_PEERS=b=http://127.0.0.1:7880
 FLEET_PEER_TUNNELS="7880:hostb:7879"   # <本地端口>:<ssh 主机>:<对端端口>
 ```
 
-然后 `scripts/peer-tunnel.sh start`、`bash run.sh restart`。共享 `.env.local` 里的 `FLEET_API_TOKEN` 用来通过对端的密码门。搜索 / History / Skills / Memory 只显示聚合机本身的数据。
+然后 `scripts/peer-tunnel.sh start`、`bash run.sh restart`。共享 `.env.local` 里的 `FLEET_API_TOKEN` 用来通过对端的密码门。搜索 / History / Skills / Memory 只显示聚合机本身的数据。设 `FLEET_SPAWN_HOST=b`，New Session 默认开在 b 而不是聚合机上。
 
 别的机器也能显示整个集群、操作其中任何一张卡：设 `FLEET_UPSTREAM=http://127.0.0.1:<端口>` 指向聚合机（照上面经端口转发），对别台卡片的操作经聚合机转过去。只被别人轮询的机器会在页头标出「全集群在 …」。只能经一台已经登录着的网关进去时，在条目后加第 4 段 `"<本地端口>:<主机>:<对端端口>:<网关>"`：转发走那台网关现有的 ssh ControlMaster（`FLEET_SSH_CONTROL_DIR`，或它的 `ControlPath`），第二跳从网关上发起，不对网关新开登录。
 

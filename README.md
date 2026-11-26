@@ -143,7 +143,8 @@ FLEET_PEER_TUNNELS="7880:hostb:7879"   # <local port>:<ssh host>:<peer's port>
 
 then `scripts/peer-tunnel.sh start` and `bash run.sh restart`. `FLEET_API_TOKEN`
 from the shared `.env.local` gets through the peers' password gate. Search,
-History, Skills and Memory show the aggregating host only.
+History, Skills and Memory show the aggregating host only. `FLEET_SPAWN_HOST=b`
+makes New Session start on b instead of the aggregator.
 
 Any other machine can show the whole fleet too, and drive any card in it: point
 it at the aggregator with `FLEET_UPSTREAM=http://127.0.0.1:<port>` (over a
