@@ -14,7 +14,8 @@ that lists them, never a guess.
 The send goes through the board's own prompt route, so it gets what that route
 does — the right tmux server and pane, the landed check, the paste handling for
 long text, the forward to the host that owns the card — rather than a
-hand-rolled `tmux send-keys`. Newlines are folded into spaces there.
+hand-rolled `tmux send-keys`. Newlines are folded into spaces there. Run from a
+session's shell, the line shows on the timeline as sent by that session's card.
 
 Exit: 0 sent · 1 the board refused or failed the send · 2 no card / ambiguous / usage
 """
@@ -73,6 +74,29 @@ def match(windows: list[dict], target: str) -> list[dict]:
     return []
 
 
+def ancestors() -> list[int]:
+    """This process's ancestors' pids, nearest first."""
+    out, pid = [], os.getppid()
+    while pid > 1:
+        out.append(pid)
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        pid = int(stat[stat.rindex(")") + 2:].split()[1])
+    return out
+
+
+def sender(windows: list[dict]) -> str:
+    """The card this script runs under, named on the sent line: the nearest ancestor
+    process that is a card. A pid names a process on one host only, so the card must
+    also carry a session id this process inherited — Claude Code and Codex export
+    theirs to the shells they run, but a tmux server hands every pane the ids of the
+    shell it was started from, so an inherited id alone can name another session."""
+    ids = {os.environ.get(v) for v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")} - {None, ""}
+    cards = {w.get("pid"): w for w in windows if w.get("session_id") in ids}
+    w = next((cards[p] for p in ancestors() if p in cards), None)
+    return (w.get("name") or w["key"]) if w else ""
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print(__doc__.split("\n\n")[1], file=sys.stderr)
@@ -101,7 +125,7 @@ def main(argv: list[str]) -> int:
         return 2
     w = hits[0]
     key = urllib.parse.quote(str(w["key"]), safe="")
-    r = call(f"{base}/api/windows/{key}/prompt", token, "POST", {"text": text})
+    r = call(f"{base}/api/windows/{key}/prompt", token, "POST", {"text": text, "by": sender(snap["windows"])})
     ok = isinstance(r, dict) and r.get("ok")
     print(f"board-send: {'sent to' if ok else 'FAILED for'} {w.get('key')} ({w.get('name')})"
           + ("" if ok else f": {(r or {}).get('error') if isinstance(r, dict) else r}"),
